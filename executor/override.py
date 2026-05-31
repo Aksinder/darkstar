@@ -91,6 +91,7 @@ class SlotPlan:
     discharge_kw: float = 0.0
     export_kw: float = 0.0
     load_kw: float = 0.0
+    pv_kw: float = 0.0
     water_kw: float = 0.0
     ev_charging_kw: float = 0.0
     soc_target: int = 50
