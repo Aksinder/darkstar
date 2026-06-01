@@ -25,7 +25,7 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -35,11 +35,33 @@ __all__ = [
     "DetectedCycle",
     "PowerSample",
     "RunSample",
+    "StatusSample",
     "detect_cycles_from_power",
     "detect_cycles_from_runstate",
+    "detect_cycles_from_status",
     "power_samples_from_ha_history",
     "run_samples_from_ha_history",
+    "status_samples_from_ha_history",
 ]
+
+# Program-state values that mean "not running" for an appliance status sensor
+# (e.g. Home Connect dishwasher/washer). Comparison is case-insensitive.
+_DEFAULT_OFF_STATUSES = frozenset(
+    {
+        "idle",
+        "off",
+        "ready",
+        "finished",
+        "program finished",
+        "programmed",
+        "none",
+        "no program",
+        "standby",
+        "unavailable",
+        "unknown",
+        "",
+    }
+)
 
 # HA states that are not real readings and must be skipped.
 _NON_NUMERIC_STATES = frozenset({"unavailable", "unknown", "none", ""})
@@ -79,6 +101,18 @@ class DetectedCycle:
     peak_w: float = 0.0
     profile_kw: list[float] = field(default_factory=lambda: [])
     complete: bool = True
+    # Program-phase breakdown (phase name -> minutes spent), when detected from
+    # a status sensor that reports phases (Filling/Washing/Rinsing/Drying/...).
+    phase_minutes: dict[str, float] = field(default_factory=lambda: {})
+
+
+@dataclass(frozen=True)
+class StatusSample:
+    """A single appliance program-status reading, with optional live power (W)."""
+
+    ts: datetime
+    status: str
+    power_w: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +162,36 @@ def run_samples_from_ha_history(states: Sequence[dict[str, Any]]) -> list[RunSam
         if not ts_raw:
             continue
         out.append(RunSample(ts=_parse_ts(ts_raw), running=running))
+    out.sort(key=lambda s: s.ts)
+    return out
+
+
+def status_samples_from_ha_history(
+    states: Sequence[dict[str, Any]],
+    power_attr: str = "power",
+) -> list[StatusSample]:
+    """Convert HA history rows from a program-status sensor into StatusSamples.
+
+    Reads the state string (the program phase, e.g. "Filling"/"Rinsing"/"Idle")
+    and an optional live power reading from ``attributes[power_attr]`` (as on
+    Home Connect status sensors). Rows are sorted chronologically.
+    """
+    out: list[StatusSample] = []
+    for row in states:
+        status = str(row.get("state", "")).strip()
+        ts_raw = row.get("last_changed") or row.get("last_updated")
+        if not ts_raw:
+            continue
+        power: float | None = None
+        attrs = row.get("attributes")
+        if isinstance(attrs, dict):
+            raw_power: Any = cast("dict[str, Any]", attrs).get(power_attr)
+            if raw_power is not None:
+                try:
+                    power = float(raw_power)
+                except (TypeError, ValueError):
+                    power = None
+        out.append(StatusSample(ts=_parse_ts(ts_raw), status=status, power_w=power))
     out.sort(key=lambda s: s.ts)
     return out
 
@@ -362,6 +426,105 @@ def detect_cycles_from_runstate(
                 peak_w=round((assumed_power_kw or 0.0) * 1000.0, 1),
                 profile_kw=profile,
                 complete=complete,
+            )
+        )
+    return cycles
+
+
+# ---------------------------------------------------------------------------
+# Detection from a program-status sensor (cleanest signal: phases + power)
+# ---------------------------------------------------------------------------
+
+
+def detect_cycles_from_status(
+    samples: Sequence[StatusSample],
+    *,
+    off_statuses: frozenset[str] | set[str] | None = None,
+    min_on_minutes: float = 5.0,
+    merge_gap_minutes: float = 20.0,
+    profile_bucket_min: float = 15.0,
+    max_sample_gap_minutes: float = 30.0,
+) -> list[DetectedCycle]:
+    """Detect cycles from an appliance program-status sensor.
+
+    The sensor reports the running program phase (e.g. "Filling", "Washing",
+    "Rinsing", "Drying") and "Idle"/"Off" when not running. This is the cleanest
+    boundary signal — no power threshold guessing — and additionally yields a
+    per-phase time breakdown. Energy is integrated from each sample's optional
+    power reading (``StatusSample.power_w``) when available.
+
+    Args:
+        samples: StatusSamples, any order (sorted internally).
+        off_statuses: status values (case-insensitive) treated as "not running".
+            Defaults to a standard set (idle/off/ready/finished/...).
+        min_on_minutes / merge_gap_minutes: debounce, as for the other detectors.
+        profile_bucket_min: bucket width for the per-cycle power profile.
+        max_sample_gap_minutes: never integrate energy across a longer gap.
+    """
+    offs = {
+        s.lower() for s in (off_statuses if off_statuses is not None else _DEFAULT_OFF_STATUSES)
+    }
+    pts = sorted(samples, key=lambda s: s.ts)
+    if not pts:
+        return []
+
+    def _running(s: StatusSample) -> bool:
+        return s.status.strip().lower() not in offs
+
+    # Raw running segments.
+    raw: list[tuple[datetime, datetime]] = []
+    seg_start: datetime | None = None
+    last_run_ts: datetime | None = None
+    for s in pts:
+        if _running(s):
+            if seg_start is None:
+                seg_start = s.ts
+            last_run_ts = s.ts
+        elif seg_start is not None:
+            assert last_run_ts is not None
+            raw.append((seg_start, s.ts))
+            seg_start = None
+    open_tail: tuple[datetime, datetime] | None = None
+    if seg_start is not None:
+        open_tail = (seg_start, pts[-1].ts)
+        raw.append(open_tail)
+
+    merged = _merge_segments(raw, merge_gap_minutes)
+    cycles: list[DetectedCycle] = []
+    for start, end in merged:
+        duration_min = (end - start).total_seconds() / 60.0
+        if duration_min < min_on_minutes:
+            continue
+        window = [s for s in pts if start <= s.ts <= end]
+
+        # Energy + profile from the power attribute (where present).
+        power_pts = [
+            PowerSample(ts=s.ts, power_w=s.power_w) for s in window if s.power_w is not None
+        ]
+        energy_kwh = _integrate_energy_kwh(power_pts, max_sample_gap_minutes) if power_pts else 0.0
+        peak_w = max((p.power_w for p in power_pts), default=0.0)
+        profile = _bucket_profile(power_pts, start, end, profile_bucket_min) if power_pts else []
+
+        # Per-phase time breakdown (step-held at each sample's status).
+        phase_minutes: dict[str, float] = {}
+        for i in range(len(window) - 1):
+            dt_min = (window[i + 1].ts - window[i].ts).total_seconds() / 60.0
+            if dt_min <= 0:
+                continue
+            name = window[i].status.strip() or "Unknown"
+            phase_minutes[name] = round(phase_minutes.get(name, 0.0) + dt_min, 2)
+
+        complete = not (open_tail is not None and end == open_tail[1])
+        cycles.append(
+            DetectedCycle(
+                start=start,
+                end=end,
+                duration_min=round(duration_min, 1),
+                energy_kwh=round(energy_kwh, 3),
+                peak_w=round(peak_w, 1),
+                profile_kw=profile,
+                complete=complete,
+                phase_minutes=phase_minutes,
             )
         )
     return cycles

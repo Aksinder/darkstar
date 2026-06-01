@@ -6,10 +6,13 @@ from backend.learning.cycle_learning import (
     CycleStats,
     PowerSample,
     RunSample,
+    StatusSample,
     detect_cycles_from_power,
     detect_cycles_from_runstate,
+    detect_cycles_from_status,
     power_samples_from_ha_history,
     run_samples_from_ha_history,
+    status_samples_from_ha_history,
 )
 
 T0 = datetime(2026, 5, 30, 8, 0, 0)
@@ -22,6 +25,14 @@ def _p(samples_min_w):
 
 def _r(samples_min_bool):
     return [RunSample(ts=T0 + timedelta(minutes=m), running=b) for m, b in samples_min_bool]
+
+
+def _s(samples_min_status_power):
+    """Build StatusSamples from (minute, status, power|None) tuples."""
+    return [
+        StatusSample(ts=T0 + timedelta(minutes=m), status=st, power_w=pw)
+        for m, st, pw in samples_min_status_power
+    ]
 
 
 class TestHaHistoryParsing:
@@ -185,3 +196,89 @@ class TestCycleStats:
         )
         assert stats.n_cycles == 1
         assert stats.duration_min == 90.0
+
+
+class TestStatusParsing:
+    def test_parses_state_and_power_attribute(self):
+        rows = [
+            {
+                "state": "Filling",
+                "last_changed": "2026-05-30T08:00:00+00:00",
+                "attributes": {"power": 1850, "icon": "mdi:dishwasher"},
+            },
+            {
+                "state": "Idle",
+                "last_changed": "2026-05-30T09:30:00+00:00",
+                "attributes": {"power": 0},
+            },
+        ]
+        out = status_samples_from_ha_history(rows)
+        assert [s.status for s in out] == ["Filling", "Idle"]
+        assert out[0].power_w == 1850.0
+
+
+class TestDetectFromStatus:
+    def test_idle_to_phases_to_idle_is_one_cycle(self):
+        samples = _s(
+            [
+                (0, "Idle", 0),
+                (1, "Filling", 200),
+                (20, "Washing", 2000),
+                (60, "Rinsing", 300),
+                (90, "Drying", 50),
+                (110, "Idle", 0),
+            ]
+        )
+        cycles = detect_cycles_from_status(samples)
+        assert len(cycles) == 1
+        c = cycles[0]
+        assert c.complete
+        assert c.start == T0 + timedelta(minutes=1)
+        assert c.end == T0 + timedelta(minutes=110)
+        assert c.peak_w == 2000.0
+
+    def test_phase_minutes_breakdown(self):
+        samples = _s(
+            [
+                (0, "Idle", 0),
+                (10, "Washing", 2000),  # 30 min washing
+                (40, "Rinsing", 300),  # 20 min rinsing
+                (60, "Idle", 0),
+            ]
+        )
+        c = detect_cycles_from_status(samples)[0]
+        assert c.phase_minutes["Washing"] == 30.0
+        assert c.phase_minutes["Rinsing"] == 20.0
+        assert "Idle" not in c.phase_minutes  # off-state ends the cycle
+
+    def test_energy_integrated_from_power_attribute(self):
+        # 60 min steady at 2 kW (sampled densely) -> ~2 kWh.
+        rows = [(0, "Idle", 0)]
+        rows += [(m, "Washing", 2000) for m in range(1, 61, 5)]
+        rows.append((61, "Idle", 0))
+        c = detect_cycles_from_status(_s(rows))[0]
+        # ~2 kWh (sampling at the edges trims a little); ballpark is what matters.
+        assert 1.6 < c.energy_kwh < 2.1
+
+    def test_pausing_flaps_merge_into_one_cycle(self):
+        # Real dishwashers flap Filling<->Pausing; with the merge gap these are
+        # one cycle, and Pausing is still counted as part of the run.
+        rows = [(0, "Idle", 0)]
+        for m in range(1, 40, 2):
+            rows.append((m, "Filling", 30))
+            rows.append((m + 1, "Pausing", 4))
+        rows.append((41, "Idle", 0))
+        cycles = detect_cycles_from_status(_s(rows), merge_gap_minutes=20)
+        assert len(cycles) == 1
+        assert cycles[0].duration_min >= 38
+
+    def test_custom_off_statuses(self):
+        samples = _s([(0, "Ready", 0), (5, "Run", 1000), (35, "Ready", 0)])
+        cycles = detect_cycles_from_status(samples, off_statuses={"ready"})
+        assert len(cycles) == 1
+        assert cycles[0].duration_min == 30.0
+
+    def test_open_tail_incomplete(self):
+        samples = _s([(0, "Idle", 0), (1, "Washing", 2000), (40, "Washing", 2000)])
+        c = detect_cycles_from_status(samples)[0]
+        assert c.complete is False
