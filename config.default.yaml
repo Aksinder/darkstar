@@ -144,6 +144,32 @@ ev_chargers:
   #   replan_on_plugin: true
   #   replan_on_unplug: false
 
+# Deferrable household loads (dishwasher, washing machine, ...).
+# Darkstar schedules each queued run into the globally cheapest window (free PV
+# surplus -> battery -> cheap grid) within a deadline, instead of price-only HA
+# automations. A run is non-interruptible (one contiguous block). Disabled by
+# default: with no enabled loads + no pending run, nothing changes.
+deferrable_loads: []
+  # - id: dishwasher                 # Unique identifier (slug)
+  #   name: "Diskmaskin"
+  #   enabled: true
+  #   duration_min: 120              # Seed cycle length (min); overridden by learned stats
+  #   energy_kwh: 1.2                # Seed cycle energy (kWh); overridden by learned stats
+  #   deadline_mode: cheapest_within_hours   # or: hard_deadline
+  #   window_hours: 14               # for cheapest_within_hours (soft)
+  #   # hard_deadline: "07:00"       # for hard_deadline (finish-by clock time)
+  #   phase: A                       # optional grid phase (A/B/C) for phase-balancing
+  #   switch_entity: switch.diskmaskin          # HA switch Darkstar gates power with
+  #   running_sensor: binary_sensor.dishwasher_running
+  #   queued_signal: input_boolean.dishwasher_active   # auto-detect a queued cycle
+  #   energy_sensor: sensor.diskmaskin_energy   # for learned per-cycle energy
+
+# Global settings for deferrable loads (penalties used by the MILP).
+deferrable_load_settings:
+  soft_deadline_penalty_sek: 30.0    # tardiness penalty/slot for "cheapest within X h"
+  hard_deadline_penalty_sek: 1000.0  # tardiness penalty/slot for hard "done by HH:MM"
+  phase_penalty_sek: 0.0             # >0 to discourage same-phase concurrency (balancing)
+
 # S-Index Configuration (Risk & Safety Strategy)
 s_index:
   mode: "probabilistic"            # Options: probabilistic | dynamic

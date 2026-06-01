@@ -15,6 +15,7 @@ import pulp  # type: ignore[import,no-redef]
 from planner.errors import PlannerError, PlannerErrorCode
 
 from .types import (
+    DeferrableLoadInput,
     EVChargerInput,
     KeplerConfig,
     KeplerInput,
@@ -144,6 +145,48 @@ class KeplerSolver:
             )
         else:
             any_ev_charging = dict.fromkeys(range(T), 0)
+
+        # Deferrable household loads (dishwasher, washing machine, ...).
+        # Each pending run is a single non-interruptible contiguous block that
+        # must run exactly once within the horizon. We model only the START slot
+        # as a binary; "running" in slot t is the linear expression
+        # sum(start[s] for s in [t-N+1 .. t]) which is 0/1 because exactly one
+        # start is chosen and the block is contiguous.
+        defl_start: dict[str, dict[int, Any]] = {}
+        defl_valid: dict[str, list[int]] = {}
+        defl_n: dict[str, int] = {}
+        defl_energy_per_slot: dict[str, float] = {}
+        scheduled_defl: list[DeferrableLoadInput] = []
+        for load in config.deferrable_loads:
+            n = max(1, int(load.duration_slots))
+            e_start = max(0, int(load.earliest_start_slot))
+            last_start = T - n  # last slot index at which a full block still fits
+            valid = list(range(e_start, last_start + 1))
+            if n > T or not valid:
+                logger.warning(
+                    "Deferrable load %s: cannot fit (dur=%d slots, earliest=%d, T=%d) - skipping",
+                    load.id,
+                    n,
+                    e_start,
+                    T,
+                )
+                continue
+            safe_d = load.id.replace("-", "_").replace(".", "_")
+            defl_start[load.id] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
+                f"defl_start_{safe_d}", valid, cat="Binary"
+            )
+            defl_valid[load.id] = valid
+            defl_n[load.id] = n
+            defl_energy_per_slot[load.id] = load.energy_kwh / n
+            scheduled_defl.append(load)
+            # Run exactly once within the valid start window.
+            prob += pulp.lpSum(defl_start[load.id][t] for t in valid) == 1
+
+        def _defl_run_expr(load_id: str, t: int) -> Any:
+            """Linear 0/1 expression: is deferrable load `load_id` running in slot t?"""
+            n = defl_n[load_id]
+            starts = defl_start[load_id]
+            return pulp.lpSum(starts[s] for s in defl_valid[load_id] if 0 <= t - s < n)
 
         # SoC state variables (T+1 states for T slots)
 
@@ -380,11 +423,24 @@ class KeplerSolver:
                 if custom_entity_enabled
                 else 0.0
             )
+
+            # Deferrable household loads running this slot (energy split evenly
+            # across the block's slots), added to the demand side.
+            deferrable_load_kwh_t: Any = (
+                pulp.lpSum(
+                    _defl_run_expr(load.id, t) * defl_energy_per_slot[load.id]
+                    for load in scheduled_defl
+                )
+                if scheduled_defl
+                else 0.0
+            )
+
             prob += (
                 s.load_kwh
                 + water_load_kwh
                 + total_ev_energy_t
                 + custom_entity_load_kwh
+                + deferrable_load_kwh_t
                 + charge[t]
                 + grid_export[t]
                 + curtailment[t]
@@ -506,6 +562,46 @@ class KeplerSolver:
         # Terminal constraints
         prob += soc[T] >= min_soc_kwh - soc_violation[T]
         prob += soc[T] <= max_soc_kwh + soc_overshoot[T]
+
+        # Deferrable-load deadline penalty (tardiness). A run that starts at slot
+        # s finishes at s+N-1; slots beyond the deadline are penalised. Because
+        # the lateness of each candidate start is a constant, this stays linear.
+        for load in scheduled_defl:
+            n = defl_n[load.id]
+            deadline = load.deadline_slot if load.deadline_slot is not None else (T - 1)
+            penalty = (
+                config.deferrable_hard_deadline_penalty_sek
+                if load.deadline_hard
+                else config.deferrable_soft_deadline_penalty_sek
+            )
+            if penalty > 0:
+                total_cost.append(
+                    penalty
+                    * pulp.lpSum(
+                        defl_start[load.id][s] * max(0, (s + n - 1) - deadline)
+                        for s in defl_valid[load.id]
+                    )
+                )
+
+        # Deferrable-load phase balancing (optional): penalise two same-phase
+        # loads running concurrently, so large single-phase appliances spread out.
+        if config.deferrable_phase_penalty_sek > 0 and len(scheduled_defl) >= 2:
+            phase_groups: defaultdict[str, list[DeferrableLoadInput]] = defaultdict(list)
+            for load in scheduled_defl:
+                if load.phase:
+                    phase_groups[str(load.phase)].append(load)
+            for phase, loads in phase_groups.items():
+                if len(loads) < 2:
+                    continue
+                safe_p = phase.replace("-", "_").replace(".", "_")
+                for t in range(T):
+                    overlap: Any = pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
+                        f"defl_phase_over_{safe_p}_{t}", lowBound=0
+                    )
+                    prob += overlap >= (  # type: ignore[operator]
+                        pulp.lpSum(_defl_run_expr(load.id, t) for load in loads) - 1
+                    )
+                    total_cost.append(config.deferrable_phase_penalty_sek * overlap)
 
         # Terminal SoC Target (BIDIRECTIONAL soft constraint)
         # Penalize both being UNDER target (risk) AND OVER target (missed discharge opportunity)
@@ -743,6 +839,19 @@ class KeplerSolver:
                     total_ev_kw += device_kw
                 ev_kw = total_ev_kw
 
+                # Per-device deferrable-load results
+                deferrable_load_results: dict[str, float] = {}
+                total_defl_kw: float = 0.0
+                for load in scheduled_defl:
+                    run_val: float | None = pulp.value(_defl_run_expr(load.id, t))  # type: ignore[assignment]
+                    device_kw = (
+                        defl_energy_per_slot[load.id] / h
+                        if run_val is not None and run_val > 0.5 and h > 0
+                        else 0.0
+                    )
+                    deferrable_load_results[load.id] = device_kw
+                    total_defl_kw += device_kw
+
                 wear: float = (
                     (c_val + d_val) * config.wear_cost_sek_per_kwh * 0.5
                     if c_val is not None and d_val is not None
@@ -775,6 +884,8 @@ class KeplerSolver:
                         and _cev > 0.5,
                         ev_charge_kw=ev_kw,
                         ev_charger_results=ev_charger_results,
+                        deferrable_load_kw=total_defl_kw,
+                        deferrable_load_results=deferrable_load_results,
                         is_optimal=True,
                     )
                 )

@@ -44,6 +44,29 @@ class EVChargerInput:
 
 
 @dataclass
+class DeferrableLoadInput:
+    """Per-device deferrable household load (dishwasher, washing machine, ...).
+
+    Represents a single *pending* run: a non-interruptible, contiguous block of
+    ``duration_slots`` slots that must run once within the planning horizon,
+    consuming ``energy_kwh`` total, ideally finishing by ``deadline_slot``.
+    Only loads with a pending run should appear in the solver input.
+    """
+
+    id: str
+    energy_kwh: float
+    duration_slots: int
+    earliest_start_slot: int = 0
+    # Finish-by slot index (inclusive). None = end of horizon.
+    deadline_slot: int | None = None
+    # True => deadline strongly enforced (high tardiness penalty); False => soft
+    # "cheapest within window" (moderate penalty, economics may run late).
+    deadline_hard: bool = True
+    # Optional grid phase ("A"/"B"/"C") for phase-balancing (see phase penalty).
+    phase: str | None = None
+
+
+@dataclass
 class KeplerConfig:
     """Configuration for the Kepler MILP solver."""
 
@@ -101,6 +124,15 @@ class KeplerConfig:
     excess_pv_reward_sek_per_kwh: float = 0.5  # Reward for using excess PV at sink vs exporting
     excess_pv_soc_threshold_percent: float = 95.0  # Battery SoC % required before sink activates
     excess_pv_custom_entity_power_kw: float = 1.0  # Estimated power of custom entity (kW)
+
+    # Deferrable household loads (dishwasher, washing machine, ...)
+    deferrable_loads: list[DeferrableLoadInput] = field(default_factory=lambda: [])
+    # Tardiness penalty (SEK per slot finished after the deadline).
+    deferrable_soft_deadline_penalty_sek: float = 30.0  # for soft "cheapest within X h"
+    deferrable_hard_deadline_penalty_sek: float = 1000.0  # for hard "done by HH:MM"
+    # Soft penalty (SEK per slot) for two deferrable loads running on the same
+    # phase at the same time (0 = phase-balancing disabled).
+    deferrable_phase_penalty_sek: float = 0.0
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -170,6 +202,10 @@ class KeplerResultSlot:
         default_factory=lambda: {}
     )  # Per-device: heater_id -> boost active
     custom_entity_active: bool = False  # Whether custom entity sink should be on
+    deferrable_load_kw: float = 0.0  # Aggregate deferrable-load power this slot
+    deferrable_load_results: dict[str, float] = field(
+        default_factory=lambda: {}
+    )  # Per-device: load_id -> kW
     is_optimal: bool = True
 
 
