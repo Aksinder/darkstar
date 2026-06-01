@@ -1,6 +1,7 @@
 import pandas as pd
 
 from planner.strategy.s_index import (
+    calculate_bridging_reserve,
     calculate_deficit_ratio,
     calculate_safety_floor,
     calculate_temporal_deficit,
@@ -35,6 +36,55 @@ def test_calculate_temporal_deficit():
     # Expected: (5-2) + (10-5) + max(0, 3-5) = 3 + 5 + 0 = 8.0
     deficit = calculate_temporal_deficit(df)
     assert deficit == 8.0
+
+
+def test_bridging_reserve_equals_deficit_for_pure_night():
+    """With no intervening surplus, the bridging reserve equals the naive
+    temporal deficit (cumulative balance only ever decreases)."""
+    df = pd.DataFrame(
+        {
+            "load_forecast_kwh": [1.0, 2.0, 1.5],
+            "pv_forecast_kwh": [0.0, 0.0, 0.0],
+        }
+    )
+    # net = [-1, -2, -1.5], cumulative = [-1, -3, -4.5], deepest dip = 4.5
+    assert calculate_bridging_reserve(df) == 4.5
+    assert calculate_bridging_reserve(df) == calculate_temporal_deficit(df)
+
+
+def test_bridging_reserve_credits_incoming_surplus():
+    """Surplus that arrives before a deficit cancels it out, so the bridging
+    reserve is strictly smaller than the naive sum-of-deficits. This is the
+    'enough sun is coming' case — the planner should not over-reserve."""
+    df = pd.DataFrame(
+        {
+            "load_forecast_kwh": [0.0, 0.0, 3.0, 3.0],
+            "pv_forecast_kwh": [5.0, 5.0, 0.0, 0.0],
+        }
+    )
+    # net = [+5, +5, -3, -3], cumulative = [5, 10, 7, 4]; never dips below 0.
+    assert calculate_bridging_reserve(df) == 0.0
+    # Naive deficit would have demanded a 6.0 kWh reserve.
+    assert calculate_temporal_deficit(df) == 6.0
+
+
+def test_bridging_reserve_deficit_then_surplus():
+    """When the deficit comes first, surplus afterwards cannot retroactively
+    cover it — the reserve still reflects the early dip."""
+    df = pd.DataFrame(
+        {
+            "load_forecast_kwh": [3.0, 3.0, 0.0, 0.0],
+            "pv_forecast_kwh": [0.0, 0.0, 5.0, 5.0],
+        }
+    )
+    # net = [-3, -3, +5, +5], cumulative = [-3, -6, -1, 4], deepest dip = 6
+    assert calculate_bridging_reserve(df) == 6.0
+
+
+def test_bridging_reserve_empty_df():
+    """Empty DataFrame returns 0."""
+    df = pd.DataFrame({"load_forecast_kwh": [], "pv_forecast_kwh": []})
+    assert calculate_bridging_reserve(df) == 0.0
 
 
 def test_calculate_safety_floor_defaults():

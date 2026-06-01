@@ -207,9 +207,20 @@ class Controller:
             # Charge battery from PV while exporting excess - use self_consumption
             mode_intent = "self_consumption"
         elif round(state.current_soc_percent) <= slot.soc_target:
-            # At or below SoC target - use idle to hold battery
-            # Round current SoC to integer for consistent comparison with plan target
-            mode_intent = "idle"
+            # At or below SoC target - hold the battery.
+            # Round current SoC to integer for consistent comparison with plan target.
+            #
+            # Exception: during a PV-surplus slot (forecast PV > load), freezing the
+            # battery (idle) means any load the inverter can't cover from PV in real
+            # time — transient spikes or single-phase loads on a 3-phase PV feed — is
+            # pulled from the grid, even with a full battery. Use self_consumption so
+            # the battery covers those deficits; the surplus PV refills it within the
+            # slot, so net SoC is preserved. EV-charging slots stay idle to keep
+            # battery→EV source isolation (handled by the dedicated branch below).
+            if slot.pv_kw > slot.load_kw and slot.ev_charging_kw <= 0.1:
+                mode_intent = "self_consumption"
+            else:
+                mode_intent = "idle"
         elif slot.discharge_kw == 0 and slot.ev_charging_kw > 0.1:
             # REV F76 Phase 3: EV charging active - use idle instead of self_consumption
             # to prevent any battery discharge to EV
