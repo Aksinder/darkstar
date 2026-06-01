@@ -259,9 +259,87 @@ def build_tracked_from_config(
     return appliances, tanks
 
 
+async def run_publisher_loop(
+    config: dict[str, Any],
+    *,
+    interval_s: float = 300.0,
+    history_hours: int = 336,
+) -> None:
+    """Deploy-ready periodic loop wiring real HA I/O to the publisher service.
+
+    Start it once from the add-on startup, e.g.::
+
+        asyncio.create_task(run_publisher_loop(app_config))
+
+    Reads HA history/state and POSTs ``sensor.darkstar_*`` (sensor writes only -
+    controls no hardware). Returns immediately if nothing is configured.
+    """
+    import asyncio
+    from datetime import timedelta
+
+    import httpx
+
+    from backend.core import secrets
+    from backend.core.ha_client import get_ha_sensor_float, make_ha_headers
+    from backend.learning.cycle_publisher import publish_sensors
+
+    appliances, tanks = build_tracked_from_config(config)
+    if not appliances and not tanks:
+        logger.info("Cycle publisher: no tracked loads/tanks configured; not starting")
+        return
+
+    ha_cfg = secrets.load_home_assistant_config()
+    base_url = ha_cfg.get("url")
+    token = ha_cfg.get("token")
+    if not base_url or not token:
+        logger.warning("Cycle publisher: HA url/token missing; not starting")
+        return
+
+    async def fetch_history(entity_id: str, hours: int) -> list[dict[str, Any]]:
+        now = datetime.now().astimezone()
+        start = now - timedelta(hours=hours)
+        api_url = f"{base_url.rstrip('/')}/api/history/period/{start.isoformat()}"
+        params: dict[str, Any] = {
+            "filter_entity_id": entity_id,
+            "end_time": now.isoformat(),
+            "significant_changes_only": False,
+            "minimal_response": False,
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(api_url, headers=make_ha_headers(token), params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        return data[0] if data else []
+
+    async def publish(sensors: list[PublishedSensor]) -> int:
+        return await publish_sensors(sensors, base_url, token)
+
+    service = DeferrablePublisherService(
+        appliances,
+        tanks,
+        fetch_history,
+        get_ha_sensor_float,
+        publish,
+        history_hours=history_hours,
+    )
+    logger.info(
+        "Cycle publisher started: %d appliance(s), %d tank(s), every %.0fs",
+        len(appliances),
+        len(tanks),
+        interval_s,
+    )
+    while True:
+        try:
+            await service.run_once()
+        except Exception as exc:
+            logger.warning("Cycle publisher tick failed: %s", exc)
+        await asyncio.sleep(interval_s)
+
+
 __all__ = [
     "DeferrablePublisherService",
     "TrackedAppliance",
     "TrackedTank",
     "build_tracked_from_config",
+    "run_publisher_loop",
 ]
