@@ -2,6 +2,8 @@
 
 from datetime import datetime, timedelta
 
+import pytest
+
 from backend.learning.cycle_learning import (
     CycleStats,
     PowerSample,
@@ -282,3 +284,38 @@ class TestDetectFromStatus:
         samples = _s([(0, "Idle", 0), (1, "Washing", 2000), (40, "Washing", 2000)])
         c = detect_cycles_from_status(samples)[0]
         assert c.complete is False
+
+
+class TestPowerScaleAndRobustStatus:
+    def test_power_scale_doubles_energy_from_power(self):
+        # Single phase metered at 1 kW; a 2-phase element draws ~2 kW.
+        rows = [(0, 0)] + [(m, 1000) for m in range(1, 61, 5)] + [(61, 0)]
+        base = detect_cycles_from_power(_p(rows))[0]
+        scaled = detect_cycles_from_power(_p(rows), power_scale=2.0)[0]
+        assert scaled.energy_kwh == pytest.approx(base.energy_kwh * 2.0, abs=0.01)
+        assert scaled.peak_w == pytest.approx(base.peak_w * 2.0, abs=0.1)
+        assert scaled.profile_kw[0] == pytest.approx(base.profile_kw[0] * 2.0, abs=0.01)
+
+    def test_status_power_scale(self):
+        rows = (
+            [(0, "Idle", 0)] + [(m, "Washing", 1000) for m in range(1, 61, 5)] + [(61, "Idle", 0)]
+        )
+        base = detect_cycles_from_status(_s(rows))[0]
+        scaled = detect_cycles_from_status(_s(rows), power_scale=2.0)[0]
+        assert scaled.energy_kwh == pytest.approx(base.energy_kwh * 2.0, abs=0.01)
+
+    def test_running_power_overrides_mislabelled_idle(self):
+        # Phase sensor wrongly reports "Idle" mid-cycle while power stays high.
+        samples = _s(
+            [
+                (0, "Idle", 0),
+                (1, "Washing", 2000),
+                (20, "Idle", 2000),  # mislabelled: still drawing 2 kW
+                (40, "Washing", 2000),
+                (60, "Idle", 0),
+            ]
+        )
+        # Without corroboration the cycle would split at minute 20.
+        with_power = detect_cycles_from_status(samples, running_power_w=500)
+        assert len(with_power) == 1
+        assert with_power[0].duration_min >= 58
