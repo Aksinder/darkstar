@@ -277,6 +277,7 @@ def detect_cycles_from_power(
     merge_gap_minutes: float = 20.0,
     profile_bucket_min: float = 15.0,
     max_sample_gap_minutes: float = 30.0,
+    power_scale: float = 1.0,
 ) -> list[DetectedCycle]:
     """Detect appliance cycles from a power (W) time series.
 
@@ -335,9 +336,12 @@ def detect_cycles_from_power(
         if duration_min < min_on_minutes:
             continue
         window = [s for s in pts if start <= s.ts <= end]
-        energy_kwh = _integrate_energy_kwh(window, max_sample_gap_minutes)
-        peak_w = max((s.power_w for s in window), default=0.0)
-        profile = _bucket_profile(window, start, end, profile_bucket_min)
+        energy_kwh = _integrate_energy_kwh(window, max_sample_gap_minutes) * power_scale
+        peak_w = max((s.power_w for s in window), default=0.0) * power_scale
+        profile = [
+            round(p * power_scale, 3)
+            for p in _bucket_profile(window, start, end, profile_bucket_min)
+        ]
         complete = not (open_tail is not None and end == open_tail[1])
         cycles.append(
             DetectedCycle(
@@ -444,14 +448,21 @@ def detect_cycles_from_status(
     merge_gap_minutes: float = 20.0,
     profile_bucket_min: float = 15.0,
     max_sample_gap_minutes: float = 30.0,
+    running_power_w: float | None = None,
+    power_scale: float = 1.0,
 ) -> list[DetectedCycle]:
     """Detect cycles from an appliance program-status sensor.
 
     The sensor reports the running program phase (e.g. "Filling", "Washing",
-    "Rinsing", "Drying") and "Idle"/"Off" when not running. This is the cleanest
-    boundary signal — no power threshold guessing — and additionally yields a
-    per-phase time breakdown. Energy is integrated from each sample's optional
-    power reading (``StatusSample.power_w``) when available.
+    "Rinsing", "Drying") and "Idle"/"Off" when not running. State-based boundaries
+    avoid power-threshold guessing, and yield a per-phase time breakdown. Energy is
+    integrated from each sample's optional power reading (``StatusSample.power_w``).
+
+    Program-phase labels are treated as an *indication*, not ground truth: when
+    ``running_power_w`` is set, a sample also counts as running whenever its power
+    is at/above that threshold, so a mislabelled "Idle" mid-cycle (or a flaky phase
+    sensor) does not prematurely end the cycle. ``phase_minutes`` therefore remains
+    approximate.
 
     Args:
         samples: StatusSamples, any order (sorted internally).
@@ -460,6 +471,11 @@ def detect_cycles_from_status(
         min_on_minutes / merge_gap_minutes: debounce, as for the other detectors.
         profile_bucket_min: bucket width for the per-cycle power profile.
         max_sample_gap_minutes: never integrate energy across a longer gap.
+        running_power_w: if set, power at/above this (W) also marks a sample as
+            running, making detection robust to an imperfect phase sensor.
+        power_scale: multiply measured energy/peak/profile by this factor. Use for
+            a partially-metered element, e.g. a 2-phase water heater with only one
+            phase metered -> ``power_scale=2.0`` to recover the true draw.
     """
     offs = {
         s.lower() for s in (off_statuses if off_statuses is not None else _DEFAULT_OFF_STATUSES)
@@ -469,7 +485,12 @@ def detect_cycles_from_status(
         return []
 
     def _running(s: StatusSample) -> bool:
-        return s.status.strip().lower() not in offs
+        if s.status.strip().lower() not in offs:
+            return True
+        # Phase labels are only an indication: corroborate with power.
+        return (
+            running_power_w is not None and s.power_w is not None and s.power_w >= running_power_w
+        )
 
     # Raw running segments.
     raw: list[tuple[datetime, datetime]] = []
@@ -501,9 +522,18 @@ def detect_cycles_from_status(
         power_pts = [
             PowerSample(ts=s.ts, power_w=s.power_w) for s in window if s.power_w is not None
         ]
-        energy_kwh = _integrate_energy_kwh(power_pts, max_sample_gap_minutes) if power_pts else 0.0
-        peak_w = max((p.power_w for p in power_pts), default=0.0)
-        profile = _bucket_profile(power_pts, start, end, profile_bucket_min) if power_pts else []
+        energy_kwh = (
+            _integrate_energy_kwh(power_pts, max_sample_gap_minutes) if power_pts else 0.0
+        ) * power_scale
+        peak_w = max((p.power_w for p in power_pts), default=0.0) * power_scale
+        profile = (
+            [
+                round(p * power_scale, 3)
+                for p in _bucket_profile(power_pts, start, end, profile_bucket_min)
+            ]
+            if power_pts
+            else []
+        )
 
         # Per-phase time breakdown (step-held at each sample's status).
         phase_minutes: dict[str, float] = {}
