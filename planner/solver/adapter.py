@@ -6,12 +6,14 @@ Migrated from backend/kepler/adapter.py during Rev K13 modularization.
 """
 
 import logging
-from datetime import datetime  # noqa: TC003
+import math
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
 
 from .types import (
+    DeferrableLoadInput,
     EVChargerInput,
     IncentiveBucket,
     KeplerConfig,
@@ -334,12 +336,126 @@ def _apply_bulk_mode_override(params: dict[str, float]) -> dict[str, float]:
     return params
 
 
+def _slot_minutes(slots: list[Any] | None, default: float = 15.0) -> float:
+    """Infer slot length in minutes from the first slot, falling back to default."""
+    if slots and len(slots) >= 1:
+        s = slots[0]
+        try:
+            return (s.end_time - s.start_time).total_seconds() / 60.0
+        except (AttributeError, TypeError):
+            pass
+    return default
+
+
+def _resolve_deadline_slot(
+    load_cfg: dict[str, Any],
+    slots: list[Any] | None,
+    slot_minutes: float,
+) -> tuple[int | None, bool]:
+    """Resolve (deadline_slot, hard) from a load's deadline config.
+
+    - ``hard_deadline``: finish by the next occurrence of an "HH:MM" clock time.
+    - ``cheapest_within_hours``: soft finish-by a number of hours from now.
+    Returns (None, False) when no deadline applies (run any time in horizon).
+    """
+    mode = str(load_cfg.get("deadline_mode", "cheapest_within_hours"))
+    if mode == "hard_deadline" and slots:
+        hhmm = load_cfg.get("hard_deadline")
+        target = _next_clock_time(slots, hhmm)
+        if target is None:
+            return None, True
+        # Last slot that ends at/before the deadline.
+        idx = None
+        for i, s in enumerate(slots):
+            if getattr(s, "end_time", None) is not None and s.end_time <= target:
+                idx = i
+        return (idx if idx is not None else None), True
+    # Soft "cheapest within X hours".
+    window_h = float(load_cfg.get("window_hours", 12.0))
+    n = max(1, int(round(window_h * 60.0 / slot_minutes)))
+    horizon = len(slots) if slots else n
+    return min(horizon - 1, n - 1), False
+
+
+def _next_clock_time(slots: list[Any], hhmm: Any) -> datetime | None:
+    """Next datetime matching "HH:MM" at/after the first slot start."""
+    if not slots or not hhmm:
+        return None
+    try:
+        hour, minute = (int(x) for x in str(hhmm).split(":"))
+    except (ValueError, AttributeError):
+        return None
+    base = getattr(slots[0], "start_time", None)
+    if base is None:
+        return None
+    target = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target < base:
+        target = target + timedelta(days=1)
+    return target
+
+
+def build_deferrable_load_inputs(
+    loads_config: list[dict[str, Any]],
+    deferrable_load_states: list[dict[str, Any]] | None,
+    slots: list[Any] | None,
+) -> list[DeferrableLoadInput]:
+    """Build DeferrableLoadInput list for loads with a *pending* run.
+
+    A run is scheduled only when its state dict has ``pending=True`` (the HA
+    bridge sets this when a cycle is queued/started). Duration and energy come
+    from learned values in the state dict when present, otherwise the config
+    seed. Loads without a pending run are omitted (no scheduling).
+
+    Args:
+        loads_config: ``deferrable_loads`` list from config.yaml.
+        deferrable_load_states: per-load HA state dicts
+            (``id``, ``pending``, optional ``duration_min``/``energy_kwh``/
+            ``earliest_offset_min``).
+        slots: KeplerInputSlot list (for slot length and deadline resolution).
+    """
+    slot_min = _slot_minutes(slots)
+    state_by_id: dict[str, dict[str, Any]] = {
+        str(s.get("id", "")): s for s in (deferrable_load_states or []) if s.get("id")
+    }
+    out: list[DeferrableLoadInput] = []
+    for cfg in loads_config:
+        if not cfg.get("enabled", True):
+            continue
+        lid = str(cfg.get("id", ""))
+        if not lid:
+            continue
+        state = state_by_id.get(lid)
+        if not state or not state.get("pending", False):
+            continue  # only schedule a run that is actually queued
+
+        duration_min = float(state.get("duration_min", cfg.get("duration_min", 120.0)))
+        energy_kwh = float(state.get("energy_kwh", cfg.get("energy_kwh", 1.0)))
+        duration_slots = max(1, math.ceil(duration_min / slot_min))
+        earliest_offset_min = float(state.get("earliest_offset_min", 0.0))
+        earliest_slot = max(0, int(earliest_offset_min / slot_min))
+        deadline_slot, hard = _resolve_deadline_slot(cfg, slots, slot_min)
+
+        out.append(
+            DeferrableLoadInput(
+                id=lid,
+                energy_kwh=energy_kwh,
+                duration_slots=duration_slots,
+                earliest_start_slot=earliest_slot,
+                deadline_slot=deadline_slot,
+                deadline_hard=hard,
+                phase=cfg.get("phase"),
+            )
+        )
+    return out
+
+
 def config_to_kepler_config(
     planner_config: dict[str, Any],
     overrides: dict[str, Any] | None = None,
     slots: list[Any] | None = None,
     water_heater_states: list[dict[str, Any]] | None = None,
     ev_charger_states: list[dict[str, Any]] | None = None,
+    deferrable_load_states: list[dict[str, Any]] | None = None,
 ) -> KeplerConfig:
     """
     Convert the main config dictionary to KeplerConfig.
@@ -506,6 +622,23 @@ def config_to_kepler_config(
         ),
     )
 
+    # Deferrable household loads (dishwasher, washing machine, ...).
+    # Only pending runs are scheduled; the master toggle lives in the pipeline
+    # (default off), so absent state/config means nothing changes.
+    loads_cfg = planner_config.get("deferrable_loads", []) or []
+    if loads_cfg:
+        kepler_cfg.deferrable_loads = build_deferrable_load_inputs(
+            loads_cfg, deferrable_load_states, slots
+        )
+    defl_settings = planner_config.get("deferrable_load_settings", {}) or {}
+    kepler_cfg.deferrable_soft_deadline_penalty_sek = float(
+        defl_settings.get("soft_deadline_penalty_sek", 30.0)
+    )
+    kepler_cfg.deferrable_hard_deadline_penalty_sek = float(
+        defl_settings.get("hard_deadline_penalty_sek", 1000.0)
+    )
+    kepler_cfg.deferrable_phase_penalty_sek = float(defl_settings.get("phase_penalty_sek", 0.0))
+
     return kepler_cfg
 
 
@@ -572,6 +705,8 @@ def kepler_result_to_dataframe(
                 "water_from_battery_kwh": 0.0,
                 "ev_charging_kw": s.ev_charge_kw,  # Aggregate EV charging power (backward compat)
                 "ev_chargers": s.ev_charger_results,  # Per-device: charger_id -> kW
+                "deferrable_load_kw": s.deferrable_load_kw,  # Aggregate deferrable-load power
+                "deferrable_loads": s.deferrable_load_results,  # Per-device: load_id -> kW
                 "projected_battery_cost": 0.0,
             }
         )

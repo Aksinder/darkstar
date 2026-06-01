@@ -158,6 +158,20 @@ async def lifespan(app: FastAPI):
         # For now, let's allow it but semantic routes will 500.
         app.state.learning_store = None
 
+    # Start deferrable-load cycle publisher (publishes sensor.darkstar_* with
+    # per-cycle energy/duration/phase, daily draw, and hot-water tank state).
+    # Sensor writes only - controls no hardware. No-ops when nothing configured.
+    try:
+        from backend.learning.cycle_publisher_service import run_publisher_loop
+
+        publisher_config = load_yaml("config.yaml")
+        asyncio.create_task(  # noqa: RUF006 - lifetime is the app process
+            run_publisher_loop(publisher_config), name="cycle_publisher_loop"
+        )
+        logger.info("✅ Cycle publisher loop scheduled")
+    except Exception as e:
+        logger.error(f"❌ Failed to start cycle publisher: {e}")
+
     yield  # Server is running
 
     # Shutdown

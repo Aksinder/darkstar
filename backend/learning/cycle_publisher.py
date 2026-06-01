@@ -1,0 +1,215 @@
+"""
+Publish deferrable-load cycle statistics and hot-water state to Home Assistant.
+
+This is the clean alternative to per-appliance helper/automation sprawl in HA:
+Darkstar computes per-cycle energy/duration/phase and daily draw (via the
+Cycle Learning module) and the hot-water tank state (via the thermal estimator),
+then publishes them as ``sensor.darkstar_*`` entities through the HA REST API.
+
+Creating sensor states is additive and controls no hardware, so it is safe to
+run from the executor's read path.
+
+The state-building functions are pure (no I/O) and fully unit-testable; only
+``publish_sensors`` performs the HTTP POST.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from backend.learning.cycle_learning import CycleStats, DetectedCycle
+    from planner.hot_water import HotWaterEstimator
+
+logger = logging.getLogger("darkstar.cycle_publisher")
+
+__all__ = [
+    "PublishedSensor",
+    "build_hot_water_sensors",
+    "build_load_sensors",
+    "publish_sensors",
+]
+
+
+@dataclass(frozen=True)
+class PublishedSensor:
+    """One HA sensor state to publish via POST /api/states/<entity_id>."""
+
+    object_id: str  # without the "sensor." prefix
+    state: str
+    unit: str | None = None
+    device_class: str | None = None
+    state_class: str | None = None
+    icon: str | None = None
+    friendly_name: str | None = None
+    attributes: dict[str, Any] = field(default_factory=lambda: {})
+
+    @property
+    def entity_id(self) -> str:
+        return f"sensor.{self.object_id}"
+
+    def to_payload(self) -> dict[str, Any]:
+        """REST body for /api/states (state + merged attributes)."""
+        attrs: dict[str, Any] = dict(self.attributes)
+        if self.unit is not None:
+            attrs["unit_of_measurement"] = self.unit
+        if self.device_class is not None:
+            attrs["device_class"] = self.device_class
+        if self.state_class is not None:
+            attrs["state_class"] = self.state_class
+        if self.icon is not None:
+            attrs["icon"] = self.icon
+        if self.friendly_name is not None:
+            attrs["friendly_name"] = self.friendly_name
+        return {"state": self.state, "attributes": attrs}
+
+
+def _slug(value: str) -> str:
+    """Sanitise an id into a safe entity object_id fragment."""
+    s = re.sub(r"[^a-z0-9]+", "_", value.strip().lower())
+    return s.strip("_") or "load"
+
+
+def build_load_sensors(
+    load_id: str,
+    name: str,
+    stats: CycleStats,
+    last_cycle: DetectedCycle | None,
+    draw_today_kwh: float,
+) -> list[PublishedSensor]:
+    """Build the sensor set for one deferrable appliance.
+
+    Produces last-cycle energy/duration, learned typical values, and today's
+    total energy. The main sensor carries the rich detail (cycle count, learned
+    flag, per-phase minutes, power profile) as attributes.
+    """
+    sid = _slug(load_id)
+    last_energy = round(last_cycle.energy_kwh, 3) if last_cycle else 0.0
+    last_minutes = round(last_cycle.duration_min, 1) if last_cycle else 0.0
+
+    main_attrs: dict[str, Any] = {
+        "load_id": load_id,
+        "cycles_observed": stats.n_cycles,
+        "learned": stats.learned,
+        "typical_minutes": stats.duration_min,
+        "typical_minutes_p90": stats.duration_min_p90,
+        "typical_energy_kwh": stats.energy_kwh,
+        "typical_profile_kw": stats.typical_profile_kw,
+    }
+    if last_cycle is not None:
+        main_attrs["last_cycle_start"] = last_cycle.start.isoformat()
+        if last_cycle.phase_minutes:
+            main_attrs["last_cycle_phases"] = last_cycle.phase_minutes
+
+    return [
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_last_cycle_energy",
+            state=f"{last_energy}",
+            unit="kWh",
+            device_class="energy",
+            state_class="total",
+            icon="mdi:lightning-bolt",
+            friendly_name=f"{name} senaste cykel energi",
+            attributes=main_attrs,
+        ),
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_last_cycle_minutes",
+            state=f"{last_minutes}",
+            unit="min",
+            icon="mdi:timer-outline",
+            friendly_name=f"{name} senaste cykel tid",
+        ),
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_typical_minutes",
+            state=f"{stats.duration_min}",
+            unit="min",
+            icon="mdi:timer-sand",
+            friendly_name=f"{name} typisk cykeltid",
+            attributes={"learned": stats.learned, "cycles_observed": stats.n_cycles},
+        ),
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_draw_today",
+            state=f"{round(draw_today_kwh, 3)}",
+            unit="kWh",
+            device_class="energy",
+            state_class="total_increasing",
+            icon="mdi:counter",
+            friendly_name=f"{name} förbrukning idag",
+        ),
+    ]
+
+
+def build_hot_water_sensors(
+    load_id: str,
+    name: str,
+    estimator: HotWaterEstimator,
+    draw_today_kwh: float,
+) -> list[PublishedSensor]:
+    """Build the hot-water availability sensors for one tank (VVB)."""
+    sid = _slug(load_id)
+    return [
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_hot_water_soc",
+            state=f"{round(estimator.soc_percent(), 1)}",
+            unit="%",
+            icon="mdi:water-percent",
+            friendly_name=f"{name} varmvattennivå",
+            attributes={"temperature_c": round(estimator.temperature_c(), 1)},
+        ),
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_hot_water_liters",
+            state=f"{round(estimator.liters_in_tank(), 0)}",
+            unit="L",
+            icon="mdi:water",
+            friendly_name=f"{name} varmvatten kvar",
+            attributes={"mixed_liters_at_comfort": round(estimator.mixed_liters_at(), 0)},
+        ),
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_temperature",
+            state=f"{round(estimator.temperature_c(), 1)}",
+            unit="°C",
+            device_class="temperature",
+            state_class="measurement",
+            icon="mdi:thermometer-water",
+            friendly_name=f"{name} temperatur",
+        ),
+        PublishedSensor(
+            object_id=f"darkstar_{sid}_draw_today",
+            state=f"{round(draw_today_kwh, 3)}",
+            unit="kWh",
+            device_class="energy",
+            state_class="total_increasing",
+            icon="mdi:counter",
+            friendly_name=f"{name} förbrukning idag",
+        ),
+    ]
+
+
+async def publish_sensors(
+    sensors: list[PublishedSensor],
+    base_url: str,
+    token: str,
+    *,
+    timeout_s: float = 10.0,
+) -> int:
+    """POST each sensor to HA /api/states. Returns the number published.
+
+    Failures are logged and skipped (one bad sensor never blocks the rest).
+    """
+    import httpx
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    published = 0
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        for s in sensors:
+            endpoint = f"{base_url.rstrip('/')}/api/states/{s.entity_id}"
+            try:
+                resp = await client.post(endpoint, headers=headers, json=s.to_payload())
+                resp.raise_for_status()
+                published += 1
+            except Exception as exc:
+                logger.warning("Failed to publish %s: %s", s.entity_id, exc)
+    return published
