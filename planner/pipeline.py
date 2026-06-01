@@ -568,11 +568,17 @@ class PlannerPipeline:
             max_dc_input_kw = float(max_dc_input_kw)
 
         kepler_input = planner_to_kepler_input(future_df, initial_soc_kwh, max_dc_input_kw)
+        # Deferrable household loads: pass through any pending-run state gathered
+        # from HA (id, pending, learned duration/energy). Absent => nothing
+        # scheduled (feature is opt-in and off by default).
+        deferrable_load_states = initial_state.get("deferrable_load_states")
+
         kepler_config = config_to_kepler_config(
             active_config,
             overrides,
             kepler_input.slots,
             water_heater_states=water_heater_states,  # task 3.3
+            deferrable_load_states=deferrable_load_states,
         )
 
         # Pre-calculate excess PV slot flags from raw forecasts (task 3.1)
