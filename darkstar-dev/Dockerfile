@@ -6,13 +6,12 @@ FROM python:3.12-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Node.js and npm for frontend build
-    nodejs \
-    npm \
-    # Utilities
+    # Utilities + TLS for the NodeSource repo
     curl \
     jq \
     bash \
+    ca-certificates \
+    gnupg \
     # GLPK solver for PuLP (Kepler optimizer)
     glpk-utils \
     libglpk-dev \
@@ -20,13 +19,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     make \
+    # Node.js 22.x from NodeSource (frontend engines require >=20.19; node:sqlite needs 22)
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install pnpm and build frontend
+# Install pnpm and build frontend. Pin pnpm@9 to match lockfileVersion 9.0
+# (pnpm 10 changes frozen-lockfile/approve-builds behaviour and breaks the build).
 COPY frontend/package.json frontend/pnpm-lock.yaml ./frontend/
-RUN npm install -g pnpm && cd frontend && pnpm install --frozen-lockfile
+RUN npm install -g pnpm@9 && cd frontend && pnpm install --frozen-lockfile
 
 # Install Python dependencies
 COPY requirements.txt ./
