@@ -688,6 +688,47 @@ def calculate_temporal_deficit(df: pd.DataFrame) -> float:
     return float(slot_deficit.sum())
 
 
+def calculate_bridging_reserve(df: pd.DataFrame) -> float:
+    """
+    Calculate the PV-aware bridging reserve over a look-ahead window.
+
+    Unlike ``calculate_temporal_deficit`` (which sums every slot's shortfall and
+    so ignores PV that arrives to recharge the battery), this walks the window
+    chronologically and tracks the running cumulative net energy (PV minus load).
+    The deepest the cumulative balance dips below the starting point is the most
+    energy the battery must supply *before upcoming PV refills it* — i.e. the
+    reserve actually needed to bridge to the next surplus.
+
+    Consequence: a sunny forecast no longer inflates the reserve. Surplus that
+    arrives before a deficit cancels it out, so the planner stops topping the
+    battery from the grid when it can see enough incoming solar to cover the gap.
+
+    This is always <= calculate_temporal_deficit(df): for a pure-night window
+    (monotonic deficit) the two are equal; any intervening surplus makes the
+    bridging reserve strictly smaller.
+
+    Caveat: surplus is assumed bankable (battery not yet full). The caller caps
+    the final floor at battery capacity / max_safety_buffer, which bounds any
+    over-credit from surplus that physically could not be stored.
+
+    Args:
+        df: DataFrame with 'load_forecast_kwh' and 'pv_forecast_kwh' columns,
+            ordered chronologically.
+
+    Returns:
+        Bridging reserve in kWh (>= 0).
+    """
+    if df.empty:
+        return 0.0
+
+    net = df["pv_forecast_kwh"] - df["load_forecast_kwh"]
+    cumulative = net.cumsum()
+    min_cumulative = float(cumulative.min())
+
+    # Deepest dip below zero = energy the battery must hold now to bridge the gap.
+    return max(0.0, -min_cumulative)
+
+
 def calculate_safety_floor(
     df: pd.DataFrame,
     battery_config: dict[str, Any],
@@ -839,9 +880,18 @@ def calculate_safety_floor(
             )
 
     # 5. Calculate Base Reserve
-    # Base reserve = temporal deficit * risk margin
+    # PV-aware: credit incoming surplus against the deficit it precedes, so a
+    # sunny forecast does not inflate the reserve (and the planner stops buying
+    # grid to top up a battery that upcoming solar will refill). Falls back to
+    # the same value as the naive temporal deficit for pure-night windows.
+    if deficit_df is not None and not deficit_df.empty:
+        bridging_reserve_kwh = calculate_bridging_reserve(deficit_df)
+    else:
+        bridging_reserve_kwh = temporal_deficit_kwh
+
+    # Base reserve = bridging reserve * risk margin
     # This is the energy we want to preserve for the period beyond the horizon
-    base_reserve_kwh = temporal_deficit_kwh * risk_margin
+    base_reserve_kwh = bridging_reserve_kwh * risk_margin
 
     # 6. Weather Buffer (Explicit adders)
     weather_buffer_kwh = 0.0
@@ -894,6 +944,7 @@ def calculate_safety_floor(
     debug: dict[str, Any] = {
         "method": "temporal_deficit",
         "temporal_deficit_kwh": round(temporal_deficit_kwh, 2),
+        "bridging_reserve_kwh": round(bridging_reserve_kwh, 2),
         "lookahead_start": str(lookahead_start),
         "lookahead_end": str(lookahead_end),
         "using_extended_data": using_extended_data,

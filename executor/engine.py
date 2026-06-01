@@ -1309,6 +1309,7 @@ class ExecutorEngine:
                     discharge_kw=0.0,  # Block discharge
                     export_kw=slot.export_kw,
                     load_kw=slot.load_kw,
+                    pv_kw=slot.pv_kw,
                     water_kw=slot.water_kw,
                     ev_charging_kw=slot.ev_charging_kw,  # REV F76: Preserve EV data
                     soc_target=slot.soc_target,
@@ -1604,6 +1605,10 @@ class ExecutorEngine:
         export_kw = float(slot_data.get("export_kwh", 0.0) or 0.0) * 4  # kWh to kW
         # Load forecast: convert kWh per slot to kW (multiply by 4 for 15-min slots)
         load_kw = float(slot_data.get("load_forecast_kwh", 0.0) or 0.0) * 4
+        # PV forecast: convert kWh per slot to kW (multiply by 4 for 15-min slots).
+        # Used by the controller to detect PV-surplus slots where the battery should
+        # stay available to cover load (self_consumption) rather than freeze (idle).
+        pv_kw = float(slot_data.get("pv_kwh", slot_data.get("pv_forecast_kwh", 0.0)) or 0.0) * 4
         water_kw = float(slot_data.get("water_heating_kw", 0.0) or 0.0)
         ev_charging_kw = float(slot_data.get("ev_charging_kw", 0.0) or 0.0)
         soc_target = int(slot_data.get("soc_target_percent", slot_data.get("soc_target", 50)) or 50)
@@ -1649,6 +1654,7 @@ class ExecutorEngine:
             discharge_kw=discharge_kw,
             export_kw=export_kw,
             load_kw=load_kw,
+            pv_kw=pv_kw,
             water_kw=water_kw,
             ev_charging_kw=ev_charging_kw,
             soc_target=soc_target,

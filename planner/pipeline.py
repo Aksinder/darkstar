@@ -748,16 +748,20 @@ class PlannerPipeline:
         if mode == "full" and target_soc_kwh > 0:
             kepler_config.target_soc_kwh = target_soc_kwh
 
-            # Target penalty derived from risk_appetite
+            # Target penalty (SEK/kWh) for ending the horizon below the reserve
+            # floor. Scales with risk_appetite: Safety defends the floor hard,
+            # Gambler lets hourly economics trade it off (bet on the MPC replan and
+            # cheap/​sunny hours ahead). Neutral (3) keeps the historical 200 value
+            # so existing setups are unchanged.
             RISK_PENALTY_MAP = {
-                1: 200.0,  # Safety: Strong incentive to hit target
-                2: 200.0,
-                3: 200.0,
-                4: 200.0,
-                5: 200.0,
+                1: 400.0,  # Safety: defend the reserve floor hard
+                2: 300.0,  # Conservative
+                3: 200.0,  # Neutral (unchanged)
+                4: 120.0,  # Aggressive
+                5: 60.0,  # Gambler: economics can override the floor
             }
             risk_appetite = int(s_index_cfg.get("risk_appetite", 3))
-            kepler_config.target_soc_penalty_sek = RISK_PENALTY_MAP.get(risk_appetite, 8.0)
+            kepler_config.target_soc_penalty_sek = RISK_PENALTY_MAP.get(risk_appetite, 200.0)
 
         run_preflight(input_data, active_config)
 

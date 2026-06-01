@@ -208,6 +208,59 @@ class TestControllerFollowPlan:
         # Below target with no charge/export planned - use idle to hold battery
         assert decision.mode_intent == "idle"
 
+    def test_pv_surplus_hold_uses_self_consumption_not_idle(self, controller):
+        """At SoC target during a PV-surplus slot, use self_consumption so the
+        battery can cover load deficits (transient/single-phase loads the 3-phase
+        PV feed can't reach) instead of freezing and forcing a grid import."""
+        slot = SlotPlan(
+            charge_kw=0.0,
+            export_kw=0.0,
+            discharge_kw=0.0,
+            soc_target=100,
+            pv_kw=11.0,
+            load_kw=1.5,
+        )
+        state = SystemState(current_soc_percent=100)
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "self_consumption"
+
+    def test_hold_without_pv_surplus_stays_idle(self, controller):
+        """At SoC target with no PV surplus (e.g. overnight reserve hold), keep
+        idle so the battery is preserved at the safety floor."""
+        slot = SlotPlan(
+            charge_kw=0.0,
+            export_kw=0.0,
+            discharge_kw=0.0,
+            soc_target=30,
+            pv_kw=0.0,
+            load_kw=1.5,
+        )
+        state = SystemState(current_soc_percent=30)
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "idle"
+
+    def test_pv_surplus_hold_with_ev_charging_stays_idle(self, controller):
+        """A PV-surplus hold while an EV is charging must stay idle to preserve
+        battery→EV source isolation (battery must not discharge into the EV)."""
+        slot = SlotPlan(
+            charge_kw=0.0,
+            export_kw=0.0,
+            discharge_kw=0.0,
+            soc_target=100,
+            pv_kw=11.0,
+            load_kw=1.5,
+            ev_charging_kw=7.0,
+        )
+        state = SystemState(current_soc_percent=100)
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "idle"
+
     def test_soc_target_from_plan(self, controller):
         """SoC target comes from slot plan."""
         slot = SlotPlan(soc_target=85)
@@ -375,6 +428,7 @@ class TestControllerApplyOverride:
 
         assert decision.source == "plan"
         assert decision.mode_intent == "export"
+
 
 class TestCalculateChargeCurrent:
     """Test Controller._calculate_charge_current."""
