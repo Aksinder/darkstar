@@ -64,15 +64,18 @@ jobs:
       - name: Setup environment
         id: setup
         run: |
+          # GHCR requires a lowercase owner; derive it from the repo so forks
+          # publish to their own namespace instead of the upstream's.
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           if [[ $GITHUB_REF == refs/tags/v* ]]; then
             VERSION=${GITHUB_REF#refs/tags/v}
-            IMAGE_NAME="ergetie/darkstar"
+            IMAGE_NAME="${OWNER}/darkstar"
             ADDON_PATH="darkstar"
             IS_DEV=false
           else
             # Build DEV image for any non-tag push (main or dev)
             VERSION="dev-$(date +'%Y%m%d.%H%M')"
-            IMAGE_NAME="ergetie/darkstar-dev"
+            IMAGE_NAME="${OWNER}/darkstar-dev"
             ADDON_PATH="darkstar-dev"
             IS_DEV=true
             # Update version in config.yaml for HA to see the update
