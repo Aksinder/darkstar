@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Any
 
@@ -49,6 +49,45 @@ FetchFloat = Callable[[str], Awaitable[float | None]]
 Publish = Callable[[list[PublishedSensor]], Awaitable[int]]
 
 
+class _CumulativeMeter:
+    """Step lookup over a cumulative-energy (kWh) sensor's history.
+
+    Timestamps are kept timezone-aware (as HA provides them), so deltas compare
+    cleanly against the detector's tz-aware cycle boundaries.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        pts: list[tuple[datetime, float]] = []
+        for r in rows:
+            try:
+                value = float(r["state"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            ts_raw = r.get("last_changed") or r.get("last_updated")
+            if not ts_raw:
+                continue
+            pts.append((datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")), value))
+        pts.sort(key=lambda x: x[0])
+        self._pts = pts
+
+    def _value_at(self, ts: datetime) -> float | None:
+        val: float | None = None
+        for t, v in self._pts:
+            if t <= ts:
+                val = v
+            else:
+                break
+        return val
+
+    def delta(self, start: datetime, end: datetime) -> float | None:
+        """Energy consumed between start and end (kWh, >= 0), or None if unknown."""
+        a = self._value_at(start)
+        b = self._value_at(end)
+        if a is None or b is None:
+            return None
+        return max(0.0, b - a)
+
+
 @dataclass
 class TrackedAppliance:
     """A deferrable appliance to learn cycles for and publish."""
@@ -63,6 +102,10 @@ class TrackedAppliance:
     seed_duration_min: float = 120.0
     seed_energy_kwh: float = 1.0
     assumed_power_kw: float | None = None  # runstate energy estimate
+    # Optional cumulative-energy sensor (kWh) for accurate per-cycle energy. When
+    # set, the energy of the last cycle and today's draw are taken from this
+    # meter's delta instead of the (often unreliable) status power attribute.
+    energy_sensor: str | None = None
 
 
 @dataclass
@@ -134,6 +177,27 @@ class DeferrablePublisherService:
         draw_today = round(
             sum(c.energy_kwh for c in cycles if c.complete and c.start.date() == today), 3
         )
+
+        # Prefer a real cumulative-energy meter when configured: the status power
+        # attribute is often unreliable, but the plug's kWh meter gives an
+        # accurate per-cycle delta. Compared against the (tz-aware) cycle
+        # boundaries, so there is no naive/aware datetime mismatch.
+        if app.energy_sensor:
+            energy_rows = await self._fetch_history(app.energy_sensor, self._history_hours)
+            meter = _CumulativeMeter(energy_rows)
+            if last is not None:
+                d = meter.delta(last.start, last.end)
+                if d is not None:
+                    last = replace(last, energy_kwh=round(d, 3))
+            today_deltas = [
+                meter.delta(c.start, c.end)
+                for c in cycles
+                if c.complete and c.start.date() == today
+            ]
+            today_deltas = [d for d in today_deltas if d is not None]
+            if today_deltas:
+                draw_today = round(sum(today_deltas), 3)
+
         return build_load_sensors(app.id, app.name, stats, last, draw_today)
 
     # -- tanks --------------------------------------------------------------
@@ -233,6 +297,7 @@ def build_tracked_from_config(
                 seed_duration_min=float(cfg.get("duration_min", 120.0)),
                 seed_energy_kwh=float(cfg.get("energy_kwh", 1.0)),
                 assumed_power_kw=cfg.get("assumed_power_kw"),
+                energy_sensor=cfg.get("energy_sensor"),
             )
         )
 

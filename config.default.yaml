@@ -110,6 +110,19 @@ water_heaters:
   #   target_entity: ''
   #   type: binary
 
+  # Example: Thermal tank (publishes sensor.darkstar_<id>_hot_water_soc/_liters/_temperature/_draw_today).
+  # Models the tank as a thermal battery from the heating-power meter (no temp/flow sensor needed).
+  # - id: house_vvb
+  #   name: "VVB Huset"
+  #   enabled: true
+  #   type: thermal                  # enables the hot-water estimator + publishing
+  #   power_sensor: sensor.house_vvb_real_power   # heating-element power (W)
+  #   power_scale: 1.0               # 2.0 if only one of two phases is metered
+  #   volume_litres: 200             # tank volume
+  #   t_cold_c: 10                   # cold-inlet reference
+  #   t_max_c: 85                    # max tank temperature
+  #   ua_w_per_k: 2.5                # standing-loss coefficient (W per K above ambient); tune to taste
+
 # EV Chargers (Array for multiple electric vehicles)
 # ARC15: Replaces deferrable_loads entry for EV charging
 # Note: penalty_levels are configured per-EV in the UI (Settings > Parameters)
@@ -160,9 +173,13 @@ deferrable_loads: []
   #   # hard_deadline: "07:00"       # for hard_deadline (finish-by clock time)
   #   phase: A                       # optional grid phase (A/B/C) for phase-balancing
   #   switch_entity: switch.diskmaskin          # HA switch Darkstar gates power with
-  #   running_sensor: binary_sensor.dishwasher_running
   #   queued_signal: input_boolean.dishwasher_active   # auto-detect a queued cycle
-  #   energy_sensor: sensor.diskmaskin_energy   # for learned per-cycle energy
+  #   # --- Cycle learning / HA publishing signals (sensor.darkstar_<id>_*) ---
+  #   running_sensor: sensor.dishwasher_status  # program-status sensor (Idle/Filling/Washing/...)
+  #   # status_sensor: sensor.dishwasher_status # alias for running_sensor (status kind)
+  #   # power_sensor: sensor.diskmaskin_power   # use instead for power-based detection
+  #   power_scale: 1.0                          # multiply the metered power (e.g. 2 if only one phase is metered)
+  #   energy_sensor: sensor.diskmaskin_energy   # cumulative kWh meter for ACCURATE per-cycle energy + daily draw
 
 # Global settings for deferrable loads (penalties used by the MILP).
 deferrable_load_settings:
