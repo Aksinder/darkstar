@@ -79,6 +79,49 @@ async def test_appliance_cycle_published():
 
 
 @pytest.mark.asyncio
+async def test_energy_sensor_gives_accurate_cycle_energy():
+    # Status sensor's power attr is tiny/unreliable; a cumulative kWh meter
+    # provides the accurate per-cycle energy and today's draw.
+    start = NOW - timedelta(hours=2)
+    status_rows = _status_rows(start, [("Washing", 60)], power_w=50)  # bogus low power
+    end = start + timedelta(minutes=60)
+    energy_rows = [
+        {"state": "100.0", "last_changed": (start - timedelta(minutes=30)).isoformat()},
+        {"state": "100.0", "last_changed": start.isoformat()},
+        {"state": "101.4", "last_changed": end.isoformat()},  # +1.4 kWh over the cycle
+        {"state": "101.4", "last_changed": NOW.isoformat()},
+    ]
+
+    async def fetch_history(entity_id, hours):
+        return energy_rows if entity_id == "sensor.washer_energy" else status_rows
+
+    async def fetch_float(entity_id):
+        return 0.0
+
+    cap = _Capture()
+    svc = DeferrablePublisherService(
+        appliances=[
+            TrackedAppliance(
+                id="washer",
+                name="Tvattmaskin",
+                signal_entity="sensor.washing_machine_status",
+                energy_sensor="sensor.washer_energy",
+            )
+        ],
+        tanks=[],
+        fetch_history=fetch_history,
+        fetch_float=fetch_float,
+        publish=cap.publish,
+        now_fn=lambda: NOW,
+    )
+    await svc.run_once()
+    energy = next(s for s in cap.sensors if s.object_id.endswith("last_cycle_energy"))
+    draw = next(s for s in cap.sensors if s.object_id.endswith("draw_today"))
+    assert float(energy.state) == pytest.approx(1.4, abs=0.01)  # from the meter, not 0.0x
+    assert float(draw.state) == pytest.approx(1.4, abs=0.01)
+
+
+@pytest.mark.asyncio
 async def test_one_failing_load_does_not_block_others():
     async def fetch_history(entity_id, hours):
         if entity_id == "sensor.bad":
