@@ -834,6 +834,31 @@ class PlannerPipeline:
         # Export blocks → projected end SoC, Discharge → min_soc, Hold → entry SoC
         final_df = apply_soc_target_percent(final_df, active_config, now_slot)
 
+        # 7b. Realism check (Predbat-inspired): surface grid cost the single-net-node
+        # MILP hides — phase imbalance (a 3-phase inverter can't cover a single-phase
+        # load even with a full battery) + idle-freeze exposure. Observability only;
+        # never blocks planning.
+        try:
+            from planner.simulation import realism_from_schedule
+
+            realism = realism_from_schedule(final_df, active_config)
+            s_index_debug["realism"] = {
+                "gap_sek": realism.realism_gap_sek,
+                "extra_import_kwh": realism.extra_import_kwh,
+                "phase_flagged_slots": len(realism.phase_flagged_slots),
+                "idle_exposed_slots": len(realism.idle_exposed_slots),
+            }
+            if realism.realism_gap_sek > 0.01 or realism.idle_exposed_slots:
+                logger.info(
+                    "Realism check: gap=%.2f SEK, extra_import=%.2f kWh, phase_flagged=%d, idle_exposed=%d",
+                    realism.realism_gap_sek,
+                    realism.extra_import_kwh,
+                    len(realism.phase_flagged_slots),
+                    len(realism.idle_exposed_slots),
+                )
+        except Exception as exc:
+            logger.warning("Realism check failed: %s", exc)
+
         # 7. Output & Observability
         # Safety Check: Do not save empty/garbage plan
         if mode == "full" and (final_df.empty or "battery_charge_kw" not in final_df.columns):
