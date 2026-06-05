@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from backend.learning.cycle_learning import CycleStats, DetectedCycle
+    from backend.learning.phase_learning import PhaseLoadEstimate, PhaseMapping
+    from backend.learning.phase_recommend import MoveRecommendation
     from planner.hot_water import HotWaterEstimator
 
 logger = logging.getLogger("darkstar.cycle_publisher")
@@ -30,8 +32,13 @@ __all__ = [
     "PublishedSensor",
     "build_hot_water_sensors",
     "build_load_sensors",
+    "build_phase_recommendation_sensors",
+    "build_phase_sensors",
     "publish_sensors",
 ]
+
+# Human-friendly state for a learned device phase (single-phase uses the phase label).
+_PHASE_STATE = {"three_phase": "3-fas", "unknown": "okänd"}
 
 
 @dataclass(frozen=True)
@@ -147,12 +154,22 @@ def build_hot_water_sensors(
     name: str,
     estimator: HotWaterEstimator,
     draw_today_kwh: float,
+    *,
+    object_id_prefix: str = "darkstar_",
 ) -> list[PublishedSensor]:
-    """Build the hot-water availability sensors for one tank (VVB)."""
-    sid = _slug(load_id)
+    """Build the hot-water availability sensors for one tank (VVB).
+
+    Object-id suffixes follow the canonical scheme also used by HA-native template
+    sensors (``_hot_water_level`` / ``_liters_remaining`` / ``_estimated_temperature``),
+    so there is one naming convention across the install. ``object_id_prefix`` defaults
+    to ``"darkstar_"`` so this publisher never collides with existing template sensors;
+    set it to ``""`` (per tank, via ``sensor_prefix``) only when Darkstar should OWN the
+    tank's sensors and no template sensor of the same id exists.
+    """
+    base = f"{object_id_prefix}{_slug(load_id)}"
     return [
         PublishedSensor(
-            object_id=f"darkstar_{sid}_hot_water_soc",
+            object_id=f"{base}_hot_water_level",
             state=f"{round(estimator.soc_percent(), 1)}",
             unit="%",
             icon="mdi:water-percent",
@@ -160,7 +177,7 @@ def build_hot_water_sensors(
             attributes={"temperature_c": round(estimator.temperature_c(), 1)},
         ),
         PublishedSensor(
-            object_id=f"darkstar_{sid}_hot_water_liters",
+            object_id=f"{base}_liters_remaining",
             state=f"{round(estimator.liters_in_tank(), 0)}",
             unit="L",
             icon="mdi:water",
@@ -168,7 +185,7 @@ def build_hot_water_sensors(
             attributes={"mixed_liters_at_comfort": round(estimator.mixed_liters_at(), 0)},
         ),
         PublishedSensor(
-            object_id=f"darkstar_{sid}_temperature",
+            object_id=f"{base}_estimated_temperature",
             state=f"{round(estimator.temperature_c(), 1)}",
             unit="°C",
             device_class="temperature",
@@ -177,7 +194,7 @@ def build_hot_water_sensors(
             friendly_name=f"{name} temperatur",
         ),
         PublishedSensor(
-            object_id=f"darkstar_{sid}_draw_today",
+            object_id=f"{base}_draw_today",
             state=f"{round(draw_today_kwh, 3)}",
             unit="kWh",
             device_class="energy",
@@ -185,6 +202,132 @@ def build_hot_water_sensors(
             icon="mdi:counter",
             friendly_name=f"{name} förbrukning idag",
         ),
+    ]
+
+
+def build_phase_sensors(
+    estimate: PhaseLoadEstimate,
+    mappings: list[PhaseMapping],
+    *,
+    device_names: dict[str, str] | None = None,
+    current_imbalance_w: float | None = None,
+) -> list[PublishedSensor]:
+    """Build the per-phase observability sensors (Observe phase).
+
+    Publishes each phase's house load (W) and share (%), the load imbalance (W,
+    the real money signal the net-node LP hides), and one sensor per learned device
+    reporting its electrical phase plus the regression detail as attributes.
+    """
+    names = device_names or {}
+    sensors: list[PublishedSensor] = []
+
+    for ph in ("A", "B", "C"):
+        load = estimate.load_w.get(ph)
+        frac = estimate.fractions.get(ph)
+        sensors.append(
+            PublishedSensor(
+                object_id=f"darkstar_phase_{ph.lower()}_load",
+                state=f"{round(load, 0) if load is not None else 0.0}",
+                unit="W",
+                device_class="power",
+                state_class="measurement",
+                icon="mdi:flash",
+                friendly_name=f"Fas {ph} last",
+                attributes={"share_percent": round((frac or 0.0) * 100.0, 1)},
+            )
+        )
+
+    imbalance = current_imbalance_w if current_imbalance_w is not None else estimate.imbalance_w
+    sensors.append(
+        PublishedSensor(
+            object_id="darkstar_phase_imbalance",
+            state=f"{round(imbalance, 0)}",
+            unit="W",
+            device_class="power",
+            state_class="measurement",
+            icon="mdi:scale-balance",
+            friendly_name="Fasobalans",
+            attributes={
+                "average_imbalance_w": estimate.imbalance_w,
+                "samples": estimate.n_samples,
+                "fractions": estimate.fractions,
+            },
+        )
+    )
+
+    for m in mappings:
+        if m.load_type == "single":
+            state = m.phase or "okänd"
+        else:
+            state = _PHASE_STATE.get(m.load_type, "okänd")
+        sensors.append(
+            PublishedSensor(
+                object_id=f"darkstar_{_slug(m.device_id)}_phase",
+                state=state,
+                icon="mdi:sine-wave",
+                friendly_name=f"{names.get(m.device_id, m.device_id)} fas",
+                attributes={
+                    "load_type": m.load_type,
+                    "confidence": m.confidence,
+                    "slopes": m.slopes,
+                    "steps_observed": m.n_steps,
+                },
+            )
+        )
+
+    return sensors
+
+
+def build_phase_recommendation_sensors(
+    recommendations: list[MoveRecommendation],
+) -> list[PublishedSensor]:
+    """Build the rebalancing-recommendation sensor (Recommend phase).
+
+    A single ``sensor.darkstar_phase_recommendation`` whose state is the top
+    suggestion (or "balanserat") and whose attributes carry the full ranked list, so
+    a dashboard can show "move device X from phase P to Q, ~N kr/yr".
+    """
+    if not recommendations:
+        return [
+            PublishedSensor(
+                object_id="darkstar_phase_recommendation",
+                state="balanserat",
+                icon="mdi:scale-balance",
+                friendly_name="Fasbalans-rekommendation",
+                attributes={"count": 0, "recommendations": []},
+            )
+        ]
+
+    top = recommendations[0]
+    state = (
+        f"Flytta {top.device_name} {top.from_phase}→{top.to_phase} "
+        f"(~{round(top.annual_saving_sek)} kr/år)"
+    )
+    items = [
+        {
+            "device_id": r.device_id,
+            "device_name": r.device_name,
+            "from_phase": r.from_phase,
+            "to_phase": r.to_phase,
+            "device_avg_w": r.device_avg_w,
+            "annual_import_avoided_kwh": r.annual_import_avoided_kwh,
+            "annual_saving_sek": r.annual_saving_sek,
+            "confidence": r.confidence,
+        }
+        for r in recommendations
+    ]
+    return [
+        PublishedSensor(
+            object_id="darkstar_phase_recommendation",
+            state=state[:255],
+            icon="mdi:transit-connection-variant",
+            friendly_name="Fasbalans-rekommendation",
+            attributes={
+                "count": len(recommendations),
+                "top_saving_sek": top.annual_saving_sek,
+                "recommendations": items,
+            },
+        )
     ]
 
 

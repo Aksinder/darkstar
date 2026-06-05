@@ -162,15 +162,27 @@ async def lifespan(app: FastAPI):
     # per-cycle energy/duration/phase, daily draw, and hot-water tank state).
     # Sensor writes only - controls no hardware. No-ops when nothing configured.
     try:
-        from backend.learning.cycle_publisher_service import run_publisher_loop
+        from backend.learning.cycle_publisher_service import (
+            run_phase_observer_loop,
+            run_publisher_loop,
+        )
 
         publisher_config = load_yaml("config.yaml")
         asyncio.create_task(  # noqa: RUF006 - lifetime is the app process
             run_publisher_loop(publisher_config), name="cycle_publisher_loop"
         )
         logger.info("✅ Cycle publisher loop scheduled")
+
+        # Phase-aware observability: learn each device's phase + per-phase load,
+        # publish sensor.darkstar_phase_* and feed measured fractions to the realism
+        # simulation. Read-only (sensor writes + a JSON model file). No-op when the
+        # phase_observer block is not enabled in config.
+        asyncio.create_task(  # noqa: RUF006 - lifetime is the app process
+            run_phase_observer_loop(publisher_config), name="phase_observer_loop"
+        )
+        logger.info("✅ Phase observer loop scheduled")
     except Exception as e:
-        logger.error(f"❌ Failed to start cycle publisher: {e}")
+        logger.error(f"❌ Failed to start cycle/phase publisher: {e}")
 
     yield  # Server is running
 

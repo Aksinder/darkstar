@@ -623,6 +623,16 @@ class KeplerSolver:
             # If no target, we don't care where we end up (within min_soc limits)
             pass
 
+        # Improvement B: continuous stored-energy value (Predbat-inspired).
+        # Reward energy remaining at the END of the horizon at its expected forward
+        # worth. Applied to soc[T] ONLY -> symmetric (no discharge penalty without an
+        # offsetting charge credit), so unlike the removed K20 stored_energy_cost it
+        # cannot distort mid-horizon cycling. Lets the planner hold cheaply-charged
+        # energy for a genuinely more expensive period without a hard floor forcing
+        # grid top-ups. Wear cost still discourages pointless churn.
+        if config.battery_value_sek_per_kwh > 0:
+            total_cost.append(-config.battery_value_sek_per_kwh * soc[T])
+
         # Rev // F51: Removed legacy EV target SoC constraint.
         # Replaced by Incentive Buckets in the objective function.
 

@@ -92,19 +92,33 @@ def test_slug_sanitises_id():
 def test_build_hot_water_sensors():
     tank = WaterTankModel(volume_litres=200, t_cold_c=10, t_max_c=80, ua_w_per_k=2.0)
     est = HotWaterEstimator.from_temperature(tank, 65.0)
+    # Default prefix keeps a darkstar_ namespace (never collides with template sensors),
+    # but the suffix scheme matches the canonical HA-native template sensors.
     sensors = build_hot_water_sensors("house_vvb", "VVB Huset", est, draw_today_kwh=4.5)
 
     ids = {s.object_id for s in sensors}
     assert ids == {
-        "darkstar_house_vvb_hot_water_soc",
-        "darkstar_house_vvb_hot_water_liters",
-        "darkstar_house_vvb_temperature",
+        "darkstar_house_vvb_hot_water_level",
+        "darkstar_house_vvb_liters_remaining",
+        "darkstar_house_vvb_estimated_temperature",
         "darkstar_house_vvb_draw_today",
     }
-    temp = _by_id(sensors, "_temperature")
+    temp = _by_id(sensors, "_estimated_temperature")
     assert temp.state == "65.0"
     assert temp.device_class == "temperature"
-    soc = _by_id(sensors, "hot_water_soc")
+    soc = _by_id(sensors, "hot_water_level")
     # 65 over [10,80] -> ~78.6%
     assert abs(float(soc.state) - 78.6) < 0.5
     assert _by_id(sensors, "draw_today").state == "4.5"
+
+
+def test_hot_water_sensor_prefix_can_be_emptied_to_own_canonical_ids():
+    # With sensor_prefix="" the publisher emits the bare canonical ids (only safe when
+    # no template sensor of the same id exists).
+    tank = WaterTankModel(volume_litres=200, t_cold_c=10, t_max_c=80, ua_w_per_k=2.0)
+    est = HotWaterEstimator.from_temperature(tank, 65.0)
+    sensors = build_hot_water_sensors("house_vvb", "VVB", est, 0.0, object_id_prefix="")
+    ids = {s.object_id for s in sensors}
+    assert "house_vvb_hot_water_level" in ids
+    assert "house_vvb_liters_remaining" in ids
+    assert "house_vvb_estimated_temperature" in ids
