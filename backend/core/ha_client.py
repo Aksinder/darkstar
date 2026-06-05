@@ -334,6 +334,15 @@ async def get_initial_state(
                 key = f"ev_plug_{charger_id}"
                 per_device_reads.append((key, lambda e=plug_sensor: get_ha_bool(e)))
 
+            # Home-zone presence (e.g. device_tracker for the car). When configured we
+            # read its state so the EV can be excluded from the plan while away — the
+            # car's API reports plug/charging regardless of location, which would
+            # otherwise become a phantom load.
+            home_entity = ev.get("home_entity", "")
+            if home_entity:
+                key = f"ev_home_{charger_id}"
+                per_device_reads.append((key, lambda e=home_entity: get_ha_entity_state(e)))
+
         per_device_results: dict[str, Any] = {}
         if per_device_reads:
             per_device_results = await gather_sensor_reads(
@@ -373,11 +382,30 @@ async def get_initial_state(
                 # No plug sensor → assume plugged in (let enabled flag be the control)
                 plugged_in = True
 
+            # Home-zone gate: car must be in an allowed location/zone to count.
+            at_home = True
+            home_entity = ev.get("home_entity", "")
+            if home_entity:
+                home_states = [str(s).lower() for s in (ev.get("home_states") or ["home"])]
+                home_obj = per_device_results.get(f"ev_home_{charger_id}")
+                current_zone = ""
+                if isinstance(home_obj, dict):
+                    current_zone = str(cast("dict[str, Any]", home_obj).get("state", "")).lower()
+                at_home = current_zone in home_states
+                if not at_home:
+                    logger.info(
+                        "EV %s is away (%s=%s); excluding from plan",
+                        charger_id,
+                        home_entity,
+                        current_zone or "unknown",
+                    )
+
             ev_charger_states.append(
                 {
                     "id": charger_id,
                     "soc_percent": soc_percent,
                     "plugged_in": plugged_in,
+                    "at_home": at_home,
                 }
             )
 
