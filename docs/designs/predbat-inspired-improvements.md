@@ -1,6 +1,10 @@
 # Blueprint: Predbat-inspired improvements (realism simulation + stored-energy value)
 
-**Status:** Draft / for review. No code yet.
+**Status:** Both improvements **implemented** (with tests). Improvement A (realism
+simulation) is always-on observability; Improvement B (continuous stored-energy value)
+is opt-in via `battery_value.enabled` (default off). See also
+`docs/designs/phase-aware-load-modeling.md`, which subsumes A's phase modeling with
+learned per-phase data.
 
 **Objective:** Adopt the two strongest ideas from Predbat's approach that address
 weaknesses we found in Darkstar's pure-MILP planner:

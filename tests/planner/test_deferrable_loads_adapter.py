@@ -54,6 +54,28 @@ def test_disabled_load_skipped():
     assert out == []
 
 
+def test_learned_phase_fills_when_config_has_none():
+    # Phase 3 control: no explicit phase in config -> use the learned mapping.
+    cfg = [{"id": "washer", "enabled": True, "duration_min": 60}]
+    state = [{"id": "washer", "pending": True}]
+    out = build_deferrable_load_inputs(cfg, state, _slots(), {"washer": "B"})
+    assert out[0].phase == "B"
+
+
+def test_config_phase_wins_over_learned():
+    cfg = [{"id": "washer", "enabled": True, "duration_min": 60, "phase": "A"}]
+    state = [{"id": "washer", "pending": True}]
+    out = build_deferrable_load_inputs(cfg, state, _slots(), {"washer": "B"})
+    assert out[0].phase == "A"
+
+
+def test_unmapped_load_keeps_none_phase():
+    cfg = [{"id": "washer", "enabled": True, "duration_min": 60}]
+    state = [{"id": "washer", "pending": True}]
+    out = build_deferrable_load_inputs(cfg, state, _slots(), {"other": "C"})
+    assert out[0].phase is None
+
+
 def test_hard_deadline_resolves_clock_time():
     # Slots start at 18:00; deadline 07:00 -> next day 07:00 = 13 h later = 52 slots.
     cfg = [
