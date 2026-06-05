@@ -182,12 +182,12 @@ async def test_tank_estimator_advances_and_publishes():
     assert n == 4  # 4 hot-water sensors
     ids = {s.object_id for s in cap.sensors}
     assert ids == {
-        "darkstar_house_vvb_hot_water_soc",
-        "darkstar_house_vvb_hot_water_liters",
-        "darkstar_house_vvb_temperature",
+        "darkstar_house_vvb_hot_water_level",
+        "darkstar_house_vvb_liters_remaining",
+        "darkstar_house_vvb_estimated_temperature",
         "darkstar_house_vvb_draw_today",
     }
-    soc = next(s for s in cap.sensors if s.object_id.endswith("hot_water_soc"))
+    soc = next(s for s in cap.sensors if s.object_id.endswith("hot_water_level"))
     assert 0 <= float(soc.state) <= 100
 
 

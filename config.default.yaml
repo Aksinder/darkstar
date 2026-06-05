@@ -110,8 +110,19 @@ water_heaters:
   #   target_entity: ''
   #   type: binary
 
-  # Example: Thermal tank (publishes sensor.darkstar_<id>_hot_water_soc/_liters/_temperature/_draw_today).
-  # Models the tank as a thermal battery from the heating-power meter (no temp/flow sensor needed).
+  # Example: Thermal tank — models the tank as a thermal battery from the heating-power
+  # meter (no temp/flow sensor needed) and publishes, using ONE canonical naming scheme:
+  #   sensor.<sensor_prefix><id>_hot_water_level   (%)
+  #   sensor.<sensor_prefix><id>_liters_remaining  (L)
+  #   sensor.<sensor_prefix><id>_estimated_temperature (°C)
+  #   sensor.<sensor_prefix><id>_draw_today        (kWh)
+  # The suffixes match HA-native template sensors so there is a single convention.
+  #
+  # IMPORTANT — do NOT run this for a tank that already has HA template sensors of the
+  # same id (e.g. sensor.house_vvb_hot_water_level): a template sensor owns its
+  # entity_id and a REST push would conflict. sensor_prefix defaults to "darkstar_" so
+  # this publisher never collides; set sensor_prefix: "" only when Darkstar should OWN
+  # the tank's sensors and no template sensor of that id exists.
   # - id: house_vvb
   #   name: "VVB Huset"
   #   enabled: true
@@ -122,6 +133,7 @@ water_heaters:
   #   t_cold_c: 10                   # cold-inlet reference
   #   t_max_c: 85                    # max tank temperature
   #   ua_w_per_k: 2.5                # standing-loss coefficient (W per K above ambient); tune to taste
+  #   sensor_prefix: "darkstar_"     # "" to own the bare canonical ids (no template conflict)
 
 # EV Chargers (Array for multiple electric vehicles)
 # ARC15: Replaces deferrable_loads entry for EV charging
