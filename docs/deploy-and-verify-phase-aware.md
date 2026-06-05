@@ -170,6 +170,26 @@ curves before raising `scale`.
 - **Recommendation always "balanserat"** → loads are already split, or no two heavy
   single-phase loads stack on one phase. Nothing to fix.
 
+## Hot-water sensors — one naming scheme
+
+This install already publishes hot-water state via **HA-native template sensors**
+(`sensor.house_vvb_*`, `sensor.villavagn_vvb_*`, with an `House VVB - Auto calibrate
+full` automation). That is the **canonical scheme** and the Varmvatten dashboard uses
+it directly — nothing to change.
+
+Darkstar's own thermal hot-water publisher (`water_heaters: type: thermal`) now emits
+the **same suffix scheme** (`_hot_water_level` / `_liters_remaining` /
+`_estimated_temperature` / `_draw_today`) under a `sensor_prefix` that defaults to
+`darkstar_`. So:
+
+- **Keep `water_heaters` hot-water publishing OFF for tanks that already have template
+  sensors** — a template sensor owns its `entity_id` and a REST push would conflict.
+- Only use Darkstar's publisher for a tank **without** native sensors. Set
+  `sensor_prefix: ""` if you want it to own the bare canonical ids
+  (`<id>_hot_water_level` …); leave the default `darkstar_` to namespace it safely.
+
+Net: one suffix convention everywhere; no `_soc`-vs-`_level` divergence.
+
 ## Safety
 
 All of this is additive: sensor writes + one JSON file, plus opt-in objective/penalty

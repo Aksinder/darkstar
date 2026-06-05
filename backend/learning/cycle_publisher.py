@@ -154,12 +154,22 @@ def build_hot_water_sensors(
     name: str,
     estimator: HotWaterEstimator,
     draw_today_kwh: float,
+    *,
+    object_id_prefix: str = "darkstar_",
 ) -> list[PublishedSensor]:
-    """Build the hot-water availability sensors for one tank (VVB)."""
-    sid = _slug(load_id)
+    """Build the hot-water availability sensors for one tank (VVB).
+
+    Object-id suffixes follow the canonical scheme also used by HA-native template
+    sensors (``_hot_water_level`` / ``_liters_remaining`` / ``_estimated_temperature``),
+    so there is one naming convention across the install. ``object_id_prefix`` defaults
+    to ``"darkstar_"`` so this publisher never collides with existing template sensors;
+    set it to ``""`` (per tank, via ``sensor_prefix``) only when Darkstar should OWN the
+    tank's sensors and no template sensor of the same id exists.
+    """
+    base = f"{object_id_prefix}{_slug(load_id)}"
     return [
         PublishedSensor(
-            object_id=f"darkstar_{sid}_hot_water_soc",
+            object_id=f"{base}_hot_water_level",
             state=f"{round(estimator.soc_percent(), 1)}",
             unit="%",
             icon="mdi:water-percent",
@@ -167,7 +177,7 @@ def build_hot_water_sensors(
             attributes={"temperature_c": round(estimator.temperature_c(), 1)},
         ),
         PublishedSensor(
-            object_id=f"darkstar_{sid}_hot_water_liters",
+            object_id=f"{base}_liters_remaining",
             state=f"{round(estimator.liters_in_tank(), 0)}",
             unit="L",
             icon="mdi:water",
@@ -175,7 +185,7 @@ def build_hot_water_sensors(
             attributes={"mixed_liters_at_comfort": round(estimator.mixed_liters_at(), 0)},
         ),
         PublishedSensor(
-            object_id=f"darkstar_{sid}_temperature",
+            object_id=f"{base}_estimated_temperature",
             state=f"{round(estimator.temperature_c(), 1)}",
             unit="°C",
             device_class="temperature",
@@ -184,7 +194,7 @@ def build_hot_water_sensors(
             friendly_name=f"{name} temperatur",
         ),
         PublishedSensor(
-            object_id=f"darkstar_{sid}_draw_today",
+            object_id=f"{base}_draw_today",
             state=f"{round(draw_today_kwh, 3)}",
             unit="kWh",
             device_class="energy",

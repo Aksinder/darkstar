@@ -130,6 +130,10 @@ class TrackedTank:
     t_max_c: float = 85.0
     ua_w_per_k: float = 2.0
     power_scale: float = 1.0
+    # Object-id prefix for the published sensors. Defaults to "darkstar_" so it never
+    # collides with HA-native template sensors of the same canonical id; set to "" only
+    # when Darkstar should own the tank's sensors.
+    object_id_prefix: str = "darkstar_"
 
 
 class DeferrablePublisherService:
@@ -243,7 +247,9 @@ class DeferrablePublisherService:
         hours_today = (now.hour * 60 + now.minute) / 60.0 or 0.001
         losses = est.tank.avg_loss_kw(est.temperature_c()) * hours_today
         draw_today = max(0.0, heating_today - losses)
-        return build_hot_water_sensors(tank.id, tank.name, est, draw_today)
+        return build_hot_water_sensors(
+            tank.id, tank.name, est, draw_today, object_id_prefix=tank.object_id_prefix
+        )
 
     # -- tick ---------------------------------------------------------------
 
@@ -329,6 +335,7 @@ def build_tracked_from_config(
                 t_max_c=float(cfg.get("t_max_c", 85.0)),
                 ua_w_per_k=float(cfg.get("ua_w_per_k", 2.0)),
                 power_scale=float(cfg.get("power_scale", 1.0)),
+                object_id_prefix=str(cfg.get("sensor_prefix", "darkstar_")),
             )
         )
     return appliances, tanks
