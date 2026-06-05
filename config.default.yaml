@@ -110,8 +110,19 @@ water_heaters:
   #   target_entity: ''
   #   type: binary
 
-  # Example: Thermal tank (publishes sensor.darkstar_<id>_hot_water_soc/_liters/_temperature/_draw_today).
-  # Models the tank as a thermal battery from the heating-power meter (no temp/flow sensor needed).
+  # Example: Thermal tank — models the tank as a thermal battery from the heating-power
+  # meter (no temp/flow sensor needed) and publishes, using ONE canonical naming scheme:
+  #   sensor.<sensor_prefix><id>_hot_water_level   (%)
+  #   sensor.<sensor_prefix><id>_liters_remaining  (L)
+  #   sensor.<sensor_prefix><id>_estimated_temperature (°C)
+  #   sensor.<sensor_prefix><id>_draw_today        (kWh)
+  # The suffixes match HA-native template sensors so there is a single convention.
+  #
+  # IMPORTANT — do NOT run this for a tank that already has HA template sensors of the
+  # same id (e.g. sensor.house_vvb_hot_water_level): a template sensor owns its
+  # entity_id and a REST push would conflict. sensor_prefix defaults to "darkstar_" so
+  # this publisher never collides; set sensor_prefix: "" only when Darkstar should OWN
+  # the tank's sensors and no template sensor of that id exists.
   # - id: house_vvb
   #   name: "VVB Huset"
   #   enabled: true
@@ -122,6 +133,7 @@ water_heaters:
   #   t_cold_c: 10                   # cold-inlet reference
   #   t_max_c: 85                    # max tank temperature
   #   ua_w_per_k: 2.5                # standing-loss coefficient (W per K above ambient); tune to taste
+  #   sensor_prefix: "darkstar_"     # "" to own the bare canonical ids (no template conflict)
 
 # EV Chargers (Array for multiple electric vehicles)
 # ARC15: Replaces deferrable_loads entry for EV charging
@@ -171,7 +183,8 @@ deferrable_loads: []
   #   deadline_mode: cheapest_within_hours   # or: hard_deadline
   #   window_hours: 14               # for cheapest_within_hours (soft)
   #   # hard_deadline: "07:00"       # for hard_deadline (finish-by clock time)
-  #   phase: A                       # optional grid phase (A/B/C) for phase-balancing
+  #   phase: A                       # optional grid phase (A/B/C); auto-filled from the
+  #                                  # learned phase_model.json when phase_observer is on
   #   switch_entity: switch.diskmaskin          # HA switch Darkstar gates power with
   #   queued_signal: input_boolean.dishwasher_active   # auto-detect a queued cycle
   #   # --- Cycle learning / HA publishing signals (sensor.darkstar_<id>_*) ---
@@ -185,7 +198,56 @@ deferrable_loads: []
 deferrable_load_settings:
   soft_deadline_penalty_sek: 30.0    # tardiness penalty/slot for "cheapest within X h"
   hard_deadline_penalty_sek: 1000.0  # tardiness penalty/slot for hard "done by HH:MM"
-  phase_penalty_sek: 0.0             # >0 to discourage same-phase concurrency (balancing)
+  phase_penalty_sek: 0.0             # >0 to discourage same-phase concurrency (balancing).
+                                     # Uses each load's phase: explicit config, else the
+                                     # learned phase (Phase 3) when phase_observer is on.
+
+# Phase-aware observability (Observe phase of docs/designs/phase-aware-load-modeling.md).
+# Read-only: learns each metered device's electrical phase by correlating its power
+# changes against the per-phase grid meter (cancelling the balanced inverter so the
+# real load phase shows through), reconstructs the per-phase house-load split, and:
+#   - publishes sensor.darkstar_phase_a/b/c_load, sensor.darkstar_phase_imbalance,
+#     and sensor.darkstar_<device>_phase (state = A/B/C / "3-fas" / "okänd");
+#   - writes <config_dir>/phase_model.json so the planner's realism simulation uses
+#     the MEASURED fractions instead of a static guess.
+# Controls no hardware. Devices listed under deferrable_loads with a power_sensor are
+# learned automatically too (no need to repeat them here).
+phase_observer:
+  enabled: false                                   # set true to start learning + publishing
+  phase_a_sensor: sensor.meter_phase_a_active_power
+  phase_b_sensor: sensor.meter_phase_b_active_power
+  phase_c_sensor: sensor.meter_phase_c_active_power
+  # Inverter AC output S (= PV + battery discharge), split balanced across phases to
+  # reconstruct per-phase house load. battery discharge must be POSITIVE; set
+  # battery_power_scale: -1 if your sensor reports discharge as negative.
+  battery_power_sensor: sensor.battery_power
+  battery_power_scale: 1.0
+  # pv_power_sensor: sensor.total_pv_power          # optional; omit if folded into battery
+  # pv_power_scale: 1.0
+  # Average prices used to value the rebalancing recommendations (kr/kWh). The hidden
+  # per-phase import is bought high and would otherwise be exported low, so the saving
+  # uses the (import - export) spread.
+  import_price_sek_kwh: 2.0
+  export_price_sek_kwh: 0.5
+  devices: []
+  #   - id: easee
+  #     name: "Easee laddare"
+  #     power_sensor: sensor.easee_niska_it_power   # proven on live data -> phase A
+  #   - id: tvatt
+  #     name: "Tvättmaskin"
+  #     power_sensor: sensor.tvattstuga_plugg_power # proven on live data -> phase B
+
+# Continuous stored-energy value (Improvement B, Predbat-inspired). When enabled, the
+# Kepler objective gets a terminal credit for energy left at the end of the horizon,
+# valued at a conservative fraction of the cheapest upcoming import price. This makes
+# the planner hold cheaply-charged / surplus-PV energy instead of exporting it low,
+# WITHOUT a hard SoC floor forcing grid top-ups (it complements, doesn't replace, the
+# safety floor). The value never exceeds the minimum forward import price, so it can
+# never make the planner buy grid just to inflate the terminal SoC. Default off.
+battery_value:
+  enabled: false           # opt-in: value stored energy continuously in the objective
+  lookahead_hours: 12      # forward price window for the estimate
+  scale: 0.75              # fraction of the forward floor price to credit (lower = more willing to trade)
 
 # S-Index Configuration (Risk & Safety Strategy)
 s_index:

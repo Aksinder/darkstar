@@ -39,6 +39,7 @@ from planner.strategy.s_index import (
     calculate_dynamic_s_index,
     calculate_probabilistic_s_index,
     calculate_safety_floor,
+    derive_battery_value_sek_per_kwh,
 )
 from planner.vacation_state import load_last_anti_legionella, save_last_anti_legionella
 
@@ -769,6 +770,28 @@ class PlannerPipeline:
             risk_appetite = int(s_index_cfg.get("risk_appetite", 3))
             kepler_config.target_soc_penalty_sek = RISK_PENALTY_MAP.get(risk_appetite, 200.0)
 
+        # Improvement B: continuous stored-energy value (opt-in, default off). Credits
+        # energy left at the end of the horizon at a conservative fraction of the
+        # cheapest upcoming import price, so the planner holds cheaply-charged/PV energy
+        # instead of exporting it low - without a hard floor forcing grid top-ups. The
+        # value never exceeds the min forward import price, so it can't trigger grid
+        # buying just to inflate the terminal SoC. Existing setups are unchanged.
+        bv_cfg: dict[str, Any] = active_config.get("battery_value", {}) or {}
+        if mode == "full" and bv_cfg.get("enabled", False):
+            import_prices = [s.import_price_sek_kwh for s in kepler_input.slots]
+            lookahead_slots = int(float(bv_cfg.get("lookahead_hours", 12)) * 4)
+            kepler_config.battery_value_sek_per_kwh = derive_battery_value_sek_per_kwh(
+                import_prices,
+                lookahead_slots=lookahead_slots,
+                scale=float(bv_cfg.get("scale", 0.75)),
+                wear_cost_sek_per_kwh=kepler_config.wear_cost_sek_per_kwh,
+            )
+            logger.info(
+                "Battery value (Improvement B): %.4f SEK/kWh (window %d slots)",
+                kepler_config.battery_value_sek_per_kwh,
+                lookahead_slots,
+            )
+
         run_preflight(input_data, active_config)
 
         solver = KeplerSolver()
@@ -833,6 +856,43 @@ class PlannerPipeline:
         # This sets per-slot targets: Charge blocks → projected end SoC,
         # Export blocks → projected end SoC, Discharge → min_soc, Hold → entry SoC
         final_df = apply_soc_target_percent(final_df, active_config, now_slot)
+
+        # 7b. Realism check (Predbat-inspired): surface grid cost the single-net-node
+        # MILP hides — phase imbalance (a 3-phase inverter can't cover a single-phase
+        # load even with a full battery) + idle-freeze exposure. Observability only;
+        # never blocks planning.
+        try:
+            from planner.simulation import realism_from_schedule
+
+            # Prefer measured per-phase load fractions learned by the phase observer
+            # (phase-aware-load-modeling.md) over any static config guess, so the
+            # realism gap reflects the installation's real imbalance. Use a local copy
+            # so active_config's type/contents are untouched downstream.
+            realism_config = active_config
+            if not active_config.get("phase_load_fractions"):
+                from backend.learning.phase_learning import load_phase_fractions
+
+                learned_fractions = load_phase_fractions(active_config)
+                if learned_fractions:
+                    realism_config = {**active_config, "phase_load_fractions": learned_fractions}
+
+            realism = realism_from_schedule(final_df, realism_config)
+            s_index_debug["realism"] = {
+                "gap_sek": realism.realism_gap_sek,
+                "extra_import_kwh": realism.extra_import_kwh,
+                "phase_flagged_slots": len(realism.phase_flagged_slots),
+                "idle_exposed_slots": len(realism.idle_exposed_slots),
+            }
+            if realism.realism_gap_sek > 0.01 or realism.idle_exposed_slots:
+                logger.info(
+                    "Realism check: gap=%.2f SEK, extra_import=%.2f kWh, phase_flagged=%d, idle_exposed=%d",
+                    realism.realism_gap_sek,
+                    realism.extra_import_kwh,
+                    len(realism.phase_flagged_slots),
+                    len(realism.idle_exposed_slots),
+                )
+        except Exception as exc:
+            logger.warning("Realism check failed: %s", exc)
 
         # 7. Output & Observability
         # Safety Check: Do not save empty/garbage plan

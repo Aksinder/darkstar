@@ -134,6 +134,15 @@ class KeplerConfig:
     # phase at the same time (0 = phase-balancing disabled).
     deferrable_phase_penalty_sek: float = 0.0
 
+    # Improvement B (Predbat-inspired): continuous stored-energy value (SEK/kWh).
+    # Rewards energy left in the battery at the END of the horizon at its expected
+    # forward worth, applied to soc[T] ONLY. This is a terminal credit (symmetric:
+    # no discharge cost without an offsetting charge credit), so unlike the removed
+    # K20 term it cannot distort mid-horizon cycling. It softens the hard terminal
+    # SoC floor: the floor stays as a low hard-safety reserve while this term makes
+    # the economic "how much extra to keep" decision continuously. 0 = disabled.
+    battery_value_sek_per_kwh: float = 0.0
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         # Rev F39: Validate battery configuration
