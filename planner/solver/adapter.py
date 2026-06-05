@@ -142,6 +142,12 @@ def build_ev_charger_inputs(
 
         soc_percent = float(state.get("soc_percent", 0.0))
         plugged_in = bool(state.get("plugged_in", False))
+        # Home-zone gate (EV presence): when the car is away, exclude it from the plan
+        # entirely so charging the car reports via its API at another location never
+        # becomes a phantom load the MILP schedules around. Default True keeps existing
+        # setups (no home_entity configured) unchanged.
+        if not bool(state.get("at_home", True)):
+            plugged_in = False
         deadline = state.get("deadline")  # datetime | None
 
         # Build incentive buckets from penalty_levels config

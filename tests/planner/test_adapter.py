@@ -250,6 +250,26 @@ class TestBuildEvChargerInputs:
         assert len(result) == 1
         assert result[0].id == "charger_b"
 
+    def test_away_car_is_forced_not_plugged(self):
+        """Home-zone gate: at_home=False excludes the EV even if plugged elsewhere."""
+        chargers = [{"id": "tesla", "enabled": True, "max_power_kw": 11.0}]
+        states = [{"id": "tesla", "soc_percent": 50.0, "plugged_in": True, "at_home": False}]
+        result = build_ev_charger_inputs(chargers, ev_charger_states=states)
+        assert result[0].plugged_in is False
+
+    def test_home_car_stays_plugged(self):
+        chargers = [{"id": "tesla", "enabled": True, "max_power_kw": 11.0}]
+        states = [{"id": "tesla", "soc_percent": 50.0, "plugged_in": True, "at_home": True}]
+        result = build_ev_charger_inputs(chargers, ev_charger_states=states)
+        assert result[0].plugged_in is True
+
+    def test_at_home_absent_keeps_existing_behavior(self):
+        """No home_entity configured -> no at_home key -> gate is a no-op."""
+        chargers = [{"id": "tesla", "enabled": True, "max_power_kw": 11.0}]
+        states = [{"id": "tesla", "soc_percent": 50.0, "plugged_in": True}]
+        result = build_ev_charger_inputs(chargers, ev_charger_states=states)
+        assert result[0].plugged_in is True
+
 
 class TestKeplerConfigWithARC15:
     """Test full config_to_kepler_config with ARC15 structure."""

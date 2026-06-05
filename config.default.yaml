@@ -154,6 +154,12 @@ ev_chargers:
     switch_entity: ""                # HA entity to enable/disable smart charging (e.g. switch.ev_charger)
     replan_on_plugin: true           # Re-run planner immediately when this EV plugs in
     replan_on_unplug: false          # Re-run planner immediately when this EV unplugs
+    # Home-zone gate (presence). For cars whose API reports plug/charging regardless of
+    # location (e.g. Tesla), set home_entity to the car's device_tracker/zone so the EV
+    # is only scheduled while actually home — otherwise charging elsewhere (work,
+    # Supercharger) leaks in as a phantom load. Omit to disable the gate.
+    home_entity: ""                  # e.g. device_tracker.white_betty_location
+    home_states: ["home"]            # zone/state(s) that count as "home"
 
   # Example: Second EV (disabled by default)
   # - id: ev_charger_2
