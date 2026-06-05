@@ -16,7 +16,7 @@ import pytz
 from utils.time_utils import dst_safe_localize
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 async def calculate_dynamic_s_index(
@@ -727,6 +727,40 @@ def calculate_bridging_reserve(df: pd.DataFrame) -> float:
 
     # Deepest dip below zero = energy the battery must hold now to bridge the gap.
     return max(0.0, -min_cumulative)
+
+
+def derive_battery_value_sek_per_kwh(
+    import_prices: Sequence[float | None],
+    *,
+    lookahead_slots: int = 48,
+    scale: float = 0.75,
+    wear_cost_sek_per_kwh: float = 0.0,
+) -> float:
+    """Derive the continuous stored-energy value for the Kepler objective (Improvement B).
+
+    Returns SEK/kWh to credit for energy left at the end of the horizon. The base is
+    the **minimum** forward import price over the look-ahead window: a conservative
+    estimate of what stored energy is worth (the cheapest you could ever refill it).
+    Scaling by ``scale`` (<= 1) guarantees the value never exceeds that minimum, so the
+    terminal credit can never make the planner buy grid purely to inflate the terminal
+    SoC - it only tips hold-vs-export and hold-vs-discharge decisions. Half the wear
+    cost is subtracted so it never rewards pointless churn. Clamped to >= 0.
+
+    Args:
+        import_prices: forward import prices (SEK/kWh), chronological.
+        lookahead_slots: how many leading slots to consider (default 48 = 12 h at 15 min).
+        scale: fraction of the forward floor price to credit (risk appetite can lower it).
+        wear_cost_sek_per_kwh: battery wear, to avoid rewarding churn.
+
+    Returns:
+        Stored-energy value in SEK/kWh (>= 0); 0 when no prices are available.
+    """
+    window = [float(p) for p in import_prices[:lookahead_slots] if p is not None]
+    if not window:
+        return 0.0
+    floor_price = min(window)
+    value = scale * floor_price - 0.5 * wear_cost_sek_per_kwh
+    return max(0.0, round(value, 4))
 
 
 def calculate_safety_floor(

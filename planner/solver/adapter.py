@@ -372,7 +372,7 @@ def _resolve_deadline_slot(
         return (idx if idx is not None else None), True
     # Soft "cheapest within X hours".
     window_h = float(load_cfg.get("window_hours", 12.0))
-    n = max(1, int(round(window_h * 60.0 / slot_minutes)))
+    n = max(1, round(window_h * 60.0 / slot_minutes))
     horizon = len(slots) if slots else n
     return min(horizon - 1, n - 1), False
 
@@ -398,6 +398,7 @@ def build_deferrable_load_inputs(
     loads_config: list[dict[str, Any]],
     deferrable_load_states: list[dict[str, Any]] | None,
     slots: list[Any] | None,
+    learned_phases: dict[str, str] | None = None,
 ) -> list[DeferrableLoadInput]:
     """Build DeferrableLoadInput list for loads with a *pending* run.
 
@@ -417,6 +418,7 @@ def build_deferrable_load_inputs(
     state_by_id: dict[str, dict[str, Any]] = {
         str(s.get("id", "")): s for s in (deferrable_load_states or []) if s.get("id")
     }
+    learned = learned_phases or {}
     out: list[DeferrableLoadInput] = []
     for cfg in loads_config:
         if not cfg.get("enabled", True):
@@ -443,7 +445,10 @@ def build_deferrable_load_inputs(
                 earliest_start_slot=earliest_slot,
                 deadline_slot=deadline_slot,
                 deadline_hard=hard,
-                phase=cfg.get("phase"),
+                # Explicit config phase wins; otherwise fall back to the learned
+                # device->phase mapping (Phase 3 control) so the deferrable phase
+                # penalty balances real single-phase appliances without manual wiring.
+                phase=cfg.get("phase") or learned.get(lid),
             )
         )
     return out
@@ -627,8 +632,17 @@ def config_to_kepler_config(
     # (default off), so absent state/config means nothing changes.
     loads_cfg = planner_config.get("deferrable_loads", []) or []
     if loads_cfg:
+        # Phase 3 control: fall back to learned device->phase mappings for any load
+        # without an explicit config phase, so the deferrable phase penalty balances
+        # real single-phase appliances. Opt-in via phase_observer; empty otherwise.
+        phase_obs_cfg: dict[str, Any] = planner_config.get("phase_observer", {}) or {}
+        learned_phases: dict[str, str] = {}
+        if phase_obs_cfg.get("enabled", False):
+            from backend.learning.phase_learning import load_device_phases
+
+            learned_phases = load_device_phases(planner_config)
         kepler_cfg.deferrable_loads = build_deferrable_load_inputs(
-            loads_cfg, deferrable_load_states, slots
+            loads_cfg, deferrable_load_states, slots, learned_phases
         )
     defl_settings = planner_config.get("deferrable_load_settings", {}) or {}
     kepler_cfg.deferrable_soft_deadline_penalty_sek = float(
