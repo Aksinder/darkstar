@@ -58,6 +58,7 @@ class ControllerDecision:
 
     export_power_w: float = 0.0  # Planned grid export power in Watts
     export_with_load_w: float = 0.0  # Export power + house load (for Fronius export mode)
+    export_price_sek_kwh: float = 0.0  # Effective export price for this slot (C3 curtailment)
 
     # User's configured max limits (for templates like {{max_charge}})
     max_charge: float = 0.0
@@ -276,6 +277,7 @@ class Controller:
             discharge_value=discharge_value,
             export_power_w=export_power_w,
             export_with_load_w=export_with_load_w,
+            export_price_sek_kwh=slot.export_price_sek_kwh,
             soc_target=soc_target,
             water_temp=water_temp,
             water_temps=water_temps,

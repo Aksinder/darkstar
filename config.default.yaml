@@ -349,6 +349,19 @@ pricing:
   vat_percent: 25.0                    # VAT percentage on electricity
   grid_transfer_fee_sek: 0.2456        # Grid operator transfer fee per kWh
   energy_tax_sek: 0.439                # Energy tax per kWh
+  # --- Export compensation (what you are PAID for exported energy) ---
+  # Effective export price = (spot if export_includes_spot) + premium + grid_benefit - fee.
+  # Set the literals to your contract, OR point *_entity at an HA sensor/input_number (SEK/kWh)
+  # so the value follows the contract automatically (a configured entity overrides its literal).
+  # All default to 0.0 -> export == spot (legacy). When the effective export price goes negative
+  # the planner curtails/stores instead of exporting (see kepler.curtailment_penalty_sek).
+  export_includes_spot: true           # Include the raw Nord Pool spot in the export price
+  export_premium_sek_kwh: 0.0          # Elhandlarens påslag/ersättning (e.g. 0.10 = 10 öre/kWh)
+  export_premium_entity: ""            # Optional HA entity (SEK/kWh) overriding the literal above
+  export_grid_benefit_sek_kwh: 0.0     # Nätnytta (grid-benefit compensation), SEK/kWh
+  export_grid_benefit_entity: ""       # Optional HA entity (SEK/kWh) overriding the literal above
+  export_fee_sek_kwh: 0.0              # Per-kWh fee subtracted from the sale, SEK/kWh
+  export_fee_entity: ""                # Optional HA entity (SEK/kWh) overriding the literal above
 
 # Price Forecasting (Nordpool spot price prediction)
 price_forecast:
@@ -373,7 +386,13 @@ grid:
 # Kepler Solver (MILP optimizer settings)
 kepler:
   ramping_cost_sek_per_kw: 0.01        # Penalty for power changes between slots (reduces sawtooth)
-  curtailment_penalty_sek: 0.1         # Penalty for wasting available solar power
+  # Near-zero so the planner CURTAILS (clips) surplus PV instead of exporting it whenever the
+  # effective export price is negative — exporting at a negative price means paying to export.
+  # Kept slightly >0 so the planner still prefers to *use/store* PV (charge battery, heat water,
+  # serve load) over wasting it; those carry real value and always beat a tiny curtailment cost.
+  # Raising this above |negative price| re-enables the old bug where shallow negative-price export
+  # (cheaper than the penalty) was preferred over curtailing.
+  curtailment_penalty_sek: 0.001       # SEK/kWh soft cost for clipping otherwise-unusable solar
 
 # =============================================================================
 # Home Assistant Integration
@@ -409,6 +428,17 @@ executor:
   interval_seconds: 60                           # How often to run (default: 1 minute)
   pause_reminder_minutes: 30                     # Notify if paused longer than this
   history_retention_days: 30                     # Keep execution history for N days
+
+  # Price-conditioned grid-export curtailment (C3): when the EFFECTIVE export price
+  # (pricing.export_* => spot + premium + grid_benefit - fee, i.e. what you are actually paid)
+  # drops below the threshold, force the inverter export limit to 0 W so surplus PV is clipped
+  # instead of exported at a loss; restore it above the threshold. Uses the inverter profile's
+  # export_power_limit entity automatically (no entity config needed). Off by default.
+  export_curtailment:
+    enabled: false                # Master toggle
+    threshold_sek_per_kwh: 0.0    # Curtail when effective export price < this (0 = when you'd pay)
+    restore_limit_w: 0.0          # Watts to restore when not curtailing; 0 = auto-capture the
+                                  # feed-in limit observed right before the first curtailment
   # HTTP Timeout: All Home Assistant API calls use a 5-second timeout with automatic
   # retry (3 attempts) for transient network failures. This prevents the executor from
   # freezing when HA becomes unresponsive (e.g., Fronius inverter via Modbus issues).

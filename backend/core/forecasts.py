@@ -1,3 +1,4 @@
+import contextlib
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -544,7 +545,26 @@ async def get_all_input_data(
     }
     # -------------------------------------
 
-    price_data = await prices.get_nordpool_data(config_path)
+    # Resolve sensor-backed export-price components (premium / nätnytta / fee) so the plan's
+    # export compensation follows the contract live (C1). Literals in config are the fallback.
+    pricing_cfg: dict[str, Any] = config.get("pricing", {}) or {}
+    component_values: dict[str, float] = {}
+    for ent_key in ("export_premium_entity", "export_grid_benefit_entity", "export_fee_entity"):
+        eid = str(pricing_cfg.get(ent_key, "") or "").strip()
+        if not eid:
+            continue
+        st = await ha_client.get_ha_entity_state(eid)
+        raw = st.get("state") if st is not None else None
+        if raw is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                component_values[eid] = float(raw)
+    pricing_overrides = (
+        prices.resolve_export_price_components(pricing_cfg, lambda e: component_values.get(e))
+        if component_values
+        else None
+    )
+
+    price_data = await prices.get_nordpool_data(config_path, pricing_overrides=pricing_overrides)
 
     forecast_result = await get_forecast_data(price_data, config)
     forecast_data = forecast_result.get("slots", [])
