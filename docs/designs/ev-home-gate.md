@@ -59,11 +59,30 @@ must read EV intent on `is_historical=false` slots only.
 
 ---
 
-## Backlog: come-home prediction (NOT built)
-"The car is on the island / heading home, so reserve charging capacity ahead of time."
-Deliberately **out of the gate** because being *near* home ≠ charging at our outlet (a
-car 5 km away at a friend's charges there). This is a separate, predictive feature with
-real risk: it would reserve battery/grid for a car that *might* not come home, re-introducing
-a softer version of the phantom-load problem. If pursued, model it as a low-confidence
-"expected arrival" signal that nudges (not commits) the plan, and gate the actual charge
-on real presence (the gate above) when the car arrives. Keep separate from the hard gate.
+## Come-home prediction (Step 1 — implemented)
+Pre-positions a **soft, capped, low-weight** home-battery buffer when the car is likely to
+come home, so its charging can lean on cheap/solar energy. It never charges the car or
+forces grid purchase — the hard gate above still governs actual charging.
+
+**Three distance zones** (`backend/core/ev_arrival.py`):
+- **near** (`distance <= near_radius_km`, default 5 km): treat as certainly arriving →
+  `p = 1.0`, full reserve.
+- **extended** (`distance <= extended_radius_km`, default 30 km — the island/region):
+  `p` from the learned **arrival profile** (weekday x hour fraction of time home, built from
+  `device_tracker` history over ~8 weeks, rebuilt every 6 h by `ev_arrival_service`).
+- **beyond**: `p = 0`.
+
+**Reservation:** `reserve_kwh = clamp(p x buffer_kwh, 0, max_reserve_kwh)`. The pipeline
+lifts the **soft** target-SoC floor by the summed reserve (same risk-scaled penalty, so
+economics still override). Default off (`come_home.enabled`).
+
+**Phantom-load safeguards (as required):** soft only (never a hard charge), capped
+(`max_reserve_kwh`), zone/probability-weighted, and a manual **override** via an HA
+`input_select` (`auto` / `force_reserve` / `force_off`) read at plan time — `force_off`
+also blocks the hard gate. Every come-home reservation and override is logged
+(`EV <id> come-home: zone=… p=… reserve=… kWh`).
+
+### Backlog (Step 2+)
+- Condition `p` on current distance/region buckets ("from D km at time T, P(home within H h)").
+- Per-slot soft reserve at the *predicted arrival time* (instead of a terminal-SoC bump).
+- A small model (logistic/GBM) only if the rolling stats prove insufficient.

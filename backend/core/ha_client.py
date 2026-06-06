@@ -11,7 +11,14 @@ import pytz
 import yaml
 
 from backend.core import secrets
-from backend.core.ev_presence import ev_is_home
+from backend.core.ev_arrival import (
+    OVERRIDE_AUTO,
+    OVERRIDE_FORCE_OFF,
+    come_home_probability,
+    load_arrival_profile,
+    reserve_kwh,
+)
+from backend.core.ev_presence import ev_is_home, haversine_km
 from backend.health import set_load_forecast_status
 
 logger = logging.getLogger("darkstar.core.ha_client")
@@ -356,6 +363,14 @@ async def get_initial_state(
                 key = f"ev_home_{charger_id}"
                 per_device_reads.append((key, lambda e=home_entity: get_ha_entity_state(e)))
 
+            # Manual override helper (input_select: auto / force_reserve / force_off) for
+            # the come-home prediction + gate, so it can be driven from the dashboard.
+            ch_cfg: dict[str, Any] = ev.get("come_home", {}) or {}
+            override_entity = ch_cfg.get("override_entity", "")
+            if override_entity:
+                key = f"ev_override_{charger_id}"
+                per_device_reads.append((key, lambda e=override_entity: get_ha_entity_state(e)))
+
         per_device_results: dict[str, Any] = {}
         if per_device_reads:
             per_device_results = await gather_sensor_reads(
@@ -398,6 +413,8 @@ async def get_initial_state(
             # Home-zone gate (robust both ways): zone OR distance-within-radius OR a
             # grace window after the tracker flips away. See backend/core/ev_presence.py.
             at_home = True
+            ev_reserve = 0.0
+            come_home_zone = "home"
             home_entity = ev.get("home_entity", "")
             if home_entity:
                 home_obj = per_device_results.get(f"ev_home_{charger_id}")
@@ -417,11 +434,13 @@ async def get_initial_state(
                     if isinstance(lc, str):
                         last_changed = datetime.fromisoformat(lc.replace("Z", "+00:00"))
                 loc = config.get("system", {}).get("location", {})
+                home_lat = _as_float(loc.get("latitude"))
+                home_lon = _as_float(loc.get("longitude"))
                 at_home, reason = ev_is_home(
                     zone_state,
                     home_states=ev.get("home_states") or ["home"],
-                    home_lat=_as_float(loc.get("latitude")),
-                    home_lon=_as_float(loc.get("longitude")),
+                    home_lat=home_lat,
+                    home_lon=home_lon,
                     car_lat=car_lat,
                     car_lon=car_lon,
                     radius_km=float(ev.get("home_radius_km", 0.0) or 0.0),
@@ -429,8 +448,54 @@ async def get_initial_state(
                     grace_minutes=float(ev.get("home_grace_minutes", 0.0) or 0.0),
                     now=datetime.now(UTC),
                 )
+
+                # Manual override helper (auto / force_reserve / force_off).
+                override = OVERRIDE_AUTO
+                ov_obj = per_device_results.get(f"ev_override_{charger_id}")
+                if isinstance(ov_obj, dict):
+                    override = (
+                        str(cast("dict[str, Any]", ov_obj).get("state", "")) or OVERRIDE_AUTO
+                    )
+                if override == OVERRIDE_FORCE_OFF:
+                    at_home = False  # force off also blocks charging now
+                    reason = "override:force_off"
                 if not at_home:
-                    logger.info("EV %s away (%s); excluding from plan", charger_id, reason)
+                    logger.info("EV %s not home (%s); excluding from plan", charger_id, reason)
+
+                # Come-home prediction (Step 1): soft, capped, low-weight battery buffer
+                # to pre-position for a likely arrival. Only when away (home -> charge now).
+                ch_cfg2: dict[str, Any] = ev.get("come_home", {}) or {}
+                if ch_cfg2.get("enabled", False) and not at_home:
+                    dist: float | None = None
+                    if (
+                        car_lat is not None
+                        and car_lon is not None
+                        and home_lat is not None
+                        and home_lon is not None
+                    ):
+                        dist = haversine_km(car_lat, car_lon, home_lat, home_lon)
+                    p, come_home_zone, ch_reason = come_home_probability(
+                        datetime.now(UTC),
+                        dist,
+                        load_arrival_profile(config, charger_id),
+                        override=override,
+                        near_radius_km=float(ch_cfg2.get("near_radius_km", 0.0) or 0.0),
+                        extended_radius_km=float(ch_cfg2.get("extended_radius_km", 0.0) or 0.0),
+                    )
+                    ev_reserve = reserve_kwh(
+                        p,
+                        float(ch_cfg2.get("buffer_kwh", 0.0) or 0.0),
+                        float(ch_cfg2.get("max_reserve_kwh", 0.0) or 0.0),
+                    )
+                    if ev_reserve > 0:
+                        logger.info(
+                            "EV %s come-home: zone=%s p=%.2f reserve=%.2f kWh (%s)",
+                            charger_id,
+                            come_home_zone,
+                            p,
+                            ev_reserve,
+                            ch_reason,
+                        )
 
             ev_charger_states.append(
                 {
@@ -438,6 +503,8 @@ async def get_initial_state(
                     "soc_percent": soc_percent,
                     "plugged_in": plugged_in,
                     "at_home": at_home,
+                    "reserve_kwh": ev_reserve,
+                    "come_home_zone": come_home_zone,
                 }
             )
 

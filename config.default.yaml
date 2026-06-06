@@ -165,6 +165,19 @@ ev_chargers:
     #                               #   (uses the tracker's latitude/longitude attrs)
     home_grace_minutes: 0.0         # >0: keep "home" for N min after the tracker flips away
     #                               #   (debounces momentary GPS drift)
+    # Come-home prediction (Step 1): pre-position a SOFT, capped battery buffer when the
+    # car is likely to come home, so its charging can lean on cheap/solar energy. Three
+    # distance zones: near (<=near_radius_km) => certain arrival (p=1, full reserve);
+    # extended (<=extended_radius_km) => probability from the learned arrival profile
+    # (weekday x hour, built from device_tracker history); beyond => no reserve. The
+    # reserve only lifts a SOFT target-SoC floor (economics still override). Default off.
+    come_home:
+      enabled: false
+      near_radius_km: 5             # this close => treat as certainly arriving (p=1)
+      extended_radius_km: 30        # region where the probability model works (e.g. the island)
+      buffer_kwh: 5.0               # battery buffer to reserve at p=1
+      max_reserve_kwh: 8.0          # hard cap on the reserved buffer
+      override_entity: ""           # input_select (auto/force_reserve/force_off) for dashboard control
 
   # Example: Second EV (disabled by default)
   # - id: ev_charger_2
