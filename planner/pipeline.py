@@ -618,6 +618,8 @@ class PlannerPipeline:
             timezone_name = active_config.get("timezone", "Europe/Stockholm")
 
             # Calculate per-device deadlines and attach to state dicts
+            from planner.solver.adapter import ev_state_for_solver
+
             ev_charger_states_with_deadline: list[dict[str, Any]] = []
             for ev_cfg_item in ev_chargers_cfg:
                 if not ev_cfg_item.get("enabled", True):
@@ -654,12 +656,7 @@ class PlannerPipeline:
                             ha_state.get("plugged_in", False),
                         )
                 ev_charger_states_with_deadline.append(
-                    {
-                        "id": charger_id,
-                        "soc_percent": ha_state.get("soc_percent", 0.0),
-                        "plugged_in": ha_state.get("plugged_in", False),
-                        "deadline": deadline,
-                    }
+                    ev_state_for_solver(ha_state, charger_id, deadline)
                 )
 
             # Rebuild kepler_config with per-device EV charger inputs

@@ -102,6 +102,25 @@ def build_water_heater_inputs(
     return result
 
 
+def ev_state_for_solver(
+    ha_state: dict[str, Any], charger_id: str, deadline: Any
+) -> dict[str, Any]:
+    """Build the per-charger state dict the solver consumes from a live HA state.
+
+    Carries through ``at_home`` (the home-zone gate set by ``get_initial_state``) so a
+    car that is away is excluded by ``build_ev_charger_inputs``. Dropping it here is
+    exactly the bug that let an away EV get scheduled — keep this the single place that
+    constructs the solver state so the gate cannot be silently bypassed.
+    """
+    return {
+        "id": charger_id,
+        "soc_percent": ha_state.get("soc_percent", 0.0),
+        "plugged_in": ha_state.get("plugged_in", False),
+        "at_home": ha_state.get("at_home", True),
+        "deadline": deadline,
+    }
+
+
 def build_ev_charger_inputs(
     ev_chargers_config: list[dict[str, Any]],
     ev_charger_states: list[dict[str, Any]] | None = None,
