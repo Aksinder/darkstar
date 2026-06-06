@@ -160,6 +160,11 @@ ev_chargers:
     # Supercharger) leaks in as a phantom load. Omit to disable the gate.
     home_entity: ""                  # e.g. device_tracker.white_betty_location
     home_states: ["home"]            # zone/state(s) that count as "home"
+    # Robustness so a car that IS home isn't wrongly excluded by a tight zone / GPS drift:
+    home_radius_km: 0.0              # >0: also count as home within N km of system.location
+    #                               #   (uses the tracker's latitude/longitude attrs)
+    home_grace_minutes: 0.0         # >0: keep "home" for N min after the tracker flips away
+    #                               #   (debounces momentary GPS drift)
 
   # Example: Second EV (disabled by default)
   # - id: ev_charger_2

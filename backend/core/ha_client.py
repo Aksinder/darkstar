@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Callable, Coroutine
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -11,9 +11,22 @@ import pytz
 import yaml
 
 from backend.core import secrets
+from backend.core.ev_presence import ev_is_home
 from backend.health import set_load_forecast_status
 
 logger = logging.getLogger("darkstar.core.ha_client")
+
+
+def _as_float(value: Any) -> float | None:
+    """Best-effort float, or None (for optional lat/lon/attribute values)."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def make_ha_headers(token: str) -> dict[str, str]:
@@ -382,23 +395,42 @@ async def get_initial_state(
                 # No plug sensor → assume plugged in (let enabled flag be the control)
                 plugged_in = True
 
-            # Home-zone gate: car must be in an allowed location/zone to count.
+            # Home-zone gate (robust both ways): zone OR distance-within-radius OR a
+            # grace window after the tracker flips away. See backend/core/ev_presence.py.
             at_home = True
             home_entity = ev.get("home_entity", "")
             if home_entity:
-                home_states = [str(s).lower() for s in (ev.get("home_states") or ["home"])]
                 home_obj = per_device_results.get(f"ev_home_{charger_id}")
-                current_zone = ""
+                zone_state = ""
+                car_lat: float | None = None
+                car_lon: float | None = None
+                last_changed: datetime | None = None
                 if isinstance(home_obj, dict):
-                    current_zone = str(cast("dict[str, Any]", home_obj).get("state", "")).lower()
-                at_home = current_zone in home_states
+                    ho = cast("dict[str, Any]", home_obj)
+                    zone_state = str(ho.get("state", ""))
+                    attrs = ho.get("attributes")
+                    if isinstance(attrs, dict):
+                        a = cast("dict[str, Any]", attrs)
+                        car_lat = _as_float(a.get("latitude"))
+                        car_lon = _as_float(a.get("longitude"))
+                    lc = ho.get("last_changed")
+                    if isinstance(lc, str):
+                        last_changed = datetime.fromisoformat(lc.replace("Z", "+00:00"))
+                loc = config.get("system", {}).get("location", {})
+                at_home, reason = ev_is_home(
+                    zone_state,
+                    home_states=ev.get("home_states") or ["home"],
+                    home_lat=_as_float(loc.get("latitude")),
+                    home_lon=_as_float(loc.get("longitude")),
+                    car_lat=car_lat,
+                    car_lon=car_lon,
+                    radius_km=float(ev.get("home_radius_km", 0.0) or 0.0),
+                    last_changed=last_changed,
+                    grace_minutes=float(ev.get("home_grace_minutes", 0.0) or 0.0),
+                    now=datetime.now(UTC),
+                )
                 if not at_home:
-                    logger.info(
-                        "EV %s is away (%s=%s); excluding from plan",
-                        charger_id,
-                        home_entity,
-                        current_zone or "unknown",
-                    )
+                    logger.info("EV %s away (%s); excluding from plan", charger_id, reason)
 
             ev_charger_states.append(
                 {
