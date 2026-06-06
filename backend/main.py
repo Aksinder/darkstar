@@ -181,6 +181,16 @@ async def lifespan(app: FastAPI):
             run_phase_observer_loop(publisher_config), name="phase_observer_loop"
         )
         logger.info("✅ Phase observer loop scheduled")
+
+        # EV come-home prediction (Step 1): rebuild the car's arrival profile from
+        # device_tracker history so the planner can pre-position a soft battery buffer.
+        # Read-only (one JSON file). No-op unless a charger has come_home.enabled.
+        from backend.core.ev_arrival_service import run_ev_arrival_loop
+
+        asyncio.create_task(  # noqa: RUF006 - lifetime is the app process
+            run_ev_arrival_loop(publisher_config), name="ev_arrival_loop"
+        )
+        logger.info("✅ EV come-home arrival loop scheduled")
     except Exception as e:
         logger.error(f"❌ Failed to start cycle/phase publisher: {e}")
 

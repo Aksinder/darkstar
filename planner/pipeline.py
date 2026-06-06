@@ -749,6 +749,26 @@ class PlannerPipeline:
         # - min_soc violation: 1000 SEK/kWh (HARD - don't violate!)
         # - target violation: derived from risk_appetite (SOFT - economics can override)
         # Safety = high penalty (harder to violate), Gambler = low penalty (easier to trade off)
+        # Come-home reservation (Step 1): pre-position a soft battery buffer for a
+        # likely-arriving EV. get_initial_state put a per-charger reserve_kwh (p x buffer,
+        # capped) into the EV state; sum it and lift the soft target SoC floor by it. Soft
+        # (same risk-scaled penalty, so economics still override) and default off
+        # (no come_home config -> reserve 0 -> no change).
+        ev_states: list[dict[str, Any]] = initial_state.get("ev_charger_states", []) or []
+        ev_reserve_total = sum(float(s.get("reserve_kwh", 0.0) or 0.0) for s in ev_states)
+        if mode == "full" and ev_reserve_total > 0:
+            cap_kwh = float(kepler_config.capacity_kwh or 0.0)
+            new_target = target_soc_kwh + ev_reserve_total
+            if cap_kwh > 0:
+                new_target = min(cap_kwh, new_target)
+            logger.info(
+                "EV come-home: +%.2f kWh soft battery reserve (target_soc %.2f -> %.2f kWh)",
+                ev_reserve_total,
+                target_soc_kwh,
+                new_target,
+            )
+            target_soc_kwh = new_target
+
         if mode == "full" and target_soc_kwh > 0:
             kepler_config.target_soc_kwh = target_soc_kwh
 
