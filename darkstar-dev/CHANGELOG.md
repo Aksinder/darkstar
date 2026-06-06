@@ -1,3 +1,7 @@
+## dev-20260606.2214 — 2026-06-06 22:16
+
+- docs(changelog): add HA add-on CHANGELOG + CI auto-append per dev build
+
 # Changelog — [FORK] Darkstar Energy Manager
 
 Newest first. Dev builds auto-prepend an entry (the triggering commit) via CI; the notes
