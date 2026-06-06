@@ -1314,6 +1314,7 @@ class ExecutorEngine:
                     ev_charging_kw=slot.ev_charging_kw,  # REV F76: Preserve EV data
                     soc_target=slot.soc_target,
                     soc_projected=slot.soc_projected,
+                    export_price_sek_kwh=slot.export_price_sek_kwh,
                 )
 
                 # EV charge failure detection: track ticks with zero actual power
@@ -1663,6 +1664,7 @@ class ExecutorEngine:
             water_heater_plans=water_heater_plans,
             water_heating_boost=water_heating_boost,
             custom_entity_active=custom_entity_active,
+            export_price_sek_kwh=float(slot_data.get("export_price_sek_kwh", 0.0) or 0.0),
         )
 
     async def _gather_system_state(self) -> SystemState:

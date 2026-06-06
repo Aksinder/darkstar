@@ -80,6 +80,22 @@ class InverterConfig:
 
 
 @dataclass
+class ExportCurtailmentConfig:
+    """Price-conditioned grid-export curtailment (C3).
+
+    When the current slot's effective export price (spot + premium + grid_benefit - fee, i.e.
+    what you are actually paid) is below ``threshold_sek_per_kwh`` the executor forces the
+    inverter export-power limit to 0 W so surplus PV is clipped instead of exported at a loss.
+    Above the threshold the limit is restored to ``restore_limit_w`` (or, when that is 0, the
+    feed-in limit auto-captured the moment before the first curtailment). Off by default.
+    """
+
+    enabled: bool = False
+    threshold_sek_per_kwh: float = 0.0
+    restore_limit_w: float = 0.0
+
+
+@dataclass
 class WaterHeaterGlobalConfig:
     """Global water heater temperature configuration (house-level preferences)."""
 
@@ -219,6 +235,7 @@ class ExecutorConfig:
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     excess_pv: ExcessPVConfig = field(default_factory=ExcessPVConfig)
+    export_curtailment: ExportCurtailmentConfig = field(default_factory=ExportCurtailmentConfig)
 
     history_retention_days: int = 30
     schedule_path: str = "data/schedule.json"
@@ -557,6 +574,17 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         custom_entity=custom_entity,
     )
 
+    ec_data: dict[str, Any] = (
+        executor_data.get("export_curtailment", {})
+        if isinstance(executor_data.get("export_curtailment"), dict)
+        else {}
+    )
+    export_curtailment = ExportCurtailmentConfig(
+        enabled=bool(ec_data.get("enabled", False)),
+        threshold_sek_per_kwh=float(ec_data.get("threshold_sek_per_kwh", 0.0)),
+        restore_limit_w=float(ec_data.get("restore_limit_w", 0.0)),
+    )
+
     return ExecutorConfig(
         enabled=bool(executor_data.get("enabled", False)),
         shadow_mode=bool(executor_data.get("shadow_mode", False)),
@@ -571,6 +599,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         notifications=notifications,
         controller=controller,
         excess_pv=excess_pv,
+        export_curtailment=export_curtailment,
         history_retention_days=int(executor_data.get("history_retention_days", 30)),
         schedule_path=str(executor_data.get("schedule_path", "data/schedule.json")),
         timezone=timezone,

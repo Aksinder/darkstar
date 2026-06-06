@@ -588,7 +588,7 @@ def config_to_kepler_config(
             )
         ),
         curtailment_penalty_sek=float(
-            planner_config.get("kepler", {}).get("curtailment_penalty_sek", 0.1)
+            planner_config.get("kepler", {}).get("curtailment_penalty_sek", 0.001)
         ),
         export_threshold_sek_per_kwh=get_val("export_threshold_sek_per_kwh", 0.0),
         # Per-device water heater inputs

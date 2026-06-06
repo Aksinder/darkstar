@@ -100,6 +100,7 @@ class SlotPlan:
     water_heater_plans: dict[str, float] = field(default_factory=lambda: {})
     water_heating_boost: dict[str, bool] = field(default_factory=lambda: {})
     custom_entity_active: bool = False
+    export_price_sek_kwh: float = 0.0  # Effective export price for this slot (C3 curtailment)
 
 
 class OverrideEvaluator:

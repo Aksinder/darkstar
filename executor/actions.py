@@ -486,6 +486,9 @@ class ActionDispatcher:
         self.config = config
         self.shadow_mode = shadow_mode
         self.profile = profile
+        # C3: feed-in limit to restore to after a curtailment window. Captured lazily the moment
+        # before the first clamp when export_curtailment.restore_limit_w is left at 0 (auto).
+        self._restore_export_limit_w: float | None = None
 
     def _resolve_entity_id(self, key: str) -> str | None:
         """
@@ -635,6 +638,14 @@ class ActionDispatcher:
             if action.settle_ms and action.settle_ms > 0:
                 logger.debug("Settle delay: %dms after %s", action.settle_ms, action.entity)
                 await asyncio.sleep(action.settle_ms / 1000.0)
+
+        # C3: price-conditioned export curtailment. Run AFTER the mode's own actions so it sets
+        # the resting export limit, except in explicit grid-export mode (which manages the limit
+        # itself and is only chosen by the planner at a profitable price).
+        if self.config.export_curtailment.enabled and mode_intent != "export":
+            clamp = await self._apply_export_curtailment(decision.export_price_sek_kwh)
+            if clamp is not None:
+                results.append(clamp)
 
         if results:
             successful = sum(1 for r in results if r.success)
@@ -966,39 +977,59 @@ class ActionDispatcher:
             error_details=error_details,
         )
 
+    async def _read_current_export_limit(self) -> float | None:
+        """Read the inverter's current export-power limit (W), or None if unavailable."""
+        entity = self.config.inverter.grid_max_export_power or self._resolve_entity_id(
+            "export_power_limit"
+        )
+        if not _is_entity_configured(entity) or entity is None:
+            return None
+        try:
+            raw = await self.ha.get_state_value(entity)
+            return float(raw) if raw is not None else None
+        except (ValueError, TypeError, HACallError):
+            return None
+
+    async def _apply_export_curtailment(self, export_price_sek_kwh: float) -> ActionResult | None:
+        """Clamp grid export to 0 W when the effective export price is below the threshold (you
+        would pay to export), and restore the feed-in limit otherwise. C3."""
+        cc = self.config.export_curtailment
+        if export_price_sek_kwh < cc.threshold_sek_per_kwh:
+            # Capture the resting feed-in limit before overriding it, so restore is exact.
+            if cc.restore_limit_w <= 0 and self._restore_export_limit_w is None:
+                current = await self._read_current_export_limit()
+                if current is not None and current > 0:
+                    self._restore_export_limit_w = current
+                    logger.info("Export curtailment: captured restore limit %.0f W", current)
+            logger.info(
+                "Export curtailment ACTIVE: effective export %.3f < %.3f SEK/kWh -> clamp 0 W",
+                export_price_sek_kwh,
+                cc.threshold_sek_per_kwh,
+            )
+            return await self._set_max_export_power(0.0)
+
+        # Not curtailing: restore the feed-in limit if we know it (config value or captured).
+        restore = (
+            cc.restore_limit_w if cc.restore_limit_w > 0 else (self._restore_export_limit_w or 0.0)
+        )
+        if restore > 0:
+            return await self._set_max_export_power(restore)
+        return None
+
     async def _set_max_export_power(self, watts: float) -> ActionResult | None:
         """Set max grid export power."""
         start = time.time()
 
-        entity = self.config.inverter.grid_max_export_power
-
-        # Check if profile supports grid export limit via entity registry
-        if self.profile and "grid_max_export_power" not in self.profile.entities:
-            logger.debug(
-                "Skipping max_export_power action: profile '%s' does not define grid_max_export_power entity",
-                self.profile.metadata.name,
-            )
-            return None  # Silent skip - no entry in execution history
+        # Resolve the export-limit entity: explicit executor config wins, otherwise fall back to
+        # the inverter profile's export_power_limit entity (e.g. Sungrow number.export_power_limit)
+        # so price-conditioned curtailment works without extra entity configuration.
+        entity = self.config.inverter.grid_max_export_power or self._resolve_entity_id(
+            "export_power_limit"
+        )
 
         if not _is_entity_configured(entity):
-            # Check if this entity is actually required by the profile
-            is_required = True
-            if self.profile and "grid_max_export_power" in self.profile.entities:
-                is_required = self.profile.entities["grid_max_export_power"].required
-
-            if not is_required:
-                # Silent skip - not configured and not required
-                return None  # Silent skip - no entry in execution history
-
-            logger.debug("Skipping max_export_power action: entity not configured")
-            return ActionResult(
-                action_type="max_export_power",
-                success=True,
-                message="Export power entity not configured. Configure in Settings → System → HA Entities",
-                skipped=True,
-                duration_ms=int((time.time() - start) * 1000),
-                error_details=None,
-            )
+            logger.debug("Skipping max_export_power action: no export-limit entity available")
+            return None  # Silent skip - no entry in execution history
 
         # Check current value and apply write threshold to prevent EEPROM wear
         if entity is None:
@@ -1062,7 +1093,9 @@ class ActionDispatcher:
         # 5. Handle Export Switch (F49)
         # If a switch is configured, turn it ON when setting a limit.
         # This ensures that inverter actually enforces the numeric value.
-        switch_entity = self.config.inverter.grid_max_export_power_switch
+        switch_entity = self.config.inverter.grid_max_export_power_switch or self._resolve_entity_id(
+            "export_power_limit_switch"
+        )
         if success and _is_entity_configured(switch_entity) and switch_entity is not None:
             logger.info("Enabling export power limit switch: %s", switch_entity)
             try:

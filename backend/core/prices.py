@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,13 +13,32 @@ from backend.core.cache import cache_sync
 logger = logging.getLogger("darkstar.core.prices")
 
 
-async def get_nordpool_data(config_path: str = "config.yaml") -> list[dict[str, Any]]:
-    # --- Smart Cache Check ---
-    cache_key = "nordpool_data"
-    cached = cache_sync.get(cache_key)
-
+async def get_nordpool_data(
+    config_path: str = "config.yaml",
+    *,
+    pricing_overrides: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     with Path(config_path).open() as f:
         config = yaml.safe_load(f)
+
+    # Apply live-resolved export-price components (e.g. premium / nätnytta read from HA
+    # sensors) so the computed per-slot export compensation follows the contract. The
+    # literals in config["pricing"] are the fallback when no override is supplied.
+    if pricing_overrides:
+        config["pricing"] = {**config.get("pricing", {}), **pricing_overrides}
+
+    # --- Smart Cache Check ---
+    # The cache key embeds the export components so a contract/sensor change invalidates any
+    # stale price series instead of serving export prices computed under the old contract.
+    _pc: dict[str, Any] = config.get("pricing", {}) or {}
+    cache_key = "nordpool_data:{}:{}:{}:{}".format(
+        _pc.get("export_includes_spot", True),
+        _pc.get("export_premium_sek_kwh", 0.0),
+        _pc.get("export_grid_benefit_sek_kwh", 0.0),
+        _pc.get("export_fee_sek_kwh", 0.0),
+    )
+    cached = cache_sync.get(cache_key)
+
     local_tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
     now = datetime.now(local_tz)
     today = now.date()
@@ -144,6 +164,18 @@ def calculate_import_export_prices(
     """
     Calculate import and export prices from spot price.
 
+    Export price is the *net compensation you actually receive* for exported energy,
+    built from configurable components so it tracks your contract rather than assuming
+    raw spot:
+
+        export = (spot if export_includes_spot) + premium + grid_benefit - fee
+
+    where premium (elhandlarens påslag), grid_benefit (nätnytta) and fee are SEK/kWh.
+    All components default to 0.0, so an unconfigured system keeps the legacy behaviour
+    ``export == spot``. Sensor-backed components are resolved upstream into these same
+    ``pricing`` keys via :func:`resolve_export_price_components` so a contract change just
+    means updating a sensor/helper — no code change.
+
     Args:
         spot_price_mwh: Spot price in SEK/MWh
         config: Configuration dictionary
@@ -157,13 +189,54 @@ def calculate_import_export_prices(
     energy_tax_sek = pricing_config.get("energy_tax_sek", 0.439)
 
     spot_price_sek_kwh = spot_price_mwh / 1000.0
-    export_price_sek_kwh = spot_price_sek_kwh
+
+    include_spot = bool(pricing_config.get("export_includes_spot", True))
+    export_premium_sek = float(pricing_config.get("export_premium_sek_kwh", 0.0) or 0.0)
+    export_grid_benefit_sek = float(pricing_config.get("export_grid_benefit_sek_kwh", 0.0) or 0.0)
+    export_fee_sek = float(pricing_config.get("export_fee_sek_kwh", 0.0) or 0.0)
+    export_price_sek_kwh = (
+        (spot_price_sek_kwh if include_spot else 0.0)
+        + export_premium_sek
+        + export_grid_benefit_sek
+        - export_fee_sek
+    )
 
     import_price_sek_kwh = (spot_price_sek_kwh + grid_transfer_fee_sek + energy_tax_sek) * (
         1 + vat_percent / 100.0
     )
 
     return import_price_sek_kwh, export_price_sek_kwh
+
+
+def resolve_export_price_components(
+    pricing_config: dict[str, Any],
+    get_state: Callable[[str], float | None],
+) -> dict[str, Any]:
+    """Resolve sensor-backed export-price components into literal SEK/kWh values.
+
+    Returns a shallow copy of ``pricing_config`` where each ``export_*_sek_kwh`` value is
+    overwritten by the current reading of its companion ``export_*_entity`` HA sensor,
+    when that entity is configured and readable. ``get_state`` maps an ``entity_id`` to a
+    float (SEK/kWh) or ``None`` when unavailable. Unset/unreadable entities leave the
+    literal untouched, so this is always safe to call.
+
+    This lets the effective export compensation follow the user's contract live: point an
+    ``export_*_entity`` at an ``input_number``/sensor and adjust it when the contract
+    changes — no redeploy.
+    """
+    resolved = dict(pricing_config)
+    for value_key, entity_key in (
+        ("export_premium_sek_kwh", "export_premium_entity"),
+        ("export_grid_benefit_sek_kwh", "export_grid_benefit_entity"),
+        ("export_fee_sek_kwh", "export_fee_entity"),
+    ):
+        entity_id = str(pricing_config.get(entity_key, "") or "").strip()
+        if not entity_id:
+            continue
+        value = get_state(entity_id)
+        if value is not None:
+            resolved[value_key] = float(value)
+    return resolved
 
 
 def _process_nordpool_data(
