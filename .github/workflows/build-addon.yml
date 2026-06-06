@@ -121,6 +121,21 @@ jobs:
           # Re-apply the version bump to the dev branch file
           sed -i "s/^version: .*/version: \"${{ steps.setup.outputs.version }}\"/" darkstar-dev/config.yaml
 
+          # Prepend a changelog entry (newest first) for HA's Changelog tab, from the commit
+          # that triggered this build. Skip pure version-bump commits. Best-effort (|| true).
+          SUBJECT="$(git log -1 --pretty=%s)"
+          if [[ "$SUBJECT" != "chore(dev): bump version"* ]]; then
+            CL="darkstar-dev/CHANGELOG.md"
+            TMP="$(mktemp)"
+            {
+              echo "## ${{ steps.setup.outputs.version }} — $(date +'%Y-%m-%d %H:%M')"
+              echo ""
+              echo "- ${SUBJECT}"
+              echo ""
+              [ -f "$CL" ] && cat "$CL"
+            } > "$TMP" && mv "$TMP" "$CL" && git add "$CL" || true
+          fi
+
           git add darkstar-dev/config.yaml
           git commit -m "chore(dev): bump version to ${{ steps.setup.outputs.version }} [skip ci]"
           git push origin ${{ github.ref_name }}
