@@ -12,7 +12,33 @@ from datetime import datetime
 from pytz import timezone as pytz_timezone
 
 from planner.pipeline import calculate_ev_deadline
-from planner.solver.adapter import build_ev_charger_inputs
+from planner.solver.adapter import build_ev_charger_inputs, ev_state_for_solver
+
+
+class TestHomeZoneGateThreadedThroughPipeline:
+    """Regression: the pipeline must carry at_home from the live state into the solver
+    state, or an away car gets scheduled (the home gate is silently bypassed)."""
+
+    def test_ev_state_for_solver_preserves_at_home(self):
+        ha_state = {"soc_percent": 40.0, "plugged_in": True, "at_home": False}
+        out = ev_state_for_solver(ha_state, "tesla", None)
+        assert out["at_home"] is False
+        assert out["plugged_in"] is True  # raw plug state preserved; gate applied later
+
+    def test_away_car_excluded_end_to_end(self):
+        # Cable connected (plugged) but car away -> must NOT be scheduled.
+        chargers = [{"id": "tesla", "enabled": True, "max_power_kw": 11.0}]
+        ha_state = {"id": "tesla", "soc_percent": 40.0, "plugged_in": True, "at_home": False}
+        states = [ev_state_for_solver(ha_state, "tesla", None)]
+        result = build_ev_charger_inputs(chargers, ev_charger_states=states)
+        assert result[0].plugged_in is False
+
+    def test_home_car_still_scheduled_end_to_end(self):
+        chargers = [{"id": "tesla", "enabled": True, "max_power_kw": 11.0}]
+        ha_state = {"id": "tesla", "soc_percent": 40.0, "plugged_in": True, "at_home": True}
+        states = [ev_state_for_solver(ha_state, "tesla", None)]
+        result = build_ev_charger_inputs(chargers, ev_charger_states=states)
+        assert result[0].plugged_in is True
 
 # ---------------------------------------------------------------------------
 # Helpers
