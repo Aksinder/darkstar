@@ -1,3 +1,7 @@
+## dev-20260607.1811 — 2026-06-07 18:13
+
+- fix(executor): don't force grid-charge a near-full battery on PV surplus
+
 ## dev-20260607.1730 — 2026-06-07 17:32
 
 - fix(phase): publish realism sensor from the phase-observer loop (was wired to an inactive loop)
