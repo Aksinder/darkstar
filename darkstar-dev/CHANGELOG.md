@@ -1,3 +1,7 @@
+## dev-20260607.0725 — 2026-06-07 07:26
+
+- fix(planner): enforce load_safety_margin_percent floor + centralize export-price overrides
+
 ## dev-20260606.2214 — 2026-06-06 22:16
 
 - docs(changelog): add HA add-on CHANGELOG + CI auto-append per dev build
