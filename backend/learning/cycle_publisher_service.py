@@ -724,7 +724,7 @@ async def run_phase_observer_loop(
 
     from backend.core import secrets
     from backend.core.ha_client import get_ha_sensor_float, make_ha_headers
-    from backend.learning.cycle_publisher import publish_sensors
+    from backend.learning.cycle_publisher import build_realism_sensors, publish_sensors
 
     built = build_phase_observer_from_config(config)
     if built is None:
@@ -765,6 +765,20 @@ async def run_phase_observer_loop(
     async def publish(sensors: list[PublishedSensor]) -> int:
         return await publish_sensors(sensors, base_url, token)
 
+    async def publish_realism() -> None:
+        """Publish the latest plan's per-phase imbalance cost alongside the phase sensors."""
+        sched = Path("data/schedule.json")
+        if not sched.exists():
+            return
+        with sched.open() as f:
+            payload: dict[str, Any] = json.load(f)
+        meta: dict[str, Any] = payload.get("meta") or {}
+        s_index: dict[str, Any] = meta.get("s_index") or {}
+        realism: dict[str, Any] = s_index.get("realism") or {}
+        sensors = build_realism_sensors(realism)
+        if sensors:
+            await publish(sensors)
+
     async def persist(model: dict[str, Any]) -> None:
         model_path.parent.mkdir(parents=True, exist_ok=True)
         model_path.write_text(json.dumps(model, indent=2), encoding="utf-8")
@@ -791,6 +805,10 @@ async def run_phase_observer_loop(
             await service.run_once()
         except Exception as exc:
             logger.warning("Phase observer tick failed: %s", exc)
+        try:
+            await publish_realism()
+        except Exception as exc:
+            logger.debug("Realism sensor publish skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
 
