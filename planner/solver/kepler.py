@@ -179,8 +179,15 @@ class KeplerSolver:
             defl_n[load.id] = n
             defl_energy_per_slot[load.id] = load.energy_kwh / n
             scheduled_defl.append(load)
-            # Run exactly once within the valid start window.
-            prob += pulp.lpSum(defl_start[load.id][t] for t in valid) == 1
+            # Run within the valid start window. A priority-bearing load (WTP layer
+            # enabled) is OPTIONAL — at most once — so it can be skipped when no slot
+            # is cheap enough for its reservation price; its urgency ramp pulls it in
+            # before the deadline when running is worthwhile. Every other load keeps
+            # the legacy mandatory run-once semantics (byte-identical when off).
+            if config.load_priority_enabled and load.id in config.load_priorities:
+                prob += pulp.lpSum(defl_start[load.id][t] for t in valid) <= 1
+            else:
+                prob += pulp.lpSum(defl_start[load.id][t] for t in valid) == 1
 
         def _defl_run_expr(load_id: str, t: int) -> Any:
             """Linear 0/1 expression: is deferrable load `load_id` running in slot t?"""
@@ -567,6 +574,10 @@ class KeplerSolver:
         # s finishes at s+N-1; slots beyond the deadline are penalised. Because
         # the lateness of each candidate start is a constant, this stays linear.
         for load in scheduled_defl:
+            # A priority-bearing load prices its deadline via the WTP urgency ramp
+            # (added below), so skip the legacy tardiness penalty to avoid double-counting.
+            if config.load_priority_enabled and load.id in config.load_priorities:
+                continue
             n = defl_n[load.id]
             deadline = load.deadline_slot if load.deadline_slot is not None else (T - 1)
             penalty = (
@@ -582,6 +593,32 @@ class KeplerSolver:
                         for s in defl_valid[load.id]
                     )
                 )
+
+        # Load-priority WTP credit (flag-gated). For each priority-bearing deferrable
+        # load, running it in slot t earns a credit = WTP(t) * energy_slot, where
+        # WTP(t) = base + rank_epsilon + urgency(t); urgency ramps linearly from 0 at
+        # the earliest start to urgency_wtp at the deadline. The credit is granted ONLY
+        # when the load actually runs (multiplied by the linear run indicator), never
+        # for exporting/curtailing, so it cannot distort those decisions. The solver
+        # runs the load iff WTP(t) >= the marginal price — WTP is a reservation price.
+        # All coefficients are Python constants, so the term is strictly linear (no new
+        # variables, no MILP growth).
+        if config.load_priority_enabled:
+            for load in scheduled_defl:
+                lp = config.load_priorities.get(load.id)
+                if lp is None:
+                    continue
+                e_slot = defl_energy_per_slot[load.id]
+                earliest = max(0, int(load.earliest_start_slot))
+                deadline = load.deadline_slot if load.deadline_slot is not None else (T - 1)
+                span = max(1, deadline - earliest)
+                base = lp.base_wtp_sek_per_kwh + lp.rank_epsilon_sek_per_kwh
+                for t in range(T):
+                    ramp = min(1.0, max(0.0, (t - earliest) / span))
+                    wtp_t = base + lp.urgency_wtp_sek_per_kwh * ramp
+                    if wtp_t == 0.0:
+                        continue
+                    total_cost.append(-wtp_t * e_slot * _defl_run_expr(load.id, t))
 
         # Deferrable-load phase balancing (optional): penalise two same-phase
         # loads running concurrently, so large single-phase appliances spread out.

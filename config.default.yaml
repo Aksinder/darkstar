@@ -226,6 +226,33 @@ deferrable_load_settings:
                                      # Uses each load's phase: explicit config, else the
                                      # learned phase (Phase 3) when phase_observer is on.
 
+# Load priority / willingness-to-pay (WTP) layer (increment 1, default OFF).
+# A unified way to say "this load matters more than that one". Each controllable load
+# is assigned a tier (and an optional intra-tier rank); a tier carries a reservation
+# price in SEK/kWh: base_wtp is what the load is worth at rest, urgency_wtp is the extra
+# it will pay as its deadline/comfort window closes (linear ramp). The planner then runs
+# a load only while its WTP for the slot meets the marginal energy price — so a
+# low-priority load (e.g. spa) defers or skips during price peaks and soaks cheap/surplus
+# energy, while a high-priority load keeps running. When enabled=false (or for any load
+# without an entry) the planner behaves exactly as before.
+# Increment 1 wires DEFERRABLE loads only (water VVB and EV fold in later increments).
+load_priority:
+  enabled: false
+  rank_step_sek_per_kwh: 0.001       # intra-tier tiebreak granularity (lower rank wins)
+  tiers:
+    important:                       # e.g. air-source heat pumps, VVB hot water
+      base_wtp_sek_per_kwh: 3.0      # worth running up to ~3 SEK/kWh even at rest
+      urgency_wtp_sek_per_kwh: 5.0   # +up to 5 SEK/kWh as its deadline approaches
+    comfort:                         # e.g. spa / spabad — nice-to-have, price-sensitive
+      base_wtp_sek_per_kwh: 0.4      # only runs when energy is cheap/surplus
+      urgency_wtp_sek_per_kwh: 0.6
+  loads: {}
+    # spa:                           # key = the deferrable load's id
+    #   tier: comfort
+    #   rank: 0                       # lower rank = preferred within the tier
+    #   # base_wtp_sek_per_kwh: 0.5   # optional per-load overrides of the tier values
+    #   # urgency_wtp_sek_per_kwh: 0.7
+
 # Phase-aware observability (Observe phase of docs/designs/phase-aware-load-modeling.md).
 # Read-only: learns each metered device's electrical phase by correlating its power
 # changes against the per-phase grid meter (cancelling the balanced inverter so the

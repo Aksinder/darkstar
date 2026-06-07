@@ -67,6 +67,27 @@ class DeferrableLoadInput:
 
 
 @dataclass
+class LoadPriority:
+    """Resolved per-load willingness-to-pay (WTP) parameters.
+
+    Already merged from tier defaults + intra-tier rank + per-load overrides by the
+    adapter, so the solver consumes pure numbers. The WTP is a reservation price
+    (SEK/kWh): the load is worth running in a slot when its WTP for that slot meets
+    or exceeds the slot's marginal energy price. ``base_wtp`` is the floor value at
+    zero urgency; ``urgency_wtp`` is the additional WTP fully ramped in by the
+    deadline/comfort gap (linear ramp), so a load tolerates progressively more
+    expensive energy as its window closes. ``rank_epsilon`` is a tiny signed
+    tiebreak (lower rank => slightly higher WTP) that breaks intra-tier ties
+    deterministically without perturbing real economics.
+    """
+
+    tier_rank: int = 0
+    base_wtp_sek_per_kwh: float = 0.0
+    urgency_wtp_sek_per_kwh: float = 0.0
+    rank_epsilon_sek_per_kwh: float = 0.0
+
+
+@dataclass
 class KeplerConfig:
     """Configuration for the Kepler MILP solver."""
 
@@ -133,6 +154,17 @@ class KeplerConfig:
     # Soft penalty (SEK per slot) for two deferrable loads running on the same
     # phase at the same time (0 = phase-balancing disabled).
     deferrable_phase_penalty_sek: float = 0.0
+
+    # ---- Load priority / willingness-to-pay (WTP) layer (flag-gated, default OFF) ----
+    # A unified tier+rank+time->WTP reservation-price model. When enabled, a load
+    # that has a LoadPriority entry is run by the planner only while its WTP for the
+    # slot meets the marginal energy price (cheap/surplus) — low-priority loads
+    # (e.g. spa) defer or skip under scarcity, high-priority loads keep running, and
+    # a linear urgency ramp pulls a load in before its deadline. When disabled (or
+    # for any load without an entry) behaviour is byte-identical to before.
+    load_priority_enabled: bool = False
+    # Map of load id -> resolved LoadPriority. Empty => no WTP applied to any load.
+    load_priorities: dict[str, LoadPriority] = field(default_factory=lambda: {})
 
     # Improvement B (Predbat-inspired): continuous stored-energy value (SEK/kWh).
     # Rewards energy left in the battery at the END of the horizon at its expected

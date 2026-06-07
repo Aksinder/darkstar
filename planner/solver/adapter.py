@@ -20,6 +20,7 @@ from .types import (
     KeplerInput,
     KeplerInputSlot,
     KeplerResult,
+    LoadPriority,
     WaterHeaterInput,
 )
 
@@ -479,6 +480,64 @@ def build_deferrable_load_inputs(
     return out
 
 
+def build_load_priorities(
+    planner_config: dict[str, Any],
+) -> tuple[bool, dict[str, LoadPriority]]:
+    """Parse the ``load_priority`` config block into resolved per-load WTP params.
+
+    Schema (config.default.yaml)::
+
+        load_priority:
+          enabled: false
+          rank_step_sek_per_kwh: 0.001   # intra-tier tiebreak granularity
+          tiers:
+            important: { base_wtp_sek_per_kwh: 3.0, urgency_wtp_sek_per_kwh: 5.0 }
+            comfort:   { base_wtp_sek_per_kwh: 0.4, urgency_wtp_sek_per_kwh: 0.6 }
+          loads:
+            spa: { tier: comfort, rank: 0 }   # optional per-load base/urgency overrides
+
+    Returns ``(enabled, {load_id: LoadPriority})``. When disabled or malformed the
+    map is empty, so the solver applies no WTP term and behaviour is unchanged. A
+    load that references an unknown tier is skipped (logged), never raising — a bad
+    yaml can therefore never harden into a behaviour-changed or infeasible solve.
+    """
+    cfg: dict[str, Any] = planner_config.get("load_priority", {}) or {}
+    if not bool(cfg.get("enabled", False)):
+        return False, {}
+
+    tiers_cfg: dict[str, Any] = cfg.get("tiers", {}) or {}
+    loads_cfg: dict[str, Any] = cfg.get("loads", {}) or {}
+    rank_step = float(cfg.get("rank_step_sek_per_kwh", 0.001))
+    # Stable tier ordering (0 = first declared = most important) for metadata.
+    tier_rank_by_id = {name: i for i, name in enumerate(tiers_cfg.keys())}
+
+    priorities: dict[str, LoadPriority] = {}
+    for load_id, raw in loads_cfg.items():
+        spec: dict[str, Any] = raw or {}
+        tier_id = spec.get("tier")
+        if tier_id is not None and tier_id not in tiers_cfg:
+            logger.warning(
+                "load_priority: load %s references unknown tier %r - skipping",
+                load_id,
+                tier_id,
+            )
+            continue
+        tier: dict[str, Any] = tiers_cfg.get(tier_id, {}) or {}
+        base = float(spec.get("base_wtp_sek_per_kwh", tier.get("base_wtp_sek_per_kwh", 0.0)))
+        urgency = float(
+            spec.get("urgency_wtp_sek_per_kwh", tier.get("urgency_wtp_sek_per_kwh", 0.0))
+        )
+        rank = int(spec.get("rank", 0))
+        priorities[str(load_id)] = LoadPriority(
+            tier_rank=tier_rank_by_id.get(tier_id, 0),
+            base_wtp_sek_per_kwh=base,
+            urgency_wtp_sek_per_kwh=urgency,
+            # Lower rank => slightly higher WTP => preferred in intra-tier ties.
+            rank_epsilon_sek_per_kwh=-rank * rank_step,
+        )
+    return True, priorities
+
+
 def config_to_kepler_config(
     planner_config: dict[str, Any],
     overrides: dict[str, Any] | None = None,
@@ -677,6 +736,11 @@ def config_to_kepler_config(
         defl_settings.get("hard_deadline_penalty_sek", 1000.0)
     )
     kepler_cfg.deferrable_phase_penalty_sek = float(defl_settings.get("phase_penalty_sek", 0.0))
+
+    # Load priority / WTP layer (flag-gated; empty map => byte-identical to before).
+    kepler_cfg.load_priority_enabled, kepler_cfg.load_priorities = build_load_priorities(
+        planner_config
+    )
 
     return kepler_cfg
 
