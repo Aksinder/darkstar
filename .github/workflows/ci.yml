@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}   # also runnable on demand (push-triggered runs are gated on this fork)
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
