@@ -373,7 +373,9 @@ price_forecast:
 forecasting:
   active_forecast_version: "aurora"
   pv_confidence_percent: 83.0          # PV forecast scaling (100 = trust forecast fully)
-  load_safety_margin_percent: 117.0    # Load forecast scaling (>100 = expect more load)
+  load_safety_margin_percent: 117.0    # HARD FLOOR on the S-Index load margin: the planner never
+                                       # plans for less load than this % of the forecast, regardless
+                                       # of s_index.risk_appetite (which tunes conservatism ABOVE it).
 
 # Grid Limits (Soft Constraint)
 # This is a SOFT limit with penalty - planner prefers to stay under but can breach if needed.

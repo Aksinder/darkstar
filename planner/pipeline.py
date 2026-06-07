@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 from backend.core.version import get_version
 from backend.learning.store import LearningStore
 from planner.errors import PlannerError, PlannerErrorCode
-from planner.inputs.data_prep import apply_safety_margins, prepare_df
+from planner.inputs.data_prep import apply_safety_margins, floored_load_margin, prepare_df
 from planner.inputs.learning import load_learning_overlays
 from planner.inputs.weather import fetch_temperature_forecast
 from planner.output.schedule import save_schedule_to_json
@@ -436,6 +436,11 @@ class PlannerPipeline:
                 effective_load_margin = factor if factor is not None else base_factor
 
                 s_index_debug.update(s_debug or {})
+
+            # Hard load-safety floor: never plan for less load than forecasting.load_safety_margin_percent
+            # of the forecast (wires that previously-dead knob). Prevents an aggressive risk_appetite
+            # from planning for < forecast load; risk_appetite still tunes conservatism above the floor.
+            effective_load_margin = floored_load_margin(effective_load_margin, active_config)
 
             # Rev K23 Phase 3: Physical Deficit Logic
             # Replaces legacy Risk Factor + Dynamic Target SoC logic
