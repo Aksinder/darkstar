@@ -1,3 +1,7 @@
+## dev-20260607.2229 — 2026-06-07 22:30
+
+- feat(planner): load priority / willingness-to-pay layer (increment 1, flag-gated off)
+
 ## dev-20260607.1811 — 2026-06-07 18:13
 
 - fix(executor): don't force grid-charge a near-full battery on PV surplus
