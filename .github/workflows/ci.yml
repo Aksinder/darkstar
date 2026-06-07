@@ -15,78 +15,101 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
       - name: Install Ruff
         run: pip install ruff
+      - name: Run Ruff (all source dirs, not just backend/)
+        run: ruff check backend/ planner/ ml/ executor/ --output-format=github
 
-      - name: Run Ruff
-        run: ruff check backend/ --output-format=github
+  typecheck-backend:
+    name: Typecheck Backend (Pyright)
+    runs-on: ubuntu-latest
+    # Informational for now: strict pyright has a ~42-error pre-existing baseline.
+    # Drive that to 0, then drop continue-on-error to make this a hard gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run Pyright
+        run: pyright
+
+  test-core:
+    name: Tests (core suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run pytest (planner / solver / executor / ev / backend / config / services)
+        run: PYTHONPATH=. pytest tests/ --ignore=tests/ml -q
+
+  test-ml:
+    name: Tests (ML — informational)
+    runs-on: ubuntu-latest
+    # ML tests need trained-model/data fixtures and heavier deps; keep informational until
+    # they run reliably in CI, then fold into a single blocking test job.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run ML tests
+        run: PYTHONPATH=. pytest tests/ml -q
 
   lint-frontend:
-    name: Lint Frontend (ESLint)
+    name: Lint + Typecheck Frontend
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: frontend
     steps:
       - uses: actions/checkout@v6
-
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 9
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: 'pnpm'
           cache-dependency-path: frontend/pnpm-lock.yaml
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
       - name: Run ESLint
         run: pnpm lint
-
-  test-api:
-    name: API Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest httpx
-
-      - name: Run API tests
-        run: PYTHONPATH=. pytest tests/api/test_api_routes.py -v
+      - name: Typecheck (tsc --noEmit)
+        # Informational until the frontend TS baseline is clean (vite build does not type-check).
+        continue-on-error: true
+        run: pnpm exec tsc --noEmit
 
   validate-openapi:
     name: Validate OpenAPI Schema
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Export and validate OpenAPI schema
         run: |
           python -c "
