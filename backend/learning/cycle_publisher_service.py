@@ -357,13 +357,15 @@ async def run_publisher_loop(
     controls no hardware). Returns immediately if nothing is configured.
     """
     import asyncio
+    import json
     from datetime import timedelta
+    from pathlib import Path
 
     import httpx
 
     from backend.core import secrets
     from backend.core.ha_client import get_ha_sensor_float, make_ha_headers
-    from backend.learning.cycle_publisher import publish_sensors
+    from backend.learning.cycle_publisher import build_realism_sensors, publish_sensors
 
     appliances, tanks = build_tracked_from_config(config)
     if not appliances and not tanks:
@@ -396,6 +398,20 @@ async def run_publisher_loop(
     async def publish(sensors: list[PublishedSensor]) -> int:
         return await publish_sensors(sensors, base_url, token)
 
+    async def publish_realism() -> None:
+        """Read the latest plan's per-phase imbalance cost from schedule.json and publish it."""
+        sched = Path("data/schedule.json")
+        if not sched.exists():
+            return
+        with sched.open() as f:
+            payload: dict[str, Any] = json.load(f)
+        meta: dict[str, Any] = payload.get("meta") or {}
+        s_index: dict[str, Any] = meta.get("s_index") or {}
+        realism: dict[str, Any] = s_index.get("realism") or {}
+        sensors = build_realism_sensors(realism)
+        if sensors:
+            await publish(sensors)
+
     service = DeferrablePublisherService(
         appliances,
         tanks,
@@ -415,6 +431,10 @@ async def run_publisher_loop(
             await service.run_once()
         except Exception as exc:
             logger.warning("Cycle publisher tick failed: %s", exc)
+        try:
+            await publish_realism()
+        except Exception as exc:
+            logger.debug("Realism sensor publish skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
 

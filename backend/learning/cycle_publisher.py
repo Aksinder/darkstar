@@ -34,6 +34,7 @@ __all__ = [
     "build_load_sensors",
     "build_phase_recommendation_sensors",
     "build_phase_sensors",
+    "build_realism_sensors",
     "publish_sensors",
 ]
 
@@ -78,6 +79,37 @@ def _slug(value: str) -> str:
     """Sanitise an id into a safe entity object_id fragment."""
     s = re.sub(r"[^a-z0-9]+", "_", value.strip().lower())
     return s.strip("_") or "load"
+
+
+def build_realism_sensors(realism: dict[str, Any] | None) -> list[PublishedSensor]:
+    """Surface the planner's forward per-phase imbalance cost as a sensor.
+
+    The net-node MILP is phase-blind; the realism simulation re-prices the optimal plan against
+    the measured per-phase load split and reports the hidden cost (``gap_sek``) and the extra
+    per-phase import (``extra_import_kwh``) the optimizer cannot see. Publishing it makes that
+    structural loss visible on a dashboard instead of buried in the schedule meta. Returns ``[]``
+    when no realism data is available (e.g. balanced/no measured phase fractions).
+    """
+    if not realism:
+        return []
+    gap = float(realism.get("gap_sek", 0.0) or 0.0)
+    extra_kwh = float(realism.get("extra_import_kwh", 0.0) or 0.0)
+    return [
+        PublishedSensor(
+            object_id="darkstar_phase_imbalance_cost",
+            state=f"{round(gap, 3)}",
+            unit="SEK",
+            device_class="monetary",
+            state_class="measurement",
+            icon="mdi:scale-unbalanced",
+            friendly_name="Fas-obalans kostnad (plan)",
+            attributes={
+                "extra_import_kwh": round(extra_kwh, 3),
+                "phase_flagged_slots": int(realism.get("phase_flagged_slots", 0) or 0),
+                "idle_exposed_slots": int(realism.get("idle_exposed_slots", 0) or 0),
+            },
+        )
+    ]
 
 
 def build_load_sensors(
