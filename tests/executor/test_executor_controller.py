@@ -189,6 +189,41 @@ class TestControllerFollowPlan:
 
         assert decision.mode_intent == "charge"
 
+    def test_grid_charge_requires_pv_shortfall(self, controller):
+        """Genuine grid charge: forecast PV can't cover charge + load (e.g. an
+        overnight cheap-price top-up), so the shortfall is imported -> charge."""
+        slot = SlotPlan(charge_kw=4.0, export_kw=0.0, discharge_kw=0.0, pv_kw=0.0, load_kw=1.0)
+        state = SystemState()
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "charge"
+
+    def test_near_full_pv_topup_no_export_uses_self_consumption(self, controller):
+        """Regression: a near-full battery topping off the last % from PV emits a
+        tiny charge_kw with export_kw == 0. Previously this was misclassified as
+        grid charge (Forced charge), which set max_charge to the tiny value and
+        blocked discharge -> a full battery sat idle while single-phase loads were
+        bought from the grid ("köper el fast batteriet är fullt"). When PV covers
+        charge + load, no grid import is needed -> use self_consumption so the
+        battery still covers real-time/phase deficits."""
+        slot = SlotPlan(charge_kw=0.1, export_kw=0.0, discharge_kw=0.0, pv_kw=1.5, load_kw=0.9)
+        state = SystemState(current_soc_percent=99)
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "self_consumption"
+
+    def test_pv_charge_no_export_when_pv_exactly_covers_charge_and_load(self, controller):
+        """Boundary: PV exactly equals charge + load (no import needed) -> the
+        battery is free to self-consume, not force-grid-charged."""
+        slot = SlotPlan(charge_kw=2.0, export_kw=0.0, discharge_kw=0.0, pv_kw=3.0, load_kw=1.0)
+        state = SystemState()
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "self_consumption"
+
     def test_idle_when_at_soc_target_no_activity(self, controller):
         """When at SoC target with no charging/discharging, use idle."""
         slot = SlotPlan(charge_kw=0.0, export_kw=0.0, discharge_kw=0.0, soc_target=50)

@@ -200,12 +200,26 @@ class Controller:
         if slot.export_kw > 0 and slot.discharge_kw > 0:
             # Battery discharge to grid - use export mode
             mode_intent = "export"
-        elif slot.charge_kw > 0 and slot.export_kw == 0:
-            # Grid charging (no PV surplus) - use charge mode with grid_charging ON
+        elif (
+            slot.charge_kw > 0
+            and slot.export_kw == 0
+            and slot.pv_kw < slot.charge_kw + slot.load_kw
+        ):
+            # Genuine grid charge: forecast PV cannot cover the planned charge plus
+            # the house load, so the shortfall is imported from the grid. Force
+            # grid-charge mode (Forced mode → Forced charge from AC).
             mode_intent = "charge"
         elif slot.charge_kw > 0:
-            # PV surplus (charge_kw > 0 AND export_kw > 0 AND discharge_kw == 0)
-            # Charge battery from PV while exporting excess - use self_consumption
+            # PV-driven charge (discharge_kw == 0). Two cases land here:
+            #   (a) PV surplus with export headroom (export_kw > 0), or
+            #   (b) PV covers charge + load but export_kw == 0 — e.g. a near-full
+            #       battery topping off the last few %, or export curtailed/limited.
+            # In BOTH cases no grid import is needed to charge, so do NOT force
+            # grid-charge: that sets max_charge to the (tiny) charge value and, via
+            # Forced charge, blocks the battery from discharging — leaving a full
+            # battery idle while single-phase/transient loads the balanced PV feed
+            # can't cover are pulled from the grid. Use self_consumption so the
+            # battery covers those deficits and refills from the surplus PV.
             mode_intent = "self_consumption"
         elif round(state.current_soc_percent) <= slot.soc_target:
             # At or below SoC target - hold the battery.
