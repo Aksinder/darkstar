@@ -636,6 +636,13 @@ const createChartData = (
         ],
     }
 
+    // Hide the planned "EV Charging" series when no EV charging is planned (e.g. the car is away
+    // and the home-gate excluded it), so the schedule doesn't look like it reserves for / charges
+    // a car it isn't charging. Actual/historical EV bars are left intact.
+    if (!(values.evCharging ?? []).some((v) => v != null && v > 0)) {
+        baseData.datasets = baseData.datasets.filter((ds) => ds.label !== 'EV Charging (kW)')
+    }
+
     // Add no-data message if needed
     if (values.hasNoData) {
         // cast to ExtendedChartData here to avoid ChartData strictness while manipulating plugins
