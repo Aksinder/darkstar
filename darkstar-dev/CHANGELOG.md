@@ -1,3 +1,7 @@
+## dev-20260607.1730 — 2026-06-07 17:32
+
+- fix(phase): publish realism sensor from the phase-observer loop (was wired to an inactive loop)
+
 ## dev-20260607.0914 — 2026-06-07 09:15
 
 - feat(phase): publish forward per-phase imbalance cost (Phase 1 visibility)
