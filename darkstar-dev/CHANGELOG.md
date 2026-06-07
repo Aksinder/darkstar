@@ -1,3 +1,7 @@
+## dev-20260607.0914 — 2026-06-07 09:15
+
+- feat(phase): publish forward per-phase imbalance cost (Phase 1 visibility)
+
 ## dev-20260607.0758 — 2026-06-07 08:00
 
 - fix(ui): home-gate the live power-flow EV node (away car charging elsewhere not shown)
