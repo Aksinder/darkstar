@@ -1,3 +1,7 @@
+## dev-20260607.0758 — 2026-06-07 08:00
+
+- fix(ui): home-gate the live power-flow EV node (away car charging elsewhere not shown)
+
 ## dev-20260607.0739 — 2026-06-07 07:40
 
 - fix(ui): hide planned EV-charging series when no charge is planned (away car)
