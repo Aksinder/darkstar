@@ -1,3 +1,7 @@
+## dev-20260607.0739 — 2026-06-07 07:40
+
+- fix(ui): hide planned EV-charging series when no charge is planned (away car)
+
 ## dev-20260607.0725 — 2026-06-07 07:26
 
 - fix(planner): enforce load_safety_margin_percent floor + centralize export-price overrides
