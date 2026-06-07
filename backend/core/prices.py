@@ -1,3 +1,4 @@
+import contextlib
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -21,9 +22,12 @@ async def get_nordpool_data(
     with Path(config_path).open() as f:
         config = yaml.safe_load(f)
 
-    # Apply live-resolved export-price components (e.g. premium / nätnytta read from HA
-    # sensors) so the computed per-slot export compensation follows the contract. The
-    # literals in config["pricing"] are the fallback when no override is supplied.
+    # Resolve sensor-backed export-price components for EVERY caller (recorder ML labels,
+    # schedule/forecast APIs, planner) — not just the planner path — so the effective export
+    # price is consistent everywhere. Callers that already resolved them pass pricing_overrides;
+    # otherwise we resolve here. No-op (and no HA calls) when no export_*_entity is configured.
+    if pricing_overrides is None:
+        pricing_overrides = await _resolve_pricing_overrides(config)
     if pricing_overrides:
         config["pricing"] = {**config.get("pricing", {}), **pricing_overrides}
 
@@ -237,6 +241,35 @@ def resolve_export_price_components(
         if value is not None:
             resolved[value_key] = float(value)
     return resolved
+
+
+async def _resolve_pricing_overrides(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve sensor-backed export-price components from their HA entities into literal
+    SEK/kWh overrides, so every price consumer (recorder ML labels, schedule/forecast APIs,
+    planner) shares ONE effective export price. Returns ``None`` (making zero HA calls) when no
+    ``export_*_entity`` is configured.
+    """
+    pricing_cfg: dict[str, Any] = config.get("pricing", {}) or {}
+    entity_keys = ("export_premium_entity", "export_grid_benefit_entity", "export_fee_entity")
+    if not any(str(pricing_cfg.get(k, "") or "").strip() for k in entity_keys):
+        return None
+
+    from backend.core import ha_client  # lazy import to avoid any import cycle
+
+    values: dict[str, float] = {}
+    for ek in entity_keys:
+        eid = str(pricing_cfg.get(ek, "") or "").strip()
+        if not eid:
+            continue
+        state = await ha_client.get_ha_entity_state(eid)
+        raw = state.get("state") if state is not None else None
+        if raw is None:
+            continue
+        with contextlib.suppress(TypeError, ValueError):
+            values[eid] = float(raw)
+    if not values:
+        return None
+    return resolve_export_price_components(pricing_cfg, lambda e: values.get(e))
 
 
 def _process_nordpool_data(

@@ -212,6 +212,20 @@ def apply_safety_margins(
     return df
 
 
+def floored_load_margin(effective_load_margin: float, config: dict[str, Any]) -> float:
+    """Clamp the S-Index load margin so the planner never plans for LESS load than
+    ``forecasting.load_safety_margin_percent`` of the forecast — a hard safety floor.
+
+    This makes that knob meaningful (it was previously read by no planner code) and stops an
+    aggressive ``s_index.risk_appetite`` from driving the load margin below 1.0: risk_appetite=5
+    maps to the p25 load percentile, which the uncertainty term can push toward ~0.5 (= half the
+    forecast load), systematically under-reserving and forcing grid buys. ``risk_appetite`` still
+    tunes conservatism ABOVE this floor.
+    """
+    floor_pct = float(config.get("forecasting", {}).get("load_safety_margin_percent", 100.0) or 100.0)
+    return max(float(effective_load_margin), floor_pct / 100.0)
+
+
 # Legacy aliases for backward compatibility
 _normalize_timestamp = normalize_timestamp
 _build_price_dataframe = build_price_dataframe
