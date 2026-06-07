@@ -104,6 +104,10 @@ export const NODE_REGISTRY: FlowNodeConfig[] = [
     {
         id: 'ev',
         configKey: 'system.has_ev_charger', // Match settings key
+        // Only render the EV node when a car is plugged in AT HOME. The backend home-gates the
+        // live status (an away car charging at a Supercharger still reads plugged), so evPluggedIn
+        // is false when the car is away -> don't imply we're charging a car that isn't here.
+        shouldRender: (data: PowerFlowData) => data.evPluggedIn === true,
         lucideIcon: (data: PowerFlowData) => (data.evPluggedIn ? Plug : Car),
         color: (data: PowerFlowData) => (data.evPluggedIn ? 'rgb(var(--color-ai))' : 'rgb(var(--color-muted))'),
         label: 'EV',
