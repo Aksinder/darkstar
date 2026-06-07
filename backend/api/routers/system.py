@@ -14,7 +14,12 @@ from backend.api.models.system import (
     SystemHealthResponse,
     VersionResponse,
 )
-from backend.core.ha_client import get_ha_bool, get_ha_sensor_float, get_ha_sensor_kw_normalized
+from backend.core.ha_client import (
+    get_ha_bool,
+    get_ha_entity_state,
+    get_ha_sensor_float,
+    get_ha_sensor_kw_normalized,
+)
 from backend.core.secrets import load_yaml
 from backend.core.version import get_version as _get_git_version
 
@@ -116,6 +121,17 @@ async def get_system_status() -> StatusResponse:
         # Typically people set kW for EVs.
         ev_soc = results[idx + 1]
         plugged = results[idx + 2] or False
+
+        # Home gate: only count an EV as a home load / plugged when the car is actually HOME.
+        # Its plug/charge-cable sensor reads 'on' even when charging away (e.g. a Supercharger),
+        # so without this an away car pollutes the live home power flow (ev_kw / ev_plugged_in).
+        home_entity = ev.get("home_entity")
+        if home_entity:
+            home_states = {str(s).lower() for s in (ev.get("home_states") or ["home"])}
+            hstate = await get_ha_entity_state(str(home_entity))
+            if not (hstate and str(hstate.get("state", "")).lower() in home_states):
+                plugged = False
+                kw = 0.0
 
         ev_chargers.append(
             {
