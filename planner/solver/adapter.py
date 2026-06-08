@@ -558,14 +558,63 @@ def build_load_priorities(
             spec.get("urgency_wtp_sek_per_kwh", tier.get("urgency_wtp_sek_per_kwh", 0.0))
         )
         rank = int(spec.get("rank", 0))
+        # Optional dynamic cap (percentile of the rolling 24 h import prices). Accept it
+        # from the per-load spec or the tier default; clamp to (0, 100]; None => static.
+        pct_raw = cast(
+            "float | int | str | None",
+            spec.get("wtp_percentile", tier.get("wtp_percentile")),
+        )
+        dynamic_percentile: float | None = None
+        if pct_raw is not None:
+            try:
+                p = float(pct_raw)
+                if 0.0 < p <= 100.0:
+                    dynamic_percentile = p
+                else:
+                    logger.warning(
+                        "load_priority: load %s wtp_percentile=%r out of (0,100] - ignoring",
+                        load_id,
+                        pct_raw,
+                    )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "load_priority: load %s wtp_percentile=%r not a number - ignoring",
+                    load_id,
+                    pct_raw,
+                )
         priorities[str(load_id)] = LoadPriority(
             tier_rank=tier_rank_by_id.get(tier_id, 0),
             base_wtp_sek_per_kwh=base,
             urgency_wtp_sek_per_kwh=urgency,
             # Lower rank => slightly higher WTP => preferred in intra-tier ties.
             rank_epsilon_sek_per_kwh=-rank * rank_step,
+            dynamic_percentile=dynamic_percentile,
         )
     return True, priorities
+
+
+def dynamic_wtp_from_prices(
+    import_prices: list[float], percentile: float, window_slots: int
+) -> float | None:
+    """Return the ``percentile``-th percentile of the first ``window_slots`` import prices.
+
+    Used as a load's effective base_wtp (price cap): it permits heating in the cheapest
+    ``percentile``% of the rolling window and refuses the rest. Because a water heater's
+    daily need is only a few slots — far fewer than that band — the load always has cheap
+    slots available (it never starves, even on a uniformly-expensive day), while still
+    refusing the window's most expensive hours. Linear-interpolated percentile (numpy
+    "type 7"). Returns None for an empty window.
+    """
+    window = sorted(import_prices[: max(0, window_slots)])
+    if not window:
+        return None
+    if len(window) == 1:
+        return window[0]
+    rank = (max(0.0, min(100.0, percentile)) / 100.0) * (len(window) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(window) - 1)
+    frac = rank - lo
+    return window[lo] * (1.0 - frac) + window[hi] * frac
 
 
 def _excess_pv_custom_cfg(planner_config: dict[str, Any]) -> dict[str, Any]:

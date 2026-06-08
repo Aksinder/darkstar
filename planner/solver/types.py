@@ -85,6 +85,12 @@ class LoadPriority:
     base_wtp_sek_per_kwh: float = 0.0
     urgency_wtp_sek_per_kwh: float = 0.0
     rank_epsilon_sek_per_kwh: float = 0.0
+    # Optional DYNAMIC cap: when set (0-100), base_wtp_sek_per_kwh is recomputed each plan
+    # as this percentile of the rolling 24 h import-price distribution, instead of a fixed
+    # SEK value. This keeps the load heating in the *relatively* cheapest hours on any day
+    # (cheap, expensive, or flat) so it never starves on a uniformly-expensive day, while
+    # still refusing that day's most expensive hours. None => use the static base value.
+    dynamic_percentile: float | None = None
 
 
 @dataclass
