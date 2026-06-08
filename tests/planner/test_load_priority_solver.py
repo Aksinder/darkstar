@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from planner.solver.adapter import build_load_priorities
+from planner.solver.adapter import build_ev_charger_inputs, build_load_priorities
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
     DeferrableLoadInput,
@@ -299,3 +299,62 @@ class TestWtpWaterHeaters:
         )
         assert _heated(baseline, "spa") == pytest.approx(_heated(off, "spa"))
         assert baseline.total_cost_sek == pytest.approx(off.total_cost_sek)
+
+
+_LP_CFG = {
+    "enabled": True,
+    "tiers": {
+        "important": {"base_wtp_sek_per_kwh": 3.0},
+        "comfort": {"base_wtp_sek_per_kwh": 0.4},
+    },
+}
+
+
+def _charger(wtp_tier=None):
+    c = {
+        "id": "ev1",
+        "enabled": True,
+        "max_power_kw": 11.0,
+        "battery_capacity_kwh": 80.0,
+        "penalty_levels": [
+            {"max_soc": 80, "penalty_sek": 0.5},
+            {"max_soc": 100, "penalty_sek": 0.2},
+        ],
+    }
+    if wtp_tier is not None:
+        c["wtp_tier"] = wtp_tier
+    return c
+
+
+class TestEvWtpFold:
+    """EV charging incentive folds onto the unified WTP scale via wtp_tier — the tier's
+    base_wtp sources the per-kWh bucket value while SoC thresholds (capacity) are kept."""
+
+    def test_tier_sources_bucket_values_when_enabled(self):
+        out = build_ev_charger_inputs([_charger("important")], load_priority_cfg=_LP_CFG)
+        buckets = out[0].incentive_buckets
+        assert [b.value_sek for b in buckets] == [3.0, 3.0]  # both bands take the tier WTP
+        assert [b.threshold_soc for b in buckets] == [80.0, 100.0]  # thresholds preserved
+
+    def test_comfort_tier_gives_low_value(self):
+        out = build_ev_charger_inputs([_charger("comfort")], load_priority_cfg=_LP_CFG)
+        assert [b.value_sek for b in out[0].incentive_buckets] == [0.4, 0.4]
+
+    def test_no_tier_keeps_legacy_penalty_values(self):
+        out = build_ev_charger_inputs([_charger()], load_priority_cfg=_LP_CFG)
+        assert [b.value_sek for b in out[0].incentive_buckets] == [0.5, 0.2]
+
+    def test_disabled_flag_keeps_legacy_values(self):
+        out = build_ev_charger_inputs(
+            [_charger("important")],
+            load_priority_cfg={"enabled": False, "tiers": _LP_CFG["tiers"]},
+        )
+        assert [b.value_sek for b in out[0].incentive_buckets] == [0.5, 0.2]
+
+    def test_unknown_tier_keeps_legacy_values(self):
+        out = build_ev_charger_inputs([_charger("nope")], load_priority_cfg=_LP_CFG)
+        assert [b.value_sek for b in out[0].incentive_buckets] == [0.5, 0.2]
+
+    def test_no_priority_cfg_keeps_legacy_values(self):
+        out = build_ev_charger_inputs([_charger("important")])  # load_priority_cfg=None
+        assert [b.value_sek for b in out[0].incentive_buckets] == [0.5, 0.2]
