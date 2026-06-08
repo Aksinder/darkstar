@@ -1,3 +1,7 @@
+## dev-20260608.1651 — 2026-06-08 16:53
+
+- feat(planner): phase-aware imbalance cost — battery covers the heavy phase when economic
+
 ## dev-20260608.1630 — 2026-06-08 16:32
 
 - feat(phase): per-slot phase forecasting (learn an hour-of-day phase profile)
