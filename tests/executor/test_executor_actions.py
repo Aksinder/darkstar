@@ -635,3 +635,45 @@ class TestClimateSink:
         assert result.success and result.skipped
         assert "[SHADOW]" in result.message
         ha.call_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_with_boost_sink_when_enabled(self):
+        # Primary sink is water_heater_boost; custom_entity.enabled=True must still actuate.
+        from executor.config import (
+            ControllerConfig,
+            ExcessPVConfig,
+            ExcessPVCustomEntityConfig,
+            ExcessPVSinkType,
+            ExecutorConfig,
+            InverterConfig,
+            NotificationConfig,
+            WaterHeaterConfig,
+        )
+
+        config = ExecutorConfig(
+            inverter=InverterConfig(),
+            controller=ControllerConfig(),
+            water_heater=WaterHeaterConfig(),
+            notifications=NotificationConfig(),
+            excess_pv=ExcessPVConfig(
+                sink=ExcessPVSinkType.WATER_HEATER_BOOST,
+                custom_entity=ExcessPVCustomEntityConfig(
+                    entity="climate.villavagn",
+                    enabled=True,
+                    climate_mode="cool",
+                    target_temp=22.0,
+                    comfort_min_temp=20.0,
+                ),
+            ),
+        )
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "off", "attributes": {"current_temperature": 24.0}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, config).set_custom_entity("1")
+
+        assert result.success and not result.skipped
+        ha.call_service.assert_any_call(
+            "climate", "set_hvac_mode", "climate.villavagn", {"hvac_mode": "cool"}
+        )

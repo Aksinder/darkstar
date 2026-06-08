@@ -568,6 +568,13 @@ def build_load_priorities(
     return True, priorities
 
 
+def _excess_pv_custom_cfg(planner_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``executor.excess_pv.custom_entity`` config dict (cast for typing)."""
+    executor_cfg = cast("dict[str, Any]", planner_config.get("executor", {}) or {})
+    excess_cfg = cast("dict[str, Any]", executor_cfg.get("excess_pv", {}) or {})
+    return cast("dict[str, Any]", excess_cfg.get("custom_entity", {}) or {})
+
+
 def _excess_pv_price_ceiling(planner_config: dict[str, Any]) -> float | None:
     """Resolve the optional export-price ceiling for the custom-entity excess-PV sink.
 
@@ -577,10 +584,7 @@ def _excess_pv_price_ceiling(planner_config: dict[str, Any]) -> float | None:
     "low or minus price" trigger for soaking surplus locally (e.g. villavagn AC cooling)
     instead of exporting it for next to nothing.
     """
-    executor_cfg = cast(dict[str, Any], planner_config.get("executor", {}) or {})
-    excess_cfg = cast(dict[str, Any], executor_cfg.get("excess_pv", {}) or {})
-    custom_cfg = cast(dict[str, Any], excess_cfg.get("custom_entity", {}) or {})
-    raw: Any = custom_cfg.get("price_ceiling_sek_per_kwh", None)
+    raw: Any = _excess_pv_custom_cfg(planner_config).get("price_ceiling_sek_per_kwh", None)
     if raw is None:
         return None
     try:
@@ -764,6 +768,9 @@ def config_to_kepler_config(
             .get("power_kw", 1.0)
         ),
         excess_pv_price_ceiling_sek_per_kwh=_excess_pv_price_ceiling(planner_config),
+        excess_pv_custom_entity_enabled=bool(
+            _excess_pv_custom_cfg(planner_config).get("enabled", False)
+        ),
     )
 
     # Deferrable household loads (dishwasher, washing machine, ...).

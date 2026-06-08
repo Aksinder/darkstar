@@ -149,6 +149,11 @@ class ExcessPVCustomEntityConfig:
     on_value: str = "1"
     off_value: str = "0"
     power_kw: float = 1.0
+    # Independent opt-in: when True the custom-entity sink runs REGARDLESS of the
+    # primary `sink` selector, so it can coexist with water_heater_boost (e.g. the
+    # villavagn AC cooling sink alongside the main-VVB excess-PV boost). The legacy
+    # path (sink == "custom_entity") still works and implies enabled.
+    enabled: bool = False
     # Climate-sink fields (used only when ``entity`` is a climate.* entity).
     climate_mode: str = "cool"  # hvac_mode to set when ON
     target_temp: float | None = None  # setpoint to apply when ON (None => leave as-is)
@@ -596,6 +601,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         on_value=str(custom_entity_data.get("on_value", "1")),
         off_value=str(custom_entity_data.get("off_value", "0")),
         power_kw=float(custom_entity_data.get("power_kw", 1.0)),
+        enabled=bool(custom_entity_data.get("enabled", False)),
         climate_mode=str(custom_entity_data.get("climate_mode", "cool")),
         target_temp=_float_or_none(custom_entity_data.get("target_temp")),
         comfort_min_temp=_float_or_none(custom_entity_data.get("comfort_min_temp")),

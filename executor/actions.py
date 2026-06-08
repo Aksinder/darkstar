@@ -900,7 +900,10 @@ class ActionDispatcher:
         start = time.time()
         excess_pv = self.config.excess_pv
 
-        if excess_pv.sink != ExcessPVSinkType.CUSTOM_ENTITY or not excess_pv.custom_entity.entity:
+        sink_active = (
+            excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY or excess_pv.custom_entity.enabled
+        )
+        if not sink_active or not excess_pv.custom_entity.entity:
             return ActionResult(
                 action_type="custom_entity",
                 success=True,

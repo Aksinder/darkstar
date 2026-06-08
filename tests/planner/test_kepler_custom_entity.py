@@ -214,3 +214,54 @@ class TestCustomEntityPriceCeiling:
         result = KeplerSolver().solve(inp, cfg)
         assert result.is_optimal
         assert any(s.custom_entity_active for s in result.slots)
+
+
+class TestCustomEntityIndependentEnable:
+    """custom_entity can run independently of the primary `sink` selector.
+
+    With sink set to water_heater_boost, the custom_entity sink (e.g. the villavagn AC)
+    still activates when excess_pv_custom_entity_enabled=True — so both surplus uses
+    coexist instead of being mutually exclusive.
+    """
+
+    def _cfg(self, **over):
+        capacity = 10.0
+        initial_soc = capacity * 0.97
+        kwargs = dict(
+            capacity_kwh=capacity,
+            max_charge_power_kw=5.0,
+            max_discharge_power_kw=5.0,
+            charge_efficiency=1.0,
+            discharge_efficiency=1.0,
+            min_soc_percent=0.0,
+            max_soc_percent=100.0,
+            wear_cost_sek_per_kwh=0.01,
+            enable_export=True,
+            max_export_power_kw=10.0,
+            target_soc_kwh=initial_soc,
+            target_soc_penalty_sek=1000.0,
+            excess_pv_slots=[True] * 8,
+            # Primary sink is the VVB boost; the AC sink rides alongside via the flag.
+            excess_pv_sink="water_heater_boost",
+            excess_pv_reward_sek_per_kwh=2.0,
+            excess_pv_soc_threshold_percent=95.0,
+            excess_pv_custom_entity_power_kw=2.0,
+        )
+        kwargs.update(over)
+        return KeplerInput(
+            slots=_make_slots(n=8, pv_kwh=3.0, load_kwh=1.0, export_price=0.1),
+            initial_soc_kwh=initial_soc,
+        ), KeplerConfig(**kwargs)
+
+    def test_custom_entity_runs_with_boost_sink_when_enabled(self):
+        inp, cfg = self._cfg(excess_pv_custom_entity_enabled=True)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert any(s.custom_entity_active for s in result.slots)
+
+    def test_custom_entity_off_with_boost_sink_when_not_enabled(self):
+        # Default: flag off and sink != custom_entity → custom entity stays off.
+        inp, cfg = self._cfg(excess_pv_custom_entity_enabled=False)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert not any(s.custom_entity_active for s in result.slots)

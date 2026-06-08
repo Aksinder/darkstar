@@ -1397,7 +1397,10 @@ class ExecutorEngine:
                     # Control Excess PV Custom Entity (7.2-7.4)
                     from executor.config import ExcessPVSinkType
 
-                    if self.config.excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY:
+                    if (
+                        self.config.excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY
+                        or self.config.excess_pv.custom_entity.enabled
+                    ):
                         is_fallback = (
                             override.override_needed
                             and override.override_type.value == "slot_failure_fallback"

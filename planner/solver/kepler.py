@@ -318,7 +318,9 @@ class KeplerSolver:
         if not excess_pv_flags:
             excess_pv_flags = [False] * T
 
-        custom_entity_enabled = config.excess_pv_sink == "custom_entity"
+        custom_entity_enabled = (
+            config.excess_pv_sink == "custom_entity" or config.excess_pv_custom_entity_enabled
+        )
 
         # SoC threshold binary: 1 when battery SoC >= threshold% (gates all sink activation)
         any_sink_active = boost_enabled or custom_entity_enabled
