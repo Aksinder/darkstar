@@ -79,6 +79,14 @@ export function parseFieldInput(field: BaseField, raw: string): unknown {
             return []
         }
     }
+    if (field.type === 'load_priority_editor') {
+        try {
+            const parsed: unknown = JSON.parse(raw)
+            return parsed && typeof parsed === 'object' ? parsed : {}
+        } catch {
+            return {}
+        }
+    }
     return trimmed
 }
 
@@ -101,6 +109,9 @@ export function buildFormState(config: Record<string, unknown> | null, fields: B
             state[field.key] = value === true ? 'true' : 'false'
         } else if (field.type === 'array' && Array.isArray(value)) {
             state[field.key] = value.join(', ')
+        } else if (field.type === 'load_priority_editor') {
+            // Object-valued editor (id -> {tier, rank}); default to an empty object.
+            state[field.key] = value !== null && typeof value === 'object' ? JSON.stringify(value) : JSON.stringify({})
         } else if (field.type === 'solar_arrays' || field.type === 'penalty_levels' || field.type === 'entity_array') {
             // Handle complex array/object types - stringify if array/object, default to empty array
             if (Array.isArray(value) || (value !== null && typeof value === 'object')) {
@@ -150,7 +161,8 @@ export function areEqual(a: unknown, b: unknown, type: string): boolean {
         type !== 'array' &&
         type !== 'solar_arrays' &&
         type !== 'penalty_levels' &&
-        type !== 'entity_array'
+        type !== 'entity_array' &&
+        type !== 'load_priority_editor'
     ) {
         const strA = a !== null && a !== undefined ? String(a).trim() : ''
         const strB = b !== null && b !== undefined ? String(b).trim() : ''
@@ -167,10 +179,16 @@ export function areEqual(a: unknown, b: unknown, type: string): boolean {
         return arrA.every((val, i) => val === arrB[i])
     }
 
-    if (type === 'solar_arrays' || type === 'penalty_levels' || type === 'entity_array') {
-        // Treat undefined as equivalent to empty array for array/object types
+    if (
+        type === 'solar_arrays' ||
+        type === 'penalty_levels' ||
+        type === 'entity_array' ||
+        type === 'load_priority_editor'
+    ) {
+        // Treat undefined as equivalent to empty for array/object types
+        const empty = type === 'load_priority_editor' ? '{}' : '[]'
         const normalize = (v: unknown) => {
-            if (v === undefined || v === null) return '[]'
+            if (v === undefined || v === null) return empty
             return JSON.stringify(v)
         }
         return normalize(a) === normalize(b)

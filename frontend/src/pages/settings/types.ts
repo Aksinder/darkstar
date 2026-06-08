@@ -11,6 +11,7 @@ export type FieldType =
     | 'solar_arrays'
     | 'penalty_levels'
     | 'entity_array'
+    | 'load_priority_editor'
     | 'info'
 
 export interface HaEntity {
@@ -1416,6 +1417,64 @@ export const waterFieldList = waterSections.flatMap((section) => section.fields)
 export const uiFieldList = uiSections.flatMap((section) => section.fields)
 export const advancedFieldList = advancedSections.flatMap((section) => section.fields)
 
+export const loadPrioritySections: SettingsSection[] = [
+    {
+        title: 'Load Priority (Willingness-to-Pay)',
+        description:
+            'Rank your controllable loads by how much they are worth running. Each tier carries a reservation price in SEK/kWh: a load runs only while energy is cheaper than its tier value, so low-priority loads (e.g. the spa) defer or skip during price peaks and soak cheap/surplus energy, while important loads keep running. Assign loads to tiers and drag to set the order within a tier.',
+        fields: [
+            {
+                key: 'load_priority.enabled',
+                label: 'Enable load priority',
+                path: ['load_priority', 'enabled'],
+                type: 'boolean',
+                helper: 'When off, the planner ignores tiers and behaves exactly as before.',
+            },
+            {
+                key: 'load_priority.tiers.important.base_wtp_sek_per_kwh',
+                label: 'Important — base value (SEK/kWh)',
+                path: ['load_priority', 'tiers', 'important', 'base_wtp_sek_per_kwh'],
+                type: 'number',
+                helper: 'Reservation price for important loads (heat pumps, hot water).',
+                showIf: { configKey: 'load_priority.enabled', value: true },
+            },
+            {
+                key: 'load_priority.tiers.important.urgency_wtp_sek_per_kwh',
+                label: 'Important — urgency boost (SEK/kWh)',
+                path: ['load_priority', 'tiers', 'important', 'urgency_wtp_sek_per_kwh'],
+                type: 'number',
+                helper: 'Extra it will pay as its deadline / comfort window closes.',
+                showIf: { configKey: 'load_priority.enabled', value: true },
+            },
+            {
+                key: 'load_priority.tiers.comfort.base_wtp_sek_per_kwh',
+                label: 'Comfort — base value (SEK/kWh)',
+                path: ['load_priority', 'tiers', 'comfort', 'base_wtp_sek_per_kwh'],
+                type: 'number',
+                helper: 'Reservation price for nice-to-have loads (spa). Low => only when cheap.',
+                showIf: { configKey: 'load_priority.enabled', value: true },
+            },
+            {
+                key: 'load_priority.tiers.comfort.urgency_wtp_sek_per_kwh',
+                label: 'Comfort — urgency boost (SEK/kWh)',
+                path: ['load_priority', 'tiers', 'comfort', 'urgency_wtp_sek_per_kwh'],
+                type: 'number',
+                showIf: { configKey: 'load_priority.enabled', value: true },
+            },
+            {
+                key: 'load_priority.loads',
+                label: 'Load assignments',
+                path: ['load_priority', 'loads'],
+                type: 'load_priority_editor',
+                className: 'col-span-2',
+                showIf: { configKey: 'load_priority.enabled', value: true },
+            },
+        ],
+    },
+]
+
+export const loadPriorityFieldList = loadPrioritySections.flatMap((section) => section.fields)
+
 export const allFields = [
     ...systemFieldList,
     ...parameterFieldList,
@@ -1423,6 +1482,7 @@ export const allFields = [
     ...batteryFieldList,
     ...evFieldList,
     ...waterFieldList,
+    ...loadPriorityFieldList,
     ...uiFieldList,
     ...advancedFieldList,
     {

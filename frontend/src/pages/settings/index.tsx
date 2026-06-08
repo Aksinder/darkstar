@@ -11,6 +11,7 @@ import {
     Battery,
     Zap as EvIcon,
     Droplets,
+    ListOrdered,
 } from 'lucide-react'
 
 import { SystemTab } from './SystemTab'
@@ -19,6 +20,7 @@ import { SolarTab } from './SolarTab'
 import { BatteryTab } from './BatteryTab'
 import { EVTab } from './EVTab'
 import { WaterTab } from './WaterTab'
+import { LoadPriorityTab } from './LoadPriorityTab'
 import { UITab } from './UITab'
 import { AdvancedTab } from './AdvancedTab'
 import { DebugContent } from '../Debug'
@@ -38,6 +40,7 @@ const ALL_TABS = [
     { id: 'battery', label: 'Battery', icon: <Battery size={16} />, showIf: 'system.has_battery' },
     { id: 'ev', label: 'EV', icon: <EvIcon size={16} />, showIf: 'system.has_ev_charger' },
     { id: 'water', label: 'Water', icon: <Droplets size={16} />, showIf: 'system.has_water_heater' },
+    { id: 'load_priority', label: 'Priority', icon: <ListOrdered size={16} /> },
     { id: 'ui', label: 'UI', icon: <Palette size={16} /> },
     { id: 'advanced', label: 'Advanced', icon: <Zap size={16} />, advancedOnly: true },
     { id: 'debug', label: 'Debug', icon: <Bug size={16} />, advancedOnly: true },
@@ -127,6 +130,8 @@ export default function Settings() {
                 return <EVTab advancedMode={advancedMode} />
             case 'water':
                 return <WaterTab advancedMode={advancedMode} />
+            case 'load_priority':
+                return <LoadPriorityTab advancedMode={advancedMode} />
             case 'ui':
                 return <UITab advancedMode={advancedMode} />
             case 'advanced':

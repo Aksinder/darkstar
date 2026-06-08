@@ -14,6 +14,7 @@ import configHelp from '../../../config-help.json'
 import { SolarArraysEditor } from './SolarArraysEditor'
 import { PenaltyLevelsEditor } from './PenaltyLevelsEditor'
 import { EntityArrayEditor } from './EntityArrayEditor'
+import { LoadPriorityEditor } from './LoadPriorityEditor'
 import { NumberInput } from '../../../components/ui/NumberInput'
 
 interface SettingsFieldProps {
@@ -168,6 +169,14 @@ export const SettingsField: React.FC<SettingsFieldProps> = ({
                     <PenaltyLevelsEditor
                         value={value}
                         onChange={(levels) => onChange(field.key, JSON.stringify(levels))}
+                        disabled={isDisabled}
+                    />
+                )
+            case 'load_priority_editor':
+                return (
+                    <LoadPriorityEditor
+                        value={value}
+                        onChange={(loads) => onChange(field.key, JSON.stringify(loads))}
                         disabled={isDisabled}
                     />
                 )

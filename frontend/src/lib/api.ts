@@ -592,6 +592,14 @@ async function getJSON<T>(path: string, method: 'GET' | 'POST' | 'DELETE' = 'GET
     return r.json() as Promise<T>
 }
 
+export type ControllableLoad = {
+    id: string
+    name: string
+    type: 'deferrable' | 'water_heater' | 'ev_charger'
+    enabled: boolean
+}
+export type ControllableLoadsResponse = { loads: ControllableLoad[] }
+
 export const Api = {
     dashboardBundle: () => getJSON<DashboardBundleResponse>('/api/dashboard/bundle'),
     schedule: () => getJSON<ScheduleResponse>('/api/schedule'),
@@ -601,6 +609,7 @@ export const Api = {
     version: () => getJSON<{ version: string }>('/api/version'),
     horizon: () => getJSON<HorizonResponse>('/api/forecast/horizon'),
     config: () => getJSON<ConfigResponse>('/api/config'),
+    controllableLoads: () => getJSON<ControllableLoadsResponse>('/api/loads/controllable'),
     // REV UI23: Validate config without saving
     configValidate: () => getJSON<ConfigSaveResponse>('/api/config/validate'),
     // REV LCL01: Custom configSave that handles 400 validation errors
