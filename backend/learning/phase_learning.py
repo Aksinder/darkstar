@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import datetime, tzinfo
 
     from backend.learning.cycle_learning import PowerSample
 
@@ -42,8 +43,11 @@ __all__ = [
     "learn_device_phase",
     "load_device_phases",
     "load_phase_fractions",
+    "load_phase_profile",
+    "phase_fractions_for_slot",
     "phase_imbalance_w",
     "reconstruct_phase_fractions",
+    "reconstruct_phase_profile",
 ]
 
 PHASE_LABELS = ("A", "B", "C")
@@ -341,3 +345,135 @@ def reconstruct_phase_fractions(
         imbalance_w=round(imbalance_sum / n, 1),
         n_samples=n,
     )
+
+
+def _forward_filled_ts(
+    series: Sequence[Sequence[PowerSample]],
+) -> list[tuple[datetime, tuple[float, ...]]]:
+    """Like :func:`_forward_filled` but keeps each row's timestamp (a ``datetime``)."""
+    if not series:
+        return []
+    indices = [0] * len(series)
+    last: list[float | None] = [None] * len(series)
+    timeline = sorted({s.ts for one in series for s in one})
+    rows: list[tuple[datetime, tuple[float, ...]]] = []
+    for ts in timeline:
+        for i, one in enumerate(series):
+            j = indices[i]
+            while j < len(one) and one[j].ts <= ts:
+                last[i] = one[j].power_w
+                j += 1
+            indices[i] = j
+        if all(v is not None for v in last):
+            rows.append((ts, tuple(v for v in last if v is not None)))
+    return rows
+
+
+def _fractions_from_sums(sums: dict[str, float]) -> dict[str, float]:
+    grand = sum(sums.values())
+    if grand <= 0.0:
+        return dict.fromkeys(PHASE_LABELS, round(1.0 / 3.0, 4))
+    return {ph: round(sums[ph] / grand, 4) for ph in PHASE_LABELS}
+
+
+def reconstruct_phase_profile(
+    phase_a: Sequence[PowerSample],
+    phase_b: Sequence[PowerSample],
+    phase_c: Sequence[PowerSample],
+    inverter_total: Sequence[PowerSample],
+    *,
+    min_total_w: float = 300.0,
+    min_samples_per_hour: int = 8,
+    tz: tzinfo | None = None,
+) -> dict[int, dict[str, float]]:
+    """Per-hour-of-day phase-load fractions (a daily phase profile).
+
+    Same per-sample reconstruction as :func:`reconstruct_phase_fractions`, but each
+    sample is bucketed by its LOCAL hour of day (0-23, using ``tz`` or the system
+    local zone). The result lets the planner know *when* each phase tends to be heavy
+    (e.g. cooking on one phase in the evening), so it can time controllable loads to a
+    phase's lighter hours instead of relying on a single static split.
+
+    Hours with fewer than ``min_samples_per_hour`` valid samples fall back to the
+    all-hours average, so a sparse hour never yields a noisy fraction. Always returns
+    all 24 hours populated. With no usable data, every hour is the balanced 1/3 split.
+    """
+    rows = _forward_filled_ts([phase_a, phase_b, phase_c, inverter_total])
+    sums_by_hour: dict[int, dict[str, float]] = {
+        h: dict.fromkeys(PHASE_LABELS, 0.0) for h in range(24)
+    }
+    n_by_hour: dict[int, int] = dict.fromkeys(range(24), 0)
+    overall_sums: dict[str, float] = dict.fromkeys(PHASE_LABELS, 0.0)
+    overall_n = 0
+    for ts, vals in rows:
+        a, b, c, inv = vals
+        share = inv / 3.0
+        load = {"A": a + share, "B": b + share, "C": c + share}
+        if load["A"] + load["B"] + load["C"] < min_total_w:
+            continue
+        # Bucket by LOCAL hour of day. Convert tz-aware timestamps when a zone is
+        # given; otherwise use the timestamp's own hour (tests pass naive datetimes).
+        local = ts.astimezone(tz) if (tz is not None and ts.tzinfo is not None) else ts
+        hour = local.hour
+        for ph in PHASE_LABELS:
+            v = max(0.0, load[ph])
+            sums_by_hour[hour][ph] += v
+            overall_sums[ph] += v
+        n_by_hour[hour] += 1
+        overall_n += 1
+
+    overall = _fractions_from_sums(overall_sums) if overall_n else _fractions_from_sums({})
+    return {
+        h: (_fractions_from_sums(sums_by_hour[h]) if n_by_hour[h] >= min_samples_per_hour else dict(overall))
+        for h in range(24)
+    }
+
+
+def load_phase_profile(config: dict[str, object]) -> dict[int, dict[str, float]] | None:
+    """Read the learned per-hour phase profile (``fractions_by_hour``) from
+    ``<config_dir>/phase_model.json``, or None if absent/unreadable/malformed.
+
+    Returns ``{hour: {"A":.., "B":.., "C":..}}`` for the hours present. The planner
+    feeds this to the realism simulation so each slot uses its hour's measured split.
+    """
+    import json
+    from pathlib import Path
+
+    config_dir = str(config.get("config_dir") or "/config/darkstar")
+    path = Path(config_dir) / "phase_model.json"
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    by_hour_raw = cast("dict[str, Any]", raw).get("fractions_by_hour")
+    if not isinstance(by_hour_raw, dict):
+        return None
+    out: dict[int, dict[str, float]] = {}
+    for key, val in cast("dict[str, Any]", by_hour_raw).items():
+        try:
+            hour = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(val, dict):
+            continue
+        try:
+            out[hour] = {ph: float(cast("dict[str, Any]", val)[ph]) for ph in PHASE_LABELS}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out or None
+
+
+def phase_fractions_for_slot(
+    profile: dict[int, dict[str, float]] | None,
+    hour: int,
+    fallback: dict[str, float] | None = None,
+) -> dict[str, float] | None:
+    """The phase fractions for a local ``hour`` from a per-hour ``profile``, else the
+    static ``fallback`` (so callers degrade cleanly to the single learned split)."""
+    if profile is not None:
+        hit = profile.get(hour)
+        if hit is not None:
+            return hit
+    return fallback
