@@ -32,6 +32,16 @@ def _str_or_none(value: Any) -> str | None:
     return str(value)
 
 
+def _float_or_none(value: Any) -> float | None:
+    """Convert a config value to float, or None if absent/blank/unparseable."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_departure_time(value: Any) -> str | None:
     """Parse departure time from config value.
 
@@ -119,12 +129,32 @@ class ExcessPVSinkType(Enum):
 
 @dataclass
 class ExcessPVCustomEntityConfig:
-    """Custom HA entity configuration for excess PV sink."""
+    """Custom HA entity configuration for excess PV sink.
+
+    Supports two actuation styles, chosen automatically by the entity's domain:
+
+    * Plain entities (switch/input_boolean/number/...): the executor writes
+      ``on_value``/``off_value`` directly (legacy behaviour).
+    * ``climate.*`` entities (e.g. the villavagn AC used as a surplus cooling sink):
+      the executor calls ``climate.set_hvac_mode`` (``climate_mode`` when ON, ``off``
+      when OFF) and ``climate.set_temperature`` (``target_temp``). If the unit's current
+      temperature is already at or below ``comfort_min_temp`` the ON action is skipped so
+      surplus never over-cools the space.
+
+    ``price_ceiling_sek_per_kwh`` (planner-side gate) restricts activation to slots whose
+    export price is at or below the ceiling — the "low or minus price" trigger.
+    """
 
     entity: str | None = None
     on_value: str = "1"
     off_value: str = "0"
     power_kw: float = 1.0
+    # Climate-sink fields (used only when ``entity`` is a climate.* entity).
+    climate_mode: str = "cool"  # hvac_mode to set when ON
+    target_temp: float | None = None  # setpoint to apply when ON (None => leave as-is)
+    comfort_min_temp: float | None = None  # skip ON if current_temperature <= this
+    # Planner-side export-price ceiling (SEK/kWh); None => no price gate.
+    price_ceiling_sek_per_kwh: float | None = None
 
 
 @dataclass
@@ -566,6 +596,12 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         on_value=str(custom_entity_data.get("on_value", "1")),
         off_value=str(custom_entity_data.get("off_value", "0")),
         power_kw=float(custom_entity_data.get("power_kw", 1.0)),
+        climate_mode=str(custom_entity_data.get("climate_mode", "cool")),
+        target_temp=_float_or_none(custom_entity_data.get("target_temp")),
+        comfort_min_temp=_float_or_none(custom_entity_data.get("comfort_min_temp")),
+        price_ceiling_sek_per_kwh=_float_or_none(
+            custom_entity_data.get("price_ceiling_sek_per_kwh")
+        ),
     )
     excess_pv = ExcessPVConfig(
         sink=sink_type,

@@ -523,3 +523,115 @@ class TestSetWaterTemp:
 
         # Assert HA write was attempted
         ha_client.set_input_number.assert_called_once_with("input_number.water_heater_target", 50.0)
+
+
+class TestClimateSink:
+    """ActionDispatcher.set_custom_entity climate path (villavagn AC cooling sink)."""
+
+    def _config(self, **ce_over):
+        from executor.config import (
+            ControllerConfig,
+            ExcessPVConfig,
+            ExcessPVCustomEntityConfig,
+            ExcessPVSinkType,
+            ExecutorConfig,
+            InverterConfig,
+            NotificationConfig,
+            WaterHeaterConfig,
+        )
+
+        ce_kwargs = dict(
+            entity="climate.villavagn",
+            on_value="1",
+            off_value="0",
+            climate_mode="cool",
+            target_temp=22.0,
+            comfort_min_temp=20.0,
+        )
+        ce_kwargs.update(ce_over)
+        return ExecutorConfig(
+            inverter=InverterConfig(),
+            controller=ControllerConfig(),
+            water_heater=WaterHeaterConfig(),
+            notifications=NotificationConfig(),
+            excess_pv=ExcessPVConfig(
+                sink=ExcessPVSinkType.CUSTOM_ENTITY,
+                custom_entity=ExcessPVCustomEntityConfig(**ce_kwargs),
+            ),
+        )
+
+    def _dispatcher(self, ha_client, config, shadow_mode=False):
+        from executor.actions import ActionDispatcher
+
+        return ActionDispatcher(ha_client=ha_client, config=config, shadow_mode=shadow_mode)
+
+    @pytest.mark.asyncio
+    async def test_on_sets_cool_mode_and_temperature(self):
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "off", "attributes": {"current_temperature": 24.0}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config()).set_custom_entity("1")
+
+        assert result.success and not result.skipped
+        ha.call_service.assert_any_call(
+            "climate", "set_hvac_mode", "climate.villavagn", {"hvac_mode": "cool"}
+        )
+        ha.call_service.assert_any_call(
+            "climate", "set_temperature", "climate.villavagn", {"temperature": 22.0}
+        )
+
+    @pytest.mark.asyncio
+    async def test_comfort_floor_blocks_cooling(self):
+        # Already at/below the comfort floor (20) → force off, never cool.
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "off", "attributes": {"current_temperature": 19.5}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config()).set_custom_entity("1")
+
+        assert result.success
+        # desired_mode resolved to "off"; already off → skipped, no service call.
+        assert result.new_value == "off"
+        ha.call_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_off_sets_hvac_off(self):
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "cool", "attributes": {"current_temperature": 21.0}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config()).set_custom_entity("0")
+
+        assert result.success and not result.skipped
+        ha.call_service.assert_called_once_with(
+            "climate", "set_hvac_mode", "climate.villavagn", {"hvac_mode": "off"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_already_in_mode(self):
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "cool", "attributes": {"current_temperature": 24.0}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config()).set_custom_entity("1")
+
+        assert result.success and result.skipped
+        ha.call_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_no_write(self):
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "off", "attributes": {"current_temperature": 24.0}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config(), shadow_mode=True).set_custom_entity("1")
+
+        assert result.success and result.skipped
+        assert "[SHADOW]" in result.message
+        ha.call_service.assert_not_called()

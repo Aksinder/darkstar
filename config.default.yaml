@@ -567,10 +567,21 @@ executor:
     boost_reward_sek_per_kwh: 0.5      # Reward for using excess PV at sink vs exporting (SEK/kWh)
     soc_threshold_percent: 95          # Battery SoC % required before sink activates (default 95)
     custom_entity:
-      entity: ""                       # Home Assistant entity ID (e.g., switch.pool_pump)
-      on_value: "1"                    # Value to set when excess PV is available
-      off_value: "0"                   # Value to set when excess PV is not available
+      entity: ""                       # Home Assistant entity ID (e.g., switch.pool_pump or climate.villavagn)
+      on_value: "1"                    # Value to set when excess PV is available (plain entities)
+      off_value: "0"                   # Value to set when excess PV is not available (plain entities)
       power_kw: 1.0                    # Estimated power consumption (kW) — used by solver for reward sizing
+      # Optional export-price ceiling (SEK/kWh). When set, the sink only activates in
+      # slots whose export price is at or below this value — i.e. soak surplus locally
+      # only when grid export pays little or nothing (incl. negative prices). Leave
+      # blank for "any surplus" (legacy). For the villavagn-AC summer cooling sink set
+      # e.g. 0.20 so cooling runs only on low/minus-price surplus hours.
+      price_ceiling_sek_per_kwh: ""
+      # Climate-entity fields (used ONLY when `entity` is a climate.* unit, e.g. the
+      # villavagn AC). For switches/numbers they are ignored.
+      climate_mode: "cool"             # hvac_mode to set when the sink turns ON
+      target_temp: ""                  # cooling setpoint applied when ON (blank = leave unit's own)
+      comfort_min_temp: ""             # don't cool below this current_temperature (anti-overcool floor)
 
 # =============================================================================
 # UI Settings

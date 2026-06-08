@@ -145,6 +145,12 @@ class KeplerConfig:
     excess_pv_reward_sek_per_kwh: float = 0.5  # Reward for using excess PV at sink vs exporting
     excess_pv_soc_threshold_percent: float = 95.0  # Battery SoC % required before sink activates
     excess_pv_custom_entity_power_kw: float = 1.0  # Estimated power of custom entity (kW)
+    # Optional export-price ceiling (SEK/kWh) for the custom-entity sink. When set, the
+    # sink may only activate in slots where export_price <= ceiling — i.e. soak surplus
+    # locally only when grid export pays little or nothing (incl. negative prices), and
+    # sell it otherwise. None => no price gate (legacy behaviour). This is what makes the
+    # villavagn-AC cooling sink fire on "low or minus price" rather than on any surplus.
+    excess_pv_price_ceiling_sek_per_kwh: float | None = None
 
     # Deferrable household loads (dishwasher, washing machine, ...)
     deferrable_loads: list[DeferrableLoadInput] = field(default_factory=lambda: [])
