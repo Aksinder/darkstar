@@ -1,3 +1,7 @@
+## dev-20260608.1436 — 2026-06-08 14:38
+
+- docs: add 2026-06-07 Darkstar conflict-audit report
+
 ## dev-20260608.1132 — 2026-06-08 11:34
 
 - feat(planner): extend WTP priority layer to water heaters (increment 2)
