@@ -1,3 +1,7 @@
+## dev-20260608.1132 — 2026-06-08 11:34
+
+- feat(planner): extend WTP priority layer to water heaters (increment 2)
+
 ## dev-20260607.2229 — 2026-06-07 22:30
 
 - feat(planner): load priority / willingness-to-pay layer (increment 1, flag-gated off)
