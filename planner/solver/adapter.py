@@ -125,6 +125,7 @@ def ev_state_for_solver(
 def build_ev_charger_inputs(
     ev_chargers_config: list[dict[str, Any]],
     ev_charger_states: list[dict[str, Any]] | None = None,
+    load_priority_cfg: dict[str, Any] | None = None,
 ) -> list[EVChargerInput]:
     """
     Build per-device EVChargerInput list from ev_chargers[] config + HA state.
@@ -134,11 +135,25 @@ def build_ev_charger_inputs(
         ev_charger_states: Optional list of per-device HA state dicts.
             Each dict should have: id, soc_percent, plugged_in, deadline (optional)
             If None or empty, HA state defaults are used (0% SoC, not plugged in).
+        load_priority_cfg: Optional ``load_priority`` config block. When enabled and a
+            charger sets ``wtp_tier``, every incentive bucket's per-kWh value is sourced
+            from that tier's ``base_wtp_sek_per_kwh`` — folding EV charging onto the same
+            unified WTP scale as deferrable/water loads while preserving the SoC-bucket
+            capacity structure. Off (or no ``wtp_tier``) => legacy per-bucket penalty_sek.
 
     Returns:
         List of EVChargerInput objects for enabled chargers.
         Chargers not plugged in are still included (solver skips them internally).
     """
+    # Resolve tier -> per-kWh WTP once (empty unless the priority layer is enabled).
+    ev_tier_wtp: dict[str, float] = {}
+    lp_cfg: dict[str, Any] = load_priority_cfg or {}
+    if bool(lp_cfg.get("enabled", False)):
+        tiers: dict[str, Any] = lp_cfg.get("tiers", {}) or {}
+        for tier_id, tier in tiers.items():
+            tier_spec: dict[str, Any] = tier or {}
+            ev_tier_wtp[str(tier_id)] = float(tier_spec.get("base_wtp_sek_per_kwh", 0.0))
+
     enabled_ev: list[dict[str, Any]] = [ev for ev in ev_chargers_config if ev.get("enabled", True)]
 
     # Filter out chargers registered as disabled (missing/zero max_power_kw)
@@ -180,6 +195,21 @@ def build_ev_charger_inputs(
             for p in penalty_levels
             if "max_soc" in p or "penalty_sek" in p
         ]
+
+        # Load-priority WTP fold: a charger that opts into a tier has its bucket values
+        # (the per-kWh charging incentive) sourced from the tier, replacing the raw
+        # penalty_sek. The SoC thresholds — and thus the capacity cap — are unchanged.
+        tier_id = ev.get("wtp_tier")
+        if tier_id and ev_tier_wtp:
+            if tier_id in ev_tier_wtp and buckets:
+                wtp = ev_tier_wtp[tier_id]
+                buckets = [
+                    IncentiveBucket(threshold_soc=b.threshold_soc, value_sek=wtp) for b in buckets
+                ]
+            elif tier_id not in ev_tier_wtp:
+                logger.warning(
+                    "ev_charger %s references unknown wtp_tier %r - ignoring", charger_id, tier_id
+                )
 
         result.append(
             EVChargerInput(
@@ -591,7 +621,9 @@ def config_to_kepler_config(
 
     # ARC15: Load EV charging settings (per-device)
     if config_version >= 2 and ev_chargers:
-        ev_inputs = build_ev_charger_inputs(ev_chargers, ev_charger_states)
+        ev_inputs = build_ev_charger_inputs(
+            ev_chargers, ev_charger_states, load_priority_cfg=planner_config.get("load_priority")
+        )
     else:
         ev_inputs = []
 

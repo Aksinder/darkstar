@@ -154,6 +154,12 @@ ev_chargers:
     switch_entity: ""                # HA entity to enable/disable smart charging (e.g. switch.ev_charger)
     replan_on_plugin: true           # Re-run planner immediately when this EV plugs in
     replan_on_unplug: false          # Re-run planner immediately when this EV unplugs
+    # Load-priority integration: assign this charger to a load_priority tier (see
+    # load_priority below) and its per-kWh charging willingness-to-pay is sourced from
+    # that tier instead of the raw penalty_levels values — unifying EV priority with the
+    # deferrable/water loads. The SoC thresholds (how much to charge) still come from
+    # penalty_levels. Requires load_priority.enabled: true; empty => legacy penalty_sek.
+    wtp_tier: ""                     # e.g. "important" or "comfort"
     # Home-zone gate (presence). For cars whose API reports plug/charging regardless of
     # location (e.g. Tesla), set home_entity to the car's device_tracker/zone so the EV
     # is only scheduled while actually home — otherwise charging elsewhere (work,

@@ -668,7 +668,9 @@ class PlannerPipeline:
             from planner.solver.adapter import build_ev_charger_inputs
 
             kepler_config.ev_chargers = build_ev_charger_inputs(
-                ev_chargers_cfg, ev_charger_states_with_deadline
+                ev_chargers_cfg,
+                ev_charger_states_with_deadline,
+                load_priority_cfg=active_config.get("load_priority"),
             )
 
             # Rev K19: Vacation Mode Anti-Legionella
