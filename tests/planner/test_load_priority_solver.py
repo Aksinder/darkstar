@@ -12,7 +12,11 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from planner.solver.adapter import build_ev_charger_inputs, build_load_priorities
+from planner.solver.adapter import (
+    build_ev_charger_inputs,
+    build_load_priorities,
+    dynamic_wtp_from_prices,
+)
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
     DeferrableLoadInput,
@@ -187,6 +191,68 @@ class TestBuildLoadPriorities:
         )
         assert enabled is True
         assert "spa" not in p
+
+    def test_wtp_percentile_parsed_into_dynamic(self):
+        _, p = build_load_priorities(
+            {
+                "load_priority": {
+                    "enabled": True,
+                    "tiers": {"important": {"base_wtp_sek_per_kwh": 3.0}},
+                    "loads": {"main_tank": {"tier": "important", "wtp_percentile": 50}},
+                }
+            }
+        )
+        assert p["main_tank"].dynamic_percentile == 50.0
+
+    def test_wtp_percentile_out_of_range_ignored(self):
+        _, p = build_load_priorities(
+            {
+                "load_priority": {
+                    "enabled": True,
+                    "tiers": {"important": {"base_wtp_sek_per_kwh": 3.0}},
+                    "loads": {
+                        "a": {"tier": "important", "wtp_percentile": 150},
+                        "b": {"tier": "important", "wtp_percentile": "oops"},
+                        "c": {"tier": "important"},
+                    },
+                }
+            }
+        )
+        assert p["a"].dynamic_percentile is None  # >100 rejected
+        assert p["b"].dynamic_percentile is None  # non-number rejected
+        assert p["c"].dynamic_percentile is None  # absent => static
+
+
+class TestDynamicWtpFromPrices:
+    """dynamic_wtp_from_prices: percentile of the rolling 24 h window becomes the cap."""
+
+    def test_median_of_window(self):
+        # P50 of [1,2,3,4,5] = 3.0
+        assert dynamic_wtp_from_prices([1.0, 2.0, 3.0, 4.0, 5.0], 50, 5) == pytest.approx(3.0)
+
+    def test_window_truncates(self):
+        # Only the first 3 (cheap) slots count; later expensive slots are outside 24 h.
+        cap = dynamic_wtp_from_prices([1.0, 1.0, 1.0, 9.0, 9.0], 50, 3)
+        assert cap == pytest.approx(1.0)
+
+    def test_low_percentile_sits_near_cheapest(self):
+        # P10 of a wide spread stays close to the cheapest — blocks almost everything pricey.
+        cap = dynamic_wtp_from_prices([1.0, 2.0, 3.0, 4.0, 10.0], 10, 5)
+        assert cap < 2.0
+
+    def test_adapts_to_expensive_day(self):
+        # A uniformly-expensive day: the cap rises with it, so the load still has a cheap
+        # band to use (never starves) instead of a fixed cap that would block everything.
+        cheap_day = dynamic_wtp_from_prices([1.0, 1.5, 2.0, 2.5, 3.0], 50, 5)
+        pricey_day = dynamic_wtp_from_prices([4.0, 4.5, 5.0, 5.5, 6.0], 50, 5)
+        assert pricey_day > cheap_day
+        assert pricey_day == pytest.approx(5.0)
+
+    def test_empty_window_returns_none(self):
+        assert dynamic_wtp_from_prices([], 50, 5) is None
+
+    def test_single_value(self):
+        assert dynamic_wtp_from_prices([2.7], 50, 5) == pytest.approx(2.7)
 
 
 def _wslots(prices, pv=None):

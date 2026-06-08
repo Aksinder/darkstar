@@ -30,6 +30,7 @@ from planner.output.soc_target import apply_soc_target_percent
 from planner.preflight import run_preflight
 from planner.solver.adapter import (
     config_to_kepler_config,
+    dynamic_wtp_from_prices,
     kepler_result_to_dataframe,
     planner_to_kepler_input,
 )
@@ -820,6 +821,37 @@ class PlannerPipeline:
                 kepler_config.battery_value_sek_per_kwh,
                 lookahead_slots,
             )
+
+        # Dynamic WTP caps: for any priority load configured with a percentile, recompute
+        # its base_wtp from the rolling 24 h import-price distribution so the cap tracks the
+        # day's prices. This keeps the load (e.g. the VVB) heating in the *relatively*
+        # cheapest hours on any day — it never starves on a uniformly-expensive day — while
+        # still refusing that day's most expensive hours. Static-WTP loads are untouched.
+        if (
+            kepler_config.load_priority_enabled
+            and kepler_config.load_priorities
+            and kepler_input.slots
+        ):
+            dyn_prices = [s.import_price_sek_kwh for s in kepler_input.slots]
+            slot_min = (
+                kepler_input.slots[0].end_time - kepler_input.slots[0].start_time
+            ).total_seconds() / 60.0
+            window_24h = min(
+                len(dyn_prices), max(1, round(24 * 60 / slot_min)) if slot_min > 0 else 96
+            )
+            for _lid, _lp in kepler_config.load_priorities.items():
+                if _lp.dynamic_percentile is None:
+                    continue
+                _cap = dynamic_wtp_from_prices(dyn_prices, _lp.dynamic_percentile, window_24h)
+                if _cap is not None:
+                    _lp.base_wtp_sek_per_kwh = _cap
+                    logger.info(
+                        "Dynamic WTP cap: load %s -> %.3f SEK/kWh (P%.0f of next %d slots)",
+                        _lid,
+                        _cap,
+                        _lp.dynamic_percentile,
+                        window_24h,
+                    )
 
         run_preflight(input_data, active_config)
 
