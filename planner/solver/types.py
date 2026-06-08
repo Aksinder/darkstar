@@ -166,6 +166,20 @@ class KeplerConfig:
     # Map of load id -> resolved LoadPriority. Empty => no WTP applied to any load.
     load_priorities: dict[str, LoadPriority] = field(default_factory=lambda: {})
 
+    # ---- Phase-aware imbalance cost (flag-gated, default OFF) ----
+    # The single-net-node LP nets a heavy phase's import against the light phases'
+    # export to ~zero, hiding the real cost (buy high on the heavy phase, sell low on
+    # the others). When enabled, the solver prices that hidden EXTRA into the objective
+    # and may discharge the battery to raise balanced supply and cover the heavy phase —
+    # but only WHEN ECONOMIC (the import avoided must beat the export spilled on the
+    # light phases plus the battery value spent). phase_load_fractions is the static
+    # per-phase split; phase_load_profile is the per-hour {hour: {A,B,C}} forecast used
+    # when present so the cost reflects which phase is heavy at each slot's hour.
+    phase_aware_enabled: bool = False
+    phase_aware_weight: float = 1.0  # scales the imbalance EXTRA (1.0 = full economic cost)
+    phase_load_fractions: dict[str, float] | None = None
+    phase_load_profile: dict[int, dict[str, float]] | None = None
+
     # Improvement B (Predbat-inspired): continuous stored-energy value (SEK/kWh).
     # Rewards energy left in the battery at the END of the horizon at its expected
     # forward worth, applied to soc[T] ONLY. This is a terminal credit (symmetric:
