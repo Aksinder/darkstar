@@ -1,3 +1,7 @@
+## dev-20260608.1716 — 2026-06-08 17:18
+
+- feat(excess-pv): villavagn AC as a price-gated, comfort-bounded cooling sink
+
 ## dev-20260608.1651 — 2026-06-08 16:53
 
 - feat(planner): phase-aware imbalance cost — battery covers the heavy phase when economic
