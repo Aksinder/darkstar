@@ -1,3 +1,7 @@
+## dev-20260608.1630 — 2026-06-08 16:32
+
+- feat(phase): per-slot phase forecasting (learn an hour-of-day phase profile)
+
 ## dev-20260608.1436 — 2026-06-08 14:38
 
 - docs: add 2026-06-07 Darkstar conflict-audit report
