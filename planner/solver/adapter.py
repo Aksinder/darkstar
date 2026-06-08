@@ -8,7 +8,7 @@ Migrated from backend/kepler/adapter.py during Rev K13 modularization.
 import logging
 import math
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -773,6 +773,25 @@ def config_to_kepler_config(
     kepler_cfg.load_priority_enabled, kepler_cfg.load_priorities = build_load_priorities(
         planner_config
     )
+
+    # Phase-aware imbalance cost (flag-gated). Load the learned static/per-hour phase
+    # split so the solver can price the per-phase grid cost the net-node view hides.
+    phase_cfg: dict[str, Any] = planner_config.get("phase_aware", {}) or {}
+    kepler_cfg.phase_aware_enabled = bool(phase_cfg.get("enabled", False))
+    kepler_cfg.phase_aware_weight = float(phase_cfg.get("weight", 1.0))
+    if kepler_cfg.phase_aware_enabled:
+        from backend.learning.phase_learning import load_phase_fractions, load_phase_profile
+
+        cfg_fracs = planner_config.get("phase_load_fractions")
+        kepler_cfg.phase_load_fractions = (
+            cfg_fracs if isinstance(cfg_fracs, dict) else load_phase_fractions(planner_config)
+        )
+        cfg_profile = planner_config.get("phase_load_profile")
+        kepler_cfg.phase_load_profile = (
+            cast("dict[int, dict[str, float]]", cfg_profile)
+            if isinstance(cfg_profile, dict)
+            else load_phase_profile(planner_config)
+        )
 
     return kepler_cfg
 

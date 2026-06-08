@@ -27,6 +27,17 @@ from .types import (
 logger = logging.getLogger("darkstar.kepler")
 
 
+def _phase_fraction_list(fractions: dict[str, float] | None) -> list[float] | None:
+    """Normalise a {"A":..,"B":..,"C":..} split to a list summing to 1, or None."""
+    if not fractions:
+        return None
+    vals = [max(0.0, float(v)) for v in fractions.values()]
+    total = sum(vals)
+    if total <= 0:
+        return None
+    return [v / total for v in vals]
+
+
 class KeplerSolver:
     def solve(self, input_data: KeplerInput, config: KeplerConfig) -> KeplerResult:
         """Solve the energy scheduling problem using MILP.
@@ -639,6 +650,41 @@ class KeplerSolver:
                         pulp.lpSum(_defl_run_expr(load.id, t) for load in loads) - 1
                     )
                     total_cost.append(config.deferrable_phase_penalty_sek * overlap)
+
+        # Phase-aware imbalance cost (flag-gated, default OFF). The single-net-node
+        # balance nets a heavy phase's import against the light phases' export to ~zero,
+        # hiding the real cost. Under balanced inverter supply (pv + discharge - charge)/n,
+        # phase p still imports max(0, load*f_p - supply/n). We price that per-phase import
+        # deficit (the part the net view hides) at the slot's import price, so the solver
+        # raises discharge to cover the heavy phase — but only WHEN ECONOMIC, since each
+        # extra kWh discharged costs terminal battery value + wear and spills as export.
+        # Each phase_import var is minimised (positive objective coeff) so it settles at
+        # its true max(0, ...) lower bound (no free-variable gaming). Uses the per-hour
+        # profile when present so the cost reflects which phase is heavy at the slot's hour.
+        if config.phase_aware_enabled and (config.phase_load_profile or config.phase_load_fractions):
+            static_fracs = _phase_fraction_list(config.phase_load_fractions)
+            for t in range(T):
+                s_pa: Any = slots[t]
+                fracs: list[float] | None = None
+                if config.phase_load_profile is not None:
+                    fracs = _phase_fraction_list(config.phase_load_profile.get(s_pa.start_time.hour))
+                if fracs is None:
+                    fracs = static_fracs
+                if not fracs:
+                    continue
+                n_ph = len(fracs)
+                imp_pa: float = s_pa.import_price_sek_kwh
+                # Real balanced supply to the house = PV + battery discharge - battery
+                # charge (charging consumes from the AC bus). Subtracting charge is
+                # essential: with pv+discharge alone the solver fakes phase coverage via a
+                # free charge+discharge cycle that nets zero real supply.
+                supply_pa: Any = s_pa.pv_kwh + discharge[t] - charge[t]
+                for k, f in enumerate(fracs):
+                    pi: Any = pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
+                        f"phase_imp_{t}_{k}", lowBound=0.0
+                    )
+                    prob += pi >= s_pa.load_kwh * f - supply_pa / n_ph  # type: ignore[operator]
+                    total_cost.append(pi * imp_pa * config.phase_aware_weight)
 
         # Terminal SoC Target (BIDIRECTIONAL soft constraint)
         # Penalize both being UNDER target (risk) AND OVER target (missed discharge opportunity)
