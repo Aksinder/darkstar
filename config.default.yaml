@@ -235,7 +235,11 @@ deferrable_load_settings:
 # low-priority load (e.g. spa) defers or skips during price peaks and soaks cheap/surplus
 # energy, while a high-priority load keeps running. When enabled=false (or for any load
 # without an entry) the planner behaves exactly as before.
-# Increment 1 wires DEFERRABLE loads only (water VVB and EV fold in later increments).
+# Wired: DEFERRABLE loads (dishwasher/washing machine) and WATER HEATERS (VVB, spabad).
+# For a water heater the WTP credit is satiated at its daily need (min_kwh_per_day) so it
+# never over-heats, and its reliability penalty is waived — a low-priority heater (spa)
+# then skips a day when energy costs more than its WTP. (EV folds in a later increment.)
+# Match a load's key below to its id in deferrable_loads[] or water_heaters[].
 load_priority:
   enabled: false
   rank_step_sek_per_kwh: 0.001       # intra-tier tiebreak granularity (lower rank wins)
