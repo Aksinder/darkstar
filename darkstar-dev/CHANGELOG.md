@@ -1,3 +1,7 @@
+## dev-20260608.1939 — 2026-06-08 19:41
+
+- feat(excess-pv): decouple custom_entity sink so it runs alongside water_heater_boost
+
 ## dev-20260608.1716 — 2026-06-08 17:18
 
 - feat(excess-pv): villavagn AC as a price-gated, comfort-bounded cooling sink
