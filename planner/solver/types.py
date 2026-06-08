@@ -145,6 +145,10 @@ class KeplerConfig:
     excess_pv_reward_sek_per_kwh: float = 0.5  # Reward for using excess PV at sink vs exporting
     excess_pv_soc_threshold_percent: float = 95.0  # Battery SoC % required before sink activates
     excess_pv_custom_entity_power_kw: float = 1.0  # Estimated power of custom entity (kW)
+    # Independent opt-in for the custom-entity sink. When True it activates regardless
+    # of excess_pv_sink, so it can coexist with the water_heater_boost sink (one `sink`
+    # string can't select both). sink == "custom_entity" still implies this.
+    excess_pv_custom_entity_enabled: bool = False
     # Optional export-price ceiling (SEK/kWh) for the custom-entity sink. When set, the
     # sink may only activate in slots where export_price <= ceiling — i.e. soak surplus
     # locally only when grid export pays little or nothing (incl. negative prices), and

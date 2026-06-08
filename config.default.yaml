@@ -567,6 +567,10 @@ executor:
     boost_reward_sek_per_kwh: 0.5      # Reward for using excess PV at sink vs exporting (SEK/kWh)
     soc_threshold_percent: 95          # Battery SoC % required before sink activates (default 95)
     custom_entity:
+      # Set enabled: true to run this sink ALONGSIDE the primary `sink` above (e.g. keep
+      # sink: water_heater_boost for the main VVB AND cool the villavagn AC on surplus).
+      # Leaving sink: custom_entity also activates it (legacy). Default false.
+      enabled: false
       entity: ""                       # Home Assistant entity ID (e.g., switch.pool_pump or climate.villavagn)
       on_value: "1"                    # Value to set when excess PV is available (plain entities)
       off_value: "0"                   # Value to set when excess PV is not available (plain entities)
