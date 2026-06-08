@@ -899,6 +899,16 @@ class PlannerPipeline:
                 learned_fractions = load_phase_fractions(active_config)
                 if learned_fractions:
                     realism_config = {**active_config, "phase_load_fractions": learned_fractions}
+            # Per-slot phase forecasting: pass the learned per-hour profile so the
+            # realism replay uses each slot's hour's split. Additive; absent => static.
+            if not active_config.get("phase_load_profile"):
+                from backend.learning.phase_learning import load_phase_profile
+
+                learned_profile = load_phase_profile(active_config)
+                if learned_profile:
+                    if realism_config is active_config:
+                        realism_config = {**active_config}
+                    realism_config["phase_load_profile"] = learned_profile
 
             realism = realism_from_schedule(final_df, realism_config)
             s_index_debug["realism"] = {

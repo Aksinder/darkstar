@@ -12,7 +12,7 @@ when the net balances and the battery is full. It reports the cost the LP missed
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -133,6 +133,7 @@ def simulate_realistic(
     slots: list[RealismSlot],
     *,
     phase_fractions: dict[str, float] | None = None,
+    phase_fractions_per_slot: list[dict[str, float] | None] | None = None,
 ) -> RealismResult:
     """Replay a schedule against real inverter/phase behaviour.
 
@@ -142,11 +143,16 @@ def simulate_realistic(
     the net-node LP's view by ``realism_gap_sek``. With balanced or no fractions
     the gap is 0 (the LP is already correct).
 
+    ``phase_fractions_per_slot`` is an optional list aligned with ``slots`` giving the
+    learned split for each slot's hour (per-slot phase forecasting). When an entry is
+    present it overrides ``phase_fractions`` for that slot, so the replay reflects that
+    a phase is heavier at some hours than others; missing entries fall back to the
+    static split.
+
     Also flags Hold/idle slots during PV surplus, where the executor freezes
     discharge and so cannot absorb a load spike (robustness exposure, not a cost).
     """
-    fracs = _normalise_phase_fractions(phase_fractions)
-    n_phases = len(fracs) if fracs else 0
+    default_fracs = _normalise_phase_fractions(phase_fractions)
 
     predicted = 0.0
     simulated = 0.0
@@ -160,6 +166,14 @@ def simulate_realistic(
         predicted_slot = s.grid_import_kwh * imp_p - s.grid_export_kwh * exp_p
         predicted += predicted_slot
         simulated_slot = predicted_slot
+
+        # Per-slot phase fractions (this hour's learned split) override the static one.
+        fracs = default_fracs
+        if phase_fractions_per_slot is not None and i < len(phase_fractions_per_slot):
+            per = phase_fractions_per_slot[i]
+            if per:
+                fracs = _normalise_phase_fractions(per)
+        n_phases = len(fracs) if fracs else 0
 
         # Phase-imbalance cost (only when fractions are provided).
         if fracs:
@@ -213,8 +227,21 @@ def realism_from_schedule(df: pd.DataFrame, config: dict[str, Any]) -> RealismRe
                 return float(row[name])
         return default
 
+    # Optional per-hour phase profile (per-slot phase forecasting): {hour: {A,B,C}}.
+    # When present, each slot uses its hour's learned split instead of the static one.
+    profile_cfg = config.get("phase_load_profile")
+    profile: dict[int, dict[str, float]] | None = None
+    if isinstance(profile_cfg, dict) and profile_cfg:
+        profile = {}
+        for key, val in cast("dict[Any, Any]", profile_cfg).items():
+            try:
+                profile[int(key)] = val
+            except (TypeError, ValueError):
+                continue
+
     slots: list[RealismSlot] = []
-    for _, row in df.iterrows():
+    per_slot: list[dict[str, float] | None] = []
+    for idx, row in df.iterrows():
         slots.append(
             RealismSlot(
                 pv_kwh=col(row, "pv_kwh", "adjusted_pv_kwh", "pv_forecast_kwh"),
@@ -228,4 +255,12 @@ def realism_from_schedule(df: pd.DataFrame, config: dict[str, Any]) -> RealismRe
                 soc_target_percent=col(row, "soc_target_percent"),
             )
         )
-    return simulate_realistic(slots, phase_fractions=config.get("phase_load_fractions"))
+        if profile is not None:
+            hour = getattr(idx, "hour", None)
+            per_slot.append(profile.get(hour) if isinstance(hour, int) else None)
+
+    return simulate_realistic(
+        slots,
+        phase_fractions=config.get("phase_load_fractions"),
+        phase_fractions_per_slot=per_slot if profile is not None else None,
+    )

@@ -46,6 +46,7 @@ from backend.learning.phase_learning import (
     learn_device_phase,
     phase_imbalance_w,
     reconstruct_phase_fractions,
+    reconstruct_phase_profile,
 )
 from backend.learning.phase_recommend import recommend_phase_moves
 from planner.hot_water import HotWaterEstimator
@@ -565,6 +566,9 @@ class PhaseObserverService:
         pa, pb, pc = await self._phase_grid_series()
         inv = await self._inverter_series()
         estimate = reconstruct_phase_fractions(pa, pb, pc, inv)
+        # Per-hour-of-day phase profile (per-slot phase forecasting). Cheap to compute
+        # from the same series; persisted alongside the static split for the planner.
+        profile = reconstruct_phase_profile(pa, pb, pc, inv)
 
         mappings: list[PhaseMapping] = []
         names: dict[str, str] = {}
@@ -605,6 +609,7 @@ class PhaseObserverService:
                 await self._persist(
                     {
                         "fractions": estimate.fractions,
+                        "fractions_by_hour": profile,
                         "load_w": estimate.load_w,
                         "imbalance_w": estimate.imbalance_w,
                         "samples": estimate.n_samples,
