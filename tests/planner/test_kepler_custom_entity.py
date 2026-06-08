@@ -158,3 +158,59 @@ class TestCustomEntitySolverVariable:
             f"Higher power_kw should produce equal or more activation slots. "
             f"Got high_power active={high_active}, low_power active={low_active}"
         )
+
+
+class TestCustomEntityPriceCeiling:
+    """The price ceiling restricts the sink to low/minus-price surplus hours.
+
+    This is the "low or minus price" trigger for the villavagn-AC cooling sink: even
+    with a strong activation reward, the sink stays off when grid export still pays
+    above the ceiling, and fires once export drops at/below it.
+    """
+
+    def _base(self, export_price: float, **over):
+        capacity = 10.0
+        initial_soc = capacity * 0.97
+        kwargs = dict(
+            capacity_kwh=capacity,
+            max_charge_power_kw=5.0,
+            max_discharge_power_kw=5.0,
+            charge_efficiency=1.0,
+            discharge_efficiency=1.0,
+            min_soc_percent=0.0,
+            max_soc_percent=100.0,
+            wear_cost_sek_per_kwh=0.01,
+            enable_export=True,
+            max_export_power_kw=10.0,
+            target_soc_kwh=initial_soc,
+            target_soc_penalty_sek=1000.0,
+            excess_pv_slots=[True] * 8,
+            excess_pv_sink="custom_entity",
+            excess_pv_reward_sek_per_kwh=2.0,  # strong reward — only price gate should hold it off
+            excess_pv_soc_threshold_percent=95.0,
+            excess_pv_custom_entity_power_kw=2.0,
+        )
+        kwargs.update(over)
+        slots = _make_slots(n=8, pv_kwh=3.0, load_kwh=1.0, export_price=export_price)
+        return KeplerInput(slots=slots, initial_soc_kwh=initial_soc), KeplerConfig(**kwargs)
+
+    def test_blocked_when_export_above_ceiling(self):
+        # Export pays 0.5 > ceiling 0.2 → never soak locally, sell instead.
+        inp, cfg = self._base(export_price=0.5, excess_pv_price_ceiling_sek_per_kwh=0.2)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert not any(s.custom_entity_active for s in result.slots)
+
+    def test_active_when_export_at_or_below_ceiling(self):
+        # Export pays 0.1 <= ceiling 0.2 → soak surplus locally.
+        inp, cfg = self._base(export_price=0.1, excess_pv_price_ceiling_sek_per_kwh=0.2)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert any(s.custom_entity_active for s in result.slots)
+
+    def test_none_ceiling_is_legacy_unrestricted(self):
+        # No ceiling → high reward activates even at a high export price (old behaviour).
+        inp, cfg = self._base(export_price=0.5, excess_pv_price_ceiling_sek_per_kwh=None)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert any(s.custom_entity_active for s in result.slots)

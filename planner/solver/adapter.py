@@ -568,6 +568,28 @@ def build_load_priorities(
     return True, priorities
 
 
+def _excess_pv_price_ceiling(planner_config: dict[str, Any]) -> float | None:
+    """Resolve the optional export-price ceiling for the custom-entity excess-PV sink.
+
+    Read from ``executor.excess_pv.custom_entity.price_ceiling_sek_per_kwh``. Absent,
+    null, or unparseable => None (no price gate, legacy behaviour). When present, the
+    sink may only activate in slots whose export price is at or below the ceiling — the
+    "low or minus price" trigger for soaking surplus locally (e.g. villavagn AC cooling)
+    instead of exporting it for next to nothing.
+    """
+    executor_cfg = cast(dict[str, Any], planner_config.get("executor", {}) or {})
+    excess_cfg = cast(dict[str, Any], executor_cfg.get("excess_pv", {}) or {})
+    custom_cfg = cast(dict[str, Any], excess_cfg.get("custom_entity", {}) or {})
+    raw: Any = custom_cfg.get("price_ceiling_sek_per_kwh", None)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("excess_pv price_ceiling_sek_per_kwh=%r not a number - ignoring", raw)
+        return None
+
+
 def config_to_kepler_config(
     planner_config: dict[str, Any],
     overrides: dict[str, Any] | None = None,
@@ -741,6 +763,7 @@ def config_to_kepler_config(
             .get("custom_entity", {})
             .get("power_kw", 1.0)
         ),
+        excess_pv_price_ceiling_sek_per_kwh=_excess_pv_price_ceiling(planner_config),
     )
 
     # Deferrable household loads (dishwasher, washing machine, ...).

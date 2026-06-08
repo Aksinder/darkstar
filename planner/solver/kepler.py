@@ -387,7 +387,13 @@ class KeplerSolver:
 
             # Custom entity: MILP variable gated by excess PV flag and SoC threshold
             if custom_entity_enabled:
-                if not excess_pv_flags[t]:
+                # Optional price gate: only soak surplus locally when export pays little
+                # or nothing (export_price <= ceiling, incl. negative). Sell it otherwise.
+                price_ok = (
+                    config.excess_pv_price_ceiling_sek_per_kwh is None
+                    or s.export_price_sek_kwh <= config.excess_pv_price_ceiling_sek_per_kwh
+                )
+                if not excess_pv_flags[t] or not price_ok:
                     prob += custom_entity_active[t] == 0
                 else:
                     prob += custom_entity_active[t] <= soc_above_threshold[t]

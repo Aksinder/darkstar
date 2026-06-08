@@ -22,7 +22,7 @@ from typing import Any
 
 import aiohttp
 
-from .config import ExecutorConfig
+from .config import ExcessPVCustomEntityConfig, ExecutorConfig
 from .controller import ControllerDecision
 from .profiles import InverterProfile, ModeAction
 
@@ -910,6 +910,13 @@ class ActionDispatcher:
             )
 
         entity = excess_pv.custom_entity.entity
+
+        # Climate entities (e.g. the villavagn AC as a surplus cooling sink) need
+        # hvac_mode/temperature services, not a plain state write. Delegate.
+        if entity.split(".", 1)[0] == "climate":
+            turn_on = self._values_match(value, excess_pv.custom_entity.on_value)
+            return await self._set_climate_sink(entity, turn_on, excess_pv.custom_entity, start)
+
         current = await self.ha.get_state_value(entity)
 
         if self._values_match(current, value):
@@ -976,6 +983,88 @@ class ActionDispatcher:
             duration_ms=duration,
             error_details=error_details,
         )
+
+    async def _set_climate_sink(
+        self,
+        entity: str,
+        turn_on: bool,
+        cfg: ExcessPVCustomEntityConfig,
+        start: float,
+    ) -> ActionResult:
+        """Actuate a climate.* excess-PV sink (e.g. the villavagn AC).
+
+        ON  => climate.set_hvac_mode(cfg.climate_mode) + optional set_temperature, BUT
+               skipped (and forced OFF) when current_temperature <= comfort_min_temp so
+               surplus never over-cools the space.
+        OFF => climate.set_hvac_mode("off").
+
+        Idempotent: a no-op when the unit is already in the desired mode.
+        """
+        state = await self.ha.get_state(entity)
+        current_mode = state.get("state") if state else None
+        attrs: dict[str, Any] = (state or {}).get("attributes", {}) or {}
+        current_temp = attrs.get("current_temperature")
+
+        # Comfort floor: if already cool enough, never run the AC for surplus.
+        floor_blocked = (
+            turn_on
+            and cfg.comfort_min_temp is not None
+            and isinstance(current_temp, int | float)
+            and float(current_temp) <= cfg.comfort_min_temp
+        )
+        desired_mode = cfg.climate_mode if (turn_on and not floor_blocked) else "off"
+
+        def _result(success: bool, message: str, *, skipped: bool = False) -> ActionResult:
+            return ActionResult(
+                action_type="custom_entity",
+                success=success,
+                message=message,
+                previous_value=current_mode,
+                new_value=desired_mode,
+                entity_id=entity,
+                skipped=skipped,
+                duration_ms=int((time.time() - start) * 1000),
+            )
+
+        if floor_blocked:
+            logger.info(
+                "Climate sink %s: current %.1f°C <= comfort floor %.1f°C, not cooling",
+                entity,
+                float(current_temp),  # type: ignore[arg-type]
+                cfg.comfort_min_temp,
+            )
+
+        if current_mode == desired_mode:
+            return _result(True, f"Already {desired_mode}", skipped=True)
+
+        if self.shadow_mode:
+            logger.info(
+                "[SHADOW] Would set climate sink %s %s -> %s", entity, current_mode, desired_mode
+            )
+            return _result(True, f"[SHADOW] Would change {current_mode} -> {desired_mode}", skipped=True)
+
+        try:
+            ok = await self.ha.call_service(
+                "climate", "set_hvac_mode", entity, {"hvac_mode": desired_mode}
+            )
+            if ok and desired_mode != "off" and cfg.target_temp is not None:
+                await self.ha.call_service(
+                    "climate", "set_temperature", entity, {"temperature": cfg.target_temp}
+                )
+        except HACallError as e:
+            logger.error("Failed to set climate sink %s: %s", entity, e)
+            return ActionResult(
+                action_type="custom_entity",
+                success=False,
+                message=f"Failed: {e}",
+                previous_value=current_mode,
+                new_value=desired_mode,
+                entity_id=entity,
+                error_details=str(e),
+                duration_ms=int((time.time() - start) * 1000),
+            )
+
+        return _result(True, f"Changed {current_mode} -> {desired_mode}")
 
     async def _read_current_export_limit(self) -> float | None:
         """Read the inverter's current export-power limit (W), or None if unavailable."""
