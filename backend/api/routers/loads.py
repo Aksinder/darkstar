@@ -27,6 +27,37 @@ def get_disaggregator(config: dict[str, Any] = Depends(get_config)) -> LoadDisag
     return _disaggregator
 
 
+@router.get("/controllable")
+async def get_controllable_loads(
+    config: dict[str, Any] = Depends(get_config),
+) -> dict[str, list[dict[str, Any]]]:
+    """Enumerate all CONFIG-DEFINED controllable loads (deferrable + water + EV), including
+    disabled ones, so the Load Priority GUI can assign each to a tier. Read-only; mirrors
+    the arrays already exposed by GET /api/config."""
+
+    def rows(items: Any, kind: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for x in cast("list[dict[str, Any]]", items or []):
+            load_id = str(x.get("id", ""))
+            if not load_id:
+                continue
+            out.append(
+                {
+                    "id": load_id,
+                    "name": str(x.get("name") or load_id),
+                    "type": kind,
+                    "enabled": bool(x.get("enabled", True)),
+                }
+            )
+        return out
+
+    return {
+        "loads": rows(config.get("deferrable_loads"), "deferrable")
+        + rows(config.get("water_heaters"), "water_heater")
+        + rows(config.get("ev_chargers"), "ev_charger")
+    }
+
+
 @router.get("/debug")
 async def get_loads_debug(
     disaggregator: LoadDisaggregator = Depends(get_disaggregator),
