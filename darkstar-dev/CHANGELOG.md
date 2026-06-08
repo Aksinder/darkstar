@@ -1,3 +1,7 @@
+## dev-20260608.2133 — 2026-06-08 21:35
+
+- feat(load-priority): dynamic percentile WTP cap (price cap tracks the day)
+
 ## dev-20260608.1939 — 2026-06-08 19:41
 
 - feat(excess-pv): decouple custom_entity sink so it runs alongside water_heater_boost
