@@ -8,6 +8,8 @@ energy, while a high-WTP load keeps running. When the flag is off (or a load has
 priority entry) behaviour is byte-identical to the legacy mandatory run-once model.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
 
 from planner.solver.adapter import build_load_priorities
@@ -16,7 +18,9 @@ from planner.solver.types import (
     DeferrableLoadInput,
     KeplerConfig,
     KeplerInput,
+    KeplerInputSlot,
     LoadPriority,
+    WaterHeaterInput,
 )
 from tests.planner.test_deferrable_loads_solver import _run_slots, _slots
 
@@ -183,3 +187,115 @@ class TestBuildLoadPriorities:
         )
         assert enabled is True
         assert "spa" not in p
+
+
+def _wslots(prices, pv=None):
+    """30-min slots on a single date (so the daily-minimum logic applies)."""
+    base = datetime(2026, 1, 15, 0, 0)
+    out = []
+    for i, price in enumerate(prices):
+        s = base + timedelta(minutes=30 * i)
+        out.append(
+            KeplerInputSlot(
+                start_time=s,
+                end_time=s + timedelta(minutes=30),
+                load_kwh=0.0,
+                pv_kwh=(pv[i] if pv else 0.0),
+                import_price_sek_kwh=price,
+                export_price_sek_kwh=0.0,
+            )
+        )
+    return out
+
+
+def _wcfg(heaters, **kw):
+    """KeplerConfig with battery neutralised; reliability penalty on so the legacy
+    model would FORCE the daily minimum (the contrast the WTP layer overrides)."""
+    base = {
+        "capacity_kwh": 0.0,
+        "max_charge_power_kw": 1.0,
+        "max_discharge_power_kw": 1.0,
+        "charge_efficiency": 1.0,
+        "discharge_efficiency": 1.0,
+        "min_soc_percent": 0.0,
+        "max_soc_percent": 100.0,
+        "wear_cost_sek_per_kwh": 0.0,
+        "water_heaters": heaters,
+        "water_reliability_penalty_sek": 100.0,
+    }
+    base.update(kw)
+    return KeplerConfig(**base)
+
+
+def _heated(result, heater_id):
+    """Total kWh heated by a heater (water_heater_results is kW; 30-min slots => x0.5)."""
+    return sum(s.water_heater_results.get(heater_id, 0.0) * 0.5 for s in result.slots)
+
+
+def _wh(heater_id="spa", power_kw=2.0, min_kwh_per_day=2.0):
+    return WaterHeaterInput(
+        id=heater_id,
+        power_kw=power_kw,
+        min_kwh_per_day=min_kwh_per_day,
+        max_hours_between_heating=0.0,
+        min_spacing_hours=0.0,
+    )
+
+
+class TestWtpWaterHeaters:
+    def test_low_priority_heater_is_forced_without_priority(self):
+        """Baseline contrast: without the WTP layer the reliability penalty FORCES the
+        spa to meet its daily minimum even at a high uniform price."""
+        r = KeplerSolver().solve(KeplerInput(_wslots([1.0] * 8), 0.0), _wcfg([_wh()]))
+        assert r.is_optimal
+        assert _heated(r, "spa") == pytest.approx(2.0)
+
+    def test_low_priority_heater_skips_when_expensive(self):
+        """With the WTP layer on, a low-priority heater (base_wtp 0.4) skips a day when
+        every slot costs more than its reservation price — no reliability forcing."""
+        prio = {"spa": LoadPriority(base_wtp_sek_per_kwh=0.4)}
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots([1.0] * 8), 0.0),
+            _wcfg([_wh()], load_priority_enabled=True, load_priorities=prio),
+        )
+        assert r.is_optimal
+        assert _heated(r, "spa") == pytest.approx(0.0)
+
+    def test_low_priority_heater_fills_need_in_cheap_window(self):
+        """The same low-priority heater fills its daily need when a cheap window appears."""
+        prices = [1.0, 1.0, 1.0, 0.1, 0.1, 1.0, 1.0, 1.0]
+        prio = {"spa": LoadPriority(base_wtp_sek_per_kwh=0.4)}
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots(prices), 0.0),
+            _wcfg([_wh()], load_priority_enabled=True, load_priorities=prio),
+        )
+        assert _heated(r, "spa") == pytest.approx(2.0)  # need met
+        # ...and only in the cheap slots (3, 4).
+        hot = [i for i, s in enumerate(r.slots) if s.water_heater_results.get("spa", 0.0) > 0]
+        assert hot == [3, 4]
+
+    def test_satiation_prevents_overheating(self):
+        """An important heater (base_wtp 3.0) at dirt-cheap prices heats EXACTLY its daily
+        need, not every slot — the credit is satiated at min_kwh_per_day."""
+        prio = {"vvb": LoadPriority(base_wtp_sek_per_kwh=3.0)}
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots([0.1] * 8), 0.0),
+            _wcfg(
+                [_wh("vvb", min_kwh_per_day=2.0)],
+                load_priority_enabled=True,
+                load_priorities=prio,
+            ),
+        )
+        assert _heated(r, "vvb") == pytest.approx(2.0)  # need only — no over-heating
+
+    def test_off_parity_water_heater(self):
+        """Flag OFF with priorities populated => identical heating + cost to baseline."""
+        prices = [1.0, 1.0, 0.1, 1.0, 1.0, 1.0, 1.0, 1.0]
+        baseline = KeplerSolver().solve(KeplerInput(_wslots(prices), 0.0), _wcfg([_wh()]))
+        prio = {"spa": LoadPriority(base_wtp_sek_per_kwh=0.4, urgency_wtp_sek_per_kwh=0.6)}
+        off = KeplerSolver().solve(
+            KeplerInput(_wslots(prices), 0.0),
+            _wcfg([_wh()], load_priority_enabled=False, load_priorities=prio),
+        )
+        assert _heated(baseline, "spa") == pytest.approx(_heated(off, "spa"))
+        assert baseline.total_cost_sek == pytest.approx(off.total_cost_sek)

@@ -712,6 +712,35 @@ class KeplerSolver:
                             >= day_min_kwh - water_min_kwh_violation[d][i]
                         )
 
+                    # Load-priority WTP credit (increment 2): a priority-bearing heater
+                    # earns a credit for meeting its daily comfort need (min_kwh_per_day)
+                    # at its reservation price, SATIATED at the need (served <= need) so it
+                    # never over-heats. The legacy reliability penalty is suppressed for
+                    # these heaters (in the objective below), so a low-priority heater
+                    # (e.g. spa) skips when energy costs more than its WTP, while a
+                    # high-WTP heater fills its need whenever the marginal price allows.
+                    # served = min(heated, need); the credit is linear (no integer vars).
+                    if (
+                        config.load_priority_enabled
+                        and d in config.load_priorities
+                        and day_min_kwh > 0
+                    ):
+                        lp = config.load_priorities[d]
+                        wtp_d = lp.base_wtp_sek_per_kwh + lp.rank_epsilon_sek_per_kwh
+                        if wtp_d != 0.0:
+                            safe_dp = d.replace("-", "_").replace(".", "_")
+                            served: Any = pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
+                                f"wtp_served_{safe_dp}_{i}", lowBound=0.0
+                            )
+                            # served = min(heated, need): capped at the daily comfort need
+                            # (satiation) and at the energy actually heated.
+                            prob += served <= day_min_kwh  # type: ignore[operator]
+                            prob += served <= (  # type: ignore[operator]
+                                pulp.lpSum(water_heat[d][t] for t in day_slot_indices)
+                                * kwh_per_slot
+                            )
+                            total_cost.append(-wtp_d * served)
+
                 # Constraint 2: Per-device soft block breaker (task 2.5)
                 if config.water_block_penalty_sek > 0:
                     max_block_slots: int = max(1, int(config.max_block_hours / avg_slot_hours))
@@ -775,7 +804,11 @@ class KeplerSolver:
             + (
                 pulp.lpSum(
                     water_min_kwh_violation[d][i]
+                    # Priority-bearing heaters price their comfort need via the WTP credit
+                    # (above), so exclude them from the legacy reliability penalty — this is
+                    # what lets a low-priority heater skip a day instead of being forced.
                     for d in water_min_kwh_violation
+                    if not (config.load_priority_enabled and d in config.load_priorities)
                     for i in range(len(sorted_days))
                 )
                 * config.water_reliability_penalty_sek
