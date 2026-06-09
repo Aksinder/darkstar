@@ -86,6 +86,20 @@ The comfort level controls **two key parameters**:
 **Bulk Mode Override:**
 Set `enable_top_ups: false` in config to force single-block bulk heating regardless of comfort level. This preserves reliability penalties but allows one large heating session per day.
 
+**Price-smart heating (never at the most expensive hours):**
+With the **Load Priority** layer on (`load_priority.enabled`), a water heater can be told
+what it's *worth* running (a reservation price in SEK/kWh) so it heats in the cheapest hours
+and refuses the day's most expensive ones. For the house VVB, prefer the **dynamic** cap —
+set `wtp_percentile` (e.g. `50`) instead of a fixed price: the cap is recomputed each plan
+as that percentile of the next 24 h of prices, so it always heats in the *relatively*
+cheapest hours of **any** day (cheap, expensive, or flat) and never runs out of hot water,
+while still avoiding the peaks. Lower percentile = stricter peak-avoidance; higher = more
+hot-water headroom. See `docs/designs/load-priority-wtp.md`.
+
+> **Note:** `max_hours_between_heating` is **not** enforced by the planner — it has no
+> effect. What guarantees the heater meets its daily minimum is the reliability floor
+> (`water_heating.reliability_penalty_sek`), which is kept active for dynamic-cap heaters.
+
 ### Shadow Mode
 In **Settings -> Advanced**, you can enable **Shadow Mode**.
 *   **ON**: Darkstar calculates the plan but **DOES NOT** send commands to your inverter. It just watches. Great for testing.
@@ -123,6 +137,11 @@ Darkstar treats your Electric Vehicle as a "Deferrable Load." This means it unde
 
 ### "The plan keeps changing!"
 *   This is normal. Darkstar replans every time new data comes in (weather updates, new prices). It's constantly course-correcting, like a GPS avoiding traffic.
+
+### "Why isn't my water heater heating?"
+1.  **Daily minimum already met?** Each heater heats up to `min_kwh_per_day` and then stops (satiation) — it won't over-heat.
+2.  **Waiting for a cheaper hour.** With Load Priority on, it heats in the cheapest hours and refuses pricier ones. If you used a **fixed** `base_wtp` cap and *every* hour is above it (e.g. a winter price spike), a priority heater could skip the day — switch that load to a **dynamic** `wtp_percentile` cap so the cap tracks the day and it always heats in the relatively cheapest hours.
+3.  **`max_hours_between_heating` does nothing** — it is not enforced. The daily minimum is guaranteed by the reliability floor, which stays active for dynamic-cap heaters.
 
 ---
 
