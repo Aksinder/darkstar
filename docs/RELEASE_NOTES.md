@@ -28,6 +28,31 @@
     - Structured error taxonomy, preflight validation (catches misconfiguration before solving), automatic retry for transient failures, and soft constraints to prevent infeasibility when PV exceeds inverter AC capacity.
     - Persistent UI error drawer with full context for troubleshooting.
 
+- **Load Priority / Willingness-to-Pay (WTP)** *(fork)*
+    - Unified tier + rank + reservation-price model: declare what each load is *worth*
+      running (SEK/kWh) and the planner defers/skips low-value loads under scarcity while
+      keeping high-value ones — folding deferrable loads, water heaters and EV onto one
+      scale. Flag-gated (`load_priority.enabled`), drag-to-rank Settings tab.
+    - **Dynamic percentile cap** (`wtp_percentile`): the price cap tracks each day — base_wtp
+      is recomputed as the Nth percentile of the rolling 24 h import prices, so a heater
+      heats only in the *relatively* cheapest hours on any day and never starves on a
+      uniformly-expensive one.
+    - **Anti-starvation**: dynamic-percentile heaters keep the reliability floor, so the daily
+      minimum is guaranteed *in the cheap band* — the VVB can never defer-forever / skip a
+      day, yet never heats at the day's most expensive hours. (Note: `max_hours_between_heating`
+      is not enforced in the solver; the reliability floor is the real backstop.)
+    - See `docs/designs/load-priority-wtp.md`.
+
+- **Excess-PV climate (AC) cooling sink + multi-sink coexistence** *(fork)*
+    - A `climate.*` entity (e.g. a villavagn AC) can soak surplus PV as cooling via
+      `set_hvac_mode`/`set_temperature`, gated on an **export-price ceiling** (only on
+      low/negative-price hours) with an anti-overcool **comfort floor**.
+    - New `excess_pv.custom_entity.enabled` lets the custom-entity sink run **alongside**
+      `water_heater_boost` instead of replacing it (the single `sink` selector no longer
+      forces an either/or).
+    - See `docs/designs/excess-pv-sinks.md`.
+
+
 **🐛 Bug Fixes**
 
 - **Price Forecast Deduplication**: Fixed midnight planner crash from duplicate forecasts. Filtered stale D+1 slots and deduplicated Nordpool data to prevent incorrect price signals.
