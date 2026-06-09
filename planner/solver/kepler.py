@@ -858,11 +858,20 @@ class KeplerSolver:
             + (
                 pulp.lpSum(
                     water_min_kwh_violation[d][i]
-                    # Priority-bearing heaters price their comfort need via the WTP credit
-                    # (above), so exclude them from the legacy reliability penalty — this is
-                    # what lets a low-priority heater skip a day instead of being forced.
+                    # A STATIC-WTP priority heater prices its comfort need purely via the WTP
+                    # credit, so it's excluded from the legacy reliability penalty — that's
+                    # what lets a low-priority heater (e.g. spa) skip a day when energy costs
+                    # more than its WTP. A DYNAMIC-percentile heater (e.g. the VVB) KEEPS the
+                    # reliability floor: its cap always leaves a cheap band each day, so the
+                    # floor forces it to meet the daily minimum *in that cheap band* and it can
+                    # never silently defer-forever / skip a day. (Belt-and-suspenders: the cap
+                    # steers to the cheapest hours, the floor guarantees it actually heats.)
                     for d in water_min_kwh_violation
-                    if not (config.load_priority_enabled and d in config.load_priorities)
+                    if not (
+                        config.load_priority_enabled
+                        and d in config.load_priorities
+                        and config.load_priorities[d].dynamic_percentile is None
+                    )
                     for i in range(len(sorted_days))
                 )
                 * config.water_reliability_penalty_sek
