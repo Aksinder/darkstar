@@ -340,6 +340,32 @@ class TestWtpWaterHeaters:
         hot = [i for i, s in enumerate(r.slots) if s.water_heater_results.get("spa", 0.0) > 0]
         assert hot == [3, 4]
 
+    def test_dynamic_heater_always_heats_via_reliability_floor(self):
+        """Belt-and-suspenders: a DYNAMIC-percentile heater KEEPS the reliability floor, so
+        even on a uniformly-expensive day (where a static low-WTP load would skip) it still
+        heats its daily minimum — it can never silently defer-forever / skip a day."""
+        prio = {"spa": LoadPriority(base_wtp_sek_per_kwh=0.4, dynamic_percentile=50.0)}
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots([1.0] * 8), 0.0),
+            _wcfg([_wh()], load_priority_enabled=True, load_priorities=prio),
+        )
+        assert r.is_optimal
+        # Contrast with test_low_priority_heater_skips_when_expensive (static => 0.0).
+        assert _heated(r, "spa") == pytest.approx(2.0)
+
+    def test_dynamic_heater_still_prefers_cheapest_slots(self):
+        """The floor guarantees it heats; the cap/cost-min still clusters it in the day's
+        cheapest hours (never the expensive ones)."""
+        prices = [1.0, 1.0, 1.0, 0.1, 0.1, 1.0, 1.0, 1.0]
+        prio = {"spa": LoadPriority(base_wtp_sek_per_kwh=0.4, dynamic_percentile=50.0)}
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots(prices), 0.0),
+            _wcfg([_wh()], load_priority_enabled=True, load_priorities=prio),
+        )
+        assert _heated(r, "spa") == pytest.approx(2.0)
+        hot = [i for i, s in enumerate(r.slots) if s.water_heater_results.get("spa", 0.0) > 0]
+        assert hot == [3, 4]  # the two cheapest slots
+
     def test_satiation_prevents_overheating(self):
         """An important heater (base_wtp 3.0) at dirt-cheap prices heats EXACTLY its daily
         need, not every slot — the credit is satiated at min_kwh_per_day."""
