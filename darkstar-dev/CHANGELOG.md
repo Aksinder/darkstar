@@ -1,3 +1,7 @@
+## dev-20260609.0505 — 2026-06-09 05:06
+
+- fix(load-priority): keep the reliability floor for dynamic-percentile heaters
+
 ## dev-20260608.2133 — 2026-06-08 21:35
 
 - feat(load-priority): dynamic percentile WTP cap (price cap tracks the day)
