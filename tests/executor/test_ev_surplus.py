@@ -148,11 +148,34 @@ class TestBatteryAssistTier:
 
 
 class TestDynamics:
-    def test_deadband_holds(self):
+    def test_deadband_holds_stable(self):
+        # Small opposite perturbations both within the deadband => identical command
+        # (the budget doesn't drift on noise; the deadband's job is stability).
         ch = _charger(current_power_w=5000.0)
-        # Tiny imbalance within deadband => hold at current.
-        out = compute_ev_surplus(_inputs(grid_w=-100.0, chargers=[ch]), _cfg(deadband_w=250.0))
-        assert out[0].target_power_w == 5000.0
+        a = compute_ev_surplus(_inputs(grid_w=-100.0, chargers=[ch]), _cfg(deadband_w=250.0))
+        b = compute_ev_surplus(_inputs(grid_w=120.0, chargers=[ch]), _cfg(deadband_w=250.0))
+        assert a[0].set_current_a == b[0].set_current_a
+
+
+class TestChunkySteps:
+    def test_current_snaps_to_step_grid(self):
+        # 2 A grid => commanded current is an even multiple, not a jittery 7.2 A.
+        out = compute_ev_surplus(_inputs(grid_w=-10000.0), _cfg(gain=1.0, current_step_a=2.0))
+        amps = out[0].set_current_a
+        assert amps is not None and abs((amps / 2.0) - round(amps / 2.0)) < 1e-9
+
+    def test_off_hysteresis_needs_extra_to_start(self):
+        # Charger OFF, budget just at its bare min (4.14 kW) but below min*1.15 => stays off.
+        off = _charger(current_power_w=0.0)
+        out = compute_ev_surplus(_inputs(grid_w=-4300.0, chargers=[off]), _cfg(gain=1.0, start_hysteresis=0.15))
+        assert out[0].switch_on is False
+
+    def test_on_hysteresis_keeps_running_at_min(self):
+        # Same budget but the charger is already ON => it keeps running down to its true min.
+        on = _charger(current_power_w=4200.0)
+        out = compute_ev_surplus(_inputs(grid_w=0.0, battery_w=0.0, chargers=[on]), _cfg(gain=1.0, start_hysteresis=0.15))
+        # headroom ~0 => hold at ~4200, above min 4140 => stays on.
+        assert out[0].switch_on is True
 
     def test_clamped_to_charger_max(self):
         # Huge export can't exceed the charger's 11 kW ceiling.
