@@ -148,7 +148,7 @@ async def get_nordpool_data(
                             if slot_start.tzinfo is None
                             else slot_start.astimezone(local_tz)
                         )
-                        end_time = slot_start + timedelta(hours=1)
+                        end_time = slot_start + timedelta(minutes=resolution_minutes)
                         all_entries.append(
                             {
                                 "start": slot_start,
