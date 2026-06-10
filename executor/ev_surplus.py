@@ -47,7 +47,7 @@ class EVSurplusConfig:
     # Controller dynamics.
     gain: float = 0.5  # fraction of the headroom applied per cycle (stability vs speed)
     deadband_w: float = 250.0  # hold when |headroom| is within this (anti-jitter)
-    min_charge_current_a: float = 6.0  # below this a charger can't charge => turn off
+    min_charge_current_a: float = 5.0  # global safety floor; per-charger min_current_a wins if higher
     default_voltage_v: float = 230.0
 
 
@@ -66,6 +66,9 @@ class ChargerState:
     voltage_v: float = 230.0
     controllable: bool = True  # has a settable charge-current entity (vs on/off only)
     priority: int = 0  # lower = filled first
+    # Manual override (read from an HA input_select per charger). "auto" = surplus control;
+    # "force_on" = charge at max regardless of surplus; "force_off" = never charge.
+    override: str = "auto"
 
 
 @dataclass
@@ -128,7 +131,31 @@ def compute_ev_surplus(
         # the controller never touches anything.
         return []
 
-    # --- Tier gating ---
+    commands: list[ChargerCommand] = []
+
+    # --- Manual overrides first (the user overrules the auto control) ---
+    # force_off: never charge. force_on: charge at max regardless of surplus. Their draw
+    # is reflected in the live grid/battery, so the remaining "auto" chargers see less
+    # headroom and back off accordingly — no double counting.
+    forced_off = [c for c in active if c.override == "force_off"]
+    forced_on = [c for c in active if c.override == "force_on"]
+    auto = [c for c in active if c.override not in ("force_off", "force_on")]
+
+    for c in forced_off:
+        commands.append(
+            ChargerCommand(c.id, switch_on=False, set_current_a=0.0 if c.controllable else None,
+                           target_power_w=0.0, reason="override: force_off")
+        )
+    for c in forced_on:
+        commands.append(
+            ChargerCommand(c.id, switch_on=True,
+                           set_current_a=c.max_current_a if c.controllable else None,
+                           target_power_w=_charger_max_w(c), reason="override: force_on (max)")
+        )
+    if not auto:
+        return commands
+
+    # --- Tier gating (only the auto-managed chargers share the surplus budget) ---
     cheap_grid = (
         cfg.cheap_grid_price_sek is not None
         and inputs.import_price_sek <= cfg.cheap_grid_price_sek
@@ -143,7 +170,7 @@ def compute_ev_surplus(
     )
     battery_allow_w = cfg.battery_assist_allowance_w if battery_tier else 0.0
 
-    current_total_w = sum(c.current_power_w for c in active)
+    current_total_w = sum(c.current_power_w for c in auto)
     headroom_w = (grid_setpoint_w - inputs.grid_w) + inputs.battery_w + battery_allow_w
 
     if abs(headroom_w) < cfg.deadband_w:
@@ -157,7 +184,7 @@ def compute_ev_surplus(
     else:
         target_total_w = current_total_w + cfg.gain * headroom_w
 
-    fleet_max_w = sum(_charger_max_w(c) for c in active)
+    fleet_max_w = sum(_charger_max_w(c) for c in auto)
     target_total_w = max(0.0, min(fleet_max_w, target_total_w))
 
     why = (
@@ -166,10 +193,9 @@ def compute_ev_surplus(
         f"headroom={headroom_w:.0f}W -> target={target_total_w:.0f}W"
     )
 
-    # --- Distribute the budget across chargers, greedy by priority ---
-    commands: list[ChargerCommand] = []
+    # --- Distribute the budget across the auto chargers, greedy by priority ---
     remaining_w = target_total_w
-    for c in sorted(active, key=lambda x: (x.priority, x.id)):
+    for c in sorted(auto, key=lambda x: (x.priority, x.id)):
         min_on_w = _charger_min_on_w(c, cfg)
         max_w = _charger_max_w(c)
         if remaining_w < min_on_w:
