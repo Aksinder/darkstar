@@ -175,3 +175,36 @@ class TestDistribution:
         out = compute_ev_surplus(_inputs(grid_w=-10000.0, chargers=[binc]), _cfg())
         assert out[0].set_current_a is None
         assert out[0].switch_on is True
+
+    def test_easee_priority_one_fills_before_tesla(self):
+        # User's config: Easee = #1 (priority 0), Tesla = #2 (priority 1).
+        easee = _charger(id="easee", priority=0, min_current_a=6.0, current_power_w=0.0)
+        tesla = _charger(id="tesla", priority=1, min_current_a=5.0, current_power_w=0.0)
+        out = compute_ev_surplus(_inputs(grid_w=-8000.0, chargers=[easee, tesla]), _cfg(gain=1.0))
+        by_id = {c.id: c for c in out}
+        assert by_id["easee"].target_power_w >= by_id["tesla"].target_power_w
+
+
+class TestManualOverride:
+    def test_force_off_never_charges(self):
+        ch = _charger(override="force_off")
+        out = compute_ev_surplus(_inputs(grid_w=-12000.0, chargers=[ch]), _cfg())
+        assert out[0].switch_on is False and out[0].target_power_w == 0.0
+        assert "force_off" in out[0].reason
+
+    def test_force_on_charges_at_max_despite_no_surplus(self):
+        # Importing, battery draining — surplus control would say OFF, but force_on overrules.
+        ch = _charger(override="force_on")
+        out = compute_ev_surplus(_inputs(grid_w=5000.0, battery_w=-3000.0, chargers=[ch]), _cfg())
+        assert out[0].switch_on is True
+        assert out[0].set_current_a == ch.max_current_a
+        assert "force_on" in out[0].reason
+
+    def test_forced_on_does_not_consume_auto_budget(self):
+        # Tesla force_on (its draw shows in grid/battery); Easee auto still gets the surplus.
+        tesla = _charger(id="tesla", override="force_on")
+        easee = _charger(id="easee", override="auto", current_power_w=0.0)
+        out = compute_ev_surplus(_inputs(grid_w=-9000.0, chargers=[tesla, easee]), _cfg(gain=1.0))
+        by_id = {c.id: c for c in out}
+        assert by_id["tesla"].set_current_a == tesla.max_current_a  # forced
+        assert by_id["easee"].switch_on is True  # auto still charges on the surplus
