@@ -595,6 +595,62 @@ executor:
       target_temp: ""                  # cooling setpoint applied when ON (blank = leave unit's own)
       comfort_min_temp: ""             # don't cool below this current_temperature (anti-overcool floor)
 
+  # ---------------------------------------------------------------------------
+  # Real-time EV surplus-follow controller (default OFF). Dials each charger's
+  # current so EV charging tracks an energy budget instead of draining the home
+  # battery. 3-tier source policy: solar surplus -> cheap/negative grid -> home
+  # battery (only when price negative AND lots of solar still forecast). Manual
+  # per-charger override via an input_select (auto/force_on/force_off).
+  # NOTE: Easee current is set via the FLASH-SAFE `set_charger_dynamic_limit`
+  # service (volatile/RAM). Darkstar NEVER writes the non-dynamic max/circuit
+  # limits, which would wear the charger's flash.
+  ev_surplus:
+    enabled: false
+    pv_power_entity: ""                 # solar production (W), e.g. sensor.total_pv_power
+    grid_power_entity: ""               # signed grid power (+import), e.g. sensor.meter_active_power
+    battery_power_entity: ""            # signed battery power (+charge), e.g. sensor.battery_charging_power_signed
+    battery_soc_entity: ""              # home battery SoC %, e.g. sensor.battery_level
+    price_entity: ""                    # spot price SEK/kWh, e.g. sensor.spot_price_sek_kwh
+    remaining_solar_entity: ""          # optional kWh still forecast today; blank => battery-assist tier inert
+    policy:
+      cheap_grid_price_sek: 0.30        # allow grid for EV when spot <= this (blank/absent => solar only)
+      cheap_grid_allowance_w: 3680      # max grid import to give the cars when cheap
+      gain: 0.5                         # control damping (0-1)
+      deadband_w: 250                   # hold within this power error (anti-jitter)
+      current_step_a: 2.0               # snap commanded amps to this grid (chunky steps)
+      start_hysteresis: 0.15            # extra headroom (frac of min) an OFF charger needs to start
+      battery_assist:
+        enabled: false
+        max_price_sek: 0.0              # battery only helps when spot <= this (0 = negative)
+        min_remaining_solar_kwh: 8.0    # ...and this much PV still forecast today
+        floor_soc: 40.0                 # never pull the home battery below this for cars
+        allowance_w: 6000               # cap on battery -> car
+    write_guard:
+      min_step_a: 2.0                   # only rewrite current when target moves >= this many A
+      min_interval_s: 90                # ...and at least this long since the last write (a STOP bypasses it)
+    chargers: []
+      # - id: easee                     # priority #1 (lower = filled first)
+      #   priority: 0
+      #   min_current_a: 6
+      #   max_current_a: 16
+      #   phases: 1                     # FMB charges 1-phase
+      #   switch_entity: switch.easee_niska_it_charger_enabled
+      #   easee_device_id: ""           # HA device id of the Easee (for set_charger_dynamic_limit)
+      #   power_entity: sensor.easee_niska_it_power
+      #   plug_entity: binary_sensor.easee_ev_plugged_in
+      #   override_entity: input_select.darkstar_ev_easee_mode
+      # - id: tesla                     # priority #2
+      #   priority: 1
+      #   min_current_a: 5
+      #   max_current_a: 16
+      #   phases: 3
+      #   switch_entity: switch.white_betty_charge
+      #   current_entity: number.white_betty_charge_current   # number.set_value path
+      #   power_entity: sensor.white_betty_charger_power
+      #   plug_entity: binary_sensor.white_betty_charge_cable
+      #   home_entity: device_tracker.white_betty_location
+      #   override_entity: input_select.darkstar_ev_tesla_mode
+
 # =============================================================================
 # UI Settings
 # =============================================================================
