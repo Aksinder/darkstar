@@ -100,6 +100,14 @@ class ExecutorEngine:
         # Load main config for input_sensors section
         self._full_config = load_yaml(config_path)
 
+        # Real-time EV surplus controller (variable charge current; default OFF). Construct
+        # when the executor.ev_surplus block exists; run() no-ops unless enabled. Enabling a
+        # freshly-added block is picked up on the next executor (re)start.
+        from .ev_surplus_runtime import EVSurplusController, parse_ev_surplus_config
+
+        _ev_surplus_cfg = parse_ev_surplus_config(self._full_config.get("executor", {}) or {})
+        self._ev_surplus = EVSurplusController(_ev_surplus_cfg) if _ev_surplus_cfg else None
+
         # Status tracking - MUST be initialized BEFORE profile loading (REV IP3 Phase 6 fix)
         self.status = ExecutorStatus(
             enabled=self.config.enabled,
@@ -1415,6 +1423,16 @@ class ExecutorEngine:
                             )
                         custom_result = await self.dispatcher.set_custom_entity(custom_value)
                         action_results.append(custom_result)
+
+                    # Real-time EV surplus controller (variable charge current, default OFF).
+                    # Isolated so a transient HA read can never break the main actuation.
+                    if self._ev_surplus is not None and self.ha_client is not None:
+                        try:
+                            await self._ev_surplus.run(
+                                self.ha_client, time.time(), shadow=self.config.shadow_mode
+                            )
+                        except Exception as ev_exc:
+                            logger.warning("EV surplus controller error: %s", ev_exc)
 
                     # Fix Issue 0: Await expected coroutine properly
                     profile_results = await self.dispatcher.execute(decision)
