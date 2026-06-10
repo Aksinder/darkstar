@@ -49,6 +49,13 @@ class EVSurplusConfig:
     deadband_w: float = 250.0  # hold when |headroom| is within this (anti-jitter)
     min_charge_current_a: float = 5.0  # global safety floor; per-charger min_current_a wins if higher
     default_voltage_v: float = 230.0
+    # Move in deliberately CHUNKY steps so the current isn't nudged constantly: the commanded
+    # amps are snapped to this grid (e.g. 6,8,10,... at 2 A), and the write-guard only rewrites
+    # when the target crosses a step. Bigger = fewer changes, coarser solar tracking.
+    current_step_a: float = 2.0
+    # On/off hysteresis: a charger that's OFF needs this much MORE than its min before it
+    # starts; once ON it keeps running down to its true min. Stops flapping at the threshold.
+    start_hysteresis: float = 0.15  # fraction of min_on power (e.g. 15% headroom to start)
 
 
 @dataclass
@@ -111,7 +118,7 @@ class WriteGuardConfig:
     non-dynamic limits wear flash; avoid over-frequent current changes for the car's sake).
     """
 
-    min_step_a: float = 1.0  # only rewrite when the target differs by >= this many amps
+    min_step_a: float = 2.0  # only rewrite when the target differs by >= this many amps
     min_interval_s: float = 90.0  # ...and at least this long since the last write
 
 
@@ -237,23 +244,32 @@ def compute_ev_surplus(
 
     # --- Distribute the budget across the auto chargers, greedy by priority ---
     remaining_w = target_total_w
+    step = max(0.0, cfg.current_step_a)
     for c in sorted(auto, key=lambda x: (x.priority, x.id)):
         min_on_w = _charger_min_on_w(c, cfg)
         max_w = _charger_max_w(c)
-        if remaining_w < min_on_w:
+        # Hysteresis: a charger that's currently OFF needs extra headroom to start; once ON
+        # it keeps going down to its true min. Avoids on/off flapping at the threshold.
+        currently_on = c.current_power_w > 100.0
+        threshold_w = min_on_w if currently_on else min_on_w * (1.0 + cfg.start_hysteresis)
+        if remaining_w < threshold_w:
             commands.append(
                 ChargerCommand(c.id, switch_on=False, set_current_a=0.0 if c.controllable else None,
-                               target_power_w=0.0, reason=f"off: budget {remaining_w:.0f}<min {min_on_w:.0f}; {why}")
+                               target_power_w=0.0, reason=f"off: budget {remaining_w:.0f}<thr {threshold_w:.0f}; {why}")
             )
             continue
         give_w = min(remaining_w, max_w)
         remaining_w -= give_w
         if c.controllable:
             amps = give_w / (c.voltage_v * c.phases)
+            # Snap to the chunky step grid, then clamp so we move in larger steps and
+            # don't keep re-tweaking the current.
+            if step > 0:
+                amps = round(amps / step) * step
             amps = max(c.min_current_a, min(c.max_current_a, amps))
             commands.append(
                 ChargerCommand(c.id, switch_on=True, set_current_a=round(amps, 1),
-                               target_power_w=give_w, reason=f"on {amps:.1f}A; {why}")
+                               target_power_w=amps * c.voltage_v * c.phases, reason=f"on {amps:.1f}A; {why}")
             )
         else:
             # Binary charger: on at its fixed draw (can't throttle).
