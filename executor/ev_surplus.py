@@ -95,6 +95,48 @@ class ChargerCommand:
     reason: str
 
 
+@dataclass
+class WriteGuardConfig:
+    """Rate-limit charge-current writes.
+
+    Easee's ``set_charger_dynamic_limit`` (dynamicChargerCurrent) is stored in VOLATILE
+    memory and is flash-safe — it is the non-dynamic ``max``/circuit limits that wear the
+    flash, and Darkstar never writes those. But Easee still warns that "some cars might get
+    upset if the current is changed too frequently", and Tesla current writes hit the car's
+    API / wake it. So we only actuate when the target moves by a real step AND a minimum
+    interval has elapsed. Exception: a STOP (target 0 / off) is always allowed immediately
+    so home-battery protection is never delayed.
+
+    Ref: developer.easee.com/docs/current-limits-and-control (dynamic = volatile, flash-safe;
+    non-dynamic limits wear flash; avoid over-frequent current changes for the car's sake).
+    """
+
+    min_step_a: float = 1.0  # only rewrite when the target differs by >= this many amps
+    min_interval_s: float = 90.0  # ...and at least this long since the last write
+
+
+def should_write_current(
+    last_a: float | None,
+    last_write_ts: float | None,
+    new_a: float,
+    now_ts: float,
+    cfg: WriteGuardConfig,
+) -> bool:
+    """True if the new charge-current target should be written this cycle.
+
+    First write always proceeds. A stop (new_a <= 0) is always allowed (safety — never
+    delay backing off the home battery). Otherwise require both a step >= ``min_step_a``
+    and >= ``min_interval_s`` since the last write.
+    """
+    if last_a is None or last_write_ts is None:
+        return True
+    if new_a <= 0.0 < last_a:
+        return True  # stopping / dropping to zero — act immediately
+    if abs(new_a - last_a) < cfg.min_step_a:
+        return False
+    return (now_ts - last_write_ts) >= cfg.min_interval_s
+
+
 def _charger_max_w(c: ChargerState) -> float:
     return c.max_current_a * c.voltage_v * c.phases
 

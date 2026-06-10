@@ -208,3 +208,40 @@ class TestManualOverride:
         by_id = {c.id: c for c in out}
         assert by_id["tesla"].set_current_a == tesla.max_current_a  # forced
         assert by_id["easee"].switch_on is True  # auto still charges on the surplus
+
+
+class TestWriteGuard:
+    """Rate-limit charge-current writes to protect the car (and be conservative)."""
+
+    def _cfg(self):
+        from executor.ev_surplus import WriteGuardConfig
+
+        return WriteGuardConfig(min_step_a=1.0, min_interval_s=90.0)
+
+    def test_first_write_always_proceeds(self):
+        from executor.ev_surplus import should_write_current
+
+        assert should_write_current(None, None, 10.0, 1000.0, self._cfg()) is True
+
+    def test_small_step_is_skipped(self):
+        from executor.ev_surplus import should_write_current
+
+        # 10.0 -> 10.5 (<1 A) => no write even after a long interval.
+        assert should_write_current(10.0, 0.0, 10.5, 10_000.0, self._cfg()) is False
+
+    def test_too_soon_is_skipped(self):
+        from executor.ev_surplus import should_write_current
+
+        # Big change but only 30 s since last write => wait.
+        assert should_write_current(10.0, 1000.0, 16.0, 1030.0, self._cfg()) is False
+
+    def test_real_change_after_interval_writes(self):
+        from executor.ev_surplus import should_write_current
+
+        assert should_write_current(10.0, 1000.0, 16.0, 1100.0, self._cfg()) is True
+
+    def test_stop_bypasses_interval(self):
+        from executor.ev_surplus import should_write_current
+
+        # Dropping to 0 (stop) is allowed immediately even 1 s after the last write.
+        assert should_write_current(16.0, 1000.0, 0.0, 1001.0, self._cfg()) is True
