@@ -1,3 +1,7 @@
+## dev-20260610.1804 — 2026-06-10 18:06
+
+- feat(executor): wire EV surplus controller into the engine (increment 2)
+
 ## dev-20260609.0505 — 2026-06-09 05:06
 
 - fix(load-priority): keep the reliability floor for dynamic-percentile heaters
