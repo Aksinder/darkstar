@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 from collections.abc import Coroutine  # noqa: TC003
 from datetime import UTC, datetime
@@ -261,19 +260,19 @@ async def get_system_health() -> SystemHealthResponse:
             size_mb=0.0, slot_plans_count=0, slot_observations_count=0, health="error"
         )
 
-    # 3. Planner Stats
+    # 3. Planner Stats — read the LIVE in-memory scheduler status (same source as
+    # /api/scheduler/status). The old code read a data/scheduler_status.json file that is
+    # never written, so this always reported "unknown" even while the scheduler ran fine.
     planner_health = PlannerHealth(last_run=None, status="unknown", next_scheduled=None)
     try:
-        status_path = Path("data/scheduler_status.json")
-        if status_path.exists():
-            with status_path.open() as f:
-                data = json.load(f)
+        from backend.services.scheduler_service import scheduler_service
 
-            planner_health = PlannerHealth(
-                last_run=data.get("last_run_at"),
-                status=data.get("last_run_status", "unknown"),
-                next_scheduled=data.get("next_run_at"),
-            )
+        s = scheduler_service.status
+        planner_health = PlannerHealth(
+            last_run=s.last_run_at.isoformat() if s.last_run_at else None,
+            status=s.last_run_status or "unknown",
+            next_scheduled=s.next_run_at.isoformat() if s.next_run_at else None,
+        )
     except Exception as e:
         logger.error(f"Error getting planner stats: {e}")
 

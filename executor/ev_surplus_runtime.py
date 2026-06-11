@@ -11,6 +11,7 @@ Kept separate from the engine so the integration there is a two-line construct-a
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -172,33 +173,47 @@ class EVSurplusController:
         val = str(v).lower() if v else "auto"
         return val if val in ("auto", "force_on", "force_off") else "auto"
 
+    async def _read_charger(self, ha: Any, c: EVSurplusChargerCfg) -> ChargerState:
+        """Read one charger's live state (its 4 entity reads run concurrently)."""
+        power, plugged, at_home, override = await asyncio.gather(
+            self._read_f(ha, c.power_entity, 0.0),
+            self._read_on(ha, c.plug_entity, ("on", "true", "plugged", "connected"), True),
+            self._read_on(ha, c.home_entity, c.home_states, True),
+            self._read_override(ha, c.override_entity),
+        )
+        return ChargerState(
+            id=c.id, plugged=plugged, at_home=at_home, enabled=True,
+            current_power_w=power or 0.0, max_current_a=c.max_current_a,
+            min_current_a=c.min_current_a, phases=c.phases, voltage_v=c.voltage_v,
+            controllable=c.controllable, priority=c.priority, override=override,
+        )
+
     async def run(self, ha: Any, now_ts: float, shadow: bool = False) -> dict[str, Any]:
         """One control cycle. Returns a summary (for logging / UI)."""
         cfg = self.cfg
         if not cfg.enabled or not cfg.chargers:
             return {"enabled": False}
 
-        pv_w = (await self._read_f(ha, cfg.pv_power_entity, 0.0)) or 0.0
-        grid_w = (await self._read_f(ha, cfg.grid_power_entity, 0.0)) or 0.0
-        battery_w = (await self._read_f(ha, cfg.battery_power_entity, 0.0)) or 0.0
-        soc = (await self._read_f(ha, cfg.battery_soc_entity, 100.0)) or 100.0
-        price = (await self._read_f(ha, cfg.price_entity, 999.0)) or 999.0
-        remaining_solar = (await self._read_f(ha, cfg.remaining_solar_entity, 0.0)) or 0.0
-
-        states: list[ChargerState] = []
-        for c in cfg.chargers:
-            power = (await self._read_f(ha, c.power_entity, 0.0)) or 0.0
-            plugged = await self._read_on(ha, c.plug_entity, ("on", "true", "plugged", "connected"), True)
-            at_home = await self._read_on(ha, c.home_entity, c.home_states, True)
-            override = await self._read_override(ha, c.override_entity)
-            states.append(
-                ChargerState(
-                    id=c.id, plugged=plugged, at_home=at_home, enabled=True,
-                    current_power_w=power, max_current_a=c.max_current_a,
-                    min_current_a=c.min_current_a, phases=c.phases, voltage_v=c.voltage_v,
-                    controllable=c.controllable, priority=c.priority, override=override,
-                )
-            )
+        # Read all sources AND all chargers concurrently. Serial awaits here meant ~14 HA
+        # REST round-trips per tick (~5 s), which loaded the HA API and starved the in-process
+        # web server (slow dashboard). asyncio.gather collapses that to ~one round-trip latency.
+        src: tuple[float | None, ...] = await asyncio.gather(
+            self._read_f(ha, cfg.pv_power_entity, 0.0),
+            self._read_f(ha, cfg.grid_power_entity, 0.0),
+            self._read_f(ha, cfg.battery_power_entity, 0.0),
+            self._read_f(ha, cfg.battery_soc_entity, 100.0),
+            self._read_f(ha, cfg.price_entity, 999.0),
+            self._read_f(ha, cfg.remaining_solar_entity, 0.0),
+        )
+        states: list[ChargerState] = list(
+            await asyncio.gather(*(self._read_charger(ha, c) for c in cfg.chargers))
+        )
+        pv_w = src[0] or 0.0
+        grid_w = src[1] or 0.0
+        battery_w = src[2] or 0.0
+        soc = src[3] if src[3] is not None else 100.0
+        price = src[4] if src[4] is not None else 999.0
+        remaining_solar = src[5] or 0.0
 
         inputs = EVSurplusInputs(
             pv_w=pv_w, grid_w=grid_w, battery_w=battery_w, battery_soc_percent=soc,
