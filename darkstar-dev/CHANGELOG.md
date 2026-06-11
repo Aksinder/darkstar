@@ -1,3 +1,7 @@
+## dev-20260611.0117 — 2026-06-11 01:20
+
+- fix(executor+api): EV controller slow-tick (concurrent reads) + planner-status reporting
+
 ## dev-20260610.1804 — 2026-06-10 18:06
 
 - feat(executor): wire EV surplus controller into the engine (increment 2)
