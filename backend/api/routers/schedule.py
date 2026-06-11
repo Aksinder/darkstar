@@ -56,6 +56,11 @@ async def get_scheduler_status():
         "last_training_at": status.last_training_at.isoformat()
         if status.last_training_at
         else None,
+        # Alias the frontend reads for the Activity Log "ML Train: <time>" badge — without
+        # it the timestamp never showed even though training ran.
+        "ml_training_last_run_at": status.last_training_at.isoformat()
+        if status.last_training_at
+        else None,
         "last_training_status": status.last_training_status,
     }
 
