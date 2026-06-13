@@ -50,7 +50,8 @@ class FmbSocConfig:
     # Seeding / bounds
     floor_soc: float = 0.0
     initial_soc: float = 50.0  # conservative seed when no persisted state exists
-    seed_soc: float | None = None  # one-shot manual correction: snap to this when it changes
+    seed_soc: float | None = None  # one-shot config reseed: snap to this when it changes
+    correction_threshold: float = 1.0  # adopt a user input_number change of at least this many %
     max_step_kwh: float = 25.0  # reject implausible counter jumps (≈ full pack in one tick)
 
 
@@ -67,6 +68,7 @@ class FmbSocState:
     full_latched: bool = False
     idle_full_since_ts: float | None = None
     applied_seed: float | None = None  # last seed_soc value already applied (so it fires once)
+    last_correction_value: float | None = None  # last seen user input_number value (edge-detect)
 
 
 @dataclass
@@ -80,6 +82,7 @@ class FmbSocInputs:
     charger_enabled: bool  # the Easee enable switch is on
     dynamic_limit_a: float | None = None  # offered current (None = unknown → trust taper)
     status: str | None = None  # Easee status string
+    correction_value: float | None = None  # current value of the user-editable input_number
 
 
 def initial_state(cfg: FmbSocConfig) -> FmbSocState:
@@ -157,6 +160,26 @@ def update_fmb_soc(
         )
         seed_applied = cfg.seed_soc
 
+    # Manual correction channel: a user-editable input_number the operator sets to correct the
+    # estimate. We edge-detect changes (the estimator never writes it back, so any change is the
+    # user's). The first observation is only recorded — never adopted — so a stale value at
+    # startup can't hijack the estimate. A genuine change snaps and re-arms the full anchor.
+    corr_applied: float | None = None
+    if inp.correction_value is not None:
+        if state.last_correction_value is None:
+            state = replace(state, last_correction_value=inp.correction_value)
+        elif abs(inp.correction_value - state.last_correction_value) >= cfg.correction_threshold:
+            state = replace(
+                state,
+                soc_pct=_clamp(inp.correction_value, cfg.floor_soc, 100.0),
+                last_correction_value=inp.correction_value,
+                energy_since_anchor_kwh=0.0,
+                full_latched=False,
+                last_full_ts=None,
+                idle_full_since_ts=None,
+            )
+            corr_applied = inp.correction_value
+
     # First-ever tick: just establish the counter/time baseline, no drift.
     if state.last_ts is None or state.last_energy_kwh is None:
         seeded = replace(
@@ -169,6 +192,8 @@ def update_fmb_soc(
         init_dbg: dict[str, Any] = {"reason": "init", "soc": seeded.soc_pct, "rate": learned}
         if seed_applied is not None:
             init_dbg["seeded"] = seed_applied
+        if corr_applied is not None:
+            init_dbg["corrected"] = corr_applied
         return seeded, init_dbg
 
     gained_kwh = _energy_gain_kwh(state, inp, cfg)
@@ -238,6 +263,7 @@ def update_fmb_soc(
         full_latched=full_latched,
         idle_full_since_ts=idle_since,
         applied_seed=state.applied_seed,
+        last_correction_value=state.last_correction_value,
     )
     debug: dict[str, Any] = {
         "soc": new_state.soc_pct,
@@ -252,4 +278,6 @@ def update_fmb_soc(
         debug["learned"] = learned_event
     if seed_applied is not None:
         debug["seeded"] = seed_applied
+    if corr_applied is not None:
+        debug["corrected"] = corr_applied
     return new_state, debug
