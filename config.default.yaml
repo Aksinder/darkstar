@@ -675,6 +675,11 @@ executor:
     enabled_switch_entity: ""              # e.g. switch.easee_niska_it_charger_enabled
     dynamic_limit_entity: ""               # e.g. sensor.easee_niska_it_dynamic_charger_limit
     status_entity: ""                      # e.g. sensor.easee_niska_it_status
+    correction_entity: ""                  # user-editable input_number (e.g. input_number.fmb_soc):
+                                           # set it in HA to correct the estimate; the estimator snaps
+                                           # to it on change and dead-reckons from there. The estimator
+                                           # never writes it back. (Disable any old automation that
+                                           # drives this helper, or it will fight the manual value.)
     publish_entity_id: sensor.darkstar_fmb_soc_estimate
     publish_rate_entity_id: sensor.darkstar_fmb_consumption_rate
 

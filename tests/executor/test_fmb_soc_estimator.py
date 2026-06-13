@@ -267,6 +267,54 @@ def test_seed_on_first_tick():
     assert out.applied_seed == 40.0
 
 
+def test_correction_first_observation_records_without_snapping():
+    """A stale input_number at startup must NOT hijack the estimate."""
+    cfg = _cfg()
+    st = FmbSocState(
+        soc_pct=50.0, last_energy_kwh=100.0, last_ts=0.0, learned_rate_kwh_per_day=5.6
+    )
+    # Pass an explicit stale 100 as the first-seen correction value.
+    inp = FmbSocInputs(
+        now_ts=60.0, lifetime_energy_kwh=100.0, power_w=0.0, plugged=True,
+        charger_enabled=False, dynamic_limit_a=0.0, status=None, correction_value=100.0,
+    )
+    out, dbg = update_fmb_soc(st, inp, cfg)
+    assert "corrected" not in dbg
+    assert out.soc_pct < 51.0  # stayed near 50, did NOT jump to 100
+    assert out.last_correction_value == 100.0  # but recorded for next-change detection
+
+
+def test_correction_user_change_snaps():
+    cfg = _cfg(correction_threshold=1.0)
+    st = FmbSocState(
+        soc_pct=50.0, last_energy_kwh=100.0, last_ts=0.0, learned_rate_kwh_per_day=5.6,
+        last_correction_value=100.0,  # already saw the stale 100
+    )
+    inp = FmbSocInputs(
+        now_ts=60.0, lifetime_energy_kwh=100.0, power_w=0.0, plugged=True,
+        charger_enabled=False, dynamic_limit_a=0.0, status=None, correction_value=40.0,
+    )
+    out, dbg = update_fmb_soc(st, inp, cfg)
+    assert dbg["corrected"] == 40.0
+    assert abs(out.soc_pct - 40.0) < 0.5
+    assert out.last_correction_value == 40.0
+    assert out.energy_since_anchor_kwh == 0.0  # anchor re-armed
+
+
+def test_correction_below_threshold_ignored():
+    cfg = _cfg(correction_threshold=1.0)
+    st = FmbSocState(
+        soc_pct=60.0, last_energy_kwh=100.0, last_ts=0.0, learned_rate_kwh_per_day=5.6,
+        last_correction_value=40.0,
+    )
+    inp = FmbSocInputs(
+        now_ts=60.0, lifetime_energy_kwh=100.0, power_w=0.0, plugged=True,
+        charger_enabled=False, dynamic_limit_a=0.0, status=None, correction_value=40.5,
+    )
+    _out, dbg = update_fmb_soc(st, inp, cfg)
+    assert "corrected" not in dbg  # 0.5 < threshold 1.0 → noise, ignored
+
+
 def test_low_offer_does_not_false_full():
     """If we are NOT offering meaningful current, a 0 W reading must not be read as full."""
     cfg = _cfg(full_offered_min_a=5.0, full_idle_min_s=0.0)

@@ -41,6 +41,7 @@ class FmbSocRuntimeConfig:
     enabled_switch_entity: str | None = None
     dynamic_limit_entity: str | None = None
     status_entity: str | None = None
+    correction_entity: str | None = None  # user-editable input_number to correct the estimate
     publish_entity_id: str = "sensor.darkstar_fmb_soc_estimate"
     publish_rate_entity_id: str = "sensor.darkstar_fmb_consumption_rate"
     state_path: str = "data/fmb_soc_state.json"
@@ -87,6 +88,7 @@ def parse_fmb_soc_config(executor_data: dict[str, Any]) -> FmbSocRuntimeConfig |
         enabled_switch_entity=raw.get("enabled_switch_entity") or None,
         dynamic_limit_entity=raw.get("dynamic_limit_entity") or None,
         status_entity=raw.get("status_entity") or None,
+        correction_entity=raw.get("correction_entity") or None,
         publish_entity_id=raw.get("publish_entity_id") or "sensor.darkstar_fmb_soc_estimate",
         publish_rate_entity_id=(
             raw.get("publish_rate_entity_id") or "sensor.darkstar_fmb_consumption_rate"
@@ -152,22 +154,26 @@ class FmbSocEstimator:
         if self._state is None:
             self._state = self._load_state()
 
-        energy, power, plug, sw, limit, status = await asyncio.gather(
+        # 7 reads concurrently. asyncio.gather's precise typing tops out at 6 args, so cast the
+        # results past that (the reads are heterogeneous: floats, bools, a string).
+        reads = await asyncio.gather(
             self._read_f(ha, cfg.lifetime_energy_entity),
             self._read_f(ha, cfg.power_entity, 0.0),
             self._read_bool(ha, cfg.plug_entity, True),
             self._read_bool(ha, cfg.enabled_switch_entity, False),
             self._read_f(ha, cfg.dynamic_limit_entity),
             self._read_s(ha, cfg.status_entity),
+            self._read_f(ha, cfg.correction_entity),
         )
         inp = FmbSocInputs(
             now_ts=now_ts,
-            lifetime_energy_kwh=energy,
-            power_w=power or 0.0,
-            plugged=plug,
-            charger_enabled=sw,
-            dynamic_limit_a=limit,
-            status=status,
+            lifetime_energy_kwh=cast("float | None", reads[0]),
+            power_w=cast("float", reads[1]) or 0.0,
+            plugged=cast("bool", reads[2]),
+            charger_enabled=cast("bool", reads[3]),
+            dynamic_limit_a=cast("float | None", reads[4]),
+            status=cast("str | None", reads[5]),
+            correction_value=cast("float | None", reads[6]),
         )
         new_state, dbg = update_fmb_soc(self._state, inp, cfg.pure)
         self._state = new_state
