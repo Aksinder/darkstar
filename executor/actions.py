@@ -292,6 +292,35 @@ class HAClient:
             return state.get("state")
         return None
 
+    async def set_state(
+        self, entity_id: str, state: str, attributes: dict[str, Any] | None = None
+    ) -> bool:
+        """Publish an entity state to HA via POST /api/states/<entity_id>.
+
+        Used to surface Darkstar-computed sensors (e.g. the FMB SoC estimate) that have
+        no backing integration. Returns False on failure (graceful — a missed publish is
+        recoverable next tick) rather than raising.
+        """
+        if not entity_id or entity_id.strip().lower() in ("", "none"):
+            logger.error("set_state called with invalid entity_id: %r", entity_id)
+            return False
+        body: dict[str, Any] = {"state": state, "attributes": attributes or {}}
+
+        async def _post() -> None:
+            session = await self._get_session()
+            async with session.post(
+                f"{self.base_url}/api/states/{entity_id}",
+                json=body,
+            ) as response:
+                response.raise_for_status()
+
+        try:
+            await _retry_with_backoff(_post, max_retries=2, base_delay=1.0)
+            return True
+        except (aiohttp.ClientError, TimeoutError, HACallError) as e:
+            logger.warning("Failed to publish state for %s: %s", entity_id, e)
+            return False
+
     async def call_service(
         self,
         domain: str,
