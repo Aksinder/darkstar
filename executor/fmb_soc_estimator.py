@@ -50,6 +50,7 @@ class FmbSocConfig:
     # Seeding / bounds
     floor_soc: float = 0.0
     initial_soc: float = 50.0  # conservative seed when no persisted state exists
+    seed_soc: float | None = None  # one-shot manual correction: snap to this when it changes
     max_step_kwh: float = 25.0  # reject implausible counter jumps (≈ full pack in one tick)
 
 
@@ -65,6 +66,7 @@ class FmbSocState:
     learned_rate_kwh_per_day: float = 5.6
     full_latched: bool = False
     idle_full_since_ts: float | None = None
+    applied_seed: float | None = None  # last seed_soc value already applied (so it fires once)
 
 
 @dataclass
@@ -139,6 +141,22 @@ def update_fmb_soc(
         cfg.max_consumption_kwh_per_day,
     )
 
+    # Manual one-shot reseed: when cfg.seed_soc changes value, snap to it once and re-arm
+    # the full-anchor (the learned consumption rate is kept). Lets the user correct the
+    # dead-reckoned estimate (e.g. from the car's range readout) without a code change.
+    seed_applied: float | None = None
+    if cfg.seed_soc is not None and state.applied_seed != cfg.seed_soc:
+        state = replace(
+            state,
+            soc_pct=_clamp(cfg.seed_soc, cfg.floor_soc, 100.0),
+            applied_seed=cfg.seed_soc,
+            energy_since_anchor_kwh=0.0,
+            full_latched=False,
+            last_full_ts=None,
+            idle_full_since_ts=None,
+        )
+        seed_applied = cfg.seed_soc
+
     # First-ever tick: just establish the counter/time baseline, no drift.
     if state.last_ts is None or state.last_energy_kwh is None:
         seeded = replace(
@@ -148,7 +166,10 @@ def update_fmb_soc(
             last_ts=inp.now_ts,
             learned_rate_kwh_per_day=learned,
         )
-        return seeded, {"reason": "init", "soc": seeded.soc_pct, "rate": learned}
+        init_dbg: dict[str, Any] = {"reason": "init", "soc": seeded.soc_pct, "rate": learned}
+        if seed_applied is not None:
+            init_dbg["seeded"] = seed_applied
+        return seeded, init_dbg
 
     gained_kwh = _energy_gain_kwh(state, inp, cfg)
     charging = inp.power_w > cfg.charging_power_w or gained_kwh > 0.0
@@ -216,6 +237,7 @@ def update_fmb_soc(
         learned_rate_kwh_per_day=round(learned_out, 4),
         full_latched=full_latched,
         idle_full_since_ts=idle_since,
+        applied_seed=state.applied_seed,
     )
     debug: dict[str, Any] = {
         "soc": new_state.soc_pct,
@@ -228,4 +250,6 @@ def update_fmb_soc(
     }
     if learned_event is not None:
         debug["learned"] = learned_event
+    if seed_applied is not None:
+        debug["seeded"] = seed_applied
     return new_state, debug
