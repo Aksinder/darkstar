@@ -1,3 +1,7 @@
+## dev-20260613.1844 — 2026-06-13 18:46
+
+- feat(executor): FMB SoC manual correction via user-editable input_number
+
 ## dev-20260613.1834 — 2026-06-13 18:36
 
 - feat(executor): FMB SoC estimator one-shot manual reseed (seed_soc)
