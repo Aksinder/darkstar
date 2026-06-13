@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, cast
 
+from .actions import HACallError
 from .fmb_soc_estimator import (
     FmbSocConfig,
     FmbSocInputs,
@@ -42,7 +43,9 @@ class FmbSocRuntimeConfig:
     dynamic_limit_entity: str | None = None
     status_entity: str | None = None
     correction_entity: str | None = None  # user-editable input_number to correct the estimate
-    publish_entity_id: str = "sensor.darkstar_fmb_soc_estimate"
+    writeback_entity: str | None = None  # write the SoC back into this input_number (feeds the
+    # operator's own FMB dashboard/template sensors); set "" to disable
+    publish_entity_id: str = "sensor.darkstar_fmb_soc_estimate"  # set "" to skip the SoC sensor
     publish_rate_entity_id: str = "sensor.darkstar_fmb_consumption_rate"
     state_path: str = "data/fmb_soc_state.json"
     save_interval_s: float = 120.0
@@ -73,11 +76,17 @@ def parse_fmb_soc_config(executor_data: dict[str, Any]) -> FmbSocRuntimeConfig |
         min_consumption_kwh_per_day=float(raw.get("min_consumption_kwh_per_day", 0.5)),
         max_consumption_kwh_per_day=float(raw.get("max_consumption_kwh_per_day", 20.0)),
         min_anchor_energy_kwh=float(raw.get("min_anchor_energy_kwh", 2.0)),
+        min_anchor_days=float(raw.get("min_anchor_days", 0.04)),
+        charging_power_w=float(raw.get("charging_power_w", 200.0)),
+        full_idle_power_w=float(raw.get("full_idle_power_w", 200.0)),
         full_idle_min_s=float(raw.get("full_idle_min_s", 300.0)),
         full_offered_min_a=float(raw.get("full_offered_min_a", 5.0)),
+        full_release_soc=float(raw.get("full_release_soc", 97.0)),
         floor_soc=float(raw.get("floor_soc", 0.0)),
         initial_soc=float(raw.get("initial_soc", 50.0)),
         seed_soc=_f(raw.get("seed_soc")),
+        correction_threshold=float(raw.get("correction_threshold", 1.0)),
+        max_step_kwh=float(raw.get("max_step_kwh", 25.0)),
     )
     return FmbSocRuntimeConfig(
         enabled=enabled,
@@ -89,7 +98,10 @@ def parse_fmb_soc_config(executor_data: dict[str, Any]) -> FmbSocRuntimeConfig |
         dynamic_limit_entity=raw.get("dynamic_limit_entity") or None,
         status_entity=raw.get("status_entity") or None,
         correction_entity=raw.get("correction_entity") or None,
-        publish_entity_id=raw.get("publish_entity_id") or "sensor.darkstar_fmb_soc_estimate",
+        writeback_entity=raw.get("writeback_entity") or None,
+        publish_entity_id=raw.get("publish_entity_id")
+        if raw.get("publish_entity_id") is not None
+        else "sensor.darkstar_fmb_soc_estimate",
         publish_rate_entity_id=(
             raw.get("publish_rate_entity_id") or "sensor.darkstar_fmb_consumption_rate"
         ),
@@ -103,17 +115,37 @@ class FmbSocEstimator:
 
     def __init__(self, cfg: FmbSocRuntimeConfig):
         self.cfg = cfg
+        # A sole-writer helper cannot also be an independent human correction channel: the
+        # estimator would read its own writes back as "corrections" (oscillation). Refuse it.
+        if cfg.correction_entity and cfg.correction_entity == cfg.writeback_entity:
+            logger.error(
+                "FMB SoC: correction_entity == writeback_entity (%s); disabling correction to "
+                "avoid self-adoption. Use a SEPARATE helper for manual correction, or seed_soc.",
+                cfg.writeback_entity,
+            )
+            cfg.correction_entity = None
         self._state: FmbSocState | None = None
         self._last_save: float = 0.0
+        self._last_written: int | None = None  # last integer % written to the writeback input_number
 
     # --- persistence ---
     def _load_state(self) -> FmbSocState:
+        path = Path(self.cfg.state_path)
+        if not path.exists():
+            logger.info("FMB SoC: no persisted state, seeding at %.0f%%", self.cfg.pure.initial_soc)
+            return initial_state(self.cfg.pure)
         try:
-            with Path(self.cfg.state_path).open(encoding="utf-8") as fh:
+            with path.open(encoding="utf-8") as fh:
                 data = cast("dict[str, Any]", json.load(fh))
-            return FmbSocState(**data)
-        except (OSError, ValueError, TypeError):
-            logger.info("FMB SoC: no valid persisted state, seeding at %.0f%%", self.cfg.pure.initial_soc)
+            # Drop unknown keys so loading is non-destructive across schema changes in BOTH
+            # directions (a rollback to an older image must not lose the persisted SoC).
+            known = {f.name for f in fields(FmbSocState)}
+            return FmbSocState(**{k: v for k, v in data.items() if k in known})
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(
+                "FMB SoC: persisted state unreadable (%s); reseeding at %.0f%% — learned rate lost",
+                e, self.cfg.pure.initial_soc,
+            )
             return initial_state(self.cfg.pure)
 
     def _save_state(self, state: FmbSocState) -> None:
@@ -147,7 +179,9 @@ class FmbSocEstimator:
         return str(v) if v is not None else None
 
     async def run(self, ha: Any, now_ts: float, shadow: bool = False) -> dict[str, Any]:
-        """One estimator cycle. Publishing happens even in shadow mode (it is observational)."""
+        """One estimator cycle. The Darkstar sensor publish is observational and runs even in
+        shadow mode; the writeback into the operator's input_number is a mutation and is skipped
+        in shadow (see _writeback)."""
         cfg = self.cfg
         if not cfg.enabled:
             return {"enabled": False}
@@ -173,12 +207,13 @@ class FmbSocEstimator:
             charger_enabled=cast("bool", reads[3]),
             dynamic_limit_a=cast("float | None", reads[4]),
             status=cast("str | None", reads[5]),
-            correction_value=cast("float | None", reads[6]),
+            correction_value=self._dedupe_correction(cast("float | None", reads[6])),
         )
         new_state, dbg = update_fmb_soc(self._state, inp, cfg.pure)
         self._state = new_state
 
         await self._publish(ha, new_state)
+        await self._writeback(ha, new_state, shadow)
 
         if (now_ts - self._last_save) >= cfg.save_interval_s or bool(dbg.get("learned")):
             self._save_state(new_state)
@@ -194,21 +229,47 @@ class FmbSocEstimator:
         )
         return {"enabled": True, "soc": new_state.soc_pct, "debug": dbg}
 
+    def _dedupe_correction(self, value: float | None) -> float | None:
+        """Suppress a correction reading that equals our own last writeback (echo). Belt-and-
+        suspenders alongside the __init__ same-entity guard, for shared-helper misconfigurations."""
+        if value is not None and self._last_written is not None and round(value) == self._last_written:
+            return None
+        return value
+
+    async def _writeback(self, ha: Any, st: FmbSocState, shadow: bool) -> None:
+        """Write the SoC into the operator's input_number so their own FMB sensors/dashboard
+        read it. Only on an integer-% change (the helper's step is 1) to avoid per-tick churn.
+        The estimator is the SOLE writer — disable any old automation that also writes it. This
+        MUTATES operator state, so it is skipped in shadow mode (unlike the observational publish)."""
+        if not self.cfg.writeback_entity or shadow:
+            return
+        iv = round(st.soc_pct)
+        if iv == self._last_written:
+            return
+        try:
+            await ha.call_service(
+                "input_number", "set_value", self.cfg.writeback_entity, {"value": iv}
+            )
+            self._last_written = iv
+        except HACallError as e:
+            logger.warning("FMB SoC: writeback to %s failed: %s", self.cfg.writeback_entity, e)
+
     async def _publish(self, ha: Any, st: FmbSocState) -> None:
-        await ha.set_state(
-            self.cfg.publish_entity_id,
-            str(round(st.soc_pct, 1)),
-            {
-                "unit_of_measurement": "%",
-                "device_class": "battery",
-                "state_class": "measurement",
-                "friendly_name": "FMB uppskattad SoC",
-                "icon": "mdi:battery-charging",
-                "learned_rate_kwh_per_day": round(st.learned_rate_kwh_per_day, 2),
-                "energy_since_full_kwh": round(st.energy_since_anchor_kwh, 2),
-                "full": st.full_latched,
-            },
-        )
+        if self.cfg.publish_entity_id:
+            await ha.set_state(
+                self.cfg.publish_entity_id,
+                str(round(st.soc_pct, 1)),
+                {
+                    "unit_of_measurement": "%",
+                    "device_class": "battery",
+                    "state_class": "measurement",
+                    "friendly_name": "FMB uppskattad SoC",
+                    "icon": "mdi:battery-charging",
+                    "learned_rate_kwh_per_day": round(st.learned_rate_kwh_per_day, 2),
+                    "energy_since_full_kwh": round(st.energy_since_anchor_kwh, 2),
+                    "full": st.full_latched,
+                },
+            )
         await ha.set_state(
             self.cfg.publish_rate_entity_id,
             str(round(st.learned_rate_kwh_per_day, 2)),

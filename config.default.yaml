@@ -675,12 +675,16 @@ executor:
     enabled_switch_entity: ""              # e.g. switch.easee_niska_it_charger_enabled
     dynamic_limit_entity: ""               # e.g. sensor.easee_niska_it_dynamic_charger_limit
     status_entity: ""                      # e.g. sensor.easee_niska_it_status
-    correction_entity: ""                  # user-editable input_number (e.g. input_number.fmb_soc):
-                                           # set it in HA to correct the estimate; the estimator snaps
-                                           # to it on change and dead-reckons from there. The estimator
-                                           # never writes it back. (Disable any old automation that
-                                           # drives this helper, or it will fight the manual value.)
-    publish_entity_id: sensor.darkstar_fmb_soc_estimate
+    correction_entity: ""                  # OPTIONAL user-editable input_number to correct the
+                                           # estimate (snap-on-change). MUST be a SEPARATE helper from
+                                           # writeback_entity — never the same one, or the estimator
+                                           # reads its own writes back as corrections (auto-disabled if
+                                           # equal). For config-driven correction, prefer seed_soc.
+    writeback_entity: ""                   # OPTIONAL: write the SoC into this input_number so the
+                                           # operator's own FMB template sensors/dashboard read it
+                                           # (e.g. input_number.fmb_soc). Darkstar becomes the SOLE
+                                           # writer — disable any old automation driving it FIRST.
+    publish_entity_id: sensor.darkstar_fmb_soc_estimate  # set "" to skip the Darkstar SoC sensor
     publish_rate_entity_id: sensor.darkstar_fmb_consumption_rate
 
 # =============================================================================

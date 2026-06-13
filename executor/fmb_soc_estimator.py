@@ -108,7 +108,9 @@ def _energy_gain_kwh(state: FmbSocState, inp: FmbSocInputs, cfg: FmbSocConfig) -
     return raw * cfg.charge_efficiency
 
 
-def _is_full(state: FmbSocState, inp: FmbSocInputs, cfg: FmbSocConfig) -> tuple[bool, float | None]:
+def _is_full(
+    state: FmbSocState, inp: FmbSocInputs, cfg: FmbSocConfig, recently_charged: bool
+) -> tuple[bool, float | None]:
     """True-full detection: the car stopped accepting while we offered current, or status=completed.
 
     Returns (is_full, new_idle_full_since_ts). Deliberately does NOT treat an
@@ -119,12 +121,16 @@ def _is_full(state: FmbSocState, inp: FmbSocInputs, cfg: FmbSocConfig) -> tuple[
     if inp.status and inp.status.lower() in {s.lower() for s in cfg.full_status_values}:
         return True, state.idle_full_since_ts
 
+    # Taper-full requires a KNOWN offered current (an unavailable dynamic-limit reading must NOT
+    # be read as "offering 16 A"), and that we actually delivered energy this cycle — otherwise a
+    # plugged+enabled-but-paused charger would falsely latch full and snap the SoC to 100 %.
     offering = (
         inp.plugged
         and inp.charger_enabled
-        and (inp.dynamic_limit_a is None or inp.dynamic_limit_a >= cfg.full_offered_min_a)
+        and inp.dynamic_limit_a is not None
+        and inp.dynamic_limit_a >= cfg.full_offered_min_a
     )
-    tapered = offering and inp.power_w < cfg.full_idle_power_w
+    tapered = offering and inp.power_w < cfg.full_idle_power_w and recently_charged
     if not tapered:
         return False, None  # reset the taper timer
 
@@ -217,7 +223,10 @@ def update_fmb_soc(
     soc = _clamp(soc, cfg.floor_soc, 100.0)
 
     # Full detection + learning.
-    is_full, idle_since = _is_full(state, inp, cfg)
+    # "recently_charged" = we delivered energy since the last full anchor (a real charge session
+    # happened, then tapered) — gates the taper-full path against a never-charging paused charger.
+    recently_charged = energy_since_anchor > 0.1
+    is_full, idle_since = _is_full(state, inp, cfg, recently_charged)
     full_latched = state.full_latched
     last_full_ts = state.last_full_ts
     learned_out = learned
