@@ -110,8 +110,10 @@ def test_soc_clamped_0_100():
 
 def test_taper_while_offering_latches_full_and_sets_100():
     cfg = _cfg(full_idle_min_s=300.0)
+    # energy_since_anchor>0 = a charge session happened this cycle (required for taper-full).
     st = FmbSocState(
-        soc_pct=90.0, last_energy_kwh=10.0, last_ts=0.0, learned_rate_kwh_per_day=5.6
+        soc_pct=90.0, last_energy_kwh=10.0, last_ts=0.0, energy_since_anchor_kwh=5.0,
+        learned_rate_kwh_per_day=5.6,
     )
     # t=100: offering 16 A but ~0 W → taper timer starts (not yet full).
     s1, d1 = update_fmb_soc(st, _inp(100.0, energy=10.0, power=10.0, limit=16.0), cfg)
@@ -319,8 +321,35 @@ def test_low_offer_does_not_false_full():
     """If we are NOT offering meaningful current, a 0 W reading must not be read as full."""
     cfg = _cfg(full_offered_min_a=5.0, full_idle_min_s=0.0)
     st = FmbSocState(
-        soc_pct=70.0, last_energy_kwh=10.0, last_ts=0.0, learned_rate_kwh_per_day=5.6
+        soc_pct=70.0, last_energy_kwh=10.0, last_ts=0.0, energy_since_anchor_kwh=5.0,
+        learned_rate_kwh_per_day=5.6,
     )
     out, dbg = update_fmb_soc(st, _inp(60.0, energy=10.0, power=0.0, limit=0.0), cfg)
     assert dbg["full"] is False
     assert out.soc_pct < 100.0
+
+
+def test_unknown_offered_current_does_not_false_full():
+    """Plugged + enabled + paused, but dynamic-limit UNAVAILABLE (None) must NOT latch full."""
+    cfg = _cfg(full_offered_min_a=5.0, full_idle_min_s=300.0)
+    st = FmbSocState(
+        soc_pct=80.0, last_energy_kwh=10.0, last_ts=0.0, energy_since_anchor_kwh=5.0,
+        learned_rate_kwh_per_day=5.6,
+    )
+    # limit=None (sensor unavailable), plugged+enabled, power ~0, sustained well past 300 s.
+    s1, _ = update_fmb_soc(st, _inp(100.0, energy=10.0, power=5.0, limit=None), cfg)
+    s2, d2 = update_fmb_soc(s1, _inp(1000.0, energy=10.0, power=5.0, limit=None), cfg)
+    assert d2["full"] is False
+    assert s2.soc_pct < 100.0
+
+
+def test_no_recent_charge_does_not_false_full():
+    """Plugged + enabled + offering, but no energy delivered this cycle (paused) → not full."""
+    cfg = _cfg(full_offered_min_a=5.0, full_idle_min_s=300.0)
+    st = FmbSocState(
+        soc_pct=80.0, last_energy_kwh=10.0, last_ts=0.0, energy_since_anchor_kwh=0.0,
+        learned_rate_kwh_per_day=5.6,
+    )
+    s1, _ = update_fmb_soc(st, _inp(100.0, energy=10.0, power=5.0, limit=16.0), cfg)
+    _s2, d2 = update_fmb_soc(s1, _inp(1000.0, energy=10.0, power=5.0, limit=16.0), cfg)
+    assert d2["full"] is False
