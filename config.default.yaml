@@ -664,6 +664,10 @@ executor:
     prior_consumption_kwh_per_day: 5.6     # start guess (~20%/day of 28 kWh); learned from cycles
     learn_alpha: 0.3                       # EMA weight on each full-to-full observation
     initial_soc: 50                        # conservative seed when no persisted state exists
+    # seed_soc: 40                         # one-shot manual correction: set to snap the estimate to
+                                           # this %% (e.g. from the car's range readout), then it
+                                           # dead-reckons from there. Change the value to re-apply;
+                                           # config-only, no rebuild needed.
     full_idle_min_s: 300                   # taper-at-offered-current this long => car is full
     lifetime_energy_entity: ""             # e.g. sensor.easee_niska_it_lifetime_energy
     power_entity: ""                       # e.g. sensor.easee_niska_it_power

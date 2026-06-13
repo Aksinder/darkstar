@@ -76,6 +76,7 @@ def parse_fmb_soc_config(executor_data: dict[str, Any]) -> FmbSocRuntimeConfig |
         full_offered_min_a=float(raw.get("full_offered_min_a", 5.0)),
         floor_soc=float(raw.get("floor_soc", 0.0)),
         initial_soc=float(raw.get("initial_soc", 50.0)),
+        seed_soc=_f(raw.get("seed_soc")),
     )
     return FmbSocRuntimeConfig(
         enabled=enabled,

@@ -216,6 +216,57 @@ def test_full_latch_releases_on_unplug():
     assert out.full_latched is False
 
 
+def test_seed_soc_applies_once_then_drifts():
+    cfg = _cfg(seed_soc=40.0)
+    st = FmbSocState(
+        soc_pct=50.0, last_energy_kwh=100.0, last_ts=0.0, learned_rate_kwh_per_day=5.6
+    )
+    # Charger off / not offering current (idle, plugged but no surplus) → pure drift, no false-full.
+    # Tick 1: seed snaps 50 -> 40.
+    s1, d1 = update_fmb_soc(st, _inp(60.0, energy=100.0, power=0.0, enabled=False, limit=0.0), cfg)
+    assert d1["seeded"] == 40.0
+    assert abs(s1.soc_pct - 40.0) < 0.5  # 40 minus a tiny drift over 60 s
+    assert s1.applied_seed == 40.0
+    # Tick 2: same seed → no re-snap; it drifts down from 40, not reset to 40.
+    s2, d2 = update_fmb_soc(
+        s1, _inp(DAY + 60.0, energy=100.0, power=0.0, enabled=False, limit=0.0), cfg
+    )
+    assert "seeded" not in d2
+    assert s2.soc_pct < 40.0  # drifted, not re-seeded
+
+
+def test_seed_soc_change_reseeds():
+    cfg = _cfg(seed_soc=30.0)
+    st = FmbSocState(
+        soc_pct=80.0, last_energy_kwh=100.0, last_ts=0.0, learned_rate_kwh_per_day=5.6,
+        applied_seed=40.0,  # a previous seed already applied
+    )
+    out, dbg = update_fmb_soc(st, _inp(60.0, energy=100.0, power=0.0), cfg)
+    assert dbg["seeded"] == 30.0
+    assert abs(out.soc_pct - 30.0) < 0.5
+    assert out.applied_seed == 30.0
+
+
+def test_seed_soc_none_is_noop():
+    cfg = _cfg(seed_soc=None)
+    st = FmbSocState(
+        soc_pct=55.0, last_energy_kwh=100.0, last_ts=0.0, learned_rate_kwh_per_day=5.6
+    )
+    out, dbg = update_fmb_soc(st, _inp(60.0, energy=100.0, power=0.0), cfg)
+    assert "seeded" not in dbg
+    assert out.applied_seed is None
+
+
+def test_seed_on_first_tick():
+    cfg = _cfg(seed_soc=40.0)
+    st = initial_state(cfg)  # last_ts None → init tick
+    out, dbg = update_fmb_soc(st, _inp(1000.0, energy=100.0, power=0.0), cfg)
+    assert dbg["reason"] == "init"
+    assert dbg["seeded"] == 40.0
+    assert out.soc_pct == 40.0
+    assert out.applied_seed == 40.0
+
+
 def test_low_offer_does_not_false_full():
     """If we are NOT offering meaningful current, a 0 W reading must not be read as full."""
     cfg = _cfg(full_offered_min_a=5.0, full_idle_min_s=0.0)
