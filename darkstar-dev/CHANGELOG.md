@@ -1,3 +1,7 @@
+## dev-20260613.1757 — 2026-06-13 17:59
+
+- feat(executor): FMB SoC estimator (self-calibrating dead-reckoning)
+
 ## dev-20260611.0117 — 2026-06-11 01:20
 
 - fix(executor+api): EV controller slow-tick (concurrent reads) + planner-status reporting
