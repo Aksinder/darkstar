@@ -1,3 +1,7 @@
+## dev-20260613.1834 — 2026-06-13 18:36
+
+- feat(executor): FMB SoC estimator one-shot manual reseed (seed_soc)
+
 ## dev-20260613.1757 — 2026-06-13 17:59
 
 - feat(executor): FMB SoC estimator (self-calibrating dead-reckoning)
