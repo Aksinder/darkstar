@@ -1,3 +1,7 @@
+## dev-20260613.2147 — 2026-06-13 21:49
+
+- fix(executor): FMB SoC writeback review — shadow, call_service, false-full, self-adoption
+
 ## dev-20260613.1844 — 2026-06-13 18:46
 
 - feat(executor): FMB SoC manual correction via user-editable input_number
