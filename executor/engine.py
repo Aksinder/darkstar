@@ -108,6 +108,13 @@ class ExecutorEngine:
         _ev_surplus_cfg = parse_ev_surplus_config(self._full_config.get("executor", {}) or {})
         self._ev_surplus = EVSurplusController(_ev_surplus_cfg) if _ev_surplus_cfg else None
 
+        # FMB SoC estimator (dead-reckons the FMB's unknown SoC; default OFF). Publishes
+        # sensor.darkstar_fmb_soc_estimate which the planner reads as the FMB soc_sensor.
+        from .fmb_soc_runtime import FmbSocEstimator, parse_fmb_soc_config
+
+        _fmb_soc_cfg = parse_fmb_soc_config(self._full_config.get("executor", {}) or {})
+        self._fmb_soc = FmbSocEstimator(_fmb_soc_cfg) if _fmb_soc_cfg else None
+
         # Status tracking - MUST be initialized BEFORE profile loading (REV IP3 Phase 6 fix)
         self.status = ExecutorStatus(
             enabled=self.config.enabled,
@@ -1433,6 +1440,16 @@ class ExecutorEngine:
                             )
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)
+
+                    # FMB SoC estimator (publishes the dead-reckoned FMB SoC). Isolated so a
+                    # transient HA read can never break the main actuation.
+                    if self._fmb_soc is not None and self.ha_client is not None:
+                        try:
+                            await self._fmb_soc.run(
+                                self.ha_client, time.time(), shadow=self.config.shadow_mode
+                            )
+                        except Exception as fmb_exc:
+                            logger.warning("FMB SoC estimator error: %s", fmb_exc)
 
                     # Fix Issue 0: Await expected coroutine properly
                     profile_results = await self.dispatcher.execute(decision)

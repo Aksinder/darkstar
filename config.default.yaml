@@ -651,6 +651,29 @@ executor:
       #   home_entity: device_tracker.white_betty_location
       #   override_entity: input_select.darkstar_ev_tesla_mode
 
+  # FMB SoC estimator (default OFF). The FMB reports no real SoC, so we dead-reckon it:
+  # integrate delivered energy UP while charging (Easee lifetime-energy counter), drift it
+  # DOWN at a learned consumption rate while idle, and self-calibrate that rate from how much
+  # energy each full-to-full cycle takes. Publishes sensor.darkstar_fmb_soc_estimate — point
+  # the planner's FMB soc_sensor at it (and clear that charger's switch_entity so the planner
+  # stop-when-full no longer fights the surplus controller for the Easee enable switch).
+  fmb_soc_estimator:
+    enabled: false
+    capacity_kwh: 28                       # FMB battery
+    charge_efficiency: 0.9                 # grid -> battery loss
+    prior_consumption_kwh_per_day: 5.6     # start guess (~20%/day of 28 kWh); learned from cycles
+    learn_alpha: 0.3                       # EMA weight on each full-to-full observation
+    initial_soc: 50                        # conservative seed when no persisted state exists
+    full_idle_min_s: 300                   # taper-at-offered-current this long => car is full
+    lifetime_energy_entity: ""             # e.g. sensor.easee_niska_it_lifetime_energy
+    power_entity: ""                       # e.g. sensor.easee_niska_it_power
+    plug_entity: ""                        # e.g. binary_sensor.easee_ev_plugged_in
+    enabled_switch_entity: ""              # e.g. switch.easee_niska_it_charger_enabled
+    dynamic_limit_entity: ""               # e.g. sensor.easee_niska_it_dynamic_charger_limit
+    status_entity: ""                      # e.g. sensor.easee_niska_it_status
+    publish_entity_id: sensor.darkstar_fmb_soc_estimate
+    publish_rate_entity_id: sensor.darkstar_fmb_consumption_rate
+
 # =============================================================================
 # UI Settings
 # =============================================================================
