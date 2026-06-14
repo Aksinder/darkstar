@@ -1,3 +1,7 @@
+## dev-20260614.1153 — 2026-06-14 11:55
+
+- fix(loads): unknown_load holds last value when total-load source is bad
+
 ## dev-20260614.0819 — 2026-06-14 08:20
 
 - feat(loads): publish the unknown-load residual (observability, default OFF)
