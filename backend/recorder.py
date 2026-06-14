@@ -336,6 +336,20 @@ async def record_observation_from_current_state(
     total_load_kw: float = power_results.get("load_power") or 0.0
     battery_kw: float = power_results.get("battery_power") or 0.0
 
+    # Reject a glitched/frozen total-load read. The Sungrow modbus load_power register
+    # intermittently returns 0 (≈1% of reads, plus occasional multi-hour freezes) while
+    # PV/grid/battery stay valid. A whole house is never truly at 0 W, so a 0 read is a bad
+    # sensor sample — recording it would poison the Aurora base-load training set and feed the
+    # planner a false 0 load. Skip this observation; the next tick records normally once the
+    # register recovers (fix the root cause on the Sungrow/modbus side).
+    if total_load_kw <= 0.0:
+        logger.warning(
+            "Recorder: load_power read invalid (%.3f kW) — skipping observation "
+            "(Sungrow modbus glitch; PV/grid/battery unaffected)",
+            total_load_kw,
+        )
+        return
+
     # Disaggregate loads if disaggregator is provided (REV // ML2)
     controllable_kw = 0.0
     if disaggregator:
