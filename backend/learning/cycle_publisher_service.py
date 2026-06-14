@@ -495,9 +495,15 @@ async def run_publisher_loop(
             )
             return
         controllable_kw = await disaggregator.update_current_power()
-        unknown_kw = disaggregator.calculate_base_load(total_kw, controllable_kw)
+        # The inverter's load_power EXCLUDES grid-fed EV charging, so subtract only the house-side
+        # (non-EV) metered loads — otherwise controllable > total and the residual is degenerate.
+        ev_kw = disaggregator.get_total_ev_power()
+        house_controllable_kw = max(0.0, controllable_kw - ev_kw)
+        unknown_kw = disaggregator.calculate_base_load(total_kw, house_controllable_kw)
         drift = float(disaggregator.get_quality_metrics().get("drift_rate", 0.0) or 0.0)
-        await publish(build_unknown_load_sensor(unknown_kw, total_kw, controllable_kw, drift))
+        await publish(
+            build_unknown_load_sensor(unknown_kw, total_kw, house_controllable_kw, drift, ev_kw)
+        )
 
     logger.info(
         "Cycle publisher started: %d appliance(s), %d tank(s), unknown_load=%s, every %.0fs",

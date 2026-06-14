@@ -113,15 +113,21 @@ def build_realism_sensors(realism: dict[str, Any] | None) -> list[PublishedSenso
 
 
 def build_unknown_load_sensor(
-    unknown_kw: float, total_kw: float, controllable_kw: float, drift_rate: float
+    unknown_kw: float,
+    total_kw: float,
+    controllable_kw: float,
+    drift_rate: float,
+    ev_excluded_kw: float = 0.0,
 ) -> list[PublishedSensor]:
-    """Surface the ALREADY-computed residual (total load minus metered controllable loads) as a
+    """Surface the ALREADY-computed residual (house load minus house-side metered loads) as a
     sensor, so the unmetered "unknown" consumption is visible and trendable.
 
     Deliberately NOT appliance disaggregation (infeasible on a single 3-phase main meter with no
     per-circuit CTs): it is the honest residual + its quality (``drift_rate``), useful as a guide
-    for which load is worth metering next. ``drift_rate`` is the fraction of calculations where
-    total minus controllable went negative (sensor skew / partial coverage) = untrustworthy.
+    for which load is worth metering next. ``controllable_kw`` here is the HOUSE-SIDE metered load
+    only — EV charging (``ev_excluded_kw``) is excluded because the inverter's load_power does not
+    include the grid-fed EV circuit, so subtracting it would make the residual go negative.
+    ``drift_rate`` is the fraction of calculations that still went negative = untrustworthy.
     """
     return [
         PublishedSensor(
@@ -135,6 +141,7 @@ def build_unknown_load_sensor(
             attributes={
                 "total_load_kw": round(total_kw, 3),
                 "metered_controllable_kw": round(controllable_kw, 3),
+                "ev_excluded_kw": round(ev_excluded_kw, 3),
                 "drift_rate": round(drift_rate, 3),
             },
         )
