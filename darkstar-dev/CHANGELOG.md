@@ -1,3 +1,7 @@
+## dev-20260614.1437 — 2026-06-14 14:39
+
+- fix(loads): unknown_load excludes EV charging (inverter load_power omits grid-fed EVs)
+
 ## dev-20260614.1153 — 2026-06-14 11:55
 
 - fix(loads): unknown_load holds last value when total-load source is bad
