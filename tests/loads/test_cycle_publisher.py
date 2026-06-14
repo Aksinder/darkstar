@@ -127,7 +127,7 @@ def test_hot_water_sensor_prefix_can_be_emptied_to_own_canonical_ids():
 
 def test_build_unknown_load_sensor():
     sensors = build_unknown_load_sensor(
-        unknown_kw=1.234, total_kw=5.0, controllable_kw=3.766, drift_rate=0.07
+        unknown_kw=1.234, total_kw=5.0, controllable_kw=3.766, drift_rate=0.07, ev_excluded_kw=11.0
     )
     assert len(sensors) == 1
     s = sensors[0]
@@ -137,4 +137,5 @@ def test_build_unknown_load_sensor():
     assert s.device_class == "power"
     assert s.attributes["total_load_kw"] == 5.0
     assert s.attributes["metered_controllable_kw"] == 3.766
+    assert s.attributes["ev_excluded_kw"] == 11.0
     assert s.attributes["drift_rate"] == 0.07
