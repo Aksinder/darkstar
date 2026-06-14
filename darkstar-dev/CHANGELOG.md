@@ -1,3 +1,7 @@
+## dev-20260614.1715 — 2026-06-14 17:17
+
+- fix(recorder): skip observation on glitched/zero load_power (Sungrow modbus)
+
 ## dev-20260614.1437 — 2026-06-14 14:39
 
 - fix(loads): unknown_load excludes EV charging (inverter load_power omits grid-fed EVs)
