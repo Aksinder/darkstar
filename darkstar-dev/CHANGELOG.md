@@ -1,3 +1,7 @@
+## dev-20260614.0819 — 2026-06-14 08:20
+
+- feat(loads): publish the unknown-load residual (observability, default OFF)
+
 ## dev-20260614.0642 — 2026-06-14 06:43
 
 - feat(hot-water): FMB-style learned draw + persistence for the VVB tank estimator
