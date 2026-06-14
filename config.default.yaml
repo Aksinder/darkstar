@@ -140,6 +140,15 @@ water_heaters:
   #   prior_draw_kw: 0.15            # avg draw seed (~3.6 kWh/day) until self-calibrated; lower for a small cabin tank
   #   sensor_prefix: "darkstar_"     # "" to own the bare canonical ids (no template conflict)
 
+# Unknown-load observability (default OFF). Publishes the ALREADY-computed residual
+# (total load − metered controllable loads) as sensor.darkstar_unknown_load, with total /
+# metered / drift_rate attributes. This is NOT appliance disaggregation (infeasible on one
+# 3-phase main meter without per-circuit CTs) — it just makes the unmetered "unknown" bucket
+# visible/trended, as a guide for which load is worth metering next. Reads input_sensors.load_power
+# as total and reuses the load registry (water_heaters[]/ev_chargers[]) as the metered controllable.
+unknown_load:
+  enabled: false
+
 # EV Chargers (Array for multiple electric vehicles)
 # ARC15: Replaces deferrable_loads entry for EV charging
 # Note: penalty_levels are configured per-EV in the UI (Settings > Parameters)

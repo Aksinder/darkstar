@@ -112,6 +112,35 @@ def build_realism_sensors(realism: dict[str, Any] | None) -> list[PublishedSenso
     ]
 
 
+def build_unknown_load_sensor(
+    unknown_kw: float, total_kw: float, controllable_kw: float, drift_rate: float
+) -> list[PublishedSensor]:
+    """Surface the ALREADY-computed residual (total load minus metered controllable loads) as a
+    sensor, so the unmetered "unknown" consumption is visible and trendable.
+
+    Deliberately NOT appliance disaggregation (infeasible on a single 3-phase main meter with no
+    per-circuit CTs): it is the honest residual + its quality (``drift_rate``), useful as a guide
+    for which load is worth metering next. ``drift_rate`` is the fraction of calculations where
+    total minus controllable went negative (sensor skew / partial coverage) = untrustworthy.
+    """
+    return [
+        PublishedSensor(
+            object_id="darkstar_unknown_load",
+            state=f"{round(unknown_kw, 3)}",
+            unit="kW",
+            device_class="power",
+            state_class="measurement",
+            icon="mdi:help-circle-outline",
+            friendly_name="Okänd last (omätt)",
+            attributes={
+                "total_load_kw": round(total_kw, 3),
+                "metered_controllable_kw": round(controllable_kw, 3),
+                "drift_rate": round(drift_rate, 3),
+            },
+        )
+    ]
+
+
 def build_load_sensors(
     load_id: str,
     name: str,

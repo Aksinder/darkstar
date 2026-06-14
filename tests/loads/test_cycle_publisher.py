@@ -7,6 +7,7 @@ from backend.learning.cycle_publisher import (
     PublishedSensor,
     build_hot_water_sensors,
     build_load_sensors,
+    build_unknown_load_sensor,
 )
 from planner.hot_water import HotWaterEstimator
 from planner.thermal import WaterTankModel
@@ -122,3 +123,18 @@ def test_hot_water_sensor_prefix_can_be_emptied_to_own_canonical_ids():
     assert "house_vvb_hot_water_level" in ids
     assert "house_vvb_liters_remaining" in ids
     assert "house_vvb_estimated_temperature" in ids
+
+
+def test_build_unknown_load_sensor():
+    sensors = build_unknown_load_sensor(
+        unknown_kw=1.234, total_kw=5.0, controllable_kw=3.766, drift_rate=0.07
+    )
+    assert len(sensors) == 1
+    s = sensors[0]
+    assert s.object_id == "darkstar_unknown_load"
+    assert s.state == "1.234"
+    assert s.unit == "kW"
+    assert s.device_class == "power"
+    assert s.attributes["total_load_kw"] == 5.0
+    assert s.attributes["metered_controllable_kw"] == 3.766
+    assert s.attributes["drift_rate"] == 0.07
