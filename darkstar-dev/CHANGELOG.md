@@ -1,3 +1,7 @@
+## dev-20260614.0642 — 2026-06-14 06:43
+
+- feat(hot-water): FMB-style learned draw + persistence for the VVB tank estimator
+
 ## dev-20260613.2147 — 2026-06-13 21:49
 
 - fix(executor): FMB SoC writeback review — shadow, call_service, false-full, self-adoption
