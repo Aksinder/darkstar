@@ -483,7 +483,17 @@ async def run_publisher_loop(
     async def publish_unknown_load() -> None:
         if disaggregator is None or not load_power_entity:
             return
-        total_kw = await get_ha_sensor_kw_normalized(str(load_power_entity)) or 0.0
+        # Guard against a dead/glitched total-load source (e.g. the Sungrow modbus load_power
+        # register freezing at 0): a 0/None total while loads are clearly drawing is a bad read,
+        # not a real residual. Skip the tick so the sensor HOLDS its last good value (stale
+        # timestamp signals the gap) instead of flipping to a misleading 0 and inflating drift.
+        total_kw = await get_ha_sensor_kw_normalized(str(load_power_entity))
+        if not total_kw or total_kw <= 0.0:
+            logger.debug(
+                "Unknown-load: total-load read from %s invalid (%s); holding last value",
+                load_power_entity, total_kw,
+            )
+            return
         controllable_kw = await disaggregator.update_current_power()
         unknown_kw = disaggregator.calculate_base_load(total_kw, controllable_kw)
         drift = float(disaggregator.get_quality_metrics().get("drift_rate", 0.0) or 0.0)
