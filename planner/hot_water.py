@@ -56,13 +56,29 @@ class HotWaterEstimator:
     full_anchor_after_min: float = 8.0
     comfort_c: float = 40.0
 
-    # Mutable state (defaults to a full tank at t_max).
+    # Learned hot-water DRAW — the big down-force the naive integrator lacked (only standing
+    # loss decremented before, so the level looked frozen). Draw is unmetered, so it is modelled
+    # as an average rate that depletes the tank between heating runs and is self-calibrated from
+    # each full->full window (energy_in - standing losses = what was tapped), exactly like the
+    # EV estimator learns its consumption from each full->full refill.
+    prior_draw_kw: float = 0.15  # ~3.6 kWh/day; only a seed until the first full-to-full learn
+    draw_learn_alpha: float = 0.3
+    min_draw_kw: float = 0.0
+    max_draw_kw: float = 5.0
+    learn_min_anchor_hours: float = 1.0  # need >=1 h between fulls to trust a learned rate
+
+    # Mutable state (defaults to a full tank at t_max; learned_draw seeds from prior).
     stored_kwh: float = field(default=-1.0)
+    learned_draw_kw: float = field(default=-1.0)
     _heating_run_min: float = field(default=0.0)
+    _energy_in_since_anchor_kwh: float = field(default=0.0)
+    _minutes_since_anchor: float = field(default=0.0)
 
     def __post_init__(self) -> None:
         if self.stored_kwh < 0:
             self.stored_kwh = self.tank.capacity_kwh()
+        if self.learned_draw_kw < 0:
+            self.learned_draw_kw = self.prior_draw_kw
 
     # -- constructors -------------------------------------------------------
 
@@ -122,24 +138,76 @@ class HotWaterEstimator:
 
         # Standing loss is always present, based on the current temperature.
         self.stored_kwh -= self.tank.standby_loss_kwh(self.temperature_c(), dt_h, ambient)
+        self._minutes_since_anchor += dt_minutes
 
         heating_on = heating_kw * 1000.0 >= self.heating_on_w
         if heating_on:
             self.stored_kwh += heating_kw * dt_h
             self._heating_run_min += dt_minutes
+            self._energy_in_since_anchor_kwh += heating_kw * dt_h
         else:
-            # Element just switched off after a real heat-up => tank is full.
+            # Learned hot-water draw depletes the tank between heating runs (the dominant
+            # down-force; standing loss alone is a few %/day and looks frozen).
+            self.stored_kwh -= self.learned_draw_kw * dt_h
+            # Element just switched off after a real heat-up => thermostat satisfied => full.
             if self._heating_run_min >= self.full_anchor_after_min:
-                self.stored_kwh = self.tank.capacity_kwh()
+                self._anchor_full_and_learn(ambient)
             self._heating_run_min = 0.0
 
         # Clamp to physical limits.
         self.stored_kwh = max(0.0, min(self.tank.capacity_kwh(), self.stored_kwh))
 
+    def _anchor_full_and_learn(self, ambient_c: float) -> None:
+        """On a thermostat-satisfied cutoff: learn the average draw over the just-closed
+        full->full window (energy_in - standing losses), then re-pin the tank to full."""
+        hours = self._minutes_since_anchor / 60.0
+        if hours >= self.learn_min_anchor_hours and self._energy_in_since_anchor_kwh > 0.0:
+            losses = self.tank.avg_loss_kw(self.temperature_c(), ambient_c) * hours
+            draw_kwh = max(0.0, self._energy_in_since_anchor_kwh - losses)
+            implied_kw = max(self.min_draw_kw, min(self.max_draw_kw, draw_kwh / hours))
+            self.learned_draw_kw = max(
+                self.min_draw_kw,
+                min(
+                    self.max_draw_kw,
+                    self.draw_learn_alpha * implied_kw
+                    + (1.0 - self.draw_learn_alpha) * self.learned_draw_kw,
+                ),
+            )
+        self.stored_kwh = self.tank.capacity_kwh()
+        self._energy_in_since_anchor_kwh = 0.0
+        self._minutes_since_anchor = 0.0
+
     def anchor_full(self) -> None:
         """Force the state to full (e.g. on a manual calibrate-to-100%)."""
         self.stored_kwh = self.tank.capacity_kwh()
         self._heating_run_min = 0.0
+        self._energy_in_since_anchor_kwh = 0.0
+        self._minutes_since_anchor = 0.0
+
+    # -- persistence (so a restart does not reseed every tank to FULL) ------
+
+    def state_dict(self) -> dict[str, float]:
+        return {
+            "stored_kwh": round(self.stored_kwh, 5),
+            "learned_draw_kw": round(self.learned_draw_kw, 5),
+            "heating_run_min": round(self._heating_run_min, 3),
+            "energy_in_since_anchor_kwh": round(self._energy_in_since_anchor_kwh, 5),
+            "minutes_since_anchor": round(self._minutes_since_anchor, 3),
+        }
+
+    def apply_state(self, d: dict[str, float]) -> None:
+        """Restore persisted state; missing keys keep their current value (forward/back compat)."""
+        cap = self.tank.capacity_kwh()
+        if "stored_kwh" in d:
+            self.stored_kwh = max(0.0, min(cap, float(d["stored_kwh"])))
+        if "learned_draw_kw" in d:
+            self.learned_draw_kw = max(self.min_draw_kw, min(self.max_draw_kw, float(d["learned_draw_kw"])))
+        if "heating_run_min" in d:
+            self._heating_run_min = float(d["heating_run_min"])
+        if "energy_in_since_anchor_kwh" in d:
+            self._energy_in_since_anchor_kwh = float(d["energy_in_since_anchor_kwh"])
+        if "minutes_since_anchor" in d:
+            self._minutes_since_anchor = float(d["minutes_since_anchor"])
 
 
 def estimate_draw_kwh(

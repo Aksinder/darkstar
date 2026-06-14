@@ -17,11 +17,13 @@ Publishing sensor states controls no hardware, so this is safe on the read path.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 from backend.learning.cycle_learning import (
     CycleStats,
@@ -131,6 +133,10 @@ class TrackedTank:
     t_max_c: float = 85.0
     ua_w_per_k: float = 2.0
     power_scale: float = 1.0
+    # Prior average hot-water draw (kW) until the estimator self-calibrates from a full->full
+    # window. Right-size per tank (a small cabin tank draws far less than a house tank) so the
+    # initial estimate doesn't drain implausibly fast before the first learn.
+    prior_draw_kw: float = 0.15
     # Object-id prefix for the published sensors. Defaults to "darkstar_" so it never
     # collides with HA-native template sensors of the same canonical id; set to "" only
     # when Darkstar should own the tank's sensors.
@@ -150,6 +156,7 @@ class DeferrablePublisherService:
         *,
         history_hours: int = 336,  # 14 days
         now_fn: Callable[[], datetime] | None = None,
+        state_path: str | None = "data/hot_water_state.json",
     ) -> None:
         self.appliances = list(appliances)
         self.tanks = list(tanks)
@@ -164,6 +171,9 @@ class DeferrablePublisherService:
         self._last_tick: datetime | None = None
         self._tank_heating_kwh_today: dict[str, float] = {}
         self._today: date | None = None
+        self._state_path = state_path
+        # tank_id -> persisted state dict, loaded once and applied lazily per tank.
+        self._persisted: dict[str, dict[str, float]] = self._load_states()
 
     # -- appliances ---------------------------------------------------------
 
@@ -226,9 +236,36 @@ class DeferrablePublisherService:
                 t_max_c=tank.t_max_c,
                 ua_w_per_k=tank.ua_w_per_k,
             )
-            est = HotWaterEstimator(model)  # starts full; auto-anchors on first cut-off
+            est = HotWaterEstimator(model, prior_draw_kw=tank.prior_draw_kw)  # starts full
+            persisted = self._persisted.get(tank.id)
+            if persisted:
+                est.apply_state(persisted)  # survive restarts instead of reseeding to FULL
             self._estimators[tank.id] = est
         return est
+
+    # -- persistence --------------------------------------------------------
+
+    def _load_states(self) -> dict[str, dict[str, float]]:
+        if not self._state_path or not Path(self._state_path).exists():
+            return {}
+        try:
+            with Path(self._state_path).open(encoding="utf-8") as fh:
+                return cast("dict[str, dict[str, float]]", json.load(fh))
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning("Hot-water: persisted state unreadable (%s); starting fresh", e)
+            return {}
+
+    def _save_states(self) -> None:
+        if not self._state_path or not self._estimators:
+            return
+        try:
+            p = Path(self._state_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            blob = {tid: est.state_dict() for tid, est in self._estimators.items()}
+            with p.open("w", encoding="utf-8") as fh:
+                json.dump(blob, fh)
+        except OSError as e:
+            logger.warning("Hot-water: failed to persist state: %s", e)
 
     async def _run_tank(
         self, tank: TrackedTank, now: datetime, dt_minutes: float, today: date
@@ -279,6 +316,7 @@ class DeferrablePublisherService:
                 logger.warning("Hot-water publish failed for tank %s: %s", tank.id, exc)
 
         self._last_tick = now
+        self._save_states()  # persist observer state so a restart does not reseed tanks to FULL
         published = await self._publish(sensors)
         logger.info("Published %d/%d darkstar_* sensors", published, len(sensors))
         return published
@@ -336,6 +374,7 @@ def build_tracked_from_config(
                 t_max_c=float(cfg.get("t_max_c", 85.0)),
                 ua_w_per_k=float(cfg.get("ua_w_per_k", 2.0)),
                 power_scale=float(cfg.get("power_scale", 1.0)),
+                prior_draw_kw=float(cfg.get("prior_draw_kw", 0.15)),
                 object_id_prefix=str(cfg.get("sensor_prefix", "darkstar_")),
             )
         )

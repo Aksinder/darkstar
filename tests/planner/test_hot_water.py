@@ -87,3 +87,58 @@ def test_estimate_draw_clamped_at_zero():
     tank = _tank()
     # Less heating than losses (impossible draw) -> clamp to 0.
     assert estimate_draw_kwh(tank, heating_energy_kwh=0.1, avg_temp_c=70.0, hours=6.0) == 0.0
+
+
+# -- learned draw (the FMB-style down-force) + persistence ------------------
+
+
+def test_learned_draw_depletes_between_heating_runs():
+    """A configured draw must visibly deplete the tank while idle (not just standing loss)."""
+    est = HotWaterEstimator(_tank(), prior_draw_kw=1.0)  # ~1 kW average draw
+    est.stored_kwh = est.tank.capacity_kwh()
+    before = est.stored_kwh
+    est.update(dt_minutes=60, heating_kw=0.0)  # idle 1 h, no heating
+    drop = before - est.stored_kwh
+    # ~1 kWh from draw + a little standing loss; standing loss alone would be <0.1 kWh.
+    assert drop > 0.9
+    assert est.soc_percent() < 100.0
+
+
+def test_full_anchor_learns_draw_rate():
+    """Over a full->full window, the draw rate is learned from heating_in - losses."""
+    tank = _tank()
+    est = HotWaterEstimator(tank, prior_draw_kw=0.1, draw_learn_alpha=1.0, full_anchor_after_min=8.0)
+    # Start full, then idle 10 h while ~2 kWh is tapped (we deplete via the prior, but the
+    # learner uses the energy we put back in). Simulate: idle draws it down, then a heat-up.
+    est.update(dt_minutes=600, heating_kw=0.0)  # 10 h idle (minutes_since_anchor=600)
+    # Now heat for 1 h at 3 kW (3 kWh in) then cut off -> anchor + learn.
+    est.update(dt_minutes=60, heating_kw=3.0)   # heating run = 60 min >= 8 -> eligible
+    est.update(dt_minutes=5, heating_kw=0.0)    # cut-off -> _anchor_full_and_learn
+    # Window ~11 h, 3 kWh in, losses small -> implied draw ~3/11 ~= 0.27 kW. alpha=1 -> adopt.
+    assert est.learned_draw_kw > 0.15  # moved up from the 0.1 prior toward the observed rate
+    assert est.soc_percent() == pytest.approx(100.0)  # re-pinned to full
+
+
+def test_state_dict_roundtrips_through_apply_state():
+    tank = _tank()
+    a = HotWaterEstimator(tank, prior_draw_kw=0.1)
+    a.stored_kwh = 5.0
+    a.learned_draw_kw = 0.42
+    a._energy_in_since_anchor_kwh = 1.3
+    a._minutes_since_anchor = 123.0
+    blob = a.state_dict()
+
+    b = HotWaterEstimator(tank)  # starts full
+    b.apply_state(blob)
+    assert b.stored_kwh == pytest.approx(5.0)
+    assert b.learned_draw_kw == pytest.approx(0.42)
+    assert b._energy_in_since_anchor_kwh == pytest.approx(1.3)
+    assert b._minutes_since_anchor == pytest.approx(123.0)
+
+
+def test_apply_state_ignores_missing_keys_and_clamps():
+    tank = _tank()
+    est = HotWaterEstimator(tank)
+    est.apply_state({"stored_kwh": 999.0})  # over capacity -> clamped; other keys untouched
+    assert est.stored_kwh == pytest.approx(tank.capacity_kwh())
+    assert est.learned_draw_kw == pytest.approx(est.prior_draw_kw)
