@@ -404,11 +404,22 @@ async def run_publisher_loop(
     import httpx
 
     from backend.core import secrets
-    from backend.core.ha_client import get_ha_sensor_float, make_ha_headers
-    from backend.learning.cycle_publisher import build_realism_sensors, publish_sensors
+    from backend.core.ha_client import (
+        get_ha_sensor_float,
+        get_ha_sensor_kw_normalized,
+        make_ha_headers,
+    )
+    from backend.learning.cycle_publisher import (
+        build_realism_sensors,
+        build_unknown_load_sensor,
+        publish_sensors,
+    )
 
     appliances, tanks = build_tracked_from_config(config)
-    if not appliances and not tanks:
+    unknown_cfg: dict[str, Any] = config.get("unknown_load", {}) or {}
+    publish_unknown = bool(unknown_cfg.get("enabled", False))
+    load_power_entity = (config.get("input_sensors") or {}).get("load_power")
+    if not appliances and not tanks and not publish_unknown:
         logger.info("Cycle publisher: no tracked loads/tanks configured; not starting")
         return
 
@@ -460,10 +471,29 @@ async def run_publisher_loop(
         publish,
         history_hours=history_hours,
     )
+
+    # Optional: publish the already-computed residual (total minus metered controllable) so the
+    # unmetered "unknown" load is visible/trended. Reuses LoadDisaggregator (no new disaggregation).
+    disaggregator = None
+    if publish_unknown and load_power_entity:
+        from backend.loads.service import LoadDisaggregator
+
+        disaggregator = LoadDisaggregator(config)
+
+    async def publish_unknown_load() -> None:
+        if disaggregator is None or not load_power_entity:
+            return
+        total_kw = await get_ha_sensor_kw_normalized(str(load_power_entity)) or 0.0
+        controllable_kw = await disaggregator.update_current_power()
+        unknown_kw = disaggregator.calculate_base_load(total_kw, controllable_kw)
+        drift = float(disaggregator.get_quality_metrics().get("drift_rate", 0.0) or 0.0)
+        await publish(build_unknown_load_sensor(unknown_kw, total_kw, controllable_kw, drift))
+
     logger.info(
-        "Cycle publisher started: %d appliance(s), %d tank(s), every %.0fs",
+        "Cycle publisher started: %d appliance(s), %d tank(s), unknown_load=%s, every %.0fs",
         len(appliances),
         len(tanks),
+        publish_unknown,
         interval_s,
     )
     while True:
@@ -475,6 +505,10 @@ async def run_publisher_loop(
             await publish_realism()
         except Exception as exc:
             logger.debug("Realism sensor publish skipped: %s", exc)
+        try:
+            await publish_unknown_load()
+        except Exception as exc:
+            logger.debug("Unknown-load publish skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
 
