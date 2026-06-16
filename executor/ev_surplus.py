@@ -76,6 +76,20 @@ class ChargerState:
     # Manual override (read from an HA input_select per charger). "auto" = surplus control;
     # "force_on" = charge at max regardless of surplus; "force_off" = never charge.
     override: str = "auto"
+    # --- Departure / target-SoC awareness (all optional; None => behave as before) ---
+    # The car's current SoC. For the FMB this is the dead-reckoned input_number.fmb_soc; for
+    # the Tesla it's the real sensor.white_betty_battery_level. None => no cap and no deadline
+    # logic (pure opportunistic surplus follow, the legacy behaviour).
+    soc_percent: float | None = None
+    # Desired SoC by the deadline. soc >= target => stop (never overcharge). None => no target.
+    target_soc_percent: float | None = None
+    # Usable battery capacity, to convert an SoC gap into energy. 0 => no deadline floor.
+    capacity_kwh: float = 0.0
+    # Hours until the departure deadline. None / <=0 => no grid-backed deadline floor (the car
+    # only ever charges from opportunistic surplus toward its target).
+    deadline_hours: float | None = None
+    # Plug->battery charge efficiency, for sizing the deadline floor from the SoC gap.
+    charge_efficiency: float = 0.9
 
 
 @dataclass
@@ -139,6 +153,10 @@ def should_write_current(
         return True
     if new_a <= 0.0 < last_a:
         return True  # stopping / dropping to zero — act immediately
+    if last_a <= 0.0 < new_a:
+        return True  # starting from a stop — act immediately (symmetric to the stop bypass) so a
+        # deadline-forced or surplus restart isn't stranded at 0 for up to min_interval_s. Rapid
+        # on/off flapping is already prevented upstream by the start hysteresis in compute_ev_surplus.
     if abs(new_a - last_a) < cfg.min_step_a:
         return False
     return (now_ts - last_write_ts) >= cfg.min_interval_s
@@ -150,6 +168,47 @@ def _charger_max_w(c: ChargerState) -> float:
 
 def _charger_min_on_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
     return max(c.min_current_a, cfg.min_charge_current_a) * c.voltage_v * c.phases
+
+
+def _soc_at_or_above_target(c: ChargerState) -> bool:
+    """True when the car has a known SoC at/above its target — stop (never overcharge)."""
+    return (
+        c.soc_percent is not None
+        and c.target_soc_percent is not None
+        and c.soc_percent >= c.target_soc_percent
+    )
+
+
+def _deadline_required_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
+    """Grid-backed power floor needed to reach ``target_soc`` by the deadline, else 0.
+
+    This is the average plug power required from *now*::
+
+        required = (target - soc)/100 * capacity / efficiency / hours_remaining
+
+    Returns 0 (no forcing) when any input is missing OR when ``required`` is still below the
+    charger's minimum on-power: a sub-minimum requirement means there is plenty of time, so
+    we let opportunistic solar handle it and don't pay for grid yet. As the deadline nears
+    with the car still under target, ``required`` climbs; once it crosses the minimum we begin
+    forcing grid, and it ramps toward the charger max as time runs out. Capped at the charger
+    max. The floor is honoured regardless of surplus, so a deadline car "overtakes" the others.
+    """
+    if (
+        c.soc_percent is None
+        or c.target_soc_percent is None
+        or c.capacity_kwh <= 0.0
+        or c.deadline_hours is None
+        or c.deadline_hours <= 0.0
+    ):
+        return 0.0
+    soc_gap = max(0.0, c.target_soc_percent - c.soc_percent) / 100.0
+    if soc_gap <= 0.0:
+        return 0.0
+    energy_at_plug_kwh = soc_gap * c.capacity_kwh / max(0.05, c.charge_efficiency)
+    required_w = energy_at_plug_kwh * 1000.0 / c.deadline_hours
+    if required_w < _charger_min_on_w(c, cfg):
+        return 0.0  # enough time left — wait for cheaper/solar energy instead of forcing grid
+    return min(required_w, _charger_max_w(c))
 
 
 def compute_ev_surplus(
@@ -242,26 +301,58 @@ def compute_ev_surplus(
         f"headroom={headroom_w:.0f}W -> target={target_total_w:.0f}W"
     )
 
-    # --- Distribute the budget across the auto chargers, greedy by priority ---
+    # --- SoC caps + deadline floors --------------------------------------------
+    # A car at/above its target is done (never overcharge). A car with a target + deadline
+    # gets a grid-backed FLOOR (see _deadline_required_w): the avg power it must pull now to
+    # make the deadline. Floors are honoured regardless of surplus, so a deadline car
+    # "overtakes" the others; free surplus is applied first so grid is only paid for the gap.
+    capped = [c for c in auto if _soc_at_or_above_target(c)]
+    capped_ids = {c.id for c in capped}
+    for c in capped:
+        commands.append(
+            ChargerCommand(c.id, switch_on=False, set_current_a=0.0 if c.controllable else None,
+                           target_power_w=0.0,
+                           reason=f"cap: soc {c.soc_percent:.0f}>=target {c.target_soc_percent:.0f}")
+        )
+    chargeable = [c for c in auto if c.id not in capped_ids]
+    if not chargeable:
+        return commands
+
+    floor_w = {c.id: _deadline_required_w(c, cfg) for c in chargeable}
+
+    # Deadline cars overtake (sort key 0), then by priority. Used for BOTH surplus
+    # distribution (free energy goes to the deadline car first) and emission order.
+    order = sorted(chargeable, key=lambda x: (0 if floor_w[x.id] > 0.0 else 1, x.priority, x.id))
+
+    # Pass 1: hand out the opportunistic surplus greedily in that order.
+    surplus_share = {c.id: 0.0 for c in chargeable}
     remaining_w = target_total_w
+    for c in order:
+        give = min(remaining_w, _charger_max_w(c))
+        surplus_share[c.id] = give
+        remaining_w -= give
+
+    # Pass 2: each car charges to max(free surplus share, grid-backed deadline floor).
     step = max(0.0, cfg.current_step_a)
-    for c in sorted(auto, key=lambda x: (x.priority, x.id)):
-        min_on_w = _charger_min_on_w(c, cfg)
+    for c in order:
         max_w = _charger_max_w(c)
-        # Hysteresis: a charger that's currently OFF needs extra headroom to start; once ON
-        # it keeps going down to its true min. Avoids on/off flapping at the threshold.
+        min_on_w = _charger_min_on_w(c, cfg)
+        forced = floor_w[c.id] > 0.0
+        target_w = min(max_w, max(surplus_share[c.id], floor_w[c.id]))
+        # Hysteresis: an OFF charger needs extra headroom to start; once ON it runs down to
+        # its true min. A deadline floor is exempt — it must run even with no surplus.
         currently_on = c.current_power_w > 100.0
         threshold_w = min_on_w if currently_on else min_on_w * (1.0 + cfg.start_hysteresis)
-        if remaining_w < threshold_w:
+        if target_w < threshold_w and not (forced and target_w >= min_on_w):
             commands.append(
                 ChargerCommand(c.id, switch_on=False, set_current_a=0.0 if c.controllable else None,
-                               target_power_w=0.0, reason=f"off: budget {remaining_w:.0f}<thr {threshold_w:.0f}; {why}")
+                               target_power_w=0.0,
+                               reason=f"off: target {target_w:.0f}<thr {threshold_w:.0f}; {why}")
             )
             continue
-        give_w = min(remaining_w, max_w)
-        remaining_w -= give_w
+        tag = "deadline" if forced and surplus_share[c.id] < floor_w[c.id] else "surplus"
         if c.controllable:
-            amps = give_w / (c.voltage_v * c.phases)
+            amps = target_w / (c.voltage_v * c.phases)
             # Snap to the chunky step grid, then clamp so we move in larger steps and
             # don't keep re-tweaking the current.
             if step > 0:
@@ -269,12 +360,13 @@ def compute_ev_surplus(
             amps = max(c.min_current_a, min(c.max_current_a, amps))
             commands.append(
                 ChargerCommand(c.id, switch_on=True, set_current_a=round(amps, 1),
-                               target_power_w=amps * c.voltage_v * c.phases, reason=f"on {amps:.1f}A; {why}")
+                               target_power_w=amps * c.voltage_v * c.phases,
+                               reason=f"on {amps:.1f}A ({tag}); {why}")
             )
         else:
             # Binary charger: on at its fixed draw (can't throttle).
             commands.append(
                 ChargerCommand(c.id, switch_on=True, set_current_a=None,
-                               target_power_w=max_w, reason=f"on (binary); {why}")
+                               target_power_w=max_w, reason=f"on (binary, {tag}); {why}")
             )
     return commands

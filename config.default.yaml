@@ -97,6 +97,9 @@ water_heaters:
     sensor: ''                       # Home Assistant entity for power reading
     target_entity: ''                # Thermostat entity for controlling this heater
     type: binary                     # Load type: binary (on/off) or modulating
+    exclude_from_vacation: false     # When vacation is active, this tank still gets NORMAL comfort
+                                     # heating instead of being shut off (e.g. a rented-out Villavagn
+                                     # tank while the owners are away). Default false = follows vacation.
 
   # Example: Second water heater (disabled by default)
   # - id: upstairs_tank
@@ -626,6 +629,7 @@ executor:
     battery_soc_entity: ""              # home battery SoC %, e.g. sensor.battery_level
     price_entity: ""                    # spot price SEK/kWh, e.g. sensor.spot_price_sek_kwh
     remaining_solar_entity: ""          # optional kWh still forecast today; blank => battery-assist tier inert
+    vacation_entity: ""                 # input_boolean.vacation_mode; flips per-charger vacation_target_soc
     policy:
       cheap_grid_price_sek: 0.30        # allow grid for EV when spot <= this (blank/absent => solar only)
       cheap_grid_allowance_w: 3680      # max grid import to give the cars when cheap
@@ -643,6 +647,15 @@ executor:
       min_step_a: 2.0                   # only rewrite current when target moves >= this many A
       min_interval_s: 90                # ...and at least this long since the last write (a STOP bypasses it)
     chargers: []
+      # Departure / target-SoC awareness (all optional, per charger):
+      #   soc_entity         current SoC read (FMB: input_number.fmb_soc; Tesla: sensor.*_battery_level)
+      #   target_soc_entity  user-settable target % (input_number). soc >= target => stop (cap, never overcharge)
+      #   departure_entity   input_datetime (date+time). Behind the curve to hit target by then => grid-backed
+      #                      floor that ramps to charger max as the deadline nears; a deadline car overtakes the
+      #                      others. No departure => the car only charges from opportunistic surplus toward target.
+      #   capacity_kwh       usable battery (sizes the deadline floor)
+      #   vacation_target_soc when vacation_entity is on, the target switches to this (e.g. FMB 15 = cap at 15%,
+      #                      solar-only since the FMB has no departure deadline). Omit => vacation leaves it alone.
       # - id: easee                     # priority #1 (lower = filled first)
       #   priority: 0
       #   min_current_a: 6
@@ -653,6 +666,9 @@ executor:
       #   power_entity: sensor.easee_niska_it_power
       #   plug_entity: binary_sensor.easee_ev_plugged_in
       #   override_entity: input_select.darkstar_ev_easee_mode
+      #   soc_entity: input_number.fmb_soc        # dead-reckoned FMB SoC (from fmb_soc_estimator)
+      #   capacity_kwh: 28
+      #   vacation_target_soc: 15                 # vacation: cap FMB at 15%, solar-only (no departure)
       # - id: tesla                     # priority #2
       #   priority: 1
       #   min_current_a: 5
@@ -664,6 +680,10 @@ executor:
       #   plug_entity: binary_sensor.white_betty_charge_cable
       #   home_entity: device_tracker.white_betty_location
       #   override_entity: input_select.darkstar_ev_tesla_mode
+      #   soc_entity: sensor.white_betty_battery_level
+      #   target_soc_entity: input_number.darkstar_tesla_target_soc
+      #   departure_entity: input_datetime.darkstar_tesla_departure
+      #   capacity_kwh: 60
 
   # FMB SoC estimator (default OFF). The FMB reports no real SoC, so we dead-reckon it:
   # integrate delivered energy UP while charging (Easee lifetime-energy counter), drift it

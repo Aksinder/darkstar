@@ -32,13 +32,17 @@ async def test_recorder_net_meter_mode(mock_config, mock_get_sensor, mock_store)
         "system": {"grid_meter_type": "net"},
         "input_sensors": {
             "grid_power": "sensor.grid_net",
+            "load_power": "sensor.load",
         },
     }
 
-    # Setup Sensor Values (Grid = 0.5 kW Import)
+    # Setup Sensor Values (Grid = 0.5 kW Import). A realistic non-zero house load keeps the
+    # recorder's "load==0 is a Sungrow glitch" guard from skipping the observation.
     async def side_effect(entity, **kwargs):
         if entity == "sensor.grid_net":
             return 0.5
+        if entity == "sensor.load":
+            return 1.0
         return 0.0
 
     mock_get_sensor.side_effect = side_effect
@@ -71,15 +75,19 @@ async def test_recorder_dual_meter_mode(mock_config, mock_get_sensor, mock_store
         "input_sensors": {
             "grid_import_power": "sensor.grid_import",
             "grid_export_power": "sensor.grid_export",
+            "load_power": "sensor.load",
         },
     }
 
-    # Setup Sensor Values (Import=1.0 kW, Export=0.2 kW)
+    # Setup Sensor Values (Import=1.0 kW, Export=0.2 kW). A realistic non-zero house load keeps
+    # the recorder's "load==0 is a Sungrow glitch" guard from skipping the observation.
     async def side_effect(entity, **kwargs):
         if entity == "sensor.grid_import":
             return 1.0
         if entity == "sensor.grid_export":
             return 0.2
+        if entity == "sensor.load":
+            return 1.0
         return 0.0
 
     mock_get_sensor.side_effect = side_effect

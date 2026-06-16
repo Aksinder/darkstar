@@ -48,6 +48,16 @@ class EVSurplusChargerCfg:
     max_current_a: float = 16.0
     phases: int = 3
     voltage_v: float = 230.0
+    # --- Departure / target-SoC awareness (all optional) ---
+    soc_entity: str | None = None  # current SoC (input_number.fmb_soc / sensor.*_battery_level)
+    target_soc_entity: str | None = None  # user-settable target % (input_number); None => no cap
+    departure_entity: str | None = None  # input_datetime (date+time) -> 'timestamp' attr (epoch)
+    capacity_kwh: float = 0.0  # usable battery capacity (sizes the deadline floor); 0 => no floor
+    charge_efficiency: float = 0.9  # plug->battery efficiency for the deadline floor
+    # When vacation is active (see EVSurplusRuntimeConfig.vacation_entity) the target switches to
+    # this. e.g. FMB -> 15 (cap at 15%, solar-only since it has no departure deadline). None =>
+    # vacation does not change this charger's target (e.g. the Tesla leaving FOR the trip).
+    vacation_target_soc: float | None = None
 
     @property
     def controllable(self) -> bool:
@@ -65,6 +75,7 @@ class EVSurplusRuntimeConfig:
     battery_soc_entity: str | None = None
     price_entity: str | None = None
     remaining_solar_entity: str | None = None  # optional; absent => battery-assist tier inert
+    vacation_entity: str | None = None  # input_boolean.vacation_mode; flips per-charger vacation targets
     policy: EVSurplusConfig = field(default_factory=EVSurplusConfig)
     guard: WriteGuardConfig = field(default_factory=WriteGuardConfig)
     chargers: list[EVSurplusChargerCfg] = field(default_factory=lambda: [])
@@ -126,6 +137,12 @@ def parse_ev_surplus_config(executor_data: dict[str, Any]) -> EVSurplusRuntimeCo
                 max_current_a=float(c.get("max_current_a", 16.0)),
                 phases=int(c.get("phases", 3)),
                 voltage_v=float(c.get("voltage_v", 230.0)),
+                soc_entity=c.get("soc_entity") or None,
+                target_soc_entity=c.get("target_soc_entity") or None,
+                departure_entity=c.get("departure_entity") or None,
+                capacity_kwh=float(c.get("capacity_kwh", 0.0)),
+                charge_efficiency=float(c.get("charge_efficiency", 0.9)),
+                vacation_target_soc=_f(c.get("vacation_target_soc")),
             )
         )
     return EVSurplusRuntimeConfig(
@@ -136,6 +153,7 @@ def parse_ev_surplus_config(executor_data: dict[str, Any]) -> EVSurplusRuntimeCo
         battery_soc_entity=raw.get("battery_soc_entity") or None,
         price_entity=raw.get("price_entity") or None,
         remaining_solar_entity=raw.get("remaining_solar_entity") or None,
+        vacation_entity=raw.get("vacation_entity") or None,
         policy=policy,
         guard=guard,
         chargers=chargers,
@@ -158,6 +176,19 @@ class EVSurplusController:
         v = _f(await ha.get_state_value(entity))
         return v if v is not None else default
 
+    async def _read_attr_f(
+        self, ha: Any, entity: str | None, attr: str, default: float | None = None
+    ) -> float | None:
+        """Read a numeric attribute (e.g. an input_datetime's epoch 'timestamp')."""
+        if not entity:
+            return default
+        state = cast("dict[str, Any] | None", await ha.get_state(entity))
+        if not state:
+            return default
+        attrs = cast("dict[str, Any]", state.get("attributes") or {})
+        v = _f(attrs.get(attr))
+        return v if v is not None else default
+
     async def _read_on(self, ha: Any, entity: str | None, states: tuple[str, ...], default: bool) -> bool:
         if not entity:
             return default
@@ -173,19 +204,46 @@ class EVSurplusController:
         val = str(v).lower() if v else "auto"
         return val if val in ("auto", "force_on", "force_off") else "auto"
 
-    async def _read_charger(self, ha: Any, c: EVSurplusChargerCfg) -> ChargerState:
-        """Read one charger's live state (its 4 entity reads run concurrently)."""
-        power, plugged, at_home, override = await asyncio.gather(
+    async def _read_charger(
+        self, ha: Any, c: EVSurplusChargerCfg, now_ts: float, vacation: bool
+    ) -> ChargerState:
+        """Read one charger's live state (its entity reads run concurrently)."""
+        # gather over mixed return types collapses to a union list; narrow each back explicitly.
+        res = await asyncio.gather(
             self._read_f(ha, c.power_entity, 0.0),
             self._read_on(ha, c.plug_entity, ("on", "true", "plugged", "connected"), True),
             self._read_on(ha, c.home_entity, c.home_states, True),
             self._read_override(ha, c.override_entity),
+            self._read_f(ha, c.soc_entity, None),
+            self._read_f(ha, c.target_soc_entity, None),
+            self._read_attr_f(ha, c.departure_entity, "timestamp", None),
         )
+        power = cast("float | None", res[0])
+        plugged = bool(res[1])
+        at_home = bool(res[2])
+        override = str(res[3])
+        soc = cast("float | None", res[4])
+        target = cast("float | None", res[5])
+        dep_ts = cast("float | None", res[6])
+        deadline_hours: float | None = None
+        if dep_ts is not None:
+            dh = (dep_ts - now_ts) / 3600.0
+            if dh > 0.0:
+                deadline_hours = dh
+        # Vacation overrides the target (e.g. FMB -> 15%); a charger without a vacation target is
+        # unaffected. ``soc`` / ``target`` of None disable the cap and deadline floor entirely.
+        # A vacation-targeted charger is solar-only: clear any departure deadline so it is never
+        # grid-forced toward the (low) vacation target.
+        if vacation and c.vacation_target_soc is not None:
+            target = c.vacation_target_soc
+            deadline_hours = None
         return ChargerState(
             id=c.id, plugged=plugged, at_home=at_home, enabled=True,
             current_power_w=power or 0.0, max_current_a=c.max_current_a,
             min_current_a=c.min_current_a, phases=c.phases, voltage_v=c.voltage_v,
             controllable=c.controllable, priority=c.priority, override=override,
+            soc_percent=soc, target_soc_percent=target, capacity_kwh=c.capacity_kwh,
+            deadline_hours=deadline_hours, charge_efficiency=c.charge_efficiency,
         )
 
     async def run(self, ha: Any, now_ts: float, shadow: bool = False) -> dict[str, Any]:
@@ -197,16 +255,14 @@ class EVSurplusController:
         # Read all sources AND all chargers concurrently. Serial awaits here meant ~14 HA
         # REST round-trips per tick (~5 s), which loaded the HA API and starved the in-process
         # web server (slow dashboard). asyncio.gather collapses that to ~one round-trip latency.
-        src: tuple[float | None, ...] = await asyncio.gather(
+        src = await asyncio.gather(
             self._read_f(ha, cfg.pv_power_entity, 0.0),
             self._read_f(ha, cfg.grid_power_entity, 0.0),
             self._read_f(ha, cfg.battery_power_entity, 0.0),
             self._read_f(ha, cfg.battery_soc_entity, 100.0),
             self._read_f(ha, cfg.price_entity, 999.0),
             self._read_f(ha, cfg.remaining_solar_entity, 0.0),
-        )
-        states: list[ChargerState] = list(
-            await asyncio.gather(*(self._read_charger(ha, c) for c in cfg.chargers))
+            self._read_on(ha, cfg.vacation_entity, ("on", "true"), False),
         )
         pv_w = src[0] or 0.0
         grid_w = src[1] or 0.0
@@ -214,6 +270,12 @@ class EVSurplusController:
         soc = src[3] if src[3] is not None else 100.0
         price = src[4] if src[4] is not None else 999.0
         remaining_solar = src[5] or 0.0
+        vacation = bool(src[6])
+        states: list[ChargerState] = list(
+            await asyncio.gather(
+                *(self._read_charger(ha, c, now_ts, vacation) for c in cfg.chargers)
+            )
+        )
 
         inputs = EVSurplusInputs(
             pv_w=pv_w, grid_w=grid_w, battery_w=battery_w, battery_soc_percent=soc,
@@ -230,8 +292,9 @@ class EVSurplusController:
             await self._actuate(ha, ccfg, cmd, now_ts, shadow)
             applied.append({"id": cmd.id, "on": cmd.switch_on, "a": cmd.set_current_a, "why": cmd.reason})
 
-        logger.info("EV surplus: grid=%.0fW batt=%.0fW soc=%.0f%% price=%.2f -> %s",
-                    grid_w, battery_w, soc, price, [(a["id"], a["on"], a["a"]) for a in applied])
+        logger.info("EV surplus: grid=%.0fW batt=%.0fW soc=%.0f%% price=%.2f vac=%s -> %s",
+                    grid_w, battery_w, soc, price, vacation,
+                    [(a["id"], a["on"], a["a"]) for a in applied])
         return {"enabled": True, "applied": applied}
 
     async def _actuate(self, ha: Any, ccfg: EVSurplusChargerCfg, cmd: Any, now_ts: float, shadow: bool) -> None:
@@ -241,6 +304,22 @@ class EVSurplusController:
                 svc = "turn_on" if cmd.switch_on else "turn_off"
                 await ha.call_service("switch", svc, ccfg.switch_entity)
             self._last_switch[ccfg.id] = cmd.switch_on
+
+        # Pause a switchless Easee: with no on/off switch, dynamic limit 0 IS the stop. Without
+        # this an "off" command (SoC cap / force_off) on a switchless Easee would leave it
+        # charging at its last dynamic limit. The write-guard always allows a stop immediately.
+        if not cmd.switch_on and ccfg.switch_entity is None and ccfg.easee_device_id:
+            if should_write_current(
+                self._last_a.get(ccfg.id), self._last_ts.get(ccfg.id), 0.0, now_ts, self.cfg.guard
+            ):
+                if not shadow:
+                    await ha.call_service(
+                        "easee", "set_charger_dynamic_limit", None,
+                        {"device_id": ccfg.easee_device_id, "current": 0, "time_to_live": 0},
+                    )
+                self._last_a[ccfg.id] = 0.0
+                self._last_ts[ccfg.id] = now_ts
+            return
 
         # Current: only when on, controllable, and the write-guard allows it.
         if not (cmd.switch_on and ccfg.controllable and cmd.set_current_a is not None):

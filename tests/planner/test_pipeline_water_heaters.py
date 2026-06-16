@@ -9,7 +9,37 @@ Covers:
 
 import pandas as pd
 
+from planner.pipeline import partition_vacation_water_heaters
 from planner.solver.adapter import build_water_heater_inputs
+
+
+class TestVacationPartition:
+    """Vacation mode splits tanks into excluded (keep heating) vs included (comfort off)."""
+
+    def test_default_all_included(self):
+        heaters = [{"id": "main"}, {"id": "villavagn"}]
+        excluded, included = partition_vacation_water_heaters(heaters)
+        assert excluded == []
+        assert [h["id"] for h in included] == ["main", "villavagn"]
+
+    def test_excluded_tank_kept_separate(self):
+        heaters = [
+            {"id": "main", "exclude_from_vacation": False},
+            {"id": "villavagn", "exclude_from_vacation": True},
+        ]
+        excluded, included = partition_vacation_water_heaters(heaters)
+        assert [h["id"] for h in excluded] == ["villavagn"]
+        assert [h["id"] for h in included] == ["main"]
+
+    def test_disabled_tanks_drop_from_both(self):
+        heaters = [
+            {"id": "main", "enabled": True},
+            {"id": "off", "enabled": False, "exclude_from_vacation": True},
+            {"id": "off2", "enabled": False},
+        ]
+        excluded, included = partition_vacation_water_heaters(heaters)
+        assert excluded == []
+        assert [h["id"] for h in included] == ["main"]
 
 # ---------------------------------------------------------------------------
 # Helpers replicating the pipeline's mid-block detection logic

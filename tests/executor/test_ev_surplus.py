@@ -233,6 +233,80 @@ class TestManualOverride:
         assert by_id["easee"].switch_on is True  # auto still charges on the surplus
 
 
+class TestSocCapAndDeadline:
+    """SoC caps (never overcharge) + grid-backed deadline floors (make departure)."""
+
+    def test_soc_at_or_above_target_caps_off(self):
+        # FMB at 50% with a 15% vacation target => stop, even with huge surplus.
+        ch = _charger(id="easee", soc_percent=50.0, target_soc_percent=15.0)
+        out = compute_ev_surplus(_inputs(grid_w=-12000.0, chargers=[ch]), _cfg(gain=1.0))
+        assert out[0].switch_on is False and out[0].target_power_w == 0.0
+        assert "cap" in out[0].reason
+
+    def test_soc_without_target_does_not_cap(self):
+        # A known SoC but no target => legacy opportunistic charging (no cap).
+        ch = _charger(soc_percent=50.0, target_soc_percent=None)
+        out = compute_ev_surplus(_inputs(grid_w=-12000.0, chargers=[ch]), _cfg(gain=1.0))
+        assert out[0].switch_on is True
+
+    def test_below_target_still_charges_on_surplus(self):
+        ch = _charger(soc_percent=10.0, target_soc_percent=80.0)
+        out = compute_ev_surplus(_inputs(grid_w=-12000.0, chargers=[ch]), _cfg(gain=1.0))
+        assert out[0].switch_on is True
+
+    def test_deadline_behind_forces_grid_without_surplus(self):
+        # 10%->80% of 60 kWh in 10 h => ~4.7 kW avg floor (> the 6 A min). No surplus
+        # (importing) => it must still charge from grid to make the deadline.
+        ch = _charger(
+            soc_percent=10.0, target_soc_percent=80.0, capacity_kwh=60.0, deadline_hours=10.0
+        )
+        out = compute_ev_surplus(_inputs(grid_w=5000.0, battery_w=0.0, chargers=[ch]), _cfg(gain=1.0))
+        assert out[0].switch_on is True
+        assert out[0].set_current_a is not None and out[0].set_current_a >= 6.0
+        assert "deadline" in out[0].reason
+
+    def test_plenty_of_time_does_not_force_grid(self):
+        # Only 10% to go over 100 h => required power is a trickle (< the charger min),
+        # so don't pay for grid — wait for solar. No surplus => off.
+        ch = _charger(
+            soc_percent=70.0, target_soc_percent=80.0, capacity_kwh=60.0, deadline_hours=100.0
+        )
+        out = compute_ev_surplus(_inputs(grid_w=5000.0, battery_w=0.0, chargers=[ch]), _cfg(gain=1.0))
+        assert out[0].switch_on is False
+
+    def test_deadline_car_overtakes_priority(self):
+        # Easee is priority 0 (normally first), but the Tesla (priority 1) is behind its
+        # departure deadline => the Tesla overtakes and gets the limited budget.
+        easee = _charger(id="easee", priority=0, current_power_w=0.0)
+        tesla = _charger(
+            id="tesla", priority=1, current_power_w=0.0,
+            soc_percent=10.0, target_soc_percent=80.0, capacity_kwh=60.0, deadline_hours=2.0,
+        )
+        out = compute_ev_surplus(
+            _inputs(grid_w=-6000.0, chargers=[easee, tesla]), _cfg(gain=1.0)
+        )
+        by_id = {c.id: c for c in out}
+        assert by_id["tesla"].target_power_w > by_id["easee"].target_power_w
+        assert by_id["tesla"].switch_on is True
+
+    def test_cap_takes_precedence_over_deadline(self):
+        # Already at/above target => capped off, deadline ignored (nothing left to do).
+        ch = _charger(
+            soc_percent=80.0, target_soc_percent=80.0, capacity_kwh=60.0, deadline_hours=0.5
+        )
+        out = compute_ev_surplus(_inputs(grid_w=5000.0, chargers=[ch]), _cfg(gain=1.0))
+        assert out[0].switch_on is False
+        assert "cap" in out[0].reason
+
+    def test_missing_capacity_disables_deadline_floor(self):
+        # Behind on time but no capacity configured => can't size a floor => surplus only.
+        ch = _charger(
+            soc_percent=10.0, target_soc_percent=80.0, capacity_kwh=0.0, deadline_hours=1.0
+        )
+        out = compute_ev_surplus(_inputs(grid_w=5000.0, chargers=[ch]), _cfg(gain=1.0))
+        assert out[0].switch_on is False
+
+
 class TestWriteGuard:
     """Rate-limit charge-current writes to protect the car (and be conservative)."""
 
@@ -268,3 +342,10 @@ class TestWriteGuard:
 
         # Dropping to 0 (stop) is allowed immediately even 1 s after the last write.
         assert should_write_current(16.0, 1000.0, 0.0, 1001.0, self._cfg()) is True
+
+    def test_start_from_stop_bypasses_interval(self):
+        from executor.ev_surplus import should_write_current
+
+        # Starting from 0 (e.g. deadline-forced or fresh surplus) is allowed immediately too,
+        # so a restart isn't stranded at 0 for the whole interval after a stop.
+        assert should_write_current(0.0, 1000.0, 8.0, 1001.0, self._cfg()) is True
