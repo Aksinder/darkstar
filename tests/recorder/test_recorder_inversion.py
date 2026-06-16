@@ -91,6 +91,8 @@ class TestRecorderBatteryInversion:
         async def get_kw_side_effect(entity_id):
             if entity_id == "sensor.battery_power":
                 return 2.0  # Sungrow: positive = charging
+            if entity_id == "sensor.load_power":
+                return 1.5  # realistic house load so the load==0 glitch guard doesn't skip
             return 0.0
 
         mock_get_kw.side_effect = get_kw_side_effect
@@ -137,6 +139,8 @@ class TestRecorderBatteryInversion:
         async def get_kw_side_effect(entity_id):
             if entity_id == "sensor.battery_power":
                 return -2.0  # Sungrow: negative = discharging
+            if entity_id == "sensor.load_power":
+                return 1.5  # realistic house load so the load==0 glitch guard doesn't skip
             return 0.0
 
         mock_get_kw.side_effect = get_kw_side_effect
@@ -190,6 +194,8 @@ class TestRecorderGridInversion:
         async def get_kw_side_effect(entity_id):
             if entity_id == "sensor.grid_power":
                 return 1.0  # Inverted: positive = export
+            if entity_id == "sensor.load_power":
+                return 1.5  # realistic house load so the load==0 glitch guard doesn't skip
             return 0.0
 
         mock_get_kw.side_effect = get_kw_side_effect
@@ -236,6 +242,8 @@ class TestRecorderGridInversion:
         async def get_kw_side_effect(entity_id):
             if entity_id == "sensor.grid_power":
                 return -1.0  # Inverted: negative = import
+            if entity_id == "sensor.load_power":
+                return 1.5  # realistic house load so the load==0 glitch guard doesn't skip
             return 0.0
 
         mock_get_kw.side_effect = get_kw_side_effect
@@ -341,6 +349,8 @@ class TestNonInvertedSensors:
         async def get_kw_side_effect(entity_id):
             if entity_id == "sensor.battery_power":
                 return 2.0  # Standard: positive = discharge
+            if entity_id == "sensor.load_power":
+                return 1.5  # realistic house load so the load==0 glitch guard doesn't skip
             return 0.0
 
         mock_get_kw.side_effect = get_kw_side_effect
@@ -376,6 +386,8 @@ class TestNonInvertedSensors:
         async def get_kw_side_effect(entity_id):
             if entity_id == "sensor.grid_power":
                 return 1.0  # Standard: positive = import
+            if entity_id == "sensor.load_power":
+                return 1.5  # realistic house load so the load==0 glitch guard doesn't skip
             return 0.0
 
         mock_get_kw.side_effect = get_kw_side_effect

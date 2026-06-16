@@ -9,12 +9,18 @@ from executor.ev_surplus_runtime import (
 
 
 class FakeHA:
-    def __init__(self, states):
+    def __init__(self, states, attrs=None):
         self.states = states
+        self.attrs = attrs or {}
         self.calls: list[tuple] = []
 
     async def get_state_value(self, entity):
         return self.states.get(entity)
+
+    async def get_state(self, entity):
+        if entity not in self.states and entity not in self.attrs:
+            return None
+        return {"state": self.states.get(entity), "attributes": self.attrs.get(entity, {})}
 
     async def call_service(self, domain, service, entity_id=None, data=None):
         self.calls.append((domain, service, entity_id, data))
@@ -71,6 +77,31 @@ class TestParse:
         assert tesla.current_entity == "number.tesla_amps" and tesla.min_current_a == 5.0
         assert cfg.policy.cheap_grid_price_sek == 0.3
 
+    def test_parses_departure_and_vacation_fields(self):
+        cfg = parse_ev_surplus_config(
+            _cfg_dict(
+                vacation_entity="input_boolean.vacation_mode",
+                chargers=[
+                    {"id": "easee", "easee_device_id": "dev_easee",
+                     "soc_entity": "input_number.fmb_soc", "capacity_kwh": 28,
+                     "vacation_target_soc": 15},
+                    {"id": "tesla", "current_entity": "number.tesla_amps",
+                     "soc_entity": "sensor.tesla_soc",
+                     "target_soc_entity": "input_number.tesla_target",
+                     "departure_entity": "input_datetime.tesla_departure",
+                     "capacity_kwh": 60, "charge_efficiency": 0.92},
+                ],
+            )
+        )
+        assert cfg is not None and cfg.vacation_entity == "input_boolean.vacation_mode"
+        easee = next(c for c in cfg.chargers if c.id == "easee")
+        assert easee.soc_entity == "input_number.fmb_soc" and easee.capacity_kwh == 28.0
+        assert easee.vacation_target_soc == 15.0
+        tesla = next(c for c in cfg.chargers if c.id == "tesla")
+        assert tesla.departure_entity == "input_datetime.tesla_departure"
+        assert tesla.target_soc_entity == "input_number.tesla_target"
+        assert tesla.capacity_kwh == 60.0 and tesla.charge_efficiency == 0.92
+
 
 class TestActuation:
     @pytest.mark.asyncio
@@ -124,3 +155,104 @@ class TestActuation:
         ha = FakeHA(_states())
         await EVSurplusController(cfg).run(ha, now_ts=1000.0, shadow=True)
         assert ha.calls == []
+
+
+class TestDepartureVacation:
+    @pytest.mark.asyncio
+    async def test_vacation_caps_fmb_off(self):
+        # Vacation on + FMB above its 15% vacation target => FMB stops (switch off), even with
+        # 10 kW of export available.
+        cfg = parse_ev_surplus_config(
+            _cfg_dict(
+                vacation_entity="input_boolean.vacation_mode",
+                chargers=[
+                    {"id": "easee", "priority": 0, "phases": 1, "switch_entity": "switch.easee",
+                     "easee_device_id": "dev_easee", "power_entity": "sensor.easee_power",
+                     "plug_entity": "binary_sensor.easee_plug",
+                     "soc_entity": "input_number.fmb_soc", "capacity_kwh": 28,
+                     "vacation_target_soc": 15},
+                ],
+            )
+        )
+        ha = FakeHA(_states(**{
+            "input_boolean.vacation_mode": "on", "input_number.fmb_soc": "50",
+        }))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_off", "switch.easee", None) in ha.calls
+        assert not any(s == "set_charger_dynamic_limit" for _d, s, *_ in ha.calls)
+
+    @pytest.mark.asyncio
+    async def test_switchless_easee_pauses_via_dynamic_limit_zero(self):
+        # An Easee with NO switch_entity, capped off => dynamic limit 0 IS the stop.
+        cfg = parse_ev_surplus_config(
+            _cfg_dict(
+                chargers=[
+                    {"id": "easee", "priority": 0, "phases": 1, "easee_device_id": "dev_easee",
+                     "power_entity": "sensor.easee_power", "plug_entity": "binary_sensor.easee_plug",
+                     "soc_entity": "input_number.fmb_soc", "target_soc_entity": "input_number.fmb_target"},
+                ],
+            )
+        )
+        ha = FakeHA(_states(**{"input_number.fmb_soc": "90", "input_number.fmb_target": "15"}))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        stops = [c for c in ha.calls if c[1] == "set_charger_dynamic_limit"]
+        assert stops and stops[0][3]["current"] == 0
+
+    @pytest.mark.asyncio
+    async def test_vacation_clears_deadline_so_fmb_is_solar_only(self):
+        # FMB has BOTH a vacation target (15%) and a future departure entity. In vacation the
+        # departure deadline must be ignored (solar-only): with no surplus the FMB does NOT
+        # grid-force toward 15% even though SoC (12%) is below target.
+        cfg = parse_ev_surplus_config(
+            _cfg_dict(
+                vacation_entity="input_boolean.vacation_mode",
+                chargers=[
+                    {"id": "easee", "priority": 0, "phases": 1, "easee_device_id": "dev_easee",
+                     "power_entity": "sensor.easee_power", "plug_entity": "binary_sensor.easee_plug",
+                     "soc_entity": "input_number.fmb_soc", "capacity_kwh": 28,
+                     "vacation_target_soc": 15,
+                     "departure_entity": "input_datetime.fmb_departure"},
+                ],
+            )
+        )
+        ha = FakeHA(
+            _states(**{
+                "sensor.grid": "3000", "sensor.pv": "0",
+                "input_boolean.vacation_mode": "on", "input_number.fmb_soc": "12",
+            }),
+            attrs={"input_datetime.fmb_departure": {"timestamp": 1000.0 + 3600.0}},
+        )
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        # No grid-forced dynamic-limit write (would only happen if the deadline floor fired).
+        assert not any(
+            c[1] == "set_charger_dynamic_limit" and (c[3] or {}).get("current", 0) > 0
+            for c in ha.calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_departure_behind_forces_tesla_grid(self):
+        # Tesla 10%->80% of 60 kWh, departure in 2 h, no surplus (importing) => grid-forced
+        # toward max via number.set_value.
+        cfg = parse_ev_surplus_config(
+            _cfg_dict(
+                chargers=[
+                    {"id": "tesla", "priority": 0, "phases": 3, "min_current_a": 5,
+                     "max_current_a": 16, "switch_entity": "switch.tesla",
+                     "current_entity": "number.tesla_amps", "power_entity": "sensor.tesla_power",
+                     "plug_entity": "binary_sensor.tesla_plug",
+                     "soc_entity": "sensor.tesla_soc",
+                     "target_soc_entity": "input_number.tesla_target",
+                     "departure_entity": "input_datetime.tesla_departure", "capacity_kwh": 60},
+                ],
+            )
+        )
+        ha = FakeHA(
+            _states(**{
+                "sensor.grid": "5000", "sensor.pv": "0",
+                "sensor.tesla_soc": "10", "input_number.tesla_target": "80",
+            }),
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1000.0 + 7200.0}},
+        )
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        sets = [c for c in ha.calls if c[1] == "set_value"]
+        assert sets and sets[0][3]["value"] >= 10.0  # forced well above the 5 A min

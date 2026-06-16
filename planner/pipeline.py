@@ -47,6 +47,29 @@ from planner.vacation_state import load_last_anti_legionella, save_last_anti_leg
 logger = logging.getLogger("darkstar.planner")
 
 
+def partition_vacation_water_heaters(
+    water_heaters_cfg: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split enabled water heaters into ``(excluded, included)`` for vacation mode.
+
+    Excluded tanks (``exclude_from_vacation: true`` — e.g. a Villavagn rented out while the
+    owners are away) keep their NORMAL comfort heating. Included tanks have comfort heating
+    cleared and only get an anti-legionella cycle when one is due. Disabled tanks drop out of
+    both lists.
+    """
+    excluded = [
+        wh
+        for wh in water_heaters_cfg
+        if wh.get("enabled", True) and wh.get("exclude_from_vacation", False)
+    ]
+    included = [
+        wh
+        for wh in water_heaters_cfg
+        if wh.get("enabled", True) and not wh.get("exclude_from_vacation", False)
+    ]
+    return excluded, included
+
+
 def _calculate_excess_pv_flags(
     kepler_slots: list[Any],
     water_heaters: list[Any],
@@ -691,66 +714,79 @@ class PlannerPipeline:
             vacation_enabled = True
 
         if vacation_enabled:
-            logger.info("Vacation mode enabled - disabling comfort-based water heating")
-            # Disable water heating (clear the per-device list)
-            kepler_config.water_heaters = []
+            # Partition by exclude_from_vacation (Fas 0): flagged tanks (e.g. a rented-out
+            # Villavagn) keep NORMAL comfort heating; the rest get comfort cleared + anti-legionella
+            # when due. Replaces the old all-or-nothing clear so vacation can be scoped per tank.
+            from planner.solver.adapter import build_water_heater_inputs
+
+            excluded_cfg, included_cfg = partition_vacation_water_heaters(water_heaters_cfg)
+            excluded_heaters = build_water_heater_inputs(
+                excluded_cfg, active_config.get("water_heating", {}), water_heater_states
+            )
+            logger.info(
+                "Vacation mode: comfort heating OFF for %d tank(s); %d EXCLUDED (normal heating kept): %s",
+                len(included_cfg),
+                len(excluded_heaters),
+                [h.id for h in excluded_heaters],
+            )
+            # Excluded tanks keep their normal comfort heaters; included tanks are dropped.
+            kepler_config.water_heaters = list(excluded_heaters)
             kepler_config.water_heating_max_gap_hours = 0.0
 
-            # Check if anti-legionella cycle is due
-            sqlite_path = active_config.get("learning", {}).get(
-                "sqlite_path", "data/planner_learning.db"
-            )
-            last_al = load_last_anti_legionella(sqlite_path)
-
-            # Smart detection: If water was already heated today (≥2 kWh), treat as done
-            ha_water_today_total = (
-                sum(water_heated_today_by_id.values())
-                if water_heated_today_by_id
-                else ha_water_today_total
-            )
-            if last_al is None and ha_water_today_total >= 2.0:
-                logger.info(
-                    "Vacation mode: No prior anti-legionella record, but %.1f kWh already heated today. "
-                    "Setting last_anti_legionella_at to today.",
-                    ha_water_today_total,
+            # Anti-legionella applies ONLY to the INCLUDED (on-vacation) tanks, when due.
+            if included_cfg:
+                # Check if anti-legionella cycle is due
+                sqlite_path = active_config.get("learning", {}).get(
+                    "sqlite_path", "data/planner_learning.db"
                 )
-                save_last_anti_legionella(sqlite_path, now_slot.to_pydatetime())
-                last_al = now_slot.to_pydatetime()
+                last_al = load_last_anti_legionella(sqlite_path)
 
-            days_since = (
-                (now_slot.to_pydatetime().replace(tzinfo=None) - last_al.replace(tzinfo=None)).days
-                if last_al
-                else 999
-            )
-            interval_days = int(vacation_cfg.get("anti_legionella_interval_days", 7))
+                # Smart detection: If water was already heated today (≥2 kWh), treat as done
+                ha_water_today_total = (
+                    sum(water_heated_today_by_id.values())
+                    if water_heated_today_by_id
+                    else ha_water_today_total
+                )
+                if last_al is None and ha_water_today_total >= 2.0:
+                    logger.info(
+                        "Vacation mode: No prior anti-legionella record, but %.1f kWh already heated "
+                        "today. Setting last_anti_legionella_at to today.",
+                        ha_water_today_total,
+                    )
+                    save_last_anti_legionella(sqlite_path, now_slot.to_pydatetime())
+                    last_al = now_slot.to_pydatetime()
 
-            if days_since >= (interval_days - 1) and now_slot.hour >= 14:
-                duration_hours = float(vacation_cfg.get("anti_legionella_duration_hours", 3.0))
-                # Rebuild per-device water heaters for anti-legionella
-                # Each heater runs for duration_hours, min_kwh = power_kw * duration_hours
-                from planner.solver.adapter import build_water_heater_inputs
+                days_since = (
+                    (now_slot.to_pydatetime().replace(tzinfo=None) - last_al.replace(tzinfo=None)).days
+                    if last_al
+                    else 999
+                )
+                interval_days = int(vacation_cfg.get("anti_legionella_interval_days", 7))
 
-                al_heaters = build_water_heater_inputs(
-                    water_heaters_cfg, active_config.get("water_heating", {}), water_heater_states
-                )
-                for h in al_heaters:
-                    h.min_kwh_per_day = h.power_kw * duration_hours
-                kepler_config.water_heaters = al_heaters
-                al_kwh_total = sum(h.min_kwh_per_day for h in al_heaters)
-                schedule_anti_legionella = True
-                logger.info(
-                    "Anti-legionella due: %d days since last (interval=%d). Scheduling %.1f kWh across %d heaters.",
-                    days_since,
-                    interval_days,
-                    al_kwh_total,
-                    len(al_heaters),
-                )
-            else:
-                logger.debug(
-                    "Anti-legionella not due: %d days since last, hour=%d",
-                    days_since,
-                    now_slot.hour,
-                )
+                if days_since >= (interval_days - 1) and now_slot.hour >= 14:
+                    duration_hours = float(vacation_cfg.get("anti_legionella_duration_hours", 3.0))
+                    # Anti-legionella heaters: only the INCLUDED tanks, min_kwh = power x duration.
+                    al_heaters = build_water_heater_inputs(
+                        included_cfg, active_config.get("water_heating", {}), water_heater_states
+                    )
+                    for h in al_heaters:
+                        h.min_kwh_per_day = h.power_kw * duration_hours
+                    kepler_config.water_heaters = list(excluded_heaters) + al_heaters
+                    al_kwh_total = sum(h.min_kwh_per_day for h in al_heaters)
+                    schedule_anti_legionella = True
+                    logger.info(
+                        "Anti-legionella due: %d days since last (interval=%d). Scheduling %.1f kWh across %d heaters.",
+                        days_since,
+                        interval_days,
+                        al_kwh_total,
+                        len(al_heaters),
+                    )
+                else:
+                    logger.debug(
+                        "Anti-legionella not due: %d days since last, hour=%d",
+                        days_since,
+                        now_slot.hour,
+                    )
 
         logger.info(
             "Kepler input initial_soc_kwh: %.3f, water_heated_today: %.2f kWh",

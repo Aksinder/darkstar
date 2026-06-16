@@ -342,7 +342,9 @@ async def record_observation_from_current_state(
     # sensor sample — recording it would poison the Aurora base-load training set and feed the
     # planner a false 0 load. Skip this observation; the next tick records normally once the
     # register recovers (fix the root cause on the Sungrow/modbus side).
-    if total_load_kw <= 0.0:
+    # Only guard when a load_power sensor is actually configured: a deployment with no dedicated
+    # load sensor (load derived elsewhere) must not skip every observation forever.
+    if input_sensors.get("load_power") and total_load_kw <= 0.0:
         logger.warning(
             "Recorder: load_power read invalid (%.3f kW) — skipping observation "
             "(Sungrow modbus glitch; PV/grid/battery unaffected)",
