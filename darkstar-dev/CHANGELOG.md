@@ -1,3 +1,7 @@
+## dev-20260616.0905 — 2026-06-16 09:07
+
+- feat(ev): departure/target-SoC awareness + per-tank vacation (Fas 0-2)
+
 ## dev-20260614.1715 — 2026-06-14 17:17
 
 - fix(recorder): skip observation on glitched/zero load_power (Sungrow modbus)
