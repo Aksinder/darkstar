@@ -115,6 +115,19 @@ class ExecutorEngine:
         _fmb_soc_cfg = parse_fmb_soc_config(self._full_config.get("executor", {}) or {})
         self._fmb_soc = FmbSocEstimator(_fmb_soc_cfg) if _fmb_soc_cfg else None
 
+        # Deferrable smart-appliance controller (dishwasher/washing machine; default OFF,
+        # observe-only by default). Turnkey from a power_sensor: auto-arm -> cheapest forecast
+        # window -> done; publishes sensor.<prefix><id>_state. Reads top-level deferrable_loads[].
+        from .deferrable_runtime import (
+            DeferrableApplianceController,
+            parse_deferrable_runtime_config,
+        )
+
+        _deferrable_cfg = parse_deferrable_runtime_config(self._full_config)
+        self._deferrable = (
+            DeferrableApplianceController(_deferrable_cfg) if _deferrable_cfg else None
+        )
+
         # Status tracking - MUST be initialized BEFORE profile loading (REV IP3 Phase 6 fix)
         self.status = ExecutorStatus(
             enabled=self.config.enabled,
@@ -1450,6 +1463,21 @@ class ExecutorEngine:
                             )
                         except Exception as fmb_exc:
                             logger.warning("FMB SoC estimator error: %s", fmb_exc)
+
+                    # Deferrable smart-appliance controller (observe-first; never blocks the tick).
+                    if self._deferrable is not None and self.ha_client is not None:
+                        try:
+                            _defer_ts = time.time()
+                            await self._deferrable.run(
+                                self.ha_client,
+                                _defer_ts,
+                                datetime.fromtimestamp(
+                                    _defer_ts, pytz.timezone(self.config.timezone)
+                                ),
+                                shadow=self.config.shadow_mode,
+                            )
+                        except Exception as defer_exc:
+                            logger.warning("Deferrable appliance controller error: %s", defer_exc)
 
                     # Fix Issue 0: Await expected coroutine properly
                     profile_results = await self.dispatcher.execute(decision)

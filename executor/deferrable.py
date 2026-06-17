@@ -27,10 +27,168 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "AppliancePowerConfig",
+    "AppliancePowerState",
     "DeferrableLoadDecision",
     "DeferrableLoadState",
+    "WindowSlot",
+    "cheapest_window_start",
     "decide_deferrable_loads",
+    "recommend_appliance_action",
+    "update_appliance_power_state",
 ]
+
+
+@dataclass
+class WindowSlot:
+    """One forward price slot (from the planner schedule) for window scheduling."""
+
+    start_ts: float  # epoch seconds at the slot start
+    import_price_sek_kwh: float
+
+
+def cheapest_window_start(
+    slots: list[WindowSlot],
+    now_ts: float,
+    duration_slots: int,
+    deadline_ts: float | None,
+) -> float | None:
+    """Start ts of the cheapest contiguous ``duration_slots`` block.
+
+    Considers only blocks that start at/after the current slot and finish at/before
+    ``deadline_ts``. Returns the winning block's start ts, or ``None`` if the run can't
+    fit before the deadline (caller should then run immediately — deadline pressure).
+    This is the forecast-aware core: it costs the WHOLE cycle against the forward price
+    curve, so it never starts a long run right before a peak the way a "cheap right now?"
+    trigger does.
+    """
+    n = len(slots)
+    if duration_slots <= 0 or n < duration_slots:
+        return None
+    slot_len = (slots[1].start_ts - slots[0].start_ts) if n >= 2 else 900.0
+    # Allow the in-progress current slot to count as a valid start.
+    earliest_start = now_ts - slot_len
+    best_start: float | None = None
+    best_cost: float | None = None
+    for i in range(n - duration_slots + 1):
+        block = slots[i : i + duration_slots]
+        start_ts = block[0].start_ts
+        end_ts = block[-1].start_ts + slot_len
+        if start_ts < earliest_start:
+            continue
+        if deadline_ts is not None and end_ts > deadline_ts:
+            continue
+        cost = sum(s.import_price_sek_kwh for s in block)
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_start = start_ts
+    return best_start
+
+
+def recommend_appliance_action(
+    slots: list[WindowSlot],
+    now_ts: float,
+    duration_slots: int,
+    deadline_ts: float | None,
+) -> tuple[str, float | None]:
+    """Forecast-aware recommendation for an armed cycle.
+
+    Returns ``("run", None)`` when the cheapest window has started (or the run can't
+    fit before the deadline => run now), else ``("defer", window_start_ts)``.
+    """
+    start = cheapest_window_start(slots, now_ts, duration_slots, deadline_ts)
+    if start is None:
+        return ("run", None)  # cannot fit before deadline -> run now
+    if start <= now_ts:
+        return ("run", start)
+    return ("defer", start)
+
+
+@dataclass
+class AppliancePowerConfig:
+    """Power-based auto-arm / done detection tunables for one appliance.
+
+    Defaults mirror the proven HA washing-machine automations (arm >10 W for 3 s,
+    done <3 W for 5 min) so a turnkey setup needs only a ``power_sensor`` + the plug.
+    """
+
+    on_threshold_w: float = 10.0  # sustained draw >= this => a cycle has started (arm)
+    off_threshold_w: float = 3.0  # sustained draw < this => the cycle has finished (done)
+    start_debounce_s: float = 3.0  # power must stay above on_threshold this long to arm
+    done_delay_s: float = 300.0  # power must stay below off_threshold this long to call it done
+    power_scale: float = 1.0  # multiply metered power (e.g. 2 if only one phase is metered)
+
+
+@dataclass
+class AppliancePowerState:
+    """Persisted per-appliance state for the power-only arm/run/done state machine."""
+
+    pending: bool = False  # a cycle is armed (started, not yet finished)
+    running: bool = False  # currently drawing power
+    start_ts: float | None = None  # epoch seconds when this cycle armed
+    above_since: float | None = None  # first ts power has been continuously >= on_threshold
+    below_since: float | None = None  # first ts power has been continuously < off_threshold
+
+
+def update_appliance_power_state(
+    prev: AppliancePowerState,
+    power_w: float,
+    switch_on: bool,
+    now_ts: float,
+    cfg: AppliancePowerConfig,
+) -> tuple[AppliancePowerState, str | None]:
+    """Advance the power-only arm/run/done state machine by one tick.
+
+    Mirrors the proven HA automations so a user supplies only a power sensor:
+    - **arm** when draw is sustained >= ``on_threshold_w`` for ``start_debounce_s``;
+    - **done** when draw stays < ``off_threshold_w`` for ``done_delay_s`` *while the
+      plug is ON* — a zero reading because Darkstar cut power to defer is NOT
+      completion (the ``switch_on`` guard), exactly like the automation's
+      ``waiting == off`` condition on its Done rule.
+
+    Returns the new state plus an event (``"armed"`` | ``"done"`` | ``None``) the
+    caller can use to trigger a replan / notification.
+    """
+    p = max(0.0, power_w) * cfg.power_scale
+    above = p >= cfg.on_threshold_w
+    below = p < cfg.off_threshold_w
+
+    above_since = prev.above_since if above else None
+    if above and above_since is None:
+        above_since = now_ts
+    below_since = prev.below_since if below else None
+    if below and below_since is None:
+        below_since = now_ts
+
+    pending = prev.pending
+    start_ts = prev.start_ts
+    running = above
+    event: str | None = None
+
+    if not pending:
+        # Arm on a sustained start draw (only possible while the plug is powered).
+        if above_since is not None and (now_ts - above_since) >= cfg.start_debounce_s:
+            pending = True
+            start_ts = now_ts
+            event = "armed"
+    elif switch_on and below_since is not None and (now_ts - below_since) >= cfg.done_delay_s:
+        # Done only when powered AND draw has stayed low long enough. A 0 W reading
+        # while Darkstar holds the plug OFF to defer must never look like completion.
+        pending = False
+        running = False
+        start_ts = None
+        event = "done"
+
+    return (
+        AppliancePowerState(
+            pending=pending,
+            running=running,
+            start_ts=start_ts,
+            above_since=above_since,
+            below_since=below_since,
+        ),
+        event,
+    )
 
 
 @dataclass

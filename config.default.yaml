@@ -222,24 +222,34 @@ ev_chargers:
 # automations. A run is non-interruptible (one contiguous block). Disabled by
 # default: with no enabled loads + no pending run, nothing changes.
 deferrable_loads: []
-  # - id: dishwasher                 # Unique identifier (slug)
-  #   name: "Diskmaskin"
+  # TURNKEY MINIMUM: give Darkstar a power_sensor + switch_entity and it does the rest —
+  # auto-arms when the cycle starts (power rises), schedules the whole run into the
+  # cheapest FORECAST window before the deadline (duration-aware, unlike a "is it cheap
+  # right now?" trigger), gates the plug (resume-on-power), and detects done.
+  # - id: washer
+  #   name: "Tvättmaskin"
   #   enabled: true
-  #   duration_min: 120              # Seed cycle length (min); overridden by learned stats
-  #   energy_kwh: 1.2                # Seed cycle energy (kWh); overridden by learned stats
+  #   power_sensor: sensor.tvattmaskin_power    # REQUIRED (turnkey): auto-arm/run/done from draw
+  #   switch_entity: switch.tvattmaskin         # REQUIRED to defer: the plug Darkstar gates
+  #   # --- Power-based arm/done thresholds (defaults match the proven HA automations) ---
+  #   on_threshold_w: 10            # sustained draw >= this => cycle started (arm)
+  #   off_threshold_w: 3            # sustained draw < this => cycle done
+  #   start_debounce_s: 3           # draw must stay above on_threshold this long to arm
+  #   done_delay_s: 300             # draw must stay below off_threshold this long to call it done
+  #   override_entity: input_boolean.washing_machine_override  # optional: force run now (skip deferral)
+  #   # --- Scheduling deadline ---
   #   deadline_mode: cheapest_within_hours   # or: hard_deadline
   #   window_hours: 14               # for cheapest_within_hours (soft)
   #   # hard_deadline: "07:00"       # for hard_deadline (finish-by clock time)
-  #   phase: A                       # optional grid phase (A/B/C); auto-filled from the
-  #                                  # learned phase_model.json when phase_observer is on
-  #   switch_entity: switch.diskmaskin          # HA switch Darkstar gates power with
-  #   queued_signal: input_boolean.dishwasher_active   # auto-detect a queued cycle
-  #   # --- Cycle learning / HA publishing signals (sensor.darkstar_<id>_*) ---
-  #   running_sensor: sensor.dishwasher_status  # program-status sensor (Idle/Filling/Washing/...)
-  #   # status_sensor: sensor.dishwasher_status # alias for running_sensor (status kind)
-  #   # power_sensor: sensor.diskmaskin_power   # use instead for power-based detection
-  #   power_scale: 1.0                          # multiply the metered power (e.g. 2 if only one phase is metered)
-  #   energy_sensor: sensor.diskmaskin_energy   # cumulative kWh meter for ACCURATE per-cycle energy + daily draw
+  #   # --- Optional / learning ---
+  #   duration_min: 120              # Seed cycle length (min); overridden by learned stats
+  #   energy_kwh: 1.2                # Seed cycle energy (kWh); overridden by learned stats
+  #   energy_sensor: sensor.tvattmaskin_energy  # cumulative kWh meter => accurate per-cycle cost + daily draw
+  #   power_scale: 1.0               # multiply metered power (e.g. 2 if only one phase is metered)
+  #   phase: A                       # optional grid phase (A/B/C); auto-filled from phase_observer
+  #   queued_signal: input_boolean.washing_machine_active  # optional: external "armed" signal instead of
+  #                                  # power auto-arm (e.g. a program-status integration)
+  #   # status_sensor: sensor.washer_status     # optional program-status sensor for richer cycle phases
 
 # Global settings for deferrable loads (penalties used by the MILP).
 deferrable_load_settings:
@@ -720,6 +730,20 @@ executor:
                                            # writer — disable any old automation driving it FIRST.
     publish_entity_id: sensor.darkstar_fmb_soc_estimate  # set "" to skip the Darkstar SoC sensor
     publish_rate_entity_id: sensor.darkstar_fmb_consumption_rate
+
+  # Deferrable smart-appliance controller (dishwasher / washing machine). Turnkey: each
+  # entry in the top-level `deferrable_loads:` that has a `power_sensor` is auto-armed when
+  # its cycle starts, scheduled into the cheapest FORECAST window for the whole cycle before
+  # its deadline (duration-aware), and detected as done. Publishes sensor.<prefix><id>_state
+  # (idle/armed/waiting/running) with a `recommended_action` + `recommended_start` attribute.
+  # Default OFF. OBSERVE-ONLY by default: it publishes state + notifies but does NOT gate the
+  # plug, so you can verify its decisions against your existing HA automations before cutover.
+  deferrable_appliances:
+    enabled: false
+    observe_only: true             # true = publish + notify only (no plug actuation). Verify first.
+    notify_service: ""             # e.g. notify.notify_robert_emilia; blank => no notifications
+    publish_prefix: "darkstar_"    # sensor.<prefix><id>_state
+    slot_minutes: 15               # planner slot length (for duration -> slot count)
 
 # =============================================================================
 # UI Settings

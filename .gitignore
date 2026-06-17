@@ -47,6 +47,7 @@ data/recorder_state.json
 data/strategy_history.json
 data/hot_water_state.json
 data/fmb_soc_state.json
+data/deferrable_state.json
 schedule.json
 data/*.backup*
 *.backup*.db
