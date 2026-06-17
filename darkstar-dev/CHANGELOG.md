@@ -1,3 +1,7 @@
+## dev-20260617.0626 — 2026-06-17 06:28
+
+- feat(deferrable): turnkey smart-appliance controller (power sensor in, observe-first)
+
 ## dev-20260616.0905 — 2026-06-16 09:07
 
 - feat(ev): departure/target-SoC awareness + per-tank vacation (Fas 0-2)
