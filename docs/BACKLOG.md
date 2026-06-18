@@ -33,6 +33,12 @@ This document contains ideas, improvements, and tasks that are not yet scheduled
 
 <!-- Add new bugs/requests here. AI should wipe the item after processing into a OpenSpec change. -->
 
+#### [Tooling] PuLP 4.0 watch (added 2026-06-18)
+
+**Notes:** `pulp` is pinned to `<4.0.0` in `requirements.txt` because PuLP 3.x already emits deprecation warnings that `prob.constraints` dict access is removed in 4.0 — multiple planner files use this pattern. When PuLP 4.0 releases, the upgrade must include migrating all `prob.constraints[name]` dict usages to the new `prob.constraints()` list API before lifting the ceiling.
+
+---
+
 #### [Price Forecast / S-Index] Calibrate `RISK_PRICE_KW_FRACTION` Against Real Price Data
 
 **Goal:** Revisit the risk-fraction constants `{1: 0.15, 2: 0.12, 3: 0.10, 4: 0.05, 5: 0.02}` in `planner/strategy/s_index.py` after Module 3 (price-forecasting-module-3) has been live in production for 2–4 weeks and a meaningful sample of real positive-spread events has been observed. Determine whether the resulting floor adjustments match expected behavior or need tuning.
