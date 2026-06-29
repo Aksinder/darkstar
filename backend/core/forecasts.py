@@ -1,4 +1,3 @@
-import contextlib
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -545,19 +544,17 @@ async def get_all_input_data(
     }
     # -------------------------------------
 
-    # Resolve sensor-backed export-price components (premium / nätnytta / fee) so the plan's
-    # export compensation follows the contract live (C1). Literals in config are the fallback.
+    # Resolve sensor-backed price components — export (premium / nätnytta / fee) AND import
+    # (transfer / energy-tax) — so the plan follows the contract live (C1). Literals = fallback.
     pricing_cfg: dict[str, Any] = config.get("pricing", {}) or {}
     component_values: dict[str, float] = {}
-    for ent_key in ("export_premium_entity", "export_grid_benefit_entity", "export_fee_entity"):
+    for ent_key in prices.PRICE_COMPONENT_ENTITY_KEYS:
         eid = str(pricing_cfg.get(ent_key, "") or "").strip()
         if not eid:
             continue
-        st = await ha_client.get_ha_entity_state(eid)
-        raw = st.get("state") if st is not None else None
-        if raw is not None:
-            with contextlib.suppress(TypeError, ValueError):
-                component_values[eid] = float(raw)
+        value = prices.price_entity_to_sek(await ha_client.get_ha_entity_state(eid))
+        if value is not None:
+            component_values[eid] = value
     pricing_overrides = (
         prices.resolve_export_price_components(pricing_cfg, lambda e: component_values.get(e))
         if component_values

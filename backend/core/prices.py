@@ -1,9 +1,8 @@
-import contextlib
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytz
 import yaml
@@ -12,6 +11,22 @@ from nordpool.elspot import Prices
 from backend.core.cache import cache_sync
 
 logger = logging.getLogger("darkstar.core.prices")
+
+# Price-component entity overrides, resolved into the matching ``pricing.*_sek_kwh`` literals.
+# Single source for BOTH resolvers (prices._resolve_pricing_overrides and the forecasts.py
+# forward-curve path) so the list can never drift between them.
+PRICE_COMPONENT_ENTITY_KEYS = (
+    "export_premium_entity",
+    "export_grid_benefit_entity",
+    "export_fee_entity",
+    "grid_transfer_fee_entity",
+    "energy_tax_entity",
+)
+
+# A per-kWh price adder (transfer / tax / premium / ...) is well under this in SEK. A value at
+# or above it from a UNITLESS entity is almost certainly öre/kWh, so rescue it (÷100) + warn —
+# this prevents a bare input_number (37.5 öre) being read as 37.5 SEK (a 100x pricing error).
+_ORE_MAGNITUDE_CEILING_SEK = 5.0
 
 
 async def get_nordpool_data(
@@ -35,11 +50,13 @@ async def get_nordpool_data(
     # The cache key embeds the export components so a contract/sensor change invalidates any
     # stale price series instead of serving export prices computed under the old contract.
     _pc: dict[str, Any] = config.get("pricing", {}) or {}
-    cache_key = "nordpool_data:{}:{}:{}:{}".format(
+    cache_key = "nordpool_data:{}:{}:{}:{}:{}:{}".format(
         _pc.get("export_includes_spot", True),
         _pc.get("export_premium_sek_kwh", 0.0),
         _pc.get("export_grid_benefit_sek_kwh", 0.0),
         _pc.get("export_fee_sek_kwh", 0.0),
+        _pc.get("grid_transfer_fee_sek", 0.2456),
+        _pc.get("energy_tax_sek", 0.439),
     )
     cached = cache_sync.get(cache_key)
 
@@ -212,27 +229,63 @@ def calculate_import_export_prices(
     return import_price_sek_kwh, export_price_sek_kwh
 
 
+def price_entity_to_sek(state: dict[str, Any] | None) -> float | None:
+    """Read an HA price entity's state as SEK/kWh, converting öre/kWh -> SEK/kWh by unit.
+
+    Swedish tariff helpers (nätavgift / energiskatt) are usually in öre/kWh, but Darkstar's
+    price math is in SEK/kWh — so a value whose ``unit_of_measurement`` mentions öre is
+    divided by 100. Returns ``None`` when the state is missing or not float-parseable.
+    """
+    if state is None:
+        return None
+    raw = state.get("state")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    attrs = cast("dict[str, Any]", state.get("attributes") or {})
+    unit = str(attrs.get("unit_of_measurement", "")).strip().lower()
+    if unit.startswith("öre") or unit.startswith("ore"):
+        return value / 100.0
+    if unit.startswith("sek") or unit.startswith("kr"):
+        return value
+    # No SEK/öre unit set: a per-kWh adder at/above the ceiling is almost certainly öre.
+    if abs(value) >= _ORE_MAGNITUDE_CEILING_SEK:
+        logger.warning(
+            "price_entity_to_sek: %.3f has no SEK/öre unit_of_measurement; assuming öre/kWh "
+            "(÷100). Set the helper's unit to SEK/kWh or öre/kWh to silence this.",
+            value,
+        )
+        return value / 100.0
+    return value
+
+
 def resolve_export_price_components(
     pricing_config: dict[str, Any],
     get_state: Callable[[str], float | None],
 ) -> dict[str, Any]:
-    """Resolve sensor-backed export-price components into literal SEK/kWh values.
+    """Resolve sensor-backed price components (export AND import) into literal SEK/kWh.
 
-    Returns a shallow copy of ``pricing_config`` where each ``export_*_sek_kwh`` value is
-    overwritten by the current reading of its companion ``export_*_entity`` HA sensor,
-    when that entity is configured and readable. ``get_state`` maps an ``entity_id`` to a
-    float (SEK/kWh) or ``None`` when unavailable. Unset/unreadable entities leave the
-    literal untouched, so this is always safe to call.
+    Returns a shallow copy of ``pricing_config`` where each ``*_sek_kwh`` value is overwritten
+    by the current reading of its companion ``*_entity`` HA sensor, when configured and
+    readable. ``get_state`` maps an ``entity_id`` to a float in SEK/kWh (callers do any
+    öre->SEK conversion via :func:`price_entity_to_sek` before this) or ``None``. Unset /
+    unreadable entities leave the literal untouched, so this is always safe to call.
 
-    This lets the effective export compensation follow the user's contract live: point an
-    ``export_*_entity`` at an ``input_number``/sensor and adjust it when the contract
-    changes — no redeploy.
+    This is the single-source price hook: point e.g. ``grid_transfer_fee_entity`` /
+    ``energy_tax_entity`` (import) or ``export_premium_entity`` (export) at your own
+    input_number/sensor and adjust it when the contract changes — no redeploy.
     """
     resolved = dict(pricing_config)
     for value_key, entity_key in (
         ("export_premium_sek_kwh", "export_premium_entity"),
         ("export_grid_benefit_sek_kwh", "export_grid_benefit_entity"),
         ("export_fee_sek_kwh", "export_fee_entity"),
+        # Import-side adders (single source: point these at your nätavgift / energiskatt helpers).
+        ("grid_transfer_fee_sek", "grid_transfer_fee_entity"),
+        ("energy_tax_sek", "energy_tax_entity"),
     ):
         entity_id = str(pricing_config.get(entity_key, "") or "").strip()
         if not entity_id:
@@ -250,24 +303,25 @@ async def _resolve_pricing_overrides(config: dict[str, Any]) -> dict[str, Any] |
     ``export_*_entity`` is configured.
     """
     pricing_cfg: dict[str, Any] = config.get("pricing", {}) or {}
-    entity_keys = ("export_premium_entity", "export_grid_benefit_entity", "export_fee_entity")
-    if not any(str(pricing_cfg.get(k, "") or "").strip() for k in entity_keys):
+    if not any(str(pricing_cfg.get(k, "") or "").strip() for k in PRICE_COMPONENT_ENTITY_KEYS):
         return None
 
     from backend.core import ha_client  # lazy import to avoid any import cycle
 
     values: dict[str, float] = {}
-    for ek in entity_keys:
+    for ek in PRICE_COMPONENT_ENTITY_KEYS:
         eid = str(pricing_cfg.get(ek, "") or "").strip()
         if not eid:
             continue
-        state = await ha_client.get_ha_entity_state(eid)
-        raw = state.get("state") if state is not None else None
-        if raw is None:
-            continue
-        with contextlib.suppress(TypeError, ValueError):
-            values[eid] = float(raw)
+        value = price_entity_to_sek(await ha_client.get_ha_entity_state(eid))
+        if value is not None:
+            values[eid] = value
     if not values:
+        # At least one entity was configured (guard above) but none were readable — don't
+        # silently use stale literals without saying so.
+        logger.warning(
+            "Pricing: configured price entity(ies) unreadable; falling back to config literals."
+        )
         return None
     return resolve_export_price_components(pricing_cfg, lambda e: values.get(e))
 

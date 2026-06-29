@@ -433,8 +433,12 @@ nordpool:
 # Pricing Configuration (your electricity costs)
 pricing:
   vat_percent: 25.0                    # VAT percentage on electricity
-  grid_transfer_fee_sek: 0.2456        # Grid operator transfer fee per kWh
-  energy_tax_sek: 0.439                # Energy tax per kWh
+  grid_transfer_fee_sek: 0.2456        # Grid operator transfer fee per kWh (fallback literal)
+  grid_transfer_fee_entity: ""         # Optional HA entity overriding the literal (single source).
+                                       # Accepts SEK/kWh or öre/kWh (auto-converts by unit_of_measurement),
+                                       # so you can point it straight at your nätavgift input_number.
+  energy_tax_sek: 0.439                # Energy tax per kWh (fallback literal)
+  energy_tax_entity: ""                # Optional HA entity overriding the literal (SEK or öre/kWh)
   # --- Export compensation (what you are PAID for exported energy) ---
   # Effective export price = (spot if export_includes_spot) + premium + grid_benefit - fee.
   # Set the literals to your contract, OR point *_entity at an HA sensor/input_number (SEK/kWh)
