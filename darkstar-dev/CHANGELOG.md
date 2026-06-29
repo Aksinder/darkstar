@@ -1,3 +1,7 @@
+## dev-20260629.1017 — 2026-06-29 10:19
+
+- feat(pricing): single-source import price — grid_transfer_fee/energy_tax entity overrides
+
 ## dev-20260617.0626 — 2026-06-17 06:28
 
 - feat(deferrable): turnkey smart-appliance controller (power sensor in, observe-first)
