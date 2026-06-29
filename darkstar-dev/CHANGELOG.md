@@ -1,3 +1,7 @@
+## dev-20260629.1727 — 2026-06-29 17:29
+
+- fix(planner): model hybrid-inverter PV share for max_ac_power_kw (Option A)
+
 ## dev-20260629.1017 — 2026-06-29 10:19
 
 - feat(pricing): single-source import price — grid_transfer_fee/energy_tax entity overrides
