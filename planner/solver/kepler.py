@@ -510,10 +510,17 @@ class KeplerSolver:
             if config.max_import_power_kw is not None:
                 prob += grid_import[t] <= config.max_import_power_kw * h
 
-            # Inverter AC output limit (PV + battery discharge combined)
+            # Inverter AC output limit: battery discharge shares the hybrid inverter's AC bus
+            # with that inverter's OWN PV. On a multi-inverter site, PV on a separate
+            # AC-coupled inverter (e.g. Fronius) does NOT consume the hybrid inverter's
+            # headroom, so subtract only the hybrid inverter's share of PV
+            # (hybrid_pv_fraction); None => all PV (legacy single-inverter behaviour).
             if config.max_inverter_ac_kw is not None:
                 inverter_ac_kwh = config.max_inverter_ac_kw * h
-                prob += discharge[t] <= max(0.0, inverter_ac_kwh - s.pv_kwh)
+                hybrid_pv_kwh = s.pv_kwh * (
+                    config.hybrid_pv_fraction if config.hybrid_pv_fraction is not None else 1.0
+                )
+                prob += discharge[t] <= max(0.0, inverter_ac_kwh - hybrid_pv_kwh)
 
             # Soft Grid Import Limit
             if config.grid_import_limit_kw is not None:

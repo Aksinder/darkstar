@@ -720,6 +720,21 @@ def config_to_kepler_config(
         max_charge_kw = (float(battery.get("max_charge_a", 0.0)) * voltage) / 1000.0
         max_discharge_kw = (float(battery.get("max_discharge_a", 0.0)) * voltage) / 1000.0
 
+    # Multi-inverter: fraction of total PV on the BATTERY (hybrid) inverter. The
+    # max_inverter_ac_kw discharge headroom should only reserve room for THAT inverter's own
+    # PV — PV on a separate AC-coupled inverter (e.g. Fronius) doesn't use the hybrid AC bus.
+    # None unless at least one solar_arrays entry is tagged on_battery_inverter: true
+    # (legacy single-inverter behaviour: all PV treated as on the hybrid inverter).
+    hybrid_pv_fraction: float | None = None
+    _arrays = cast("list[dict[str, Any]]", system.get("solar_arrays", []) or [])
+    if any(a.get("on_battery_inverter") for a in _arrays):
+        _total_kwp = sum(float(a.get("kwp", 0.0) or 0.0) for a in _arrays)
+        _hybrid_kwp = sum(
+            float(a.get("kwp", 0.0) or 0.0) for a in _arrays if a.get("on_battery_inverter")
+        )
+        if _total_kwp > 0.0:
+            hybrid_pv_fraction = _hybrid_kwp / _total_kwp
+
     kepler_cfg = KeplerConfig(
         capacity_kwh=capacity,
         min_soc_percent=float(battery.get("min_soc_percent", 10.0)),
@@ -748,6 +763,7 @@ def config_to_kepler_config(
             if system.get("inverter", {}).get("max_ac_power_kw")
             else None
         ),
+        hybrid_pv_fraction=hybrid_pv_fraction,
         ramping_cost_sek_per_kw=float(
             planner_config.get("kepler", {}).get(
                 "ramping_cost_sek_per_kw", get_val("ramping_cost_sek_per_kw", 0.05)
