@@ -24,7 +24,12 @@ system:
   grid:
     max_power_kw: 8                    # HARD limit: max grid import (cannot be exceeded)
   inverter:
-    max_ac_power_kw: 10.0              # Maximum inverter AC power output (PV + battery discharge)
+    max_ac_power_kw: 10.0              # Maximum inverter AC power output (PV + battery discharge).
+                                       # This caps battery DISCHARGE against the hybrid (battery)
+                                       # inverter's AC bus minus its OWN PV. On a multi-inverter
+                                       # site, tag which arrays are on this inverter via
+                                       # solar_arrays[].on_battery_inverter so PV on a separate
+                                       # AC-coupled inverter (e.g. Fronius) isn't wrongly counted.
     max_dc_input_kw: 12.0              # Maximum DC power from PV strings (clips PV forecast)
   location:
     latitude: 55.123                # Decimal degrees, positive north (for PV forecasting)
@@ -34,6 +39,11 @@ system:
       azimuth: 180                       # Panel direction: 0°=North, 90°=East, 180°=South, 270°=West
       kwp: 5.0                           # Total DC peak power of PV array in kilowatts
       tilt: 35                           # Panel angle from horizontal: 0°=flat, 90°=vertical
+      # on_battery_inverter: true        # Multi-inverter only: set on the arrays wired to the
+      #                                  # HYBRID/battery inverter. The max_ac_power_kw discharge
+      #                                  # headroom then reserves room for only this inverter's PV
+      #                                  # share (sum of tagged kWp / total kWp). Omit on a
+      #                                  # single-inverter system (all PV counts, legacy behaviour).
 
 # Battery Specifications
 battery:

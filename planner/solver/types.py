@@ -111,6 +111,12 @@ class KeplerConfig:
     max_inverter_ac_kw: float | None = (
         None  # Inverter AC output limit (PV + battery discharge combined)
     )
+    # Fraction (0..1) of total PV that flows through the BATTERY (hybrid) inverter, used to size
+    # the max_inverter_ac_kw discharge headroom. On a multi-inverter site only the hybrid
+    # inverter's own PV competes with battery discharge for its AC bus; PV on a separate
+    # AC-coupled inverter (e.g. Fronius) does not. None => treat all PV as on the hybrid
+    # inverter (legacy single-inverter behaviour).
+    hybrid_pv_fraction: float | None = None
     target_soc_kwh: float | None = None  # Minimum SoC at end of horizon
     target_soc_penalty_sek: float = 0.0  # Set by pipeline (Safety Floor penalty)
     curtailment_penalty_sek: float = 0.0  # Penalty for wasting available solar power

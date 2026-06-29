@@ -6,6 +6,7 @@ with multiple water heaters and EV chargers.
 """
 
 import pandas as pd
+import pytest
 import pytz
 
 from planner.solver.adapter import (
@@ -462,6 +463,46 @@ class TestKeplerConfigWithARC15:
         assert kepler_cfg.max_inverter_ac_kw is None, (
             f"max_inverter_ac_kw should be None when not configured, got {kepler_cfg.max_inverter_ac_kw}"
         )
+
+    def _battery(self):
+        return {
+            "capacity_kwh": 16.0,
+            "min_soc_percent": 10.0,
+            "max_soc_percent": 100.0,
+            "max_charge_a": 100.0,
+            "max_discharge_a": 100.0,
+            "nominal_voltage_v": 48.0,
+            "charge_efficiency": 0.95,
+        }
+
+    def test_hybrid_pv_fraction_from_battery_inverter_tags(self):
+        """on_battery_inverter tags => fraction = tagged kWp / total kWp."""
+        config = {
+            "config_version": 2,
+            "system": {
+                "inverter": {"max_ac_power_kw": 10.0},
+                "solar_arrays": [
+                    {"name": "fronius", "kwp": 11.4},  # AC-coupled, not on the battery inverter
+                    {"name": "sg1", "kwp": 4.5, "on_battery_inverter": True},
+                    {"name": "sg2", "kwp": 4.0, "on_battery_inverter": True},
+                ],
+            },
+            "battery": self._battery(),
+        }
+        kepler_cfg = config_to_kepler_config(config)
+        assert kepler_cfg.hybrid_pv_fraction == pytest.approx(8.5 / 19.9)
+
+    def test_hybrid_pv_fraction_none_without_tags(self):
+        """No on_battery_inverter tags => None (legacy: all PV counts)."""
+        config = {
+            "config_version": 2,
+            "system": {
+                "inverter": {"max_ac_power_kw": 10.0},
+                "solar_arrays": [{"name": "main", "kwp": 5.0}],
+            },
+            "battery": self._battery(),
+        }
+        assert config_to_kepler_config(config).hybrid_pv_fraction is None
 
 
 class TestKeplerInputConversion:

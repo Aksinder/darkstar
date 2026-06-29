@@ -168,3 +168,55 @@ def test_inverter_ac_limit_respected_at_night():
         assert s.discharge_kwh <= 2.5 + 0.01
         # Since export is profitable, should discharge significantly
         assert s.discharge_kwh > 1.0, "Should discharge at night when export is profitable"
+
+
+def _high_pv_input():
+    start = datetime(2025, 1, 1, 12, 0)
+    slots = [
+        KeplerInputSlot(
+            start_time=start + timedelta(minutes=15 * i),
+            end_time=start + timedelta(minutes=15 * (i + 1)),
+            load_kwh=0.0,
+            pv_kwh=2.5,  # 10 kW == the inverter AC limit
+            import_price_sek_kwh=0.5,
+            export_price_sek_kwh=2.0,  # export is profitable -> planner wants to discharge
+        )
+        for i in range(2)
+    ]
+    return KeplerInput(slots=slots, initial_soc_kwh=10.0)
+
+
+def _base_cfg(**over):
+    base = dict(
+        capacity_kwh=10.0,
+        max_charge_power_kw=10.0,
+        max_discharge_power_kw=10.0,
+        charge_efficiency=1.0,
+        discharge_efficiency=1.0,
+        min_soc_percent=0.0,
+        max_soc_percent=100.0,
+        wear_cost_sek_per_kwh=0.1,
+        max_inverter_ac_kw=10.0,
+        max_export_power_kw=20.0,
+        enable_export=True,
+    )
+    base.update(over)
+    return KeplerConfig(**base)
+
+
+def test_legacy_all_pv_locks_out_discharge_under_high_pv():
+    """Bug reproduction: with hybrid_pv_fraction=None, PV == inverter AC zeroes discharge."""
+    result = KeplerSolver().solve(_high_pv_input(), _base_cfg())
+    assert result.is_optimal
+    # 2.5 kWh PV == 2.5 kWh inverter cap -> max(0, 2.5-2.5) = 0 -> discharge forced off.
+    assert all(s.discharge_kwh <= 0.01 for s in result.slots)
+
+
+def test_hybrid_pv_fraction_frees_discharge_under_high_pv():
+    """Option A fix: only the hybrid inverter's PV share competes for its AC bus."""
+    result = KeplerSolver().solve(_high_pv_input(), _base_cfg(hybrid_pv_fraction=0.4))
+    assert result.is_optimal
+    # Headroom per slot = 2.5 - 0.4*2.5 = 1.5 kWh -> discharge now allowed up to 1.5.
+    assert sum(s.discharge_kwh for s in result.slots) > 1.0
+    for s in result.slots:
+        assert s.discharge_kwh <= 1.5 + 0.01
