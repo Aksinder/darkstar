@@ -105,3 +105,49 @@ class TestResolveExportComponents:
         resolved = resolve_export_price_components(pricing, lambda e: states.get(e))
         _imp, exp = calculate_import_export_prices(-50.0, {"pricing": resolved})  # spot -0.05
         assert exp == pytest.approx(0.09)
+
+
+def _import(spot_kwh: float, pricing: dict | None = None) -> float:
+    """Import price (SEK/kWh) for a given spot (SEK/kWh) and pricing config."""
+    imp, _exp = calculate_import_export_prices(spot_kwh * 1000.0, {"pricing": pricing or {}})
+    return imp
+
+
+class TestImportVat:
+    def test_legacy_fees_excl_vat_applies_vat_to_whole_sum(self):
+        # Default (fees_include_vat absent/false): VAT on (spot + fees).
+        pricing = {"vat_percent": 25.0, "grid_transfer_fee_sek": 0.30, "energy_tax_sek": 0.40}
+        # (1.00 + 0.30 + 0.40) * 1.25 = 2.125
+        assert _import(1.00, pricing) == pytest.approx(2.125)
+
+    def test_fees_include_vat_applies_vat_to_spot_only(self):
+        # VAT-inclusive fees: VAT on spot only, fees added as-is.
+        pricing = {
+            "vat_percent": 25.0,
+            "grid_transfer_fee_sek": 0.375,  # 0.30 excl * 1.25
+            "energy_tax_sek": 0.50,  # 0.40 excl * 1.25
+            "fees_include_vat": True,
+        }
+        # 1.00 * 1.25 + 0.375 + 0.50 = 2.125
+        assert _import(1.00, pricing) == pytest.approx(2.125)
+
+    def test_both_conventions_agree_for_the_same_tariff(self):
+        # The same real tariff expressed excl-VAT (legacy) vs incl-VAT (flag) must match.
+        excl = _import(0.80, {"grid_transfer_fee_sek": 0.30, "energy_tax_sek": 0.428})
+        incl = _import(
+            0.80,
+            {
+                "grid_transfer_fee_sek": 0.30 * 1.25,
+                "energy_tax_sek": 0.428 * 1.25,
+                "fees_include_vat": True,
+            },
+        )
+        assert excl == pytest.approx(incl)
+
+    def test_pointing_incl_vat_fees_without_flag_overcharges(self):
+        # Regression guard for the Burgbyn10 finding: feeding VAT-inclusive fees WITHOUT the
+        # flag double-VATs them, inflating the import price above the flag-correct value.
+        incl_fees = {"grid_transfer_fee_sek": 0.375, "energy_tax_sek": 0.535}
+        wrong = _import(0.717, incl_fees)  # legacy path re-applies VAT to the fees
+        right = _import(0.717, {**incl_fees, "fees_include_vat": True})
+        assert wrong > right + 0.2  # ~0.23 SEK/kWh double-VAT on the fees

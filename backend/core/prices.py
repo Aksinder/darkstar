@@ -197,6 +197,12 @@ def calculate_import_export_prices(
     ``pricing`` keys via :func:`resolve_export_price_components` so a contract change just
     means updating a sensor/helper — no code change.
 
+    Import price is ``(spot + grid_transfer_fee + energy_tax) * (1 + VAT)``. When
+    ``fees_include_vat`` is true the fees are treated as already VAT-inclusive, so VAT is
+    applied to the spot only and the fees are added as-is — letting you point
+    ``grid_transfer_fee_entity`` / ``energy_tax_entity`` straight at your "as billed" öre
+    helpers (nätavgift / energiskatt) without the VAT being applied a second time.
+
     Args:
         spot_price_mwh: Spot price in SEK/MWh
         config: Configuration dictionary
@@ -222,9 +228,20 @@ def calculate_import_export_prices(
         - export_fee_sek
     )
 
-    import_price_sek_kwh = (spot_price_sek_kwh + grid_transfer_fee_sek + energy_tax_sek) * (
-        1 + vat_percent / 100.0
-    )
+    # Import price. ``fees_include_vat`` selects which VAT convention the configured grid
+    # fees are in: false (legacy) = VAT-exclusive fees, VAT applied to (spot + fees); true =
+    # VAT-inclusive fees (e.g. Swedish öre helpers "as billed"), VAT applied to spot only and
+    # the fees added as-is. Both give the same total for the same real tariff.
+    fees_include_vat = bool(pricing_config.get("fees_include_vat", False))
+    vat_multiplier = 1 + vat_percent / 100.0
+    if fees_include_vat:
+        import_price_sek_kwh = (
+            spot_price_sek_kwh * vat_multiplier + grid_transfer_fee_sek + energy_tax_sek
+        )
+    else:
+        import_price_sek_kwh = (
+            spot_price_sek_kwh + grid_transfer_fee_sek + energy_tax_sek
+        ) * vat_multiplier
 
     return import_price_sek_kwh, export_price_sek_kwh
 
