@@ -449,6 +449,14 @@ pricing:
                                        # so you can point it straight at your nätavgift input_number.
   energy_tax_sek: 0.439                # Energy tax per kWh (fallback literal)
   energy_tax_entity: ""                # Optional HA entity overriding the literal (SEK or öre/kWh)
+  fees_include_vat: false              # Import price = (spot + transfer + tax) × (1 + VAT).
+                                       # false: the fees above are VAT-EXCLUSIVE (VAT applies to the
+                                       #   whole sum) — the historical default.
+                                       # true: the fees are VAT-INCLUSIVE (e.g. Swedish nätavgift /
+                                       #   energiskatt helpers in öre "as billed") — VAT is applied to
+                                       #   the spot only and the fees are added as-is, so you can point
+                                       #   grid_transfer_fee_entity / energy_tax_entity straight at those
+                                       #   helpers WITHOUT VAT being charged on them twice.
   # --- Export compensation (what you are PAID for exported energy) ---
   # Effective export price = (spot if export_includes_spot) + premium + grid_benefit - fee.
   # Set the literals to your contract, OR point *_entity at an HA sensor/input_number (SEK/kWh)
