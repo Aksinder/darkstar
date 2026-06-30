@@ -1,3 +1,7 @@
+## dev-20260630.2236 — 2026-06-30 22:38
+
+- feat(pricing): add fees_include_vat for VAT-inclusive grid fee helpers
+
 ## dev-20260629.1727 — 2026-06-29 17:29
 
 - fix(planner): model hybrid-inverter PV share for max_ac_power_kw (Option A)
