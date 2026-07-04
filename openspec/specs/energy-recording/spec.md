@@ -359,3 +359,31 @@ The recorder SHALL subtract energy from controllable loads (EV charging, water h
 - **WHEN** no `total_load_consumption` sensor is configured
 - **AND** the LoadDisaggregator provides `base_load_kw` from power snapshot isolation
 - **THEN** the recorder SHALL use `base_load_kw * 0.25` for `load_kwh`
+#### Scenario: Backfill disaggregates exactly like the live path
+- **WHEN** the backfill/gap-fill path fills a missing slot whose total load delta is `5.0 kWh`
+- **AND** EV charging consumed `2.0 kWh` and water heating `0.5 kWh` during that slot (fetched from power history for the same window)
+- **THEN** the backfill path SHALL store `2.5 kWh` as `load_kwh`, NOT the un-disaggregated `5.0 kWh`
+
+### Requirement: Single Live Recorder Instance
+Exactly one live recorder instance SHALL write `slot_observations` energy and price columns at runtime. The deployment runtime SHALL NOT start more than one concurrent recorder, and the in-process `RecorderService` (started by `backend/main.py`) SHALL be the single canonical live recorder. Container entrypoints SHALL NOT additionally launch the standalone `python -m backend.recorder` loop alongside the application server.
+
+Two concurrent recorders sharing the meter-state file (`data/recorder_state.json`) will race — the later writer reads the already-advanced cumulative state, computes a zero delta, and overwrites the earlier writer's real measurement with `0.0`. A single live recorder makes the shared-state delta calculation well-defined.
+
+#### Scenario: Application server starts exactly one recorder
+- **WHEN** the container starts the application server (`uvicorn backend.main:app`)
+- **THEN** the in-process `RecorderService` SHALL be the only recorder loop running
+- **AND** no standalone `python -m backend.recorder` process SHALL be launched alongside it
+
+#### Scenario: Entrypoint does not launch a standalone recorder
+- **WHEN** `scripts/docker-entrypoint.sh` runs
+- **THEN** it SHALL NOT invoke `python -m backend.recorder` (neither at initial startup nor in any process-monitor/restart block)
+- **AND** it SHALL rely on the application server's in-process recorder for live observation recording
+
+#### Scenario: A second concurrent recorder cannot silently zero out real data
+- **WHEN** a real cumulative-meter delta has been recorded for a slot by the single live recorder
+- **AND** any additional recorder loop were to run against the same shared meter-state file
+- **THEN** the system design SHALL prevent that second loop from overwriting the real measurement with a zero delta — enforced by ensuring only one recorder instance runs
+
+#### Scenario: Add-on and root entrypoints are consistent
+- **WHEN** the system is deployed via either the root `Dockerfile` (`scripts/docker-entrypoint.sh`) or the HA add-on Dockerfiles (`darkstar/run.sh`, `darkstar-dev/run.sh`)
+- **THEN** both topologies SHALL run exactly one live recorder (the in-process `RecorderService`)
