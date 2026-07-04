@@ -123,6 +123,19 @@ class KeplerConfig:
     ramping_cost_sek_per_kw: float = 0.0  # Penalty for power changes
     export_threshold_sek_per_kwh: float = 0.0  # Min spread to export
     grid_import_limit_kw: float | None = None  # Soft constraint
+    # Effekttariff (monthly peak demand charge). When cost > 0 the solver adds a peak
+    # variable over each clock-hour's MEAN grid import (Swedish "timmedelvärde" — what
+    # the DSO actually bills) and pays cost_sek_per_kw for raising it above the
+    # month-to-date baseline. Staying under the existing monthly peak is free, matching
+    # how a demand tariff prices only new peaks.
+    peak_power_cost_sek_per_kw: float = 0.0
+    peak_power_baseline_kw: float = 0.0
+    # kWh already imported in the in-progress clock hour BEFORE the horizon starts
+    # (mid-hour replans). Injected into that hour's peak constraint so the billed
+    # full-hour mean is priced correctly — without it a mid-hour replan both misses
+    # real peaks (elapsed burst + planned import) and hallucinates phantom ones
+    # (planned kWh divided by the covered fraction instead of the full hour).
+    peak_hour_elapsed_import_kwh: float = 0.0
     # Per-device water heater inputs (replaces scalar water fields)
     water_heaters: list[WaterHeaterInput] = field(default_factory=lambda: [])
 

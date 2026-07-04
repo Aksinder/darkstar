@@ -485,13 +485,29 @@ forecasting:
                                        # plans for less load than this % of the forecast, regardless
                                        # of s_index.risk_appetite (which tunes conservatism ABOVE it).
 
-# Grid Limits (Soft Constraint)
-# This is a SOFT limit with penalty - planner prefers to stay under but can breach if needed.
+# Grid Limits & Effekttariff
 # See system.grid.max_power_kw for the HARD limit (cannot be exceeded).
-# NOTE: Soft limit feature exists in KeplerConfig but not wired to config.
-# Planned for effekttariff feature. Currently unused.
 grid:
-  import_limit_kw: 11.0                # Soft limit for effekttariff (breached with high penalty)
+  # SOFT import cap: planner prefers to stay under import_limit_kw but can breach it
+  # at a high penalty (5000 SEK/kWh). OPT-IN via enforce_import_limit — the limit has
+  # shipped in configs for a long time without effect, so it only activates when you
+  # explicitly say so.
+  import_limit_kw: 11.0
+  enforce_import_limit: false
+  # Effekttariff (monthly peak demand charge). When cost > 0 the planner models your
+  # DSO's demand tariff: a peak variable per calendar month dominates every clock-hour's
+  # MEAN grid import (timmedelvärde — what Swedish DSOs bill) and the objective pays
+  # cost_sek_per_kw for raising it above the month-to-date baseline. Staying under the
+  # month's existing peak is free, and hours in a LATER month price their peak from
+  # zero (billing resets). Mid-hour replans inject the current hour's already-elapsed
+  # import (from the grid power sensor's history) so the billed full-hour mean is
+  # priced correctly. Point baseline at a sensor holding this month's peak so far
+  # (e.g. a utility_meter/statistics helper on hourly import power, monthly cycle);
+  # the unit is read from unit_of_measurement (kW or W — set it on the helper).
+  # 0/blank = feature off.
+  peak_power_cost_sek_per_kw: 0.0      # your DSO's kr/kW/month demand charge (0 = off)
+  peak_power_baseline_entity: ""       # HA sensor: month-to-date peak import (kW)
+  peak_power_baseline_kw: 0.0          # fallback literal when the entity is unset/unreadable
 
 # Kepler Solver (MILP optimizer settings)
 kepler:

@@ -512,6 +512,79 @@ async def get_initial_state(
     ev_soc_percent = ev_charger_states[0]["soc_percent"] if ev_charger_states else 0.0
     ev_plugged_in = ev_charger_states[0]["plugged_in"] if ev_charger_states else False
 
+    # Effekttariff inputs (only fetched when the feature is on: cost > 0).
+    grid_cfg = cast("dict[str, Any]", config.get("grid", {}) or {})
+    peak_power_baseline_kw = float(grid_cfg.get("peak_power_baseline_kw", 0.0) or 0.0)
+    peak_hour_elapsed_import_kwh = 0.0
+    if float(grid_cfg.get("peak_power_cost_sek_per_kw", 0.0) or 0.0) > 0.0:
+        # Baseline: month-to-date peak import (kW) so the planner only pays for RAISING
+        # the monthly peak. Unit-aware (W/kW via unit_of_measurement); a unitless value
+        # falls back to a magnitude heuristic; an unreadable entity keeps the literal.
+        peak_entity = str(grid_cfg.get("peak_power_baseline_entity", "") or "").strip()
+        if peak_entity:
+            peak_state = await get_ha_entity_state(peak_entity)
+            live_peak: float | None = None
+            peak_unit = ""
+            if peak_state:
+                raw_peak = peak_state.get("state")
+                if raw_peak not in (None, "unknown", "unavailable"):
+                    try:
+                        live_peak = float(raw_peak)
+                    except (TypeError, ValueError):
+                        live_peak = None
+                peak_unit = str(
+                    cast("dict[str, Any]", peak_state.get("attributes", {}) or {}).get(
+                        "unit_of_measurement", ""
+                    )
+                ).strip()
+            if live_peak is None:
+                logger.warning(
+                    "peak_power_baseline_entity %s unreadable; using literal %.2f kW",
+                    peak_entity,
+                    peak_power_baseline_kw,
+                )
+            else:
+                if peak_unit.upper() == "W":
+                    live_peak = live_peak / 1000.0
+                elif not peak_unit and abs(live_peak) > 1000.0:
+                    # No unit set: a household month-peak above 1000 is almost surely W.
+                    logger.warning(
+                        "peak_power_baseline_entity %s = %.0f has no unit; assuming W "
+                        "(set the sensor's unit_of_measurement to kW or W to silence this)",
+                        peak_entity,
+                        live_peak,
+                    )
+                    live_peak = live_peak / 1000.0
+                peak_power_baseline_kw = float(live_peak)
+
+        # Elapsed import of the in-progress clock hour up to the horizon start (the
+        # planner floors "now" to the plan resolution), so a mid-hour replan prices the
+        # billed FULL-hour mean instead of just the remaining fraction. Best-effort:
+        # unavailable history => 0.0 (the pre-fix behaviour for this hour only).
+        import_entity = str(
+            input_sensors.get("grid_import_power") or input_sensors.get("grid_power") or ""
+        ).strip()
+        if import_entity:
+            res_min = int(config.get("nordpool", {}).get("resolution_minutes", 15) or 15)
+            now_local = datetime.now().astimezone()
+            hour_start = now_local.replace(minute=0, second=0, microsecond=0)
+            horizon_start = now_local.replace(
+                minute=(now_local.minute // res_min) * res_min, second=0, microsecond=0
+            )
+            if horizon_start > hour_start:
+                elapsed = await get_energy_from_power_history(
+                    import_entity, hour_start, horizon_start
+                )
+                if elapsed is None:
+                    logger.warning(
+                        "effekttariff: no import history for %s in the current hour; "
+                        "assuming 0 kWh elapsed",
+                        import_entity,
+                    )
+                else:
+                    # net meter can go negative (export); billed import can't
+                    peak_hour_elapsed_import_kwh = max(0.0, float(elapsed))
+
     return {
         "battery_soc_percent": battery_soc_percent,
         "battery_kwh": battery_kwh,
@@ -522,6 +595,10 @@ async def get_initial_state(
         "ev_plugged_in": ev_plugged_in,
         # Per-device EV state list
         "ev_charger_states": ev_charger_states,
+        # Effekttariff: month-to-date peak import (kW) + elapsed import of the
+        # in-progress clock hour before the horizon start (kWh)
+        "peak_power_baseline_kw": peak_power_baseline_kw,
+        "peak_hour_elapsed_import_kwh": peak_hour_elapsed_import_kwh,
     }
 
 
