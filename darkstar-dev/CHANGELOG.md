@@ -1,3 +1,7 @@
+## dev-20260704.1802 — 2026-07-04 18:04
+
+- Merge branch 'upstream-fixes' into deploy-main
+
 ## dev-20260704.1203 — 2026-07-04 12:05
 
 - feat(planner): effekttariff peak-demand charge + wire the soft import cap
