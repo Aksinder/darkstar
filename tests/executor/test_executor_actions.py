@@ -435,6 +435,113 @@ class TestSetWaterTemp:
         ha_client.set_input_number.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_switch_target_heats_when_commanded_above_threshold(self, base_config):
+        """A switch. target_entity is driven directly: 60°C command => turn_on."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="off")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        result = await dispatcher.set_water_temp(60, "switch.vvb")
+
+        assert result.success is True
+        assert result.skipped is False
+        assert result.new_value == "on"
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", True)
+        ha_client.set_input_number.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_switch_target_turns_off_at_temp_off(self, base_config):
+        """40°C (temp_off) command on a switch target => turn_off. This is the exact
+        write the stranded HA bridge dropped for 3 days — now executor-owned."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        result = await dispatcher.set_water_temp(40, "switch.vvb")
+
+        assert result.success is True
+        assert result.new_value == "off"
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", False)
+
+    @pytest.mark.asyncio
+    async def test_switch_target_skips_when_already_in_desired_state(self, base_config):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        result = await dispatcher.set_water_temp(70, "switch.vvb")
+
+        assert result.success is True
+        assert result.skipped is True
+        ha_client.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_switch_target_respects_shadow_mode(self, base_config):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=True)
+        result = await dispatcher.set_water_temp(40, "switch.vvb")
+
+        assert result.success is True
+        assert result.skipped is True
+        assert "[SHADOW]" in result.message
+        ha_client.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_input_boolean_target_supported(self, base_config):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="off")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        result = await dispatcher.set_water_temp(60, "input_boolean.vvb_heat")
+
+        assert result.success is True
+        ha_client.set_switch.assert_awaited_once_with("input_boolean.vvb_heat", True)
+
+    @pytest.mark.asyncio
+    async def test_switch_target_reports_service_failure(self, base_config):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(side_effect=RuntimeError("HA API 502"))
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        result = await dispatcher.set_water_temp(40, "switch.vvb")
+
+        assert result.success is False
+        assert result.error_details is not None
+        assert "502" in result.error_details
+
+    @pytest.mark.asyncio
     async def test_set_water_temp_respects_shadow_mode(self, base_config):
         """Shadow mode: return skipped result without HA call."""
         from unittest.mock import AsyncMock, MagicMock

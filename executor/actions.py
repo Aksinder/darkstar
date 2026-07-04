@@ -170,6 +170,12 @@ _STANDARD_INVERTER_KEYS: frozenset[str] = frozenset(
     ]
 )
 
+# Water heaters whose target_entity is a relay (switch./input_boolean.) are driven
+# directly: commanded temperature above this = heat ON, at/below = OFF. Matches the
+# temp semantics (temp_off 40 / temp_normal 60 / boost 70 / max 85) and the >50°C
+# convention of the HA bridge automations this replaces.
+WATER_SWITCH_ON_THRESHOLD_C = 50.0
+
 
 @dataclass
 class ActionResult:
@@ -835,6 +841,68 @@ class ActionDispatcher:
             )
 
         current = await self.ha.get_state_value(entity)
+
+        # Direct relay targets (switch./input_boolean.): drive the heater ourselves
+        # instead of writing a temperature helper and trusting an HA bridge automation
+        # to relay it — an unloaded/stuck bridge stranded the relay ON for days while
+        # every "command" landed in a helper nothing read. Semantics match the bridges:
+        # target above the threshold (temp_normal/boost/max) = heat, temp_off = off.
+        # The executor re-reads and re-asserts every run, so any external drift
+        # (device reboot, manual toggle) self-heals within one tick.
+        if entity.startswith(("switch.", "input_boolean.")):
+            desired_state = "on" if float(target) > WATER_SWITCH_ON_THRESHOLD_C else "off"
+            current_state = str(current).strip().lower() if current is not None else None
+            if current_state == desired_state:
+                return ActionResult(
+                    action_type="water_temp",
+                    success=True,
+                    message=f"Already {desired_state} ({target}°C)",
+                    previous_value=current_state,
+                    new_value=desired_state,
+                    entity_id=entity,
+                    skipped=True,
+                    duration_ms=int((time.time() - start) * 1000),
+                    error_details=None,
+                )
+            if self.shadow_mode:
+                logger.info(
+                    "[SHADOW] Would switch water heater %s %s (%s°C)",
+                    entity,
+                    desired_state,
+                    target,
+                )
+                return ActionResult(
+                    action_type="water_temp",
+                    success=True,
+                    message=f"[SHADOW] Would switch {current_state} → {desired_state}",
+                    previous_value=current_state,
+                    new_value=desired_state,
+                    entity_id=entity,
+                    skipped=True,
+                    duration_ms=int((time.time() - start) * 1000),
+                    error_details=None,
+                )
+            switch_error: str | None = None
+            try:
+                switch_ok = await self.ha.set_switch(entity, desired_state == "on")
+            except Exception as exc:
+                switch_ok = False
+                switch_error = str(exc)
+            return ActionResult(
+                action_type="water_temp",
+                success=switch_ok,
+                message=(
+                    f"Water heater {desired_state} ({target}°C)"
+                    if switch_ok
+                    else f"Failed to switch {entity} {desired_state}"
+                ),
+                previous_value=current_state,
+                new_value=desired_state,
+                entity_id=entity,
+                duration_ms=int((time.time() - start) * 1000),
+                error_details=switch_error,
+            )
+
         try:
             current_val = int(float(current)) if current else None
         except (ValueError, TypeError):
