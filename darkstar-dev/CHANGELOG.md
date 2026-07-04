@@ -1,3 +1,7 @@
+## dev-20260704.1817 — 2026-07-04 18:19
+
+- feat(executor): drive switch/input_boolean water-heater targets directly
+
 ## dev-20260704.1802 — 2026-07-04 18:04
 
 - Merge branch 'upstream-fixes' into deploy-main
