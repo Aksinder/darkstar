@@ -124,14 +124,30 @@ class TestRunningFlag:
 
 
 class TestReArm:
-    def test_rearms_after_done(self):
+    def test_rearm_within_cooldown_is_a_silent_continuation(self):
+        """A start soon after a done is a soak-pause / resume continuation of the same
+        physical programme: pending re-establishes but NO 'armed' event fires, so the
+        actuation pause-gate stays closed and notifications don't double-fire."""
         s = AppliancePowerState()
         s, _ = _step(s, 2000.0, True, 0.0)
         s, _ = _step(s, 2000.0, True, 3.0)  # armed
         s, _ = _step(s, 1.0, True, 10.0)
         s, ev = _step(s, 1.0, True, 10.0 + 300.0)  # done
         assert s.pending is False and ev == "done"
-        # New load started later
+        # Heater kicks back in 690 s after the done (inside the 900 s cooldown).
         s, _ = _step(s, 2000.0, True, 1000.0)
         s, ev = _step(s, 2000.0, True, 1003.0)
-        assert s.pending is True and ev == "armed" and s.start_ts == 1003.0
+        assert s.pending is True and ev is None and s.start_ts == 1003.0
+
+    def test_rearms_with_event_after_cooldown(self):
+        """A start well after the previous done is a genuine new load: full arm event."""
+        s = AppliancePowerState()
+        s, _ = _step(s, 2000.0, True, 0.0)
+        s, _ = _step(s, 2000.0, True, 3.0)  # armed
+        s, _ = _step(s, 1.0, True, 10.0)
+        s, ev = _step(s, 1.0, True, 310.0)  # done at t=310
+        assert ev == "done"
+        # Next load starts 2 h later (past the 900 s cooldown).
+        s, _ = _step(s, 2000.0, True, 7510.0)
+        s, ev = _step(s, 2000.0, True, 7513.0)
+        assert s.pending is True and ev == "armed" and s.start_ts == 7513.0

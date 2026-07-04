@@ -44,9 +44,9 @@ Darkstar is a local, privacy-first energy management system that optimizes your 
 This fork tracks upstream and adds device-level controllers and pricing features, all
 **default-OFF or observe-only**. Highlights:
 
-- **Deferrable smart appliances** — turnkey dishwasher/washer recommendations from a
-  power sensor (auto-arm, cheapest *forecast* window, done detection; observe/recommend-only
-  — plug actuation planned)
+- **Deferrable smart appliances** — turnkey dishwasher/washer scheduling from a power
+  sensor + smart plug (auto-arm, cheapest *forecast* window, done detection; observe-first
+  with opt-in plug gating — pause at start only, running cycles never interrupted)
 - **Real-time EV surplus charging** — per-tick current control (solar surplus → cheap
   grid → conditional battery assist), target-SoC caps, departure deadlines, vacation targets
 - **EV SoC estimator** — self-calibrating dead-reckoning for cars with no API

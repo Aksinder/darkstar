@@ -203,7 +203,25 @@ def apply_safety_margins(
     forecasting = config.get("forecasting", {})
     pv_confidence = forecasting.get("pv_confidence_percent", 90.0) / 100.0
 
-    df["adjusted_pv_kwh"] = df["pv_forecast_kwh"] * pv_confidence
+    # PV robustness: either the legacy scalar haircut (pv_confidence_percent), or —
+    # when forecasting.pv_p10_weight > 0 and Aurora's quantile band is present — a
+    # per-slot blend toward the pessimistic p10 (Predbat-style): a slot whose own
+    # band is wide (uncertain weather) gets discounted hard, a tight-band slot
+    # barely at all, instead of one flat haircut for both. Slots without a p10
+    # fall back to the scalar so a partial band can't punch optimistic holes.
+    pv_p10_weight = float(forecasting.get("pv_p10_weight", 0.0) or 0.0)
+    if pv_p10_weight > 0.0 and "pv_p10" in df.columns:
+        w = min(1.0, pv_p10_weight)
+        # Clamp p10 at p50: legacy DB rows can carry crossed quantiles (p10 > p50 —
+        # repaired on write only since the f197c56e port), and a crossed row would
+        # otherwise INFLATE the plan's PV instead of discounting it.
+        p10 = df["pv_p10"].astype(float).clip(upper=df["pv_forecast_kwh"])
+        blended = df["pv_forecast_kwh"] * (1.0 - w) + p10 * w
+        df["adjusted_pv_kwh"] = blended.where(
+            df["pv_p10"].notna(), df["pv_forecast_kwh"] * pv_confidence
+        )
+    else:
+        df["adjusted_pv_kwh"] = df["pv_forecast_kwh"] * pv_confidence
     df["adjusted_load_kwh"] = df["load_forecast_kwh"] * effective_load_margin
 
     # Note: Per-hour learning adjustments (pv_adjustment_by_hour_kwh, load_adjustment_by_hour_kwh)

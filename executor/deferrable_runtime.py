@@ -7,8 +7,12 @@ WHOLE cycle before the deadline (duration-aware, unlike a "is it cheap right now
 trigger), detects done, publishes ``sensor.<prefix><id>_state``, and notifies.
 
 Default OFF. Even when enabled it runs **observe-only** by default: it publishes state +
-the forecast recommendation and sends notifications, but does NOT gate the plug — so its
-decisions can be verified against the user's existing HA automations before any cutover.
+the forecast recommendation and sends notifications without touching the plug, so its
+decisions can be verified first. Setting ``observe_only: false`` arms actuation (Fas 3):
+the plug is held OFF only for an armed-but-deferred cycle and re-enabled at the cheapest
+window (resume-on-power continues the programme); a RUNNING cycle is never interrupted,
+an idle plug always stays ON (manual starts keep working), and the override boolean
+forces straight through.
 
 Pure logic lives in ``executor/deferrable.py`` (update_appliance_power_state,
 recommend_appliance_action); this module is the I/O shell (read HA, read the planner
@@ -180,6 +184,7 @@ class DeferrableApplianceController:
         self.cfg = cfg
         self._state_file = state_file
         self._state: dict[str, AppliancePowerState] = {}
+        self._boot_recovered = False
         self._load_state()
 
     def _load_state(self) -> None:
@@ -211,18 +216,33 @@ class DeferrableApplianceController:
             return default
         return str(v).lower() in ("on", "true", "1", "home", "open")
 
-    def _deadline_ts(self, cfg: DeferrableApplianceCfg, now_dt: datetime) -> float | None:
+    def _deadline_ts(
+        self, cfg: DeferrableApplianceCfg, now_dt: datetime, start_ts: float | None
+    ) -> float | None:
+        """Deadline anchored to when the cycle ARMED, not to the current tick.
+
+        A now-anchored deadline is a rolling horizon that never closes (a cheaper
+        block always exists somewhere in the next N hours => hold forever) and a
+        missed hard deadline would re-roll +24h each crossing. Anchoring to
+        start_ts bounds every hold: once the anchored deadline passes,
+        recommend_appliance_action fails open to "run".
+        """
+        anchor_dt = (
+            datetime.fromtimestamp(start_ts, tz=now_dt.tzinfo)
+            if start_ts is not None
+            else now_dt
+        )
         if cfg.deadline_mode == "hard_deadline" and cfg.hard_deadline:
             try:
                 hh, mm = (int(x) for x in cfg.hard_deadline.split(":"))
             except ValueError:
                 return None
-            target = now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if target <= now_dt:
+            target = anchor_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if target <= anchor_dt:
                 target = target + timedelta(days=1)
             return target.timestamp()
-        # cheapest_within_hours (soft): window_hours from now
-        return now_dt.timestamp() + cfg.window_hours * 3600.0
+        # cheapest_within_hours (soft): window_hours from ARMING
+        return anchor_dt.timestamp() + cfg.window_hours * 3600.0
 
     async def run(
         self, ha: Any, now_ts: float, now_dt: datetime, *, shadow: bool = False
@@ -232,18 +252,82 @@ class DeferrableApplianceController:
         if not cfg.enabled or not cfg.appliances:
             return {"enabled": False}
 
+        # Boot recovery: if the persisted state was lost (an add-on update wipes
+        # /app/data) while a plug was held OFF, no state entry exists and the cycle
+        # can never re-arm through a dead plug — stranded until a human notices. On
+        # the first actuating tick, power ON any configured plug that reads OFF and
+        # has NO state entry (a live hold always has one). Trade-off: a deliberately
+        # off idle plug is re-enabled once per add-on start — harmless for an idle
+        # machine, and we notify.
+        if not self._boot_recovered and not cfg.observe_only and not shadow:
+            self._boot_recovered = True
+            for app in cfg.appliances:
+                if not app.switch_entity or app.id in self._state:
+                    continue
+                sw = await ha.get_state_value(app.switch_entity)
+                if sw is not None and str(sw).lower() == "off":
+                    try:
+                        await ha.set_switch(app.switch_entity, True)
+                        logger.warning(
+                            "Deferrable: boot recovery — re-enabled %s (no persisted hold state)",
+                            app.switch_entity,
+                        )
+                        if cfg.notify_service:
+                            await ha.send_notification(
+                                cfg.notify_service,
+                                app.name,
+                                "Plug re-enabled after restart (hold state lost)",
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Deferrable: boot recovery failed for %s: %s", app.id, exc
+                        )
+
         slots = load_forward_slots(cfg.schedule_path, now_ts, cfg.timezone)
         summaries: list[dict[str, Any]] = []
 
         for app in cfg.appliances:
             if not app.power_sensor:
                 continue
-            power = _f(await ha.get_state_value(app.power_sensor)) or 0.0
+            power_raw = await ha.get_state_value(app.power_sensor)
+            power_readable = power_raw is not None and str(power_raw) not in (
+                "unknown",
+                "unavailable",
+                "",
+            )
+            power = _f(power_raw) or 0.0
             override = await self._read_on(ha, app.override_entity)
-            switch_on = await self._read_on(ha, app.switch_entity, default=True)
+            sw_raw = (
+                await ha.get_state_value(app.switch_entity) if app.switch_entity else None
+            )
+            switch_readable = sw_raw is not None and str(sw_raw) not in (
+                "unknown",
+                "unavailable",
+            )
+            switch_on = (
+                str(sw_raw).lower() in ("on", "true", "1") if switch_readable else True
+            )
 
             prev = self._state.get(app.id, AppliancePowerState())
+
+            # FREEZE on unreadable sensors: a device that dropped off the network (its
+            # power sensor and plug flap together) must not advance the state machine —
+            # power 'unavailable'->0.0 with an hours-old below_since would fire a false
+            # "done", drop pending, and strand a held plug OFF forever (the VVB
+            # stuck-switch incident, inverted). Publish the last state as stale, touch
+            # nothing, and resume when readings return.
+            frozen = not power_readable or (bool(app.switch_entity) and not switch_readable)
+            if frozen:
+                label = self._label(prev, "run", override) + " (stale)"
+                await self._publish(ha, app, prev, label, "run", None, power, override, None)
+                summaries.append(
+                    {"id": app.id, "state": label, "power": None,
+                     "action": "frozen", "event": None, "plug": None}
+                )
+                continue
+
             new_state, event = update_appliance_power_state(prev, power, switch_on, now_ts, app.power)
+            new_state.held_by_us = prev.held_by_us and not switch_on
             self._state[app.id] = new_state
 
             # Forecast recommendation (duration-aware) for an armed cycle.
@@ -253,18 +337,64 @@ class DeferrableApplianceController:
                     app.seed_duration_min
                 )
                 duration_slots = max(1, math.ceil(duration_min / cfg.slot_minutes))
-                deadline_ts = self._deadline_ts(app, now_dt)
+                deadline_ts = self._deadline_ts(app, now_dt, new_state.start_ts)
                 action, window_start = recommend_appliance_action(
                     slots, now_ts, duration_slots, deadline_ts
                 )
 
+            # Fas 3 — plug actuation (only outside observe/shadow, only on a readable
+            # switch). Semantics:
+            #  - PAUSE only at genuine start detection (the "armed" event — a re-arm
+            #    within rearm_cooldown_s is a continuation and emits none) or while WE
+            #    are already holding the plug OFF. Never mid-cycle.
+            #  - RESUME (ON) only a hold WE own, when the window arrives / the anchored
+            #    deadline forces / override demands. A plug the USER cut (held_by_us
+            #    False) is never re-energized — manual off wins, pending or not.
+            #  - IDLE / DONE: hands off entirely.
+            plug_cmd: str | None = None
+            if (
+                not cfg.observe_only
+                and not shadow
+                and app.switch_entity
+                and switch_readable
+            ):
+                desired_on: bool | None = None
+                if new_state.pending:
+                    if (
+                        action == "defer"
+                        and not override
+                        and (event == "armed" or new_state.held_by_us)
+                    ):
+                        desired_on = False
+                    elif switch_on or new_state.held_by_us:
+                        # run/override: keep a powered plug on, or release OUR hold.
+                        desired_on = True
+                    # else: user-cut plug (off, not ours) — hands off.
+                if desired_on is not None and desired_on != switch_on:
+                    try:
+                        ok = await ha.set_switch(app.switch_entity, desired_on)
+                        plug_cmd = ("on" if desired_on else "off") if ok else "failed"
+                        if ok:
+                            # Ownership only — switch_was_on is deliberately NOT set
+                            # here: the next tick's real switch read must see the
+                            # OFF->ON transition so the state machine grants its
+                            # re-power grace (below_since reset).
+                            new_state.held_by_us = not desired_on
+                    except Exception as exc:
+                        logger.warning(
+                            "Deferrable: plug actuation failed for %s: %s", app.id, exc
+                        )
+                        plug_cmd = "failed"
+
             label = self._label(new_state, action, override)
-            await self._publish(ha, app, new_state, label, action, window_start, power, override)
+            await self._publish(
+                ha, app, new_state, label, action, window_start, power, override, plug_cmd
+            )
             await self._maybe_notify(ha, app, event, action, window_start, override, shadow)
 
             summaries.append(
                 {"id": app.id, "state": label, "power": round(power, 1),
-                 "action": action, "event": event}
+                 "action": action, "event": event, "plug": plug_cmd}
             )
 
         self._save_state()
@@ -284,6 +414,7 @@ class DeferrableApplianceController:
     async def _publish(
         self, ha: Any, app: DeferrableApplianceCfg, st: AppliancePowerState,
         label: str, action: str, window_start: float | None, power: float, override: bool,
+        plug_cmd: str | None = None,
     ) -> None:
         oid = f"{self.cfg.publish_prefix}{_slug(app.id)}_state"
         rec_start = (
@@ -301,6 +432,7 @@ class DeferrableApplianceController:
             "would_defer": bool(st.pending and action == "defer"),
             "override": override,
             "observe_only": self.cfg.observe_only,
+            "plug_commanded": plug_cmd,
             "armed_since": (
                 datetime.fromtimestamp(st.start_ts).astimezone().isoformat()
                 if st.start_ts is not None

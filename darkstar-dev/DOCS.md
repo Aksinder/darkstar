@@ -15,12 +15,14 @@ add-on Web UI (Settings) or the YAML config; keys shown are the exact schema key
 
 ## Deferrable smart appliances (dishwasher / washing machine)
 
-Turnkey: give Darkstar a **power sensor** and it auto-arms when a cycle starts (power
-rises), computes the cheapest *forecast* window for the whole run before a deadline
-(duration-aware, unlike "is it cheap right now?" triggers), publishes its
-recommendation, notifies, and detects done. **Plug actuation is not implemented yet** —
-Darkstar recommends; your existing automation (or you) stays the actuator, so it can
-never fight your current setup.
+Turnkey: give Darkstar a **power sensor + the smart plug** and it auto-arms when a
+cycle starts (power rises), computes the cheapest *forecast* window for the whole run
+before a deadline (duration-aware, unlike "is it cheap right now?" triggers), publishes
+its recommendation, notifies, and detects done. With `observe_only: false` it also
+**gates the plug**: pause happens only at start detection (or while already held —
+resume-on-power continues the programme at the window), a mid-cycle run is never
+interrupted, an idle plug is never touched (manual starts and manual-off both win),
+and the override boolean forces straight through. Verify in observe mode first.
 
 ```yaml
 deferrable_loads:
@@ -28,8 +30,9 @@ deferrable_loads:
     name: "Washing machine"
     enabled: true
     power_sensor: sensor.washer_power        # REQUIRED: auto-arm/run/done from draw
-    switch_entity: switch.washer_plug        # read-only today: a 0 W reading while the
-                                             # plug is held OFF counts as deferred, not done
+    switch_entity: switch.washer_plug        # the plug Darkstar gates when observe_only
+                                             # is false (must be resume-on-power); also the
+                                             # deferred-vs-done guard for the state machine
     on_threshold_w: 10                       # sustained draw >= this => cycle started
     off_threshold_w: 3                       # sustained draw < this => cycle done
     start_debounce_s: 3
@@ -42,9 +45,10 @@ deferrable_loads:
 executor:
   deferrable_appliances:
     enabled: true
-    observe_only: true          # publish state + notify only — never touches the plug.
-                                # (Actuation is not implemented yet; today this flag
-                                # only changes the notification wording.)
+    observe_only: true          # true = publish + notify only, never touches the plug.
+                                # Verify the recommendations for a few cycles, then set
+                                # false to let Darkstar gate the plug (and disable any
+                                # old price automations so they can't fight it).
     notify_service: ""          # e.g. notify.mobile_app_phone
     publish_prefix: "darkstar_" # publishes sensor.darkstar_<id>_state
     slot_minutes: 15
