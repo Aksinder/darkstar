@@ -1,3 +1,7 @@
+## dev-20260704.1906 — 2026-07-04 19:08
+
+- feat(executor+planner): deferrable plug actuation (Fas 3) + p10-weighted PV
+
 ## dev-20260704.1833 — 2026-07-04 18:35
 
 - feat(honesty): full-objective reporting + ML baseline A/B rows
