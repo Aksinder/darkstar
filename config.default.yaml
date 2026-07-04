@@ -489,6 +489,13 @@ price_forecast:
 forecasting:
   active_forecast_version: "aurora"
   pv_confidence_percent: 83.0          # PV forecast scaling (100 = trust forecast fully)
+  pv_p10_weight: 0.0                   # 0 = legacy scalar haircut above. >0 (e.g. 0.3-0.5):
+                                       # blend each slot toward Aurora's own pessimistic p10
+                                       # quantile instead — uncertain slots get discounted
+                                       # hard, confident slots barely at all (Predbat-style
+                                       # robustness). Slots lacking a p10 keep the scalar.
+                                       # NOTE: with weight>0, pv_confidence_percent (and any
+                                       # Reflex tuning of it) only affects p10-less slots.
   load_safety_margin_percent: 117.0    # HARD FLOOR on the S-Index load margin: the planner never
                                        # plans for less load than this % of the forecast, regardless
                                        # of s_index.risk_appetite (which tunes conservatism ABOVE it).

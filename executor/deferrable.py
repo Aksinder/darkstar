@@ -117,6 +117,13 @@ class AppliancePowerConfig:
     start_debounce_s: float = 3.0  # power must stay above on_threshold this long to arm
     done_delay_s: float = 300.0  # power must stay below off_threshold this long to call it done
     power_scale: float = 1.0  # multiply metered power (e.g. 2 if only one phase is metered)
+    # An arm this soon after a done is a CONTINUATION (soak/anti-crease pause that
+    # outlasted done_delay_s, sensor hiccup, resume after re-power), not a fresh cycle:
+    # it re-arms silently (no "armed" event), so the actuation layer's pause gate —
+    # which only opens on a genuine start — can never cut a mid-programme machine.
+    # Worst case of a too-long cooldown is a missed defer (runs at current price),
+    # never a cut. Genuine back-to-back loads within 15 min just run immediately.
+    rearm_cooldown_s: float = 900.0
 
 
 @dataclass
@@ -128,6 +135,9 @@ class AppliancePowerState:
     start_ts: float | None = None  # epoch seconds when this cycle armed
     above_since: float | None = None  # first ts power has been continuously >= on_threshold
     below_since: float | None = None  # first ts power has been continuously < off_threshold
+    switch_was_on: bool = True  # switch state at the previous tick (re-power grace)
+    last_done_ts: float | None = None  # when the last cycle completed (re-arm cooldown)
+    held_by_us: bool = False  # True while DARKSTAR holds the plug OFF (vs a manual cut)
 
 
 def update_appliance_power_state(
@@ -159,9 +169,16 @@ def update_appliance_power_state(
     below_since = prev.below_since if below else None
     if below and below_since is None:
         below_since = now_ts
+    # Re-power grace: the moment the plug transitions OFF -> ON, the low-draw clock
+    # restarts. Without this, below_since carries hours of held-OFF time into the
+    # first powered tick and a single lagging 0 W read fires an instant false "done"
+    # (stranding the resumed cycle). The done_delay must be measured from re-power.
+    if switch_on and not prev.switch_was_on:
+        below_since = now_ts if below else None
 
     pending = prev.pending
     start_ts = prev.start_ts
+    last_done_ts = prev.last_done_ts
     running = above
     event: str | None = None
 
@@ -170,13 +187,22 @@ def update_appliance_power_state(
         if above_since is not None and (now_ts - above_since) >= cfg.start_debounce_s:
             pending = True
             start_ts = now_ts
-            event = "armed"
+            recently_done = (
+                prev.last_done_ts is not None
+                and (now_ts - prev.last_done_ts) < cfg.rearm_cooldown_s
+            )
+            # A re-arm shortly after a done is a continuation of the same physical
+            # programme (see rearm_cooldown_s): keep the cycle pending but emit NO
+            # "armed" event, so the pause gate stays closed and notifications don't
+            # double-fire.
+            event = None if recently_done else "armed"
     elif switch_on and below_since is not None and (now_ts - below_since) >= cfg.done_delay_s:
         # Done only when powered AND draw has stayed low long enough. A 0 W reading
         # while Darkstar holds the plug OFF to defer must never look like completion.
         pending = False
         running = False
         start_ts = None
+        last_done_ts = now_ts
         event = "done"
 
     return (
@@ -186,6 +212,9 @@ def update_appliance_power_state(
             start_ts=start_ts,
             above_since=above_since,
             below_since=below_since,
+            switch_was_on=switch_on,
+            last_done_ts=last_done_ts,
+            held_by_us=prev.held_by_us,
         ),
         event,
     )
