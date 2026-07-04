@@ -222,6 +222,59 @@ class HealthChecker:
 
         return issues
 
+    def check_plan_realism(self) -> list[HealthIssue]:
+        """Warn when the plan's own realism simulation says its value is materially overstated.
+
+        The planner computes realism_gap_sek (phase-aware replay vs the single-net-node
+        plan) on every run and, until now, nothing consumed it. Surface it once it is
+        both absolutely (>= 2 SEK over the horizon) and relatively (>= 20% of the plan's
+        gross value) significant, so a structurally optimistic plan can't hide.
+        """
+        issues: list[HealthIssue] = []
+        try:
+            import json
+            from typing import cast
+
+            schedule_path = Path("data/schedule.json")
+            if not schedule_path.exists():
+                return issues
+            with schedule_path.open() as f:
+                schedule_raw: Any = json.load(f)
+            if not isinstance(schedule_raw, dict):
+                return issues
+            schedule = cast("dict[str, Any]", schedule_raw)
+            meta = cast("dict[str, Any]", schedule.get("meta") or {})
+            s_index = cast("dict[str, Any]", meta.get("s_index") or {})
+            realism = cast("dict[str, Any]", s_index.get("realism") or {})
+            gap = float(realism.get("gap_sek", 0.0) or 0.0)
+            slots = cast("list[Any]", schedule.get("schedule") or [])
+            gross_value_sek = 0.0
+            for slot_raw in slots:
+                if isinstance(slot_raw, dict):
+                    slot = cast("dict[str, Any]", slot_raw)
+                    gross_value_sek += abs(float(slot.get("cost_sek", 0.0) or 0.0))
+            if gap >= 2.0 and gap >= 0.2 * max(gross_value_sek, 1e-9):
+                issues.append(
+                    HealthIssue(
+                        category="planner",
+                        severity="warning",
+                        message=(
+                            f"Plan realism gap {gap:.2f} SEK "
+                            f"(~{100.0 * gap / max(gross_value_sek, 1e-9):.0f}% of plan value)"
+                        ),
+                        guidance=(
+                            "The phase-aware realism simulation expects the plan to under-"
+                            "perform its own cost estimate by this much (per-phase import "
+                            "the single-net-node solver can't see). Consider enabling "
+                            "phase_aware in the planner or reviewing phase balance; large "
+                            "persistent gaps mean the plan's economics are optimistic."
+                        ),
+                    )
+                )
+        except Exception as e:
+            logger.debug("Could not check plan realism: %s", e)
+        return issues
+
     async def check_all(self) -> HealthStatus:
         """Run all health checks and return combined status."""
         issues: list[HealthIssue] = []
@@ -252,6 +305,9 @@ class HealthChecker:
 
         # Check planner health (error codes + retry policy)
         issues.extend(self.check_planner())
+
+        # Check plan realism gap (phase-aware simulation vs single-net-node plan)
+        issues.extend(self.check_plan_realism())
 
         # Determine overall health
         has_critical = any(i.severity == "critical" for i in issues)
@@ -415,6 +471,35 @@ class HealthChecker:
                         "or set system.has_water_heater to false.",
                     )
                 )
+            # An enabled heater with no control entity is planned-but-unactuatable: the
+            # planner allocates it energy (and shapes the battery/export plan around that
+            # phantom load) while the executor silently drops every command for it
+            # (executor/config.py skips heaters without a target_entity). Surface it
+            # loudly instead of failing silent.
+            for idx, heater in enumerate(water_heaters):
+                if not heater.get("enabled", True):
+                    continue
+                if not str(heater.get("target_entity", "") or "").strip():
+                    heater_name = heater.get("name", f"Water Heater {idx + 1}")
+                    issues.append(
+                        HealthIssue(
+                            category="config",
+                            severity="critical",
+                            message=(
+                                f"Water heater '{heater_name}' has no control entity — "
+                                f"its planned heating cannot be executed"
+                            ),
+                            guidance=(
+                                f"Add 'target_entity' to water_heaters[{idx}] (the "
+                                f"input_number/thermostat entity the executor should "
+                                f"command). Until then the planner schedules this heater "
+                                f"but nothing actuates it, so the plan's water allocation "
+                                f"— and the battery/export economics built on it — are "
+                                f"fiction. If the tank is intentionally uncontrolled, set "
+                                f"enabled: false so the planner stops planning it."
+                            ),
+                        )
+                    )
 
         # Solar misconfiguration = warning (PV forecasts will be zero)
         if system_cfg.get("has_solar", True):
