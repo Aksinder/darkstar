@@ -291,6 +291,89 @@ def test_water_heater_legacy_flat_field_ignored():
     assert "Water heater enabled but power not configured" in messages
 
 
+# --- Unactuatable water heater (planned-but-no-control-entity) ---
+
+
+def test_water_heater_without_target_entity_is_critical():
+    """Regression: villavagn tank was planned 12.8 kWh/day with target_entity '' while
+    the executor silently dropped every command — health stayed green throughout."""
+    checker = _make_checker(
+        {
+            "system": {"has_water_heater": True},
+            "water_heaters": [
+                {"id": "t1", "name": "Tank 1", "enabled": True, "power_kw": 3.0,
+                 "target_entity": "input_number.t1_target"},
+                {"id": "t2", "name": "Tank 2", "enabled": True, "power_kw": 1.6,
+                 "target_entity": ""},
+            ],
+        }
+    )
+    issues = checker._validate_config_structure()
+    hits = [i for i in issues if "no control entity" in i.message]
+    assert len(hits) == 1
+    assert hits[0].severity == "critical"
+    assert "Tank 2" in hits[0].message
+
+
+def test_water_heater_disabled_without_target_entity_is_fine():
+    checker = _make_checker(
+        {
+            "system": {"has_water_heater": True},
+            "water_heaters": [
+                {"id": "t1", "name": "Tank 1", "enabled": True, "power_kw": 3.0,
+                 "target_entity": "input_number.t1_target"},
+                {"id": "t2", "name": "Tank 2", "enabled": False, "power_kw": 1.6},
+            ],
+        }
+    )
+    issues = checker._validate_config_structure()
+    assert not [i for i in issues if "no control entity" in i.message]
+
+
+# --- Plan realism gap surfacing ---
+
+
+def _write_schedule(tmp_path, gap_sek: float, slot_costs: list[float]):
+    import json
+
+    (tmp_path / "data").mkdir(exist_ok=True)
+    payload = {
+        "meta": {"s_index": {"realism": {"gap_sek": gap_sek}}},
+        "schedule": [{"cost_sek": c} for c in slot_costs],
+    }
+    (tmp_path / "data" / "schedule.json").write_text(json.dumps(payload))
+
+
+def test_realism_gap_warning_when_material(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_schedule(tmp_path, gap_sek=3.0, slot_costs=[1.0] * 10)  # 30% of 10 SEK gross
+    checker = _make_checker({})
+    issues = checker.check_plan_realism()
+    assert len(issues) == 1
+    assert issues[0].severity == "warning"
+    assert "realism gap" in issues[0].message.lower()
+
+
+def test_realism_gap_silent_when_small(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_schedule(tmp_path, gap_sek=1.0, slot_costs=[1.0] * 10)  # below 2 SEK floor
+    checker = _make_checker({})
+    assert checker.check_plan_realism() == []
+
+
+def test_realism_gap_silent_when_relatively_minor(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_schedule(tmp_path, gap_sek=3.0, slot_costs=[5.0] * 10)  # 6% of 50 SEK gross
+    checker = _make_checker({})
+    assert checker.check_plan_realism() == []
+
+
+def test_realism_gap_silent_without_schedule(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    checker = _make_checker({})
+    assert checker.check_plan_realism() == []
+
+
 def test_health_no_energy_sensor_warnings():
     """No energy-sensor warnings are emitted — energy is now measured via History API."""
     from backend.health import HealthChecker

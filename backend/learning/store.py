@@ -60,6 +60,37 @@ class LearningStore:
 
     # _init_schema was removed as Alembic handles migrations.
 
+    async def get_observation_rows_between(
+        self, start_iso: str, end_iso: str
+    ) -> list[dict[str, Any]]:
+        """Return SlotObservation rows with slot_start in [start_iso, end_iso) as dicts.
+
+        slot_start is stored as an ISO-8601 string in a consistent local-offset format,
+        so lexicographic comparison equals chronological comparison within one site.
+        """
+        async with self.AsyncSession() as session:
+            stmt = (
+                select(SlotObservation)
+                .where(
+                    SlotObservation.slot_start >= start_iso,
+                    SlotObservation.slot_start < end_iso,
+                )
+                .order_by(SlotObservation.slot_start)
+            )
+            result = await session.execute(stmt)
+            return [
+                {
+                    "slot_start": row.slot_start,
+                    "import_kwh": row.import_kwh,
+                    "export_kwh": row.export_kwh,
+                    "pv_kwh": row.pv_kwh,
+                    "load_kwh": row.load_kwh,
+                    "import_price_sek_kwh": row.import_price_sek_kwh,
+                    "export_price_sek_kwh": row.export_price_sek_kwh,
+                }
+                for row in result.scalars().all()
+            ]
+
     async def store_slot_prices(self, price_rows: Iterable[dict[str, Any]]) -> None:
         """Store slot price data (import/export SEK per kWh) using Async SQLAlchemy."""
         rows = list(price_rows or [])

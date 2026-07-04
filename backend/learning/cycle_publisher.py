@@ -35,6 +35,7 @@ __all__ = [
     "build_phase_recommendation_sensors",
     "build_phase_sensors",
     "build_realism_sensors",
+    "build_savings_sensors",
     "publish_sensors",
 ]
 
@@ -79,6 +80,47 @@ def _slug(value: str) -> str:
     """Sanitise an id into a safe entity object_id fragment."""
     s = re.sub(r"[^a-z0-9]+", "_", value.strip().lower())
     return s.strip("_") or "load"
+
+
+def build_savings_sensors(
+    today: Any,
+    last_30d: Any,
+) -> list[PublishedSensor]:
+    """Publish the no-battery counterfactual savings (see backend/learning/savings.py).
+
+    Two sensors: today-so-far and a rolling 30 days. State = savings in SEK (baseline
+    minus actual: positive = the battery layer earned money). The full breakdown rides
+    in attributes so a dashboard can show actual-vs-baseline, and ``priced_coverage``
+    exposes how much of the window could actually be valued — a thin/unpriced window
+    is visible instead of masquerading as a result.
+    """
+    sensors: list[PublishedSensor] = []
+    for object_id, name, summary in (
+        ("darkstar_savings_today", "Darkstar besparing idag", today),
+        ("darkstar_savings_30d", "Darkstar besparing 30 dagar", last_30d),
+    ):
+        if summary is None:
+            continue
+        sensors.append(
+            PublishedSensor(
+                object_id=object_id,
+                state=f"{round(float(summary.savings_sek), 2)}",
+                unit="SEK",
+                device_class="monetary",
+                state_class="measurement",
+                icon="mdi:piggy-bank-outline",
+                friendly_name=name,
+                attributes={
+                    "actual_cost_sek": round(float(summary.actual_cost_sek), 2),
+                    "baseline_cost_sek": round(float(summary.baseline_cost_sek), 2),
+                    "n_slots": int(summary.n_slots),
+                    "priced_coverage": round(float(summary.coverage), 3),
+                    "baseline": "PV house without battery layer (no arbitrage, "
+                    "no stored-solar shifting); load-shift value not included",
+                },
+            )
+        )
+    return sensors
 
 
 def build_realism_sensors(realism: dict[str, Any] | None) -> list[PublishedSensor]:

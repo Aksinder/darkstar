@@ -411,6 +411,7 @@ async def run_publisher_loop(
     )
     from backend.learning.cycle_publisher import (
         build_realism_sensors,
+        build_savings_sensors,
         build_unknown_load_sensor,
         publish_sensors,
     )
@@ -448,6 +449,39 @@ async def run_publisher_loop(
 
     async def publish(sensors: list[PublishedSensor]) -> int:
         return await publish_sensors(sensors, base_url, token)
+
+    async def publish_savings() -> None:
+        """Publish the no-battery counterfactual savings (today + rolling 30d).
+
+        Queries the recorder's slot observations and values actual vs baseline grid
+        cost (backend/learning/savings.py). Skipped silently when the learning DB or
+        observations are unavailable — this is observability, never a blocker.
+        """
+        import pytz
+
+        from backend.learning.savings import compute_savings
+        from backend.learning.store import LearningStore
+
+        learning_cfg: dict[str, Any] = config.get("learning", {}) or {}
+        db_path = str(learning_cfg.get("sqlite_path", "data/planner_learning.db"))
+        if not Path(db_path).exists():
+            return
+        tz = pytz.timezone(str(config.get("timezone", "Europe/Stockholm")))
+        now = datetime.now(tz)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        store = LearningStore(db_path, tz)
+        try:
+            today_rows = await store.get_observation_rows_between(
+                midnight.isoformat(), now.isoformat()
+            )
+            d30_rows = await store.get_observation_rows_between(
+                (now - timedelta(days=30)).isoformat(), now.isoformat()
+            )
+        finally:
+            await store.close()
+        sensors = build_savings_sensors(compute_savings(today_rows), compute_savings(d30_rows))
+        if sensors:
+            await publish(sensors)
 
     async def publish_realism() -> None:
         """Read the latest plan's per-phase imbalance cost from schedule.json and publish it."""
@@ -525,6 +559,10 @@ async def run_publisher_loop(
             await publish_unknown_load()
         except Exception as exc:
             logger.debug("Unknown-load publish skipped: %s", exc)
+        try:
+            await publish_savings()
+        except Exception as exc:
+            logger.debug("Savings publish skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
 
