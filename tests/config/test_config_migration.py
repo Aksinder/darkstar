@@ -15,15 +15,43 @@ class TestDeprecatedKeyRemoval:
 
         config = {
             "config_version": 2,
-            "deferrable_loads": [],
+            "deferrable_loads": [{"id": "washer", "power_sensor": "sensor.w"}],
             "ev_charger": {},
             "solar_array": {},
         }
         result, changed = remove_deprecated_keys(config)
         assert changed
-        assert "deferrable_loads" not in result
+        # deferrable_loads is a LIVE key again (smart-appliance controller) and must
+        # survive the deprecated-key sweep — stripping it made the feature
+        # unconfigurable (legacy-shaped ENTRIES are pruned separately).
+        assert result["deferrable_loads"] == [{"id": "washer", "power_sensor": "sensor.w"}]
         assert "ev_charger" not in result
         assert "solar_array" not in result
+
+    def test_prune_legacy_deferrable_entries(self):
+        from backend.config_migration import _prune_legacy_deferrable_entries
+
+        # Mixed: legacy entries (no power_sensor) pruned, new-schema kept.
+        config = {
+            "deferrable_loads": [
+                {"id": "my_tesla", "power": 11.0},
+                {"id": "washer", "power_sensor": "sensor.w", "switch_entity": "switch.w"},
+            ]
+        }
+        result, changed = _prune_legacy_deferrable_entries(config)
+        assert changed
+        assert [e["id"] for e in result["deferrable_loads"]] == ["washer"]
+
+        # Pure legacy: key dropped entirely (old cleanup behaviour preserved).
+        config2 = {"deferrable_loads": [{"id": "my_pool", "power": 3.0}]}
+        result2, changed2 = _prune_legacy_deferrable_entries(config2)
+        assert changed2 and "deferrable_loads" not in result2
+
+        # Pure new-schema: untouched, no change flagged.
+        config3 = {"deferrable_loads": [{"id": "dw", "power_sensor": "sensor.d"}]}
+        result3, changed3 = _prune_legacy_deferrable_entries(config3)
+        assert not changed3
+        assert result3["deferrable_loads"] == [{"id": "dw", "power_sensor": "sensor.d"}]
 
     def test_remove_deprecated_keys_nested(self):
         from backend.config_migration import remove_deprecated_keys
@@ -168,7 +196,9 @@ class TestBackendSave:
         with config_file.open() as f:
             saved_data = yaml_loader.load(f)
         assert saved_data["timezone"] == "Europe/Stockholm"
-        assert "deferrable_loads" not in saved_data
+        # {"id": "old_load"} is legacy-shaped (no power_sensor) => pruned on save; the
+        # template's empty default may merge in. No legacy content may survive.
+        assert list(saved_data.get("deferrable_loads") or []) == []
 
 
 class TestBackupSystem:

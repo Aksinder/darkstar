@@ -100,16 +100,17 @@ custom_top_level: "special"
         # VERIFICATIONS
 
         # 1. Check Key Presence
-        # version is removed by deprecated key sweep, deferrable_loads is also removed
+        # version is removed by deprecated key sweep. deferrable_loads is a LIVE key
+        # again (smart appliances): the user's LEGACY entries (my_tesla/my_pool, no
+        # power_sensor) must be pruned; the template's empty default may merge in.
         self.assertNotIn("version", result_cfg)
         self.assertIn("system", result_cfg)
         self.assertIn("battery", result_cfg)
         self.assertIn("future_stuff", result_cfg)
         self.assertIn("custom_top_level", result_cfg)
-        self.assertNotIn("deferrable_loads", result_cfg)
 
-        # 2. Check deprecated keys removed
-        self.assertNotIn("deferrable_loads", result_cfg)
+        # 2. Check legacy deferrable content removed (empty/absent both fine)
+        self.assertEqual(list(result_cfg.get("deferrable_loads") or []), [])
 
         # 4. Check Comment Preservation from Default (lenient mode may not preserve all comments)
         self.assertIn("# Darkstar Default", result_str)

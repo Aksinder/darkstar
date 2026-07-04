@@ -70,8 +70,12 @@ MigrationStep = Callable[[dict[str, Any]], tuple[dict[str, Any], bool]]
 # These keys MUST be removed during migration to prevent corruption
 
 # Root-level deprecated keys
+# NOTE: "deferrable_loads" was deprecated by ARC15 (its old water/EV entries moved to
+# water_heaters[]/ev_chargers[]) but the key was RE-INTRODUCED 2026-06 for the
+# smart-appliance controller (dishwasher/washer entries with power_sensor +
+# switch_entity). Keeping it in this registry made the new feature unconfigurable:
+# every /api/config/save silently stripped the user's appliance list. Do not re-add.
 DEPRECATED_KEYS = {
-    "deferrable_loads",  # Replaced by water_heaters[] and ev_chargers[]
     "ev_charger",  # Replaced by ev_chargers[] array (plural)
     "ev_departure_time",  # Moved into ev_chargers[].departure_time
     "solar_array",  # Replaced by solar_arrays[] array (plural)
@@ -164,7 +168,42 @@ def remove_deprecated_keys(config: dict[str, Any]) -> tuple[dict[str, Any], bool
                         logger.info(f"✂️  Removed deprecated key: '{path}.{key}'")
                         changed = True
 
+    # deferrable_loads is live again but its pre-ARC15 ENTRIES are not: prune them at
+    # every sweep site (boot migration, post-merge cleanup, save endpoint) so legacy
+    # water/EV entries can't resurrect anywhere while new-schema appliances survive.
+    config, pruned = _prune_legacy_deferrable_entries(config)
+    changed = changed or pruned
+
     return config, changed
+
+
+def _prune_legacy_deferrable_entries(config: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Prune pre-ARC15 entries from deferrable_loads WITHOUT killing the key.
+
+    ARC15 moved the old water/EV entries into water_heaters[]/ev_chargers[] and the
+    whole key sat in DEPRECATED_KEYS — but the key was re-introduced 2026-06 for the
+    smart-appliance controller, whose entries always carry a ``power_sensor`` (the
+    turnkey marker). Blanket-stripping the key made that feature unconfigurable
+    (every save silently deleted the user's appliance list). Instead: drop only
+    legacy-shaped entries (no power_sensor); drop the key when nothing remains
+    (preserving the old cleanup behaviour for genuinely pre-ARC15 configs).
+    """
+    loads_raw = config.get("deferrable_loads")
+    if not isinstance(loads_raw, list):
+        return config, False
+    loads = cast("list[Any]", loads_raw)
+    kept: list[dict[str, Any]] = [
+        cast("dict[str, Any]", e)
+        for e in loads
+        if isinstance(e, dict) and cast("dict[str, Any]", e).get("power_sensor")
+    ]
+    if kept == loads:
+        return config, False
+    if kept:
+        config["deferrable_loads"] = kept
+    else:
+        config.pop("deferrable_loads", None)
+    return config, True
 
 
 def _migrate_water_heater_fields(config: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -757,7 +796,8 @@ async def migrate_config(
     if inverter_migration_changes:
         pre_merge_changes = True
 
-    # 2.2 Sweep deprecated keys from user config
+    # 2.2 Sweep deprecated keys from user config (includes the legacy
+    # deferrable_loads entry prune — see remove_deprecated_keys)
     user_config, deprecated_changes = remove_deprecated_keys(user_config)
     if deprecated_changes:
         pre_merge_changes = True

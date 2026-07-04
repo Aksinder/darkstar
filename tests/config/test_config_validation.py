@@ -289,9 +289,23 @@ class TestPreWriteValidation:
             "battery": {},
             "executor": {},
             "input_sensors": {},
-            "deferrable_loads": [],
+            "ev_charger": {},
         }
         assert validate_config_for_write(config) is False
+
+    def test_validate_config_for_write_allows_deferrable_loads(self):
+        """deferrable_loads is live again (smart appliances) — must pass validation."""
+        from backend.config_migration import validate_config_for_write
+
+        config = {
+            "config_version": 2,
+            "system": {},
+            "battery": {},
+            "executor": {},
+            "input_sensors": {},
+            "deferrable_loads": [{"id": "washer", "power_sensor": "sensor.w"}],
+        }
+        assert validate_config_for_write(config) is True
 
 
 def test_validate_config_inverter_warnings_when_missing():
