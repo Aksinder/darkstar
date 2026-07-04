@@ -1,3 +1,7 @@
+## dev-20260704.1203 — 2026-07-04 12:05
+
+- feat(planner): effekttariff peak-demand charge + wire the soft import cap
+
 ## dev-20260630.2236 — 2026-06-30 22:38
 
 - feat(pricing): add fees_include_vat for VAT-inclusive grid fee helpers
