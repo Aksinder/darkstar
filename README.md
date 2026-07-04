@@ -39,6 +39,30 @@ Darkstar is a local, privacy-first energy management system that optimizes your 
 - **Load Disaggregation** — Separates base load from controllable appliances (Water Heater, EV, etc.) for better ML accuracy
 - **Vacation Mode** — Safe anti-legionella water heating while away
 
+## Fork additions (Aksinder)
+
+This fork tracks upstream and adds device-level controllers and pricing features, all
+**default-OFF or observe-only**. Highlights:
+
+- **Deferrable smart appliances** — turnkey dishwasher/washer recommendations from a
+  power sensor (auto-arm, cheapest *forecast* window, done detection; observe/recommend-only
+  — plug actuation planned)
+- **Real-time EV surplus charging** — per-tick current control (solar surplus → cheap
+  grid → conditional battery assist), target-SoC caps, departure deadlines, vacation targets
+- **EV SoC estimator** — self-calibrating dead-reckoning for cars with no API
+- **Thermal water tanks** — hot-water litres/level estimation from the heating-power
+  meter alone (no temperature probe), with per-tank vacation partitioning
+- **Single-source pricing** — import fees and export compensation (påslag, nätnytta)
+  driven by HA helpers, öre/SEK auto-conversion, VAT-inclusive fee support
+  (`fees_include_vat`), negative-price export curtailment
+- **Multi-inverter AC-limit modeling** — `system.solar_arrays[].on_battery_inverter` tags so a
+  hybrid + PV-only inverter site plans battery discharge correctly
+- **Load priority (WTP) tiers** — reservation prices per load, incl. dynamic
+  percentile caps; **phase-aware load modeling**; excess-PV climate sink; unknown-load
+  observability
+
+Full feature docs: [`darkstar-dev/DOCS.md`](darkstar-dev/DOCS.md) · design notes: [`docs/designs/`](docs/designs/)
+
 
 ## Installation
 
@@ -140,13 +164,12 @@ water_heaters:
     max_hours_between_heating: 8
     water_min_spacing_hours: 4
     sensor: sensor.vvb_power
-    type: binary
-    nominal_power_kw: 3.0
+    type: binary                # or `thermal` for the tank-level estimator (see fork docs)
+    target_entity: input_number.your_water_heater_temp   # per-heater control entity
 
-# Control entity for the water heater
+# Temperature levels used when controlling the heater
 executor:
   water_heater:
-    target_entity: input_number.your_water_heater_temp
     temp_off: 40       # Idle (legionella-safe minimum)
     temp_normal: 60    # Normal scheduled heating
     temp_boost: 70     # Manual boost via Dashboard
@@ -172,11 +195,13 @@ ev_chargers:
     enabled: true
     max_power_kw: 11.0
     battery_capacity_kwh: 82.0
-    min_soc_percent: 20.0
-    target_soc_percent: 80.0
-    sensor: sensor.tesla_power
-    type: variable
+    sensor: sensor.tesla_power                    # charger power reading
+    soc_sensor: sensor.tesla_battery_level        # EV battery SoC (%)
+    plug_sensor: binary_sensor.tesla_plugged_in   # plug status
+    switch_entity: switch.tesla_charger           # enable/disable smart charging
+    type: binary                                  # ON/OFF control (variable power not yet implemented)
     nominal_power_kw: 11.0
+    departure_time: ""                            # optional "HH:MM" ready-by time
 ```
 
 ### Multiple Devices
@@ -238,7 +263,7 @@ The web UI provides:
 3. **Optimization** — Kepler solver generates optimal battery schedules
 4. **Execution** — Native executor controls your inverter in real-time
 
-The system re-optimizes every hour to adapt to changing prices and conditions.
+The system re-optimizes every 30 minutes (configurable via `automation.schedule.every_minutes`) to adapt to changing prices and conditions.
 
 ---
 
