@@ -1005,6 +1005,18 @@ class PlannerPipeline:
                 "phase_flagged_slots": len(realism.phase_flagged_slots),
                 "idle_exposed_slots": len(realism.idle_exposed_slots),
             }
+            # Honest-objective reporting: expose the FULL minimized objective next to
+            # the energy-only cost. A large wedge means penalty constants — not
+            # prices — shaped this plan; without this the dashboard certifies
+            # "optimal" against an objective the user never sees.
+            _obj = getattr(result, "objective_cost_sek", None)
+            s_index_debug["objective"] = {
+                "objective_cost_sek": round(_obj, 3) if _obj is not None else None,
+                "energy_cost_sek": round(result.total_cost_sek, 3),
+                "penalty_wedge_sek": (
+                    round(_obj - result.total_cost_sek, 3) if _obj is not None else None
+                ),
+            }
             if realism.realism_gap_sek > 0.01 or realism.idle_exposed_slots:
                 logger.info(
                     "Realism check: gap=%.2f SEK, extra_import=%.2f kWh, phase_flagged=%d, idle_exposed=%d",

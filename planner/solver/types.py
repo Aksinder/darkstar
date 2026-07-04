@@ -308,3 +308,10 @@ class KeplerResult:
     is_optimal: bool
     status_msg: str
     solve_time_ms: float = 0.0
+    # The FULL objective value the solver actually minimized (energy cost PLUS every
+    # penalty/credit: deadlines, water comfort/reliability, WTP credits, peak charge,
+    # slacks...). total_cost_sek is the energy-only recomputation (import - export +
+    # wear); when the two diverge materially, penalty constants — not prices — shaped
+    # the plan. Surfacing both makes that wedge visible instead of certifying
+    # "optimal" against an objective the user never sees.
+    objective_cost_sek: float | None = None
