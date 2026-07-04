@@ -1,3 +1,7 @@
+## dev-20260704.2307 — 2026-07-04 23:09
+
+- fix(config): stop the migration from deleting the smart-appliance config
+
 ## dev-20260704.1906 — 2026-07-04 19:08
 
 - feat(executor+planner): deferrable plug actuation (Fas 3) + p10-weighted PV
