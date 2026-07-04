@@ -105,7 +105,12 @@ water_heaters:
     max_hours_between_heating: 8     # Max comfort gap between heating cycles
     water_min_spacing_hours: 4       # Minimum gap between heating starts
     sensor: ''                       # Home Assistant entity for power reading
-    target_entity: ''                # Thermostat entity for controlling this heater
+    target_entity: ''                # Control entity. A number/input_number gets the target
+                                     # TEMPERATURE written (thermostat/bridge setups). A
+                                     # switch/input_boolean is driven DIRECTLY by the executor
+                                     # (command > 50°C = on, temp_off = off) — no HA bridge
+                                     # automation needed, and drift (device reboot, manual
+                                     # toggle) self-heals on the next executor run.
     type: binary                     # Load type: binary (on/off) or modulating
     exclude_from_vacation: false     # When vacation is active, this tank still gets NORMAL comfort
                                      # heating instead of being shut off (e.g. a rented-out Villavagn
