@@ -69,9 +69,10 @@ battery_economics:
 # Per-device settings (power, min_kwh_per_day, spacing) are now in water_heaters[] array below
 water_heating:
   defer_up_to_hours: 6             # Allow deferring "today's" heating into early tomorrow morning (up to N hours) if cheaper
-  block_start_penalty_sek: 3.0     # Penalty per heating start (higher = more consolidated bulk heating)
-  comfort_level: 3                 # 1-5 (Economy→Maximum) - controls gap penalty
-  spacing_penalty_sek: 0.20        # Soft penalty for frequent starts
+  comfort_level: 3                 # 1-5 (Economy→Maximum) — drives ALL water penalties via the
+                                   # solver's COMFORT_MAP (reliability / block-start / block).
+                                   # (The old block_start_penalty_sek / spacing_penalty_sek keys
+                                   # here were read by no code and have been removed.)
   enable_top_ups: true             # Enable spaced top-up heating blocks (vs bulk heating only)
 
 
@@ -83,10 +84,12 @@ water_heating:
     anti_legionella_duration_hours: 3.0  # Duration at power_kw (e.g., 3h * 3kW = 9kWh)
     end_date: ""                      # Vacation mode end date (set by UI/Automation)
 
-  # Advanced Water Heating Tuning (Rev K17)
-  # Controls how the solver prioritizes water heating comfort and blocking.
-  reliability_penalty_sek: 1000.0   # "Must Have" penalty (missing daily min_kwh)
-  block_penalty_sek: 0.50           # "Block Breaker" penalty (discouragues long continuous runs)
+  # NOTE (2026-07-04 audit): the water-heating penalties are driven ENTIRELY by
+  # comfort_level above, via the solver's COMFORT_MAP (adapter.py). At level 3 the
+  # live values are: reliability 15 SEK/kWh, block-start 3.0 SEK, block 2.0 SEK.
+  # The old reliability_penalty_sek / block_penalty_sek keys documented here were
+  # read by NO code (removed — they only misled tuning). To make heating more/less
+  # guaranteed or more/less consolidated: change comfort_level.
 
 # =============================================================================
 # Entity-Centric Device Configuration (ARC15)

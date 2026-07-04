@@ -898,7 +898,23 @@ class KeplerSolver:
             )
             # Per-device block start penalty (task 2.9)
             + (
-                pulp.lpSum(water_start[d][t] for d in water_start for t in range(T))
+                pulp.lpSum(
+                    water_start[d][t]
+                    # A STATIC-WTP heater prices its worth purely via its per-kWh credit;
+                    # the flat block-start penalty (~3 SEK at comfort L3) exceeds a low
+                    # tier's ENTIRE daily credit (0.4 WTP x 6 kWh = 2.4 SEK), silently
+                    # turning "heats when energy is cheap/surplus" into "never heats".
+                    # Waive it for those heaters — their WTP threshold already gates
+                    # starts. Dynamic-percentile heaters keep it (consolidation within
+                    # the cheap band is exactly what the penalty is for).
+                    for d in water_start
+                    if not (
+                        config.load_priority_enabled
+                        and d in config.load_priorities
+                        and config.load_priorities[d].dynamic_percentile is None
+                    )
+                    for t in range(T)
+                )
                 * config.water_block_start_penalty_sek
                 if water_enabled and water_start and config.water_block_start_penalty_sek > 0
                 else 0.0
