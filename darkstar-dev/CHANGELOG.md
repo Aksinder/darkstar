@@ -1,3 +1,7 @@
+## dev-20260704.1833 — 2026-07-04 18:35
+
+- feat(honesty): full-objective reporting + ML baseline A/B rows
+
 ## dev-20260704.1817 — 2026-07-04 18:19
 
 - feat(executor): drive switch/input_boolean water-heater targets directly
