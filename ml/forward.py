@@ -498,6 +498,18 @@ async def generate_forward_slots(
         await engine.store_forecasts(forecasts, forecast_version=forecast_version)
         print(f"✅ Stored {len(forecasts)} forward AURORA forecasts ({forecast_version}).")
 
+        # Write the naive 7-day-average baseline for the SAME slots so the eval
+        # endpoints' aurora-vs-baseline A/B finally has a comparator (best-effort;
+        # never blocks the aurora path).
+        if forecast_version == "aurora":
+            from backend.learning.baseline import store_baseline_forecasts
+
+            baseline_n = await store_baseline_forecasts(
+                engine.store, [str(f["slot_start"]) for f in forecasts]
+            )
+            if baseline_n:
+                print(f"✅ Stored {baseline_n} baseline_7_day_avg forecasts.")
+
         # Log physics vs ML breakdown for monitoring
         if "physics_kwh" in predictions:
             total_physics = float(predictions["physics_kwh"].sum())

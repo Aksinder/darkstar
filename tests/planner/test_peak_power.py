@@ -8,6 +8,8 @@ above any planned import must make the term inert.
 
 from datetime import datetime, timedelta
 
+import pytest
+
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import KeplerConfig, KeplerInput, KeplerInputSlot
 
@@ -85,6 +87,29 @@ def test_high_baseline_makes_peak_cost_inert():
     # Behaves like the no-peak-cost case: arbitrage is free again under the baseline.
     assert sum(s.charge_kwh for s in result.slots) >= 3.9
     assert _hour_import(result, inp, 0) >= 7.5
+
+
+def test_objective_cost_is_reported_and_matches_energy_when_no_penalties():
+    """objective_cost_sek must be populated on optimal solves; in a penalty-free
+    scenario (no water/EV/deferrable, ramping 0, no slacks) it equals the
+    energy-only recomputation to within rounding."""
+    inp = _two_hour_arbitrage_input()
+    cfg = _cfg(wear_cost_sek_per_kwh=0.0, ramping_cost_sek_per_kw=0.0)
+    result = KeplerSolver().solve(inp, cfg)
+    assert result.is_optimal
+    assert result.objective_cost_sek is not None
+    assert result.objective_cost_sek == pytest.approx(result.total_cost_sek, abs=0.05)
+
+
+def test_objective_cost_reveals_penalty_wedge():
+    """With the demand charge active, the objective includes the peak cost while the
+    energy-only figure doesn't — the wedge is exactly what the reporting exposes."""
+    inp = _two_hour_arbitrage_input()
+    result = KeplerSolver().solve(inp, _cfg(peak_power_cost_sek_per_kw=50.0))
+    assert result.is_optimal
+    assert result.objective_cost_sek is not None
+    # Unavoidable 4 kW load peak x 50 SEK = 200 SEK of peak cost in the objective.
+    assert result.objective_cost_sek - result.total_cost_sek == pytest.approx(200.0, abs=1.0)
 
 
 def test_zero_cost_is_legacy_no_op():

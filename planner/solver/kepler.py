@@ -1116,9 +1116,20 @@ class KeplerSolver:
                 final_total_cost,
             )
 
+        objective_cost: float | None = None
+        if is_optimal:
+            try:
+                from typing import cast as _cast
+
+                _obj_val = _cast("float | None", pulp.value(prob.objective))  # type: ignore[arg-type]
+                objective_cost = float(_obj_val) if _obj_val is not None else None
+            except (TypeError, ValueError):
+                objective_cost = None
+
         return KeplerResult(
             slots=result_slots,
             total_cost_sek=final_total_cost,
             is_optimal=is_optimal,
             status_msg=status,
+            objective_cost_sek=objective_cost,
         )
