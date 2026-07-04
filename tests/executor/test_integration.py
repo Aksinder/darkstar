@@ -49,8 +49,10 @@ class TestF57Integration:
         assert "water_heaters" in result, "water_heaters should be present"
         assert "ev_chargers" in result, "ev_chargers should be present"
 
-        # Verify no deprecated keys added
-        assert "deferrable_loads" not in result, "deferrable_loads should not be added"
+        # Verify no deprecated keys added. deferrable_loads is a LIVE key again
+        # (smart-appliance controller): the template's empty default may merge in,
+        # but no legacy content may appear.
+        assert result.get("deferrable_loads", []) == [], "no legacy deferrable content"
         assert "ev_charger" not in result, "ev_charger should not be added"
         assert "version" not in result, "version should not be added"
 
