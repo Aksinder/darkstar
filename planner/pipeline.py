@@ -603,12 +603,25 @@ class PlannerPipeline:
         # scheduled (feature is opt-in and off by default).
         deferrable_load_states = initial_state.get("deferrable_load_states")
 
+        # Effekttariff: live month-to-date peak import (kW) resolved by ha_client;
+        # None keeps the config literal fallback inside the adapter.
+        _peak_baseline_raw = initial_state.get("peak_power_baseline_kw")
+        peak_power_baseline_kw = (
+            float(_peak_baseline_raw) if _peak_baseline_raw is not None else None
+        )
+        _peak_elapsed_raw = initial_state.get("peak_hour_elapsed_import_kwh")
+        peak_hour_elapsed_import_kwh = (
+            float(_peak_elapsed_raw) if _peak_elapsed_raw is not None else None
+        )
+
         kepler_config = config_to_kepler_config(
             active_config,
             overrides,
             kepler_input.slots,
             water_heater_states=water_heater_states,  # task 3.3
             deferrable_load_states=deferrable_load_states,
+            peak_power_baseline_kw=peak_power_baseline_kw,
+            peak_hour_elapsed_import_kwh=peak_hour_elapsed_import_kwh,
         )
 
         # Pre-calculate excess PV slot flags from raw forecasts (task 3.1)

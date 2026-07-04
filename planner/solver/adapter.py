@@ -650,6 +650,8 @@ def config_to_kepler_config(
     water_heater_states: list[dict[str, Any]] | None = None,
     ev_charger_states: list[dict[str, Any]] | None = None,
     deferrable_load_states: list[dict[str, Any]] | None = None,
+    peak_power_baseline_kw: float | None = None,
+    peak_hour_elapsed_import_kwh: float | None = None,
 ) -> KeplerConfig:
     """
     Convert the main config dictionary to KeplerConfig.
@@ -658,6 +660,8 @@ def config_to_kepler_config(
         planner_config: Main configuration dictionary
         overrides: Optional runtime overrides
         slots: Optional list of KeplerInputSlot (Legacy argument, currently unused)
+        peak_power_baseline_kw: Live month-to-date peak import (kW) resolved from HA
+            by the pipeline; None => fall back to the grid.peak_power_baseline_kw literal.
     """
     system = planner_config.get("system", {})
     battery = system.get("battery", planner_config.get("battery", {}))
@@ -735,6 +739,24 @@ def config_to_kepler_config(
         if _total_kwp > 0.0:
             hybrid_pv_fraction = _hybrid_kwp / _total_kwp
 
+    # Top-level grid section: soft import cap (opt-in via enforce_import_limit so the
+    # long-shipped import_limit_kw default doesn't suddenly activate for existing
+    # configs) + effekttariff peak-demand-charge settings.
+    _grid_cfg = cast("dict[str, Any]", planner_config.get("grid", {}) or {})
+    _import_limit_raw = _grid_cfg.get("import_limit_kw")
+    grid_import_limit_kw: float | None = (
+        float(_import_limit_raw)
+        if bool(_grid_cfg.get("enforce_import_limit", False))
+        and _import_limit_raw is not None
+        and _import_limit_raw != ""
+        else None
+    )
+    resolved_peak_baseline_kw: float = (
+        float(peak_power_baseline_kw)
+        if peak_power_baseline_kw is not None
+        else float(_grid_cfg.get("peak_power_baseline_kw", 0.0) or 0.0)
+    )
+
     kepler_cfg = KeplerConfig(
         capacity_kwh=capacity,
         min_soc_percent=float(battery.get("min_soc_percent", 10.0)),
@@ -764,6 +786,12 @@ def config_to_kepler_config(
             else None
         ),
         hybrid_pv_fraction=hybrid_pv_fraction,
+        grid_import_limit_kw=grid_import_limit_kw,
+        peak_power_cost_sek_per_kw=float(
+            _grid_cfg.get("peak_power_cost_sek_per_kw", 0.0) or 0.0
+        ),
+        peak_power_baseline_kw=resolved_peak_baseline_kw,
+        peak_hour_elapsed_import_kwh=float(peak_hour_elapsed_import_kwh or 0.0),
         ramping_cost_sek_per_kw=float(
             planner_config.get("kepler", {}).get(
                 "ramping_cost_sek_per_kw", get_val("ramping_cost_sek_per_kw", 0.05)

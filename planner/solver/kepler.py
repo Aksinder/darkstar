@@ -824,6 +824,53 @@ class KeplerSolver:
                             <= M
                         )
 
+        # Effekttariff: monthly peak demand charge on the hourly-mean grid import
+        # (timmedelvärde). One peak variable PER CALENDAR MONTH in the horizon: the
+        # current month's is floored at the month-to-date baseline (staying under the
+        # existing peak is free), later months start from zero (their billing resets).
+        # The billed mean always divides by the FULL hour: the in-progress hour gets
+        # its already-elapsed import injected as a constant (mid-hour replans would
+        # otherwise both miss real peaks and hallucinate phantom ones), and a trailing
+        # partial hour under-counts only its unknown remainder — which the next replan
+        # re-prices with that import as elapsed/planned.
+        peak_cost_term: Any = 0.0
+        if config.peak_power_cost_sek_per_kw > 0.0 and T > 0:
+            hour_slot_indices: dict[Any, list[int]] = defaultdict(list)
+            for t in range(T):
+                hour_slot_indices[
+                    input_data.slots[t].start_time.replace(minute=0, second=0, microsecond=0)
+                ].append(t)
+            first_hour_key: Any = min(hour_slot_indices)
+            months: dict[tuple[int, int], list[Any]] = defaultdict(list)
+            for hour_key in hour_slot_indices:
+                months[(hour_key.year, hour_key.month)].append(hour_key)
+            horizon_month: tuple[int, int] = (first_hour_key.year, first_hour_key.month)
+            peak_terms: list[Any] = []
+            for month_key in sorted(months):
+                month_baseline_kw: float = (
+                    max(0.0, config.peak_power_baseline_kw)
+                    if month_key == horizon_month
+                    else 0.0
+                )
+                month_peak_kw: Any = pulp.LpVariable(
+                    f"peak_import_kw_{month_key[0]}_{month_key[1]:02d}",
+                    lowBound=month_baseline_kw,
+                )
+                for hour_key in months[month_key]:
+                    hour_import: Any = pulp.lpSum(
+                        grid_import[t] for t in hour_slot_indices[hour_key]
+                    )
+                    if hour_key == first_hour_key:
+                        hour_import = hour_import + max(
+                            0.0, config.peak_hour_elapsed_import_kwh
+                        )
+                    # full-hour billed mean: kWh in the clock hour <= peak_kw * 1h
+                    prob += hour_import <= month_peak_kw  # type: ignore[operator]
+                peak_terms.append(
+                    config.peak_power_cost_sek_per_kw * (month_peak_kw - month_baseline_kw)
+                )
+            peak_cost_term = pulp.lpSum(peak_terms)
+
         # Terminal SoC Target (BIDIRECTIONAL soft constraint)
         # - min_soc violation: HARD penalty (1000 SEK/kWh)
         # - target violation: SOFT penalty (from config, derived from risk_appetite)
@@ -832,6 +879,7 @@ class KeplerSolver:
         # - gap violation: SOFT comfort penalty (Rev K18)
         prob += (  # type: ignore[operator]
             pulp.lpSum(total_cost)
+            + peak_cost_term
             + MIN_SOC_PENALTY * pulp.lpSum(soc_violation)
             + MAX_SOC_PENALTY * pulp.lpSum(soc_overshoot)
             + (

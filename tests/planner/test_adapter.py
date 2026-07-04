@@ -504,6 +504,49 @@ class TestKeplerConfigWithARC15:
         }
         assert config_to_kepler_config(config).hybrid_pv_fraction is None
 
+    def test_import_limit_not_wired_without_enforce_flag(self):
+        """The long-shipped grid.import_limit_kw default must stay inert unless opted in."""
+        config = {
+            "config_version": 2,
+            "grid": {"import_limit_kw": 11.0},
+            "battery": self._battery(),
+        }
+        assert config_to_kepler_config(config).grid_import_limit_kw is None
+
+    def test_import_limit_wired_with_enforce_flag(self):
+        config = {
+            "config_version": 2,
+            "grid": {"import_limit_kw": 11.0, "enforce_import_limit": True},
+            "battery": self._battery(),
+        }
+        assert config_to_kepler_config(config).grid_import_limit_kw == pytest.approx(11.0)
+
+    def test_peak_power_fields_default_off(self):
+        config = {"config_version": 2, "battery": self._battery()}
+        cfg = config_to_kepler_config(config)
+        assert cfg.peak_power_cost_sek_per_kw == 0.0
+        assert cfg.peak_power_baseline_kw == 0.0
+
+    def test_peak_power_fields_from_grid_section(self):
+        config = {
+            "config_version": 2,
+            "grid": {"peak_power_cost_sek_per_kw": 65.0, "peak_power_baseline_kw": 5.2},
+            "battery": self._battery(),
+        }
+        cfg = config_to_kepler_config(config)
+        assert cfg.peak_power_cost_sek_per_kw == pytest.approx(65.0)
+        assert cfg.peak_power_baseline_kw == pytest.approx(5.2)
+
+    def test_peak_baseline_kwarg_beats_literal(self):
+        """The live HA month-to-date peak (pipeline kwarg) overrides the config literal."""
+        config = {
+            "config_version": 2,
+            "grid": {"peak_power_cost_sek_per_kw": 65.0, "peak_power_baseline_kw": 5.2},
+            "battery": self._battery(),
+        }
+        cfg = config_to_kepler_config(config, peak_power_baseline_kw=7.8)
+        assert cfg.peak_power_baseline_kw == pytest.approx(7.8)
+
 
 class TestKeplerInputConversion:
     """Test planner_to_kepler_input function."""
