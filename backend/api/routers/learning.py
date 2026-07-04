@@ -143,15 +143,69 @@ async def learning_run() -> dict[str, Any]:
     description="Get status of individual learning loops.",
 )
 async def learning_loops() -> dict[str, Any]:
-    """Get status of individual learning loops (Mocked as real-time status)."""
-    # Note: learning_loops table noted in legacy code was not found in schema.
-    # Defining known loops for UI compatibility.
-    known_loops = ["pv_forecast", "load_forecast", "s_index", "arbitrage"]
-    result = {}
-    for loop in known_loops:
-        result[loop] = {"status": "active", "last_run": None, "error": None}
+    """Real status per learning loop (previously hardcoded 'active' for UI compat).
 
-    return {"loops": result}
+    - pv_forecast / load_forecast are driven by the nightly LightGBM retraining
+      (LearningRun rows): 'active' = a successful run within 8 days, 'stale' =
+      older, 'never_ran' = none.
+    - s_index / arbitrage are driven by Aurora Reflex parameter tuning
+      (ReflexState rows): they report 'never_ran' until Reflex has actually
+      applied a change — honesty over reassurance.
+    """
+    from datetime import datetime, timedelta
+
+    from backend.learning.models import ReflexState
+
+    def _freshness(last_iso: str | None) -> str:
+        if not last_iso:
+            return "never_ran"
+        try:
+            last = datetime.fromisoformat(last_iso)
+            now = datetime.now(last.tzinfo) if last.tzinfo else datetime.now()
+            return "active" if (now - last) <= timedelta(days=8) else "stale"
+        except (ValueError, TypeError):
+            return "stale"
+
+    try:
+        engine = _get_learning_engine()
+        store: LearningStore = engine.store
+        async with store.AsyncSession() as session:
+            run_stmt = (
+                select(LearningRun)
+                .where(LearningRun.status == "success")
+                .order_by(desc(LearningRun.started_at))
+                .limit(1)
+            )
+            last_run = (await session.execute(run_stmt)).scalars().first()
+            last_train = (
+                last_run.started_at.isoformat() if last_run and last_run.started_at else None
+            )
+
+            reflex_rows = (await session.execute(select(ReflexState))).scalars().all()
+            s_index_last = max(
+                (r.last_updated for r in reflex_rows if r.last_updated and "s_index" in r.param_path),
+                default=None,
+            )
+            other_last = max(
+                (
+                    r.last_updated
+                    for r in reflex_rows
+                    if r.last_updated and "s_index" not in r.param_path
+                ),
+                default=None,
+            )
+
+        train_status = _freshness(last_train)
+        result: dict[str, Any] = {
+            "pv_forecast": {"status": train_status, "last_run": last_train, "error": None},
+            "load_forecast": {"status": train_status, "last_run": last_train, "error": None},
+            "s_index": {"status": _freshness(s_index_last), "last_run": s_index_last, "error": None},
+            "arbitrage": {"status": _freshness(other_last), "last_run": other_last, "error": None},
+        }
+        return {"loops": result}
+    except Exception as e:
+        logger.exception("Failed to get learning loop status")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get(

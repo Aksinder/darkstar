@@ -366,6 +366,58 @@ class TestWtpWaterHeaters:
         hot = [i for i, s in enumerate(r.slots) if s.water_heater_results.get("spa", 0.0) > 0]
         assert hot == [3, 4]  # the two cheapest slots
 
+    def test_static_wtp_heater_not_blocked_by_block_start_penalty(self):
+        """Regression (2026-07-04 audit): at comfort L3 the flat 3.0 SEK block-start
+        penalty exceeded a comfort tier's ENTIRE daily credit (0.4 WTP x 2 kWh = 0.8
+        here), so a static-WTP heater could never heat voluntarily even in slots priced
+        below its WTP. The penalty is waived for static-WTP heaters — their reservation
+        price already gates starts."""
+        prices = [1.0, 1.0, 1.0, 0.1, 0.1, 1.0, 1.0, 1.0]
+        prio = {"spa": LoadPriority(base_wtp_sek_per_kwh=0.4)}
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots(prices), 0.0),
+            _wcfg(
+                [_wh()],
+                load_priority_enabled=True,
+                load_priorities=prio,
+                water_block_start_penalty_sek=3.0,
+            ),
+        )
+        assert r.is_optimal
+        assert _heated(r, "spa") == pytest.approx(2.0)
+
+    def test_dynamic_heater_keeps_block_start_consolidation(self):
+        """Dynamic-percentile heaters KEEP the block-start penalty: given two equally
+        cheap windows it heats in ONE contiguous block instead of splitting starts."""
+        prices = [1.0, 1.0, 0.1, 0.1, 1.0, 0.1, 0.1, 1.0]
+        prio = {"spa": LoadPriority(base_wtp_sek_per_kwh=0.4, dynamic_percentile=50.0)}
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots(prices), 0.0),
+            _wcfg(
+                [_wh()],
+                load_priority_enabled=True,
+                load_priorities=prio,
+                water_block_start_penalty_sek=3.0,
+            ),
+        )
+        assert r.is_optimal
+        assert _heated(r, "spa") == pytest.approx(2.0)
+        hot = [i for i, s in enumerate(r.slots) if s.water_heater_results.get("spa", 0.0) > 0]
+        assert hot == list(range(min(hot), max(hot) + 1))  # contiguous — one start
+
+    def test_legacy_heater_keeps_block_start_penalty(self):
+        """No-priority heaters are untouched by the waiver: with the flag off, the
+        block-start penalty still consolidates exactly as before."""
+        prices = [1.0, 1.0, 0.1, 0.1, 1.0, 0.1, 0.1, 1.0]
+        r = KeplerSolver().solve(
+            KeplerInput(_wslots(prices), 0.0),
+            _wcfg([_wh()], water_block_start_penalty_sek=3.0),
+        )
+        assert r.is_optimal
+        assert _heated(r, "spa") == pytest.approx(2.0)
+        hot = [i for i, s in enumerate(r.slots) if s.water_heater_results.get("spa", 0.0) > 0]
+        assert hot == list(range(min(hot), max(hot) + 1))
+
     def test_satiation_prevents_overheating(self):
         """An important heater (base_wtp 3.0) at dirt-cheap prices heats EXACTLY its daily
         need, not every slot — the credit is satiated at min_kwh_per_day."""
