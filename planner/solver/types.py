@@ -150,6 +150,12 @@ class KeplerConfig:
     )
     water_block_start_penalty_sek: float = 0.0  # Penalty per block start (global)
     defer_up_to_hours: float = 0.0  # Allow heating until N hours into next day (global)
+    # PERF: tie water heat/boost binaries together within each wall-clock hour.
+    # Kills the temporal near-symmetry (overnight cheap band, midday PV plateau)
+    # that makes branch-and-bound explode — measured 8x faster solves for ~0.1%
+    # objective cost on the live model. Off by default so unit tests keep exact
+    # sub-hour semantics; the production adapter turns it on.
+    water_hourly_blocks: bool = False
 
     # Rev E4: Export Toggle
     enable_export: bool = True  # If False, enforce 0 export

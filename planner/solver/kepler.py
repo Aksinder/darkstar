@@ -6,6 +6,7 @@ Migrated from backend/kepler/solver.py during Rev K13 modularization.
 """
 
 import logging
+import os
 from collections import defaultdict
 from datetime import timedelta  # Rev WH2
 from typing import Any
@@ -30,6 +31,36 @@ logger = logging.getLogger("darkstar.kepler")
 # affordable; a silently time-boxed one is not (see the CBC-first comment at the
 # solve call — GLPK at its old 30 s ceiling shipped garbage plans labeled Optimal).
 SOLVER_TIME_LIMIT_S = 120
+
+# pulp is untyped; pin the one solution-status constant the guard relies on.
+_LP_SOLUTION_OPTIMAL: int = int(pulp.constants.LpSolutionOptimal)  # type: ignore[reportUnknownMemberType]
+
+
+def solve_is_time_boxed(
+    is_optimal: bool,
+    sol_status: int,
+    used_cbc: bool,
+    solve_duration_s: float,
+    limit_s: float = SOLVER_TIME_LIMIT_S,
+) -> bool:
+    """True when an "Optimal" label is really an unproven time-boxed incumbent.
+
+    PuLP maps CBC's "Stopped on time - objective value X" (time limit hit with an
+    incumbent whose optimality gap was NEVER proven <= gapRel) to LpStatusOptimal
+    (pulp/apis/coin_api.py, the explicit NotSolved->Optimal promotion). The honest
+    discriminator is prob.sol_status: it stays LpSolutionIntegerFeasible (2) for a
+    time-boxed incumbent and is LpSolutionOptimal (1) only when CBC itself said
+    "Optimal" (including "within gap tolerance"). Empirically verified: a 2s-limited
+    solve with a 52,594% gap still reports LpStatus "Optimal" — sol_status is the
+    only tell. GLPK's wrapper synthesizes sol_status from the status (always looks
+    proven), so for that path only the wall clock can tell — and solvers exit just
+    UNDER their limit (119.939s of 120), so compare against 95% of the budget.
+    """
+    if not is_optimal:
+        return False
+    if used_cbc:
+        return sol_status != _LP_SOLUTION_OPTIMAL
+    return solve_duration_s >= 0.95 * limit_s
 
 
 def _phase_fraction_list(fractions: dict[str, float] | None) -> list[float] | None:
@@ -323,6 +354,35 @@ class KeplerSolver:
         if not excess_pv_flags:
             excess_pv_flags = [False] * T
 
+        # PERF (hourly decision blocks): tie the water binaries together within each
+        # wall-clock hour. The overnight cheap band and the midday PV plateau contain
+        # dozens of near-identical 15-min slots, so branch-and-bound explores
+        # thousands of near-equivalent schedules (the 1e-5 symmetry-breaker in the
+        # objective is below CBC's tolerances and prunes nothing). Measured on the
+        # live 107-slot model: 31.1s -> 3.8s (8.2x) for +0.03 SEK (~0.1%) objective
+        # cost, identical water totals. Slots stay 15-min for battery/EV and for the
+        # executor — water is simply constant within the hour. Boost groups split
+        # additionally on the excess-PV flag so a flag edge inside an hour cannot
+        # force the whole hour to zero (boost is hard-forced 0 on unflagged slots).
+        if water_enabled and config.water_hourly_blocks and T > 0:
+            _hour_of: list[Any] = [
+                slots[t].start_time.replace(minute=0, second=0, microsecond=0) for t in range(T)
+            ]
+            _heat_groups: defaultdict[Any, list[int]] = defaultdict(list)
+            _boost_groups: defaultdict[Any, list[int]] = defaultdict(list)
+            for t in range(T):
+                _heat_groups[_hour_of[t]].append(t)
+                _boost_groups[(_hour_of[t], excess_pv_flags[t])].append(t)
+            for d in water_heat:
+                for _group in _heat_groups.values():
+                    for t in _group[1:]:
+                        prob += water_heat[d][t] == water_heat[d][_group[0]]  # type: ignore[operator]
+            if boost_enabled:
+                for d in water_boost:
+                    for _group in _boost_groups.values():
+                        for t in _group[1:]:
+                            prob += water_boost[d][t] == water_boost[d][_group[0]]  # type: ignore[operator]
+
         custom_entity_enabled = (
             config.excess_pv_sink == "custom_entity" or config.excess_pv_custom_entity_enabled
         )
@@ -332,9 +392,20 @@ class KeplerSolver:
         soc_above_threshold: dict[int, Any]
         custom_entity_active: dict[int, Any]
         if any_sink_active:
-            soc_above_threshold = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
-                "soc_above_threshold", range(T), cat="Binary"
-            )
+            # Sinks (boost/custom) are hard-forced to 0 outside excess-PV slots, so
+            # the gating binary is dead weight there — create it only where a sink
+            # can actually fire (tonight's live model: 52 of 107 deleted). The
+            # constant 0 elsewhere keeps the gate constraints trivially satisfied.
+            soc_above_threshold = {
+                t: (
+                    pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
+                        f"soc_above_threshold_{t}", cat="Binary"
+                    )
+                    if excess_pv_flags[t]
+                    else 0
+                )
+                for t in range(T)
+            }
         else:
             soc_above_threshold = dict.fromkeys(range(T), 0)
 
@@ -411,14 +482,17 @@ class KeplerSolver:
                         * h
                     )
 
-            # SoC threshold big-M constraint (after soc[t] is defined via battery dynamics)
-            # Placed here so soc[t] is available, then linked to boost/custom_entity above.
-            # soc_above_threshold[t] = 1  =>  soc[t] >= threshold_kWh
-            # soc_above_threshold[t] = 0  =>  no constraint on soc[t]
-            if any_sink_active:
+            # SoC threshold gate (after soc[t] is defined via battery dynamics).
+            # Placed here so soc[t] is available, then linked to boost/custom above.
+            # M-free formulation: soc[t] >= threshold * b — b=1 forces SoC above the
+            # threshold, b=0 is vacuous (soc >= 0). Tighter than the old
+            # capacity-sized big-M, whose loose relaxation let fractional binaries
+            # harvest the boost reward almost for free at the root node (a major
+            # driver of CBC's weak bound / long solves). Only emitted for slots
+            # where the gating binary exists (excess-PV flagged).
+            if any_sink_active and excess_pv_flags[t]:
                 threshold_kwh = config.capacity_kwh * config.excess_pv_soc_threshold_percent / 100.0
-                M_soc = config.capacity_kwh
-                prob += soc[t] >= threshold_kwh - M_soc * (1 - soc_above_threshold[t])
+                prob += soc[t] >= threshold_kwh * soc_above_threshold[t]  # type: ignore[operator]
 
             # Per-device EV constraints
             for charger in plugged_chargers:
@@ -681,13 +755,17 @@ class KeplerSolver:
         # Each phase_import var is minimised (positive objective coeff) so it settles at
         # its true max(0, ...) lower bound (no free-variable gaming). Uses the per-hour
         # profile when present so the cost reflects which phase is heavy at the slot's hour.
-        if config.phase_aware_enabled and (config.phase_load_profile or config.phase_load_fractions):
+        if config.phase_aware_enabled and (
+            config.phase_load_profile or config.phase_load_fractions
+        ):
             static_fracs = _phase_fraction_list(config.phase_load_fractions)
             for t in range(T):
                 s_pa: Any = slots[t]
                 fracs: list[float] | None = None
                 if config.phase_load_profile is not None:
-                    fracs = _phase_fraction_list(config.phase_load_profile.get(s_pa.start_time.hour))
+                    fracs = _phase_fraction_list(
+                        config.phase_load_profile.get(s_pa.start_time.hour)
+                    )
                 if fracs is None:
                     fracs = static_fracs
                 if not fracs:
@@ -853,9 +931,7 @@ class KeplerSolver:
             peak_terms: list[Any] = []
             for month_key in sorted(months):
                 month_baseline_kw: float = (
-                    max(0.0, config.peak_power_baseline_kw)
-                    if month_key == horizon_month
-                    else 0.0
+                    max(0.0, config.peak_power_baseline_kw) if month_key == horizon_month else 0.0
                 )
                 month_peak_kw: Any = pulp.LpVariable(
                     f"peak_import_kw_{month_key[0]}_{month_key[1]:02d}",
@@ -866,9 +942,7 @@ class KeplerSolver:
                         grid_import[t] for t in hour_slot_indices[hour_key]
                     )
                     if hour_key == first_hour_key:
-                        hour_import = hour_import + max(
-                            0.0, config.peak_hour_elapsed_import_kwh
-                        )
+                        hour_import = hour_import + max(0.0, config.peak_hour_elapsed_import_kwh)
                     # full-hour billed mean: kWh in the clock hour <= peak_kw * 1h
                     prob += hour_import <= month_peak_kw  # type: ignore[operator]
                 peak_terms.append(
@@ -892,7 +966,6 @@ class KeplerSolver:
                 if export_floor_active
                 else 0.0
             )
-            + gap_violation_penalty  # Deprecated in K16 (0.0)
             + gap_violation_penalty  # Deprecated in K16 (0.0)
             # Per-device block overshoot penalty (task 2.9)
             + (
@@ -966,7 +1039,7 @@ class KeplerSolver:
             )
         )
 
-        # Solve using GLPK (available in Alpine) or CBC as fallback
+        # Solve — CBC first, GLPK fallback
         import time
 
         build_start: float = time.time()
@@ -974,22 +1047,28 @@ class KeplerSolver:
         # Note: pulp.LpProblem construction happened above, so 'build_time' here is mostly
         # just the overhead of writing the LP file in prob.solve()
 
+        used_cbc: bool = True
         try:
-            # Try GLPK first (installed in Alpine Docker image) with timeout
             # CBC FIRST. GLPK-first caused the 2026-07-05 cold-tank incident: on the
             # grown model (~3.4k vars) GLPK hit its 30 s ceiling every single run and
             # returned an incumbent with ZERO water heating while reporting "Optimal" —
             # silently shipping garbage plans. pulp's bundled CBC is a far stronger
-            # MILP solver and finds the true optimum here in seconds. GLPK stays as
-            # the fallback for images where the bundled CBC binary can't run.
+            # MILP solver. GLPK stays as the fallback for images where the bundled
+            # CBC binary can't run.
             # Generous limit: we replan every 15 min — a 2-min solve is acceptable,
             # a silently-degraded plan is not. gapRel lets CBC stop at a proven
-            # 1%-of-optimal bound instead of chasing the last epsilon.
+            # 1%-of-optimal bound instead of chasing the last epsilon. threads:
+            # the bundled CBC honors it (measured 4.3x with 8 threads); on a
+            # 1-2 vCPU box it is harmless.
             solver_cmd: Any = pulp.PULP_CBC_CMD(
-                msg=False, timeLimit=SOLVER_TIME_LIMIT_S, gapRel=0.01
+                msg=False,
+                timeLimit=SOLVER_TIME_LIMIT_S,
+                gapRel=0.01,
+                threads=max(1, os.cpu_count() or 1),
             )
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
         except Exception:
+            used_cbc = False
             solver_cmd: Any = pulp.GLPK_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_S)
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
 
@@ -1018,6 +1097,56 @@ class KeplerSolver:
                 status,
             )
 
+        # "Optimal" from PuLP does NOT mean proven optimal (see solve_is_time_boxed).
+        # A time-boxed incumbent may be arbitrarily bad — the trivial "heat nothing"
+        # plan is always feasible and is what both the 2026-07-05 GLPK incident and
+        # early CBC incumbents ship. Domain tripwire: a sane plan never violates the
+        # water comfort floors (they carry water_reliability_penalty_sek ~1000/kWh),
+        # so an incumbent that does is garbage — reject it and keep the last good
+        # plan rather than shipping cold showers. An incumbent that PASSES the
+        # tripwire is economically slightly degraded (~1-3 SEK/day measured) but
+        # qualitatively sound: ship it, honestly labeled.
+        # getattr: sol_status is standard PuLP, but test doubles / exotic wrappers
+        # may lack it — default to "proven" (old behavior) rather than false-flag.
+        _sol_status: int = int(getattr(prob, "sol_status", _LP_SOLUTION_OPTIMAL))  # type: ignore[arg-type]
+        if solve_is_time_boxed(is_optimal, _sol_status, used_cbc, solve_duration):  # type: ignore[arg-type]
+            floor_violation_kwh: float = 0.0
+            for d in water_min_kwh_violation:
+                if (
+                    config.load_priority_enabled
+                    and d in config.load_priorities
+                    and config.load_priorities[d].dynamic_percentile is None
+                ):
+                    continue  # static-WTP heaters may legitimately skip a day
+                for i in range(len(sorted_days)):
+                    _v: Any = pulp.value(water_min_kwh_violation[d][i])  # type: ignore[arg-type]
+                    if _v is not None:
+                        floor_violation_kwh += max(0.0, float(_v))  # type: ignore[arg-type]
+            if floor_violation_kwh > 0.5:
+                logger.error(
+                    "Kepler returned a time-boxed incumbent that violates the water "
+                    "comfort floors by %.2f kWh — rejecting the plan (executor keeps "
+                    "the previous one).",
+                    floor_violation_kwh,
+                )
+                raise PlannerError(
+                    code=PlannerErrorCode.SOLVER_TIMEOUT,
+                    details={
+                        "solver_status": status,
+                        "solve_duration_s": round(solve_duration, 3),
+                        "reason": "time-boxed incumbent violates water comfort floors",
+                        "floor_violation_kwh": round(floor_violation_kwh, 2),
+                    },
+                )
+            status = f"{status} (time-boxed incumbent, gap unproven)"
+            logger.warning(
+                "Kepler hit its %ds budget and returned an UNPROVEN incumbent "
+                "(passed the comfort-floor tripwire). Shipping it labeled '%s'; "
+                "objective may be a few SEK/day off optimal.",
+                SOLVER_TIME_LIMIT_S,
+                status,
+            )
+
         if not is_optimal:
             prob.writeLP("kepler_debug.lp")  # type: ignore[reportUnknownMemberType]
             print(f"Solver failed: {status}. LP written to kepler_debug.lp")
@@ -1026,7 +1155,9 @@ class KeplerSolver:
             details = {"solver_status": status, "solve_duration_s": round(solve_duration, 3)}
             if prob.status == pulp.LpStatusInfeasible:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_INFEASIBLE, details=details)
-            elif solve_duration >= SOLVER_TIME_LIMIT_S:
+            elif solve_duration >= 0.95 * SOLVER_TIME_LIMIT_S:
+                # Solvers check the clock between nodes and exit just UNDER the
+                # limit (119.939s of 120) — a >= limit comparison never fires.
                 raise PlannerError(code=PlannerErrorCode.SOLVER_TIMEOUT, details=details)
             elif prob.status == pulp.LpStatusUndefined:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_UNDEFINED, details=details)
