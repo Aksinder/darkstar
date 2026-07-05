@@ -26,6 +26,11 @@ from .types import (
 
 logger = logging.getLogger("darkstar.kepler")
 
+# Solver wall-clock budget (seconds). Replans run every 15 min, so a long solve is
+# affordable; a silently time-boxed one is not (see the CBC-first comment at the
+# solve call — GLPK at its old 30 s ceiling shipped garbage plans labeled Optimal).
+SOLVER_TIME_LIMIT_S = 120
+
 
 def _phase_fraction_list(fractions: dict[str, float] | None) -> list[float] | None:
     """Normalise a {"A":..,"B":..,"C":..} split to a list summing to 1, or None."""
@@ -971,11 +976,21 @@ class KeplerSolver:
 
         try:
             # Try GLPK first (installed in Alpine Docker image) with timeout
-            solver_cmd: Any = pulp.GLPK_CMD(msg=False, timeLimit=30)
+            # CBC FIRST. GLPK-first caused the 2026-07-05 cold-tank incident: on the
+            # grown model (~3.4k vars) GLPK hit its 30 s ceiling every single run and
+            # returned an incumbent with ZERO water heating while reporting "Optimal" —
+            # silently shipping garbage plans. pulp's bundled CBC is a far stronger
+            # MILP solver and finds the true optimum here in seconds. GLPK stays as
+            # the fallback for images where the bundled CBC binary can't run.
+            # Generous limit: we replan every 15 min — a 2-min solve is acceptable,
+            # a silently-degraded plan is not. gapRel lets CBC stop at a proven
+            # 1%-of-optimal bound instead of chasing the last epsilon.
+            solver_cmd: Any = pulp.PULP_CBC_CMD(
+                msg=False, timeLimit=SOLVER_TIME_LIMIT_S, gapRel=0.01
+            )
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
         except Exception:
-            # Fall back to CBC if GLPK not available, also with timeout
-            solver_cmd: Any = pulp.PULP_CBC_CMD(msg=False, timeLimit=30)
+            solver_cmd: Any = pulp.GLPK_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_S)
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
 
         solve_end: float = time.time()
@@ -990,6 +1005,19 @@ class KeplerSolver:
         var_count: int = len(prob.variables())  # type: ignore[reportUnknownMemberType,arg-type]
         const_count: int = len(prob.constraints)  # type: ignore[reportUnknownMemberType,arg-type]
 
+        # A solve that consumed (almost) the whole time budget returned whatever
+        # incumbent it had — possibly far from optimal — even when the status reads
+        # "Optimal" (GLPK notoriously does this). Never let that pass silently: the
+        # 2026-07-05 incident shipped zero-water plans for hours this way.
+        if solve_duration >= 0.9 * SOLVER_TIME_LIMIT_S:
+            logger.warning(
+                "Kepler solve consumed %.1fs of its %ds budget — plan quality may be "
+                "degraded (status: %s). Consider a stronger solver or smaller model.",
+                solve_duration,
+                SOLVER_TIME_LIMIT_S,
+                status,
+            )
+
         if not is_optimal:
             prob.writeLP("kepler_debug.lp")  # type: ignore[reportUnknownMemberType]
             print(f"Solver failed: {status}. LP written to kepler_debug.lp")
@@ -998,7 +1026,7 @@ class KeplerSolver:
             details = {"solver_status": status, "solve_duration_s": round(solve_duration, 3)}
             if prob.status == pulp.LpStatusInfeasible:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_INFEASIBLE, details=details)
-            elif solve_duration >= 30:  # timeLimit used above
+            elif solve_duration >= SOLVER_TIME_LIMIT_S:
                 raise PlannerError(code=PlannerErrorCode.SOLVER_TIMEOUT, details=details)
             elif prob.status == pulp.LpStatusUndefined:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_UNDEFINED, details=details)
