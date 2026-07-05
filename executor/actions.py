@@ -524,6 +524,12 @@ class ActionDispatcher:
         # C3: feed-in limit to restore to after a curtailment window. Captured lazily the moment
         # before the first clamp when export_curtailment.restore_limit_w is left at 0 (auto).
         self._restore_export_limit_w: float | None = None
+        # Manual-ON respect for switch-type water targets: what WE last commanded per
+        # entity (so a human's ON is distinguishable from our own), and until when a
+        # detected manual ON is honored as an implicit boost. In-memory: an add-on
+        # restart forgets an active window (bounded downside — the plan resumes).
+        self._last_water_cmd: dict[str, str] = {}
+        self._manual_on_until: dict[str, float] = {}
 
     def _resolve_entity_id(self, key: str) -> str | None:
         """
@@ -853,6 +859,11 @@ class ActionDispatcher:
             desired_state = "on" if float(target) > WATER_SWITCH_ON_THRESHOLD_C else "off"
             current_state = str(current).strip().lower() if current is not None else None
             if current_state == desired_state:
+                if desired_state == "on":
+                    # Plan and reality agree on ON: ratify ownership (so the eventual
+                    # plan-off is OURS to enforce) and clear any manual window.
+                    self._last_water_cmd[entity] = "on"
+                    self._manual_on_until.pop(entity, None)
                 return ActionResult(
                     action_type="water_temp",
                     success=True,
@@ -864,6 +875,44 @@ class ActionDispatcher:
                     duration_ms=int((time.time() - start) * 1000),
                     error_details=None,
                 )
+            # Manual-ON respect: the relay is ON but the plan wants OFF, and WE did not
+            # turn it on — a human did. That's a signal, not drift: honor it as an
+            # implicit boost for manual_on_respect_minutes instead of reverting on the
+            # next tick (the switch on the wall becomes an honest boost button). Only
+            # states the executor commanded itself are enforced against.
+            if desired_state == "off" and current_state == "on":
+                respect_min = float(
+                    getattr(self.config.water_heater, "manual_on_respect_minutes", 0.0) or 0.0
+                )
+                if respect_min > 0 and self._last_water_cmd.get(entity) != "on":
+                    until = self._manual_on_until.get(entity)
+                    if until is None:
+                        until = time.time() + respect_min * 60.0
+                        self._manual_on_until[entity] = until
+                        logger.info(
+                            "Water heater %s manually turned ON — respecting as implicit "
+                            "boost for %.0f min",
+                            entity,
+                            respect_min,
+                        )
+                    if time.time() < until:
+                        remaining_min = int((until - time.time()) / 60)
+                        return ActionResult(
+                            action_type="water_temp",
+                            success=True,
+                            message=(
+                                f"Manual ON respected (implicit boost, "
+                                f"{remaining_min} min left)"
+                            ),
+                            previous_value=current_state,
+                            new_value="on",
+                            entity_id=entity,
+                            skipped=True,
+                            duration_ms=int((time.time() - start) * 1000),
+                            error_details=None,
+                        )
+                    # Window expired: clear it and fall through to enforce OFF.
+                    self._manual_on_until.pop(entity, None)
             if self.shadow_mode:
                 logger.info(
                     "[SHADOW] Would switch water heater %s %s (%s°C)",
@@ -888,6 +937,10 @@ class ActionDispatcher:
             except Exception as exc:
                 switch_ok = False
                 switch_error = str(exc)
+            if switch_ok:
+                self._last_water_cmd[entity] = desired_state
+                if desired_state == "on":
+                    self._manual_on_until.pop(entity, None)
             return ActionResult(
                 action_type="water_temp",
                 success=switch_ok,
