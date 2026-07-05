@@ -1,3 +1,7 @@
+## dev-20260705.2024 — 2026-07-05 20:26
+
+- perf+guard(solver): proven-optimal CBC in seconds — hourly water blocks, threads, honest time-box handling
+
 ## dev-20260705.1112 — 2026-07-05 11:14
 
 - fix(solver): CBC-first with a real time budget — GLPK was shipping garbage as "Optimal"
