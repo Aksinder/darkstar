@@ -1,3 +1,7 @@
+## dev-20260705.1112 — 2026-07-05 11:14
+
+- fix(solver): CBC-first with a real time budget — GLPK was shipping garbage as "Optimal"
+
 ## dev-20260705.1100 — 2026-07-05 11:02
 
 - fix(executor+planner): humans outrank plans — manual-ON respect, real boost, vacation truth
