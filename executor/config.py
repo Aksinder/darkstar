@@ -113,6 +113,11 @@ class WaterHeaterGlobalConfig:
     temp_off: int = 40
     temp_boost: int = 70
     temp_max: int = 85
+    # Manual-ON respect (switch/input_boolean targets only): when a HUMAN turns the
+    # relay on while the plan wants it off, honor it as an implicit boost for this
+    # many minutes instead of reverting on the next tick. 0 = legacy (plan always
+    # wins). Anything the executor commanded itself is still enforced normally.
+    manual_on_respect_minutes: float = 90.0
 
 
 # Backward compatibility alias
@@ -423,6 +428,12 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         temp_off=int(water_data.get("temp_off", WaterHeaterGlobalConfig.temp_off)),
         temp_boost=int(water_data.get("temp_boost", WaterHeaterGlobalConfig.temp_boost)),
         temp_max=int(water_data.get("temp_max", WaterHeaterGlobalConfig.temp_max)),
+        manual_on_respect_minutes=float(
+            water_data.get(
+                "manual_on_respect_minutes",
+                WaterHeaterGlobalConfig.manual_on_respect_minutes,
+            )
+        ),
     )
 
     # Per-device water heater configs (from water_heaters[] array)

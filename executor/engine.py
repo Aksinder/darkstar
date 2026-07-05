@@ -761,16 +761,22 @@ class ExecutorEngine:
             expires_at.isoformat(),
         )
 
-        # Immediately apply the boost
+        # Immediately apply the boost — per DEVICE (the legacy no-entity call resolved
+        # to the empty global target_entity and silently skipped on ARC15 configs, so
+        # the boost button did nothing). The tick re-asserts it for the full duration.
         if self.ha_client and self.dispatcher:
             try:
-                # Schedule async water temp setting
                 loop = asyncio.get_running_loop()
-                task: asyncio.Task[Any] = loop.create_task(
-                    self.dispatcher.set_water_temp(self.config.water_heater.temp_boost)
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                boost_temp = self.config.water_heater.temp_boost
+                targets: list[str | None] = [
+                    d.target_entity for d in (self.config.water_heater_devices or [])
+                ] or [None]  # legacy single-heater fallback
+                for target in targets:
+                    task: asyncio.Task[Any] = loop.create_task(
+                        self.dispatcher.set_water_temp(boost_temp, target)
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
             except RuntimeError:
                 logger.warning("Could not apply water boost: no running event loop")
             except Exception as e:
@@ -813,6 +819,18 @@ class ExecutorEngine:
             self._emit_water_boost_status(force=True)
 
         return {"success": True, "was_active": was_active}
+
+    def _water_boost_active(self) -> bool:
+        """Whether a manual water boost is currently in force (expiry-aware)."""
+        tz = pytz.timezone(self.config.timezone)
+        now = datetime.now(tz)
+        with self._lock:
+            if self._water_boost_until is None:
+                return False
+            if now >= self._water_boost_until:
+                self._water_boost_until = None
+                return False
+            return True
 
     def get_water_boost_status(self) -> dict[str, Any] | None:
         """Get water boost status with remaining time."""
@@ -1407,7 +1425,26 @@ class ExecutorEngine:
                 try:
                     # Control Water Heater Temperature (per-device)
                     if self._has_water_heater:
-                        if decision.water_temps and self.config.water_heater_devices:
+                        # Manual boost outranks the plan and is RE-ASSERTED every tick
+                        # for its whole duration. It used to be a one-shot apply at
+                        # activation that the very next tick's plan (temp_off) undid
+                        # within 60 s — an "override" that never survived a minute.
+                        boost_active = self._water_boost_active()
+                        if boost_active and self.config.water_heater_devices:
+                            for device in self.config.water_heater_devices:
+                                water_result = await self.dispatcher.set_water_temp(
+                                    self.config.water_heater.temp_boost,
+                                    device.target_entity,
+                                )
+                                action_results.append(water_result)
+                        elif boost_active and getattr(
+                            self.config.water_heater, "target_entity", None
+                        ):
+                            water_result = await self.dispatcher.set_water_temp(
+                                self.config.water_heater.temp_boost
+                            )
+                            action_results.append(water_result)
+                        elif decision.water_temps and self.config.water_heater_devices:
                             # New multi-device format: control each heater independently
                             for device in self.config.water_heater_devices:
                                 temp = decision.water_temps.get(
@@ -1829,9 +1866,13 @@ class ExecutorEngine:
             if grid_charge is not None:
                 state.grid_charging_enabled = grid_charge == "on"
 
+            # Switch-type water targets read "on"/"off", not a temperature. Never
+            # abort the gather over it — that used to skip every read below
+            # (incl. manual_override) and spam a warning per tick.
             water_str = results.get("water_temp")
-            if water_str:
-                state.current_water_temp = float(water_str)
+            if water_str and water_str not in ("unknown", "unavailable"):
+                with contextlib.suppress(ValueError, TypeError):
+                    state.current_water_temp = float(water_str)
 
             # Pass water heater configuration to state
             state.has_water_heater = self._has_water_heater

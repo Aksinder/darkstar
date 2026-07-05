@@ -626,6 +626,12 @@ executor:
     temp_normal: 60    # Scheduled heating target (used by planner)
     temp_boost: 70     # Manual boost button (Dashboard/Executor)
     temp_max: 85       # PV dump target + safety limit (never exceeded)
+    manual_on_respect_minutes: 90   # Switch-type targets only: a HUMAN turning the
+                                    # relay on while the plan wants it off is honored
+                                    # as an implicit boost for this many minutes
+                                    # (the wall switch becomes an honest boost button).
+                                    # 0 = plan always wins. States the executor set
+                                    # itself are always enforced normally.
 
   # Notifications (via Home Assistant notify service)
   notifications:

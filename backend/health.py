@@ -254,14 +254,18 @@ class HealthChecker:
                     slot = cast("dict[str, Any]", slot_raw)
                     gross_value_sek += abs(float(slot.get("cost_sek", 0.0) or 0.0))
             if gap >= 2.0 and gap >= 0.2 * max(gross_value_sek, 1e-9):
+                # Only quote a percentage against a meaningful denominator — against a
+                # near-zero-value plan it renders as astronomical nonsense.
+                pct_part = (
+                    f" (~{100.0 * gap / gross_value_sek:.0f}% of plan value)"
+                    if gross_value_sek >= 1.0
+                    else " (plan value near zero)"
+                )
                 issues.append(
                     HealthIssue(
                         category="planner",
                         severity="warning",
-                        message=(
-                            f"Plan realism gap {gap:.2f} SEK "
-                            f"(~{100.0 * gap / max(gross_value_sek, 1e-9):.0f}% of plan value)"
-                        ),
+                        message=f"Plan realism gap {gap:.2f} SEK{pct_part}",
                         guidance=(
                             "The phase-aware realism simulation expects the plan to under-"
                             "perform its own cost estimate by this much (per-phase import "

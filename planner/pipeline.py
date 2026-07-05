@@ -70,6 +70,22 @@ def partition_vacation_water_heaters(
     return excluded, included
 
 
+def resolve_vacation_enabled(
+    config_enabled: bool, ha_vacation: bool, entity_wired: bool
+) -> bool:
+    """Decide whether vacation mode is active from its two sources.
+
+    When an HA boolean is WIRED (input_sensors.vacation_mode set), it is authoritative
+    in BOTH directions — the person flipping it off in the app must end vacation even
+    if ``water_heating.vacation_mode.enabled`` was left true in the config (a stale
+    config flag once kept suppressing comfort heating half a day after homecoming,
+    with the tank empty). Without a wired entity, the config flag decides.
+    """
+    if entity_wired:
+        return ha_vacation
+    return config_enabled or ha_vacation
+
+
 def _calculate_excess_pv_flags(
     kepler_slots: list[Any],
     water_heaters: list[Any],
@@ -723,10 +739,21 @@ class PlannerPipeline:
         schedule_anti_legionella = False
         sqlite_path: str = ""
 
-        # HA entity can override config when ON
-        ha_vacation = initial_state.get("vacation_mode", False)
-        if ha_vacation:
-            vacation_enabled = True
+        # Vacation source of truth: when the HA boolean is WIRED it is authoritative in
+        # BOTH directions — turning it off at home ends vacation even if the config flag
+        # was left true (a stale config flag once suppressed all comfort heating for
+        # half a day after homecoming). The config flag only matters when no entity is
+        # configured.
+        ha_vacation = bool(initial_state.get("vacation_mode", False))
+        _input_sensors_cfg = cast(
+            "dict[str, Any]", active_config.get("input_sensors") or {}
+        )
+        vacation_entity_wired = bool(
+            str(_input_sensors_cfg.get("vacation_mode") or "").strip()
+        )
+        vacation_enabled = resolve_vacation_enabled(
+            vacation_enabled, ha_vacation, vacation_entity_wired
+        )
 
         if vacation_enabled:
             # Partition by exclude_from_vacation (Fas 0): flagged tanks (e.g. a rented-out

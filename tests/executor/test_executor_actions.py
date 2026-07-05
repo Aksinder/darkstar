@@ -457,7 +457,9 @@ class TestSetWaterTemp:
     @pytest.mark.asyncio
     async def test_switch_target_turns_off_at_temp_off(self, base_config):
         """40°C (temp_off) command on a switch target => turn_off. This is the exact
-        write the stranded HA bridge dropped for 3 days — now executor-owned."""
+        write the stranded HA bridge dropped for 3 days — now executor-owned.
+        (Plan-ON first: an ON the executor ratified is its own to turn off — a
+        never-ratified ON would be manual-respected instead.)"""
         from unittest.mock import AsyncMock, MagicMock
 
         from executor.actions import ActionDispatcher
@@ -467,6 +469,7 @@ class TestSetWaterTemp:
         ha_client.set_switch = AsyncMock(return_value=True)
 
         dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        await dispatcher.set_water_temp(60, "switch.vvb")  # plan ON: ratifies ownership
         result = await dispatcher.set_water_temp(40, "switch.vvb")
 
         assert result.success is True
@@ -496,6 +499,7 @@ class TestSetWaterTemp:
 
         from executor.actions import ActionDispatcher
 
+        base_config.water_heater.manual_on_respect_minutes = 0.0  # isolate shadow path
         ha_client = MagicMock()
         ha_client.get_state_value = AsyncMock(return_value="on")
         ha_client.set_switch = AsyncMock(return_value=True)
@@ -525,11 +529,109 @@ class TestSetWaterTemp:
         ha_client.set_switch.assert_awaited_once_with("input_boolean.vvb_heat", True)
 
     @pytest.mark.asyncio
+    async def test_manual_on_is_respected_as_implicit_boost(self, base_config):
+        """A HUMAN turning the relay on while the plan wants OFF must not be reverted
+        (the 2026-07-05 incident: user heated an empty tank, executor flipped it off
+        within a tick). We never commanded ON => manual => honor for the window."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        result = await dispatcher.set_water_temp(40, "switch.vvb")  # plan: OFF
+
+        assert result.success is True
+        assert result.skipped is True
+        assert "Manual ON respected" in result.message
+        ha_client.set_switch.assert_not_called()
+
+        # Subsequent ticks inside the window keep respecting it.
+        result2 = await dispatcher.set_water_temp(40, "switch.vvb")
+        assert result2.skipped is True and "Manual ON respected" in result2.message
+        ha_client.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_manual_on_window_expiry_resumes_enforcement(self, base_config):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        await dispatcher.set_water_temp(40, "switch.vvb")  # window opens
+        # Backdate the window: it has expired.
+        dispatcher._manual_on_until["switch.vvb"] = 1.0
+        result = await dispatcher.set_water_temp(40, "switch.vvb")
+        assert result.success is True and result.skipped is False
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", False)
+
+    @pytest.mark.asyncio
+    async def test_own_on_command_is_enforced_not_respected(self, base_config):
+        """States the executor set itself are never treated as manual: boost/plan turns
+        it on, plan later says off => off, immediately."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="off")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        await dispatcher.set_water_temp(70, "switch.vvb")  # WE command ON (boost)
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        result = await dispatcher.set_water_temp(40, "switch.vvb")  # plan: OFF
+        assert result.skipped is False
+        ha_client.set_switch.assert_awaited_with("switch.vvb", False)
+
+    @pytest.mark.asyncio
+    async def test_plan_on_ratifies_ownership(self, base_config):
+        """Plan agrees with an already-on relay => ownership ratified, so the eventual
+        plan-off is enforced instead of opening a fresh manual window."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        await dispatcher.set_water_temp(60, "switch.vvb")  # plan ON, already on => ratify
+        result = await dispatcher.set_water_temp(40, "switch.vvb")  # plan OFF
+        assert result.skipped is False
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", False)
+
+    @pytest.mark.asyncio
+    async def test_manual_on_respect_disabled_is_legacy(self, base_config):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        base_config.water_heater.manual_on_respect_minutes = 0.0
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value="on")
+        ha_client.set_switch = AsyncMock(return_value=True)
+
+        dispatcher = ActionDispatcher(ha_client=ha_client, config=base_config, shadow_mode=False)
+        result = await dispatcher.set_water_temp(40, "switch.vvb")
+        assert result.skipped is False
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", False)
+
+    @pytest.mark.asyncio
     async def test_switch_target_reports_service_failure(self, base_config):
         from unittest.mock import AsyncMock, MagicMock
 
         from executor.actions import ActionDispatcher
 
+        base_config.water_heater.manual_on_respect_minutes = 0.0  # isolate failure path
         ha_client = MagicMock()
         ha_client.get_state_value = AsyncMock(return_value="on")
         ha_client.set_switch = AsyncMock(side_effect=RuntimeError("HA API 502"))
