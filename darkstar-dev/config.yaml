@@ -3,7 +3,7 @@
 
 name: "[FORK] Darkstar Energy Manager"
 description: "FORK BUILD (Aksinder) - deferrable loads + hot-water + HA publishing. AI-powered home battery optimization."
-version: "dev-20260705.1100"
+version: "dev-20260705.1112"
 slug: "darkstar-fork"
 url: "https://github.com/Aksinder/darkstar"
 
