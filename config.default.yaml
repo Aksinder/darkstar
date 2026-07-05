@@ -74,6 +74,11 @@ water_heating:
                                    # (The old block_start_penalty_sek / spacing_penalty_sek keys
                                    # here were read by no code and have been removed.)
   enable_top_ups: true             # Enable spaced top-up heating blocks (vs bulk heating only)
+  hourly_blocks: true              # PERF: water on/off decided per wall-clock hour instead of per
+                                   # 15-min slot (executor still gets 15-min slots — they're just
+                                   # equal within the hour). Kills the solver's temporal symmetry:
+                                   # measured 8x faster solves for ~0.1% objective cost. Only
+                                   # disable to A/B the solver.
 
 
   # Vacation Mode (anti-legionella)

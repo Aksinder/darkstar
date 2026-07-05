@@ -103,9 +103,7 @@ def build_water_heater_inputs(
     return result
 
 
-def ev_state_for_solver(
-    ha_state: dict[str, Any], charger_id: str, deadline: Any
-) -> dict[str, Any]:
+def ev_state_for_solver(ha_state: dict[str, Any], charger_id: str, deadline: Any) -> dict[str, Any]:
     """Build the per-charger state dict the solver consumes from a live HA state.
 
     Carries through ``at_home`` (the home-zone gate set by ``get_initial_state``) so a
@@ -787,9 +785,7 @@ def config_to_kepler_config(
         ),
         hybrid_pv_fraction=hybrid_pv_fraction,
         grid_import_limit_kw=grid_import_limit_kw,
-        peak_power_cost_sek_per_kw=float(
-            _grid_cfg.get("peak_power_cost_sek_per_kw", 0.0) or 0.0
-        ),
+        peak_power_cost_sek_per_kw=float(_grid_cfg.get("peak_power_cost_sek_per_kw", 0.0) or 0.0),
         peak_power_baseline_kw=resolved_peak_baseline_kw,
         peak_hour_elapsed_import_kwh=float(peak_hour_elapsed_import_kwh or 0.0),
         ramping_cost_sek_per_kw=float(
@@ -829,6 +825,7 @@ def config_to_kepler_config(
             )
         ),
         defer_up_to_hours=float(wh_cfg.get("defer_up_to_hours", 0.0)),
+        water_hourly_blocks=bool(wh_cfg.get("hourly_blocks", True)),
         # Rev E4: Export Toggle
         enable_export=bool(planner_config.get("export", {}).get("enable_export", True)),
         # Export SoC Floor: minimum SoC required to allow grid export
