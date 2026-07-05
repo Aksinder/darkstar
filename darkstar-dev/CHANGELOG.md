@@ -1,3 +1,7 @@
+## dev-20260705.1100 — 2026-07-05 11:02
+
+- fix(executor+planner): humans outrank plans — manual-ON respect, real boost, vacation truth
+
 ## dev-20260704.2307 — 2026-07-04 23:09
 
 - fix(config): stop the migration from deleting the smart-appliance config
