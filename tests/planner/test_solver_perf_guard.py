@@ -67,31 +67,48 @@ class TestSolveIsTimeBoxed:
     def test_cbc_time_limit_incumbent_is_flagged(self):
         # The exact live case: 119.939s of a 120s budget, LpStatus "Optimal",
         # sol_status = IntegerFeasible (CBC said "Stopped on time").
-        assert solve_is_time_boxed(True, INCUMBENT, True, 119.939, 120) is True
+        assert solve_is_time_boxed(True, INCUMBENT, "cbc", 119.939, 120) is True
 
     def test_cbc_incumbent_flagged_even_when_fast(self):
         # sol_status is authoritative for CBC regardless of the clock.
-        assert solve_is_time_boxed(True, INCUMBENT, True, 12.0, 120) is True
+        assert solve_is_time_boxed(True, INCUMBENT, "cbc", 12.0, 120) is True
 
     def test_cbc_gap_tolerance_stop_is_trusted(self):
         # "Optimal solution found (within gap tolerance)" -> sol_status proven,
         # even if it took nearly the whole budget.
-        assert solve_is_time_boxed(True, PROVEN, True, 119.9, 120) is False
+        assert solve_is_time_boxed(True, PROVEN, "cbc", 119.9, 120) is False
 
     def test_cbc_fast_proven_is_trusted(self):
-        assert solve_is_time_boxed(True, PROVEN, True, 3.8, 120) is False
+        assert solve_is_time_boxed(True, PROVEN, "cbc", 3.8, 120) is False
+
+    def test_highs_time_limit_incumbent_is_flagged(self):
+        # HiGHS kTimeLimit with incumbent -> (Optimal, IntegerFeasible), same
+        # convention as CBC (verified against pulp 3.3.2 highs_api.py).
+        assert solve_is_time_boxed(True, INCUMBENT, "highs", 119.9, 120) is True
+
+    def test_highs_incumbent_flagged_even_when_fast(self):
+        assert solve_is_time_boxed(True, INCUMBENT, "highs", 5.0, 120) is True
+
+    def test_highs_gap_tolerance_stop_is_trusted(self):
+        # gapRel stop reports kOptimal -> (Optimal, Optimal), trusted even at
+        # nearly the full budget — same as CBC's gapRel convention.
+        assert solve_is_time_boxed(True, PROVEN, "highs", 119.9, 120) is False
+
+    def test_highs_fast_proven_is_trusted(self):
+        assert solve_is_time_boxed(True, PROVEN, "highs", 13.6, 120) is False
 
     def test_glpk_full_budget_is_flagged(self):
         # GLPK's wrapper synthesizes sol_status from status (always looks
         # proven) — only the wall clock can catch its time-boxed incumbents.
-        assert solve_is_time_boxed(True, PROVEN, False, 119.9, 120) is True
+        assert solve_is_time_boxed(True, PROVEN, "glpk", 119.9, 120) is True
 
     def test_glpk_fast_is_trusted(self):
-        assert solve_is_time_boxed(True, PROVEN, False, 12.0, 120) is False
+        assert solve_is_time_boxed(True, PROVEN, "glpk", 12.0, 120) is False
 
     def test_not_optimal_is_never_time_boxed(self):
         # Non-Optimal statuses flow to the existing PlannerError mapping.
-        assert solve_is_time_boxed(False, INCUMBENT, True, 119.9, 120) is False
+        assert solve_is_time_boxed(False, INCUMBENT, "cbc", 119.9, 120) is False
+        assert solve_is_time_boxed(False, INCUMBENT, "highs", 119.9, 120) is False
 
 
 class TestComfortFloorTripwire:
@@ -144,6 +161,56 @@ class TestComfortFloorTripwire:
         result = KeplerSolver().solve(input_data, config)
         assert result.is_optimal
         assert "time-boxed incumbent" in result.status_msg
+
+
+class TestSolverFallbackChain:
+    """Build #10: HiGHS-first chain with honest malfunction handling."""
+
+    def _simple_setup(self):
+        heater = WaterHeaterInput(
+            id="vvb",
+            power_kw=3.0,
+            min_kwh_per_day=1.5,
+            max_hours_between_heating=0.0,
+            min_spacing_hours=0.0,
+            heated_today_kwh=0.0,
+        )
+        return KeplerInput(slots=_quarter_slots(8), initial_soc_kwh=5.0), _cfg([heater])
+
+    def test_highs_fast_not_solved_falls_back_to_cbc(self, monkeypatch):
+        # A fast NotSolved from HiGHS (e.g. the global-scheduler thread mismatch)
+        # does NOT raise from prob.solve — kepler must detect it and RE-SOLVE with
+        # CBC instead of shipping an empty plan.
+        class _MalfunctioningHiGHS:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def actualSolve(self, lp, **kwargs):
+                lp.status = pulp.LpStatusNotSolved
+                lp.sol_status = pulp.constants.LpSolutionNoSolutionFound
+                return lp.status
+
+        monkeypatch.setattr(pulp, "HiGHS", _MalfunctioningHiGHS)
+        input_data, config = self._simple_setup()
+        result = KeplerSolver().solve(input_data, config)
+        assert result.is_optimal
+        assert "time-boxed" not in result.status_msg
+        assert len(result.slots) == 8
+
+    def test_fast_not_solved_after_full_chain_raises(self, monkeypatch):
+        # Pre-existing hole: a fast NotSolved that survives the whole fallback
+        # chain used to return a KeplerResult with EMPTY slots. It must raise.
+        def _not_solved(self, solver=None, **kwargs):
+            self.status = pulp.LpStatusNotSolved
+            self.sol_status = pulp.constants.LpSolutionNoSolutionFound
+            return self.status
+
+        monkeypatch.setattr(pulp.LpProblem, "solve", _not_solved)
+        monkeypatch.setattr(pulp.LpProblem, "writeLP", lambda self, *a, **k: None)
+        input_data, config = self._simple_setup()
+        with pytest.raises(PlannerError) as exc:
+            KeplerSolver().solve(input_data, config)
+        assert exc.value.code == PlannerErrorCode.SOLVER_UNDEFINED
 
 
 class TestHourlyWaterBlocks:
