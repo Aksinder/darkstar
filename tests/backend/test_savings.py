@@ -5,12 +5,14 @@ import pytest
 from backend.learning.savings import compute_savings
 
 
-def _slot(imp=0.0, exp=0.0, pv=0.0, load=0.0, p_imp=2.0, p_exp=0.8):
+def _slot(imp=0.0, exp=0.0, pv=0.0, load=0.0, p_imp=2.0, p_exp=0.8, water=0.0, ev=0.0):
     return {
         "import_kwh": imp,
         "export_kwh": exp,
         "pv_kwh": pv,
         "load_kwh": load,
+        "water_kwh": water,
+        "ev_charging_kwh": ev,
         "import_price_sek_kwh": p_imp,
         "export_price_sek_kwh": p_exp,
     }
@@ -83,6 +85,47 @@ def test_unpriced_slots_are_skipped_and_reported():
     assert s.n_slots == 2
     assert s.n_priced_slots == 1
     assert s.coverage == pytest.approx(0.5)
+
+
+def test_vvb_heavy_day_baseline_includes_shifted_loads():
+    """Regression: load_kwh is BASE load (recorder subtracts water + EV before storing).
+
+    A house importing 2 kWh to run the VVB (1.5 kWh) on top of 0.5 kWh base load has a
+    no-battery baseline of exactly the same 2 kWh import — savings must be 0, not the
+    -3.0 SEK the pre-fix code reported (baseline understated by water_kwh * price).
+    """
+    rows = [_slot(imp=2.0, load=0.5, water=1.5, p_imp=2.0)]
+    s = compute_savings(rows)
+    assert s.baseline_cost_sek == pytest.approx(4.0)
+    assert s.savings_sek == pytest.approx(0.0)
+
+
+def test_ev_charging_counts_toward_baseline_load():
+    """Same regression for the EV column: whole-house load = base + water + EV."""
+    rows = [
+        # 7 kWh EV charge + 1 kWh base, all imported: baseline == actual == 16 SEK.
+        _slot(imp=8.0, load=1.0, ev=7.0, p_imp=2.0),
+    ]
+    s = compute_savings(rows)
+    assert s.actual_cost_sek == pytest.approx(16.0)
+    assert s.baseline_cost_sek == pytest.approx(16.0)
+    assert s.savings_sek == pytest.approx(0.0)
+
+
+def test_rows_without_water_ev_columns_still_work():
+    """Older callers may pass rows without the water/EV keys — treated as 0."""
+    rows = [
+        {
+            "import_kwh": 1.0,
+            "export_kwh": 0.0,
+            "pv_kwh": 0.0,
+            "load_kwh": 1.0,
+            "import_price_sek_kwh": 2.0,
+            "export_price_sek_kwh": 0.8,
+        }
+    ]
+    s = compute_savings(rows)
+    assert s.savings_sek == pytest.approx(0.0)
 
 
 def test_missing_export_price_treated_as_zero():

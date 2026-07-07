@@ -40,6 +40,12 @@ from .deferrable import (
 logger = logging.getLogger("darkstar.deferrable")
 
 _STATE_FILE = "data/deferrable_state.json"
+# Append-only per-cycle ledger (one JSON object per line), written on every "done"
+# event so the savings load-shift credit has a durable arm->done record — the
+# state file above only holds CURRENT state and wipes start_ts on completion.
+_LEDGER_FILE = "data/deferrable_cycles.jsonl"
+# Reserved key for chain-tracking metadata inside the state file (not a load id).
+_CHAINS_KEY = "_chains"
 
 
 def _f(v: Any) -> float | None:
@@ -180,10 +186,24 @@ def load_forward_slots(schedule_path: str, now_ts: float, tz_name: str) -> list[
 class DeferrableApplianceController:
     """Stateful runtime: reads HA + schedule, runs the state machine, publishes, notifies."""
 
-    def __init__(self, cfg: DeferrableRuntimeConfig, state_file: str = _STATE_FILE):
+    def __init__(
+        self,
+        cfg: DeferrableRuntimeConfig,
+        state_file: str = _STATE_FILE,
+        ledger_file: str | None = None,
+    ):
         self.cfg = cfg
         self._state_file = state_file
+        # Default the ledger next to the state file (data/ in production), so a
+        # custom state location — e.g. a test tmp dir — keeps both together.
+        self._ledger_file = ledger_file or str(
+            Path(state_file).parent / Path(_LEDGER_FILE).name
+        )
         self._state: dict[str, AppliancePowerState] = {}
+        # Per-appliance cycle-chain metadata for the ledger: armed_ts of the FIRST
+        # genuine arm (a rearm-cooldown continuation must not move it), whether we
+        # ever held the plug, and the deadline anchored to that first arm.
+        self._chains: dict[str, dict[str, Any]] = {}
         self._boot_recovered = False
         self._load_state()
 
@@ -192,6 +212,9 @@ class DeferrableApplianceController:
             p = Path(self._state_file)
             if p.exists():
                 raw = json.loads(p.read_text(encoding="utf-8"))
+                chains = raw.pop(_CHAINS_KEY, None)
+                if isinstance(chains, dict):
+                    self._chains = cast("dict[str, dict[str, Any]]", chains)
                 for lid, d in raw.items():
                     self._state[lid] = AppliancePowerState(**d)
         except Exception as exc:
@@ -201,12 +224,24 @@ class DeferrableApplianceController:
         try:
             p = Path(self._state_file)
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(
-                json.dumps({lid: asdict(s) for lid, s in self._state.items()}),
-                encoding="utf-8",
-            )
+            blob: dict[str, Any] = {lid: asdict(s) for lid, s in self._state.items()}
+            if self._chains:
+                blob[_CHAINS_KEY] = self._chains
+            p.write_text(json.dumps(blob), encoding="utf-8")
         except Exception as exc:
             logger.warning("Deferrable: could not save state: %s", exc)
+
+    def _append_ledger(self, row: dict[str, Any]) -> None:
+        """Append one completed-cycle record to the JSONL ledger (never raises)."""
+        try:
+            p = Path(self._ledger_file)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+        except Exception as exc:
+            logger.warning(
+                "Deferrable: cycle-ledger append failed for %s: %s", row.get("load_id"), exc
+            )
 
     async def _read_on(self, ha: Any, entity: str | None, default: bool = False) -> bool:
         if not entity:
@@ -330,6 +365,27 @@ class DeferrableApplianceController:
             new_state.held_by_us = prev.held_by_us and not switch_on
             self._state[app.id] = new_state
 
+            # Cycle-chain tracking for the ledger. A genuine "armed" event starts a
+            # new chain; a silent re-arm within rearm_cooldown_s (continuation —
+            # soak pause, resume after re-power) keeps the FIRST armed_ts so the
+            # ledger row reflects the human's original start press. Deadline is
+            # anchored to that first arm, mirroring _deadline_ts semantics.
+            if event == "armed":
+                self._chains[app.id] = {
+                    "armed_ts": new_state.start_ts,
+                    "held_ever": bool(new_state.held_by_us),
+                    "deadline_ts": self._deadline_ts(app, now_dt, new_state.start_ts),
+                }
+            elif new_state.pending and not prev.pending and app.id not in self._chains:
+                # Continuation re-arm after chain state was lost (restart/wipe):
+                # no original press is known — record the resume honestly rather
+                # than inventing an earlier timestamp.
+                self._chains[app.id] = {
+                    "armed_ts": new_state.start_ts,
+                    "held_ever": bool(new_state.held_by_us),
+                    "deadline_ts": self._deadline_ts(app, now_dt, new_state.start_ts),
+                }
+
             # Forecast recommendation (duration-aware) for an armed cycle.
             action, window_start = "run", None
             if new_state.pending and not override:
@@ -385,6 +441,31 @@ class DeferrableApplianceController:
                             "Deferrable: plug actuation failed for %s: %s", app.id, exc
                         )
                         plug_cmd = "failed"
+
+            chain = self._chains.get(app.id)
+            if chain is not None and new_state.held_by_us:
+                chain["held_ever"] = True
+
+            if event == "done":
+                # armed_ts comes from the chain (FIRST arm of the programme) with
+                # prev.start_ts as fallback — read BEFORE the state machine cleared
+                # it on the "done" transition. The chain is deliberately kept: a
+                # rearm-cooldown continuation that completes later appends another
+                # row with the SAME (load_id, armed_ts), and the ledger reader
+                # collapses those to the final done. Only the next genuine "armed"
+                # starts a fresh chain.
+                self._append_ledger(
+                    {
+                        "load_id": app.id,
+                        "armed_ts": (chain or {}).get("armed_ts") or prev.start_ts,
+                        "done_ts": now_ts,
+                        "held_by_us_ever": bool((chain or {}).get("held_ever", False)),
+                        "deadline_ts": (chain or {}).get("deadline_ts"),
+                        # Not cheaply available here (only instantaneous W reads);
+                        # the savings reader joins energy from cycle detection.
+                        "measured_kwh": None,
+                    }
+                )
 
             label = self._label(new_state, action, override)
             await self._publish(

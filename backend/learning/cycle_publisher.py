@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from backend.learning.cycle_learning import CycleStats, DetectedCycle
     from backend.learning.phase_learning import PhaseLoadEstimate, PhaseMapping
     from backend.learning.phase_recommend import MoveRecommendation
+    from backend.learning.savings_loadshift import LoadshiftSummary
     from planner.hot_water import HotWaterEstimator
 
 logger = logging.getLogger("darkstar.cycle_publisher")
@@ -32,6 +33,7 @@ __all__ = [
     "PublishedSensor",
     "build_hot_water_sensors",
     "build_load_sensors",
+    "build_loadshift_sensors",
     "build_phase_recommendation_sensors",
     "build_phase_sensors",
     "build_realism_sensors",
@@ -118,6 +120,80 @@ def build_savings_sensors(
                     "baseline": "PV house without battery layer (no arbitrage, "
                     "no stored-solar shifting); load-shift value not included",
                 },
+            )
+        )
+    return sensors
+
+
+# Human-readable baseline descriptions for the loadshift sensor attributes.
+_WATER_BASELINE_LABELS = {
+    "four_cheapest_hours": (
+        "same kWh at the day's 4 cheapest clock hours, element-power capped, "
+        "at import price (the pre-Darkstar automation)"
+    ),
+    "daily_average": (
+        "same kWh at the day's average import price (no predecessor automation; "
+        "price-blind secondary baseline)"
+    ),
+}
+
+
+def build_loadshift_sensors(
+    today: LoadshiftSummary | None,
+    last_30d: LoadshiftSummary | None,
+) -> list[PublishedSensor]:
+    """Publish the load-shift savings streams (backend/learning/savings_loadshift.py).
+
+    Two sensors: today-so-far and a rolling 30 days. State = total load-shift
+    credit in SEK (baseline minus actual; negative when Darkstar's scheduling cost
+    money — unclamped). Attributes carry the per-stream breakdown, each stream's
+    baseline spelled out by name, and per-stream coverage so unpriced slots or
+    unmeasured cycles are visible instead of shrinking silently toward zero.
+    Deliberately SEPARATE from ``sensor.darkstar_savings_*``, which stays the
+    battery-layer counterfactual — the two floors must never be conflated.
+    """
+    sensors: list[PublishedSensor] = []
+    for object_id, name, summary in (
+        ("darkstar_loadshift_today", "Darkstar lastflytt idag", today),
+        ("darkstar_loadshift_30d", "Darkstar lastflytt 30 dagar", last_30d),
+    ):
+        if summary is None:
+            continue
+        attrs: dict[str, Any] = {
+            "valuation": (
+                "actual kWh at the slot's marginal grid price: import price when "
+                "net-importing, export price when net-exporting"
+            ),
+            "ev_note": (
+                "EV charging deliberately NOT included (surplus controller has its "
+                "own economics, no arm-time counterfactual)"
+            ),
+            "battery_note": (
+                "battery-layer value is published separately as sensor.darkstar_savings_*"
+            ),
+        }
+        for w in summary.water:
+            attrs[f"{w.tank_id}_sek"] = round(float(w.credit_sek), 2)
+            attrs[f"{w.tank_id}_kwh"] = round(float(w.valued_kwh), 2)
+            attrs[f"{w.tank_id}_baseline"] = _WATER_BASELINE_LABELS.get(
+                w.baseline_name, w.baseline_name
+            )
+            attrs[f"{w.tank_id}_coverage"] = round(float(w.coverage), 3)
+        for a in summary.appliances:
+            attrs[f"{a.load_id}_sek"] = round(float(a.credit_sek), 2)
+            attrs[f"{a.load_id}_cycles"] = int(a.n_valued_cycles)
+            attrs[f"{a.load_id}_unvalued_cycles"] = int(a.unvalued_cycles)
+            attrs[f"{a.load_id}_baseline"] = "run-at-arm-time (the human's start press)"
+        sensors.append(
+            PublishedSensor(
+                object_id=object_id,
+                state=f"{round(float(summary.credit_sek), 2)}",
+                unit="SEK",
+                device_class="monetary",
+                state_class="measurement",
+                icon="mdi:swap-horizontal-circle-outline",
+                friendly_name=name,
+                attributes=attrs,
             )
         )
     return sensors

@@ -583,7 +583,10 @@ async def record_observation_from_current_state(
         "import_kwh": import_kwh,
         "export_kwh": export_kwh,
         "water_kwh": water_kwh,  # Task 8.3: aggregate preserved for backward compat
-        "water_heater_energy": water_heater_energy if water_heater_energy else None,  # Task 8.2
+        # Task 8.2: per-device dicts, persisted by the store into slot_device_energy
+        # (savings v2 needs the per-tank split — the aggregate cannot attribute
+        # PV-boost hours to the right tank).
+        "water_heater_energy": water_heater_energy if water_heater_energy else None,
         "ev_charging_kwh": ev_charging_kwh,
         "ev_charger_energy": ev_charger_energy if ev_charger_energy else None,
         "batt_charge_kwh": batt_charge_kwh,

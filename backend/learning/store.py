@@ -14,6 +14,7 @@ from backend.learning.models import (
     LearningDailyMetric,
     LearningRun,
     ReflexState,
+    SlotDeviceEnergy,
     SlotForecast,
     SlotObservation,
     SlotPlan,
@@ -85,6 +86,8 @@ class LearningStore:
                     "export_kwh": row.export_kwh,
                     "pv_kwh": row.pv_kwh,
                     "load_kwh": row.load_kwh,
+                    "water_kwh": row.water_kwh,  # type: ignore[reportUnknownMemberType]
+                    "ev_charging_kwh": row.ev_charging_kwh,  # type: ignore[reportUnknownMemberType]
                     "import_price_sek_kwh": row.import_price_sek_kwh,
                     "export_price_sek_kwh": row.export_price_sek_kwh,
                 }
@@ -240,7 +243,57 @@ class LearningStore:
                     },
                 )
                 await session.execute(stmt)
+
+                # Persist the recorder's per-device energy dicts (Task 8.2 —
+                # previously computed and then dropped here). Last write wins ON
+                # PURPOSE, including 0.0: the recorder computes each present
+                # device's slot energy authoritatively, and a legitimately-zero
+                # slot must not resurrect a stale non-zero value (unlike the
+                # aggregate columns' >0 guard above, which protects against
+                # backfill wipes). Devices absent from the dicts write no row.
+                device_energy: dict[str, float] = {}
+                for key in ("water_heater_energy", "ev_charger_energy"):
+                    dev = record.get(key)  # type: ignore[reportUnknownVariableType]
+                    if isinstance(dev, dict):
+                        for dev_id, dev_kwh in dev.items():  # type: ignore[reportUnknownVariableType]
+                            device_energy[str(dev_id)] = float(dev_kwh)  # type: ignore[reportUnknownArgumentType]
+                for device_id, kwh in device_energy.items():
+                    dstmt = sqlite_insert(SlotDeviceEnergy).values(  # type: ignore[reportUnknownMemberType]
+                        slot_start=slot_start, device_id=device_id, kwh=kwh
+                    )
+                    dstmt = dstmt.on_conflict_do_update(  # type: ignore[reportUnknownMemberType]
+                        index_elements=["slot_start", "device_id"],
+                        set_={"kwh": dstmt.excluded.kwh},  # type: ignore[reportUnknownMemberType]
+                    )
+                    await session.execute(dstmt)  # type: ignore[reportUnknownMemberType]
             await session.commit()
+
+    async def get_device_energy_rows_between(
+        self, start_iso: str, end_iso: str
+    ) -> list[dict[str, Any]]:
+        """Return slot_device_energy rows with slot_start in [start_iso, end_iso) as dicts.
+
+        Same lexicographic-equals-chronological ordering contract as
+        get_observation_rows_between.
+        """
+        async with self.AsyncSession() as session:  # type: ignore[reportUnknownMemberType]
+            stmt = (  # type: ignore[reportUnknownVariableType]
+                select(SlotDeviceEnergy)
+                .where(  # type: ignore[reportUnknownMemberType]
+                    SlotDeviceEnergy.slot_start >= start_iso,  # type: ignore[reportUnknownMemberType]
+                    SlotDeviceEnergy.slot_start < end_iso,  # type: ignore[reportUnknownMemberType]
+                )
+                .order_by(SlotDeviceEnergy.slot_start, SlotDeviceEnergy.device_id)  # type: ignore[reportUnknownMemberType]
+            )
+            result = await session.execute(stmt)  # type: ignore[reportUnknownMemberType]
+            return [
+                {
+                    "slot_start": row.slot_start,  # type: ignore[reportUnknownMemberType]
+                    "device_id": row.device_id,  # type: ignore[reportUnknownMemberType]
+                    "kwh": row.kwh,  # type: ignore[reportUnknownMemberType]
+                }
+                for row in result.scalars().all()  # type: ignore[reportUnknownMemberType]
+            ]
 
     async def store_forecasts(self, forecasts: list[dict[str, Any]], forecast_version: str) -> None:
         """Store forecast data using Async SQLAlchemy."""
