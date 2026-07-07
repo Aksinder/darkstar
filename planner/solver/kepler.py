@@ -1401,9 +1401,10 @@ class KeplerSolver:
             logger_perf = logging.getLogger("darkstar.performance")
             logger_perf.setLevel(logging.INFO)  # Ensure we see it
             logger_perf.info(
-                "Kepler Solved: %d slots in %.3fs (Vars: %d, Const: %d) | Cost: %.2f SEK",
+                "Kepler Solved: %d slots in %.3fs via %s (Vars: %d, Const: %d) | Cost: %.2f SEK",
                 T,
                 total_duration,
+                used_solver,
                 var_count,
                 const_count,
                 final_total_cost,
