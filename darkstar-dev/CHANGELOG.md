@@ -1,3 +1,7 @@
+## dev-20260707.1410 — 2026-07-07 14:12
+
+- Merge remote-tracking branch 'fork/main' into deploy-main
+
 ## dev-20260705.2024 — 2026-07-05 20:26
 
 - perf+guard(solver): proven-optimal CBC in seconds — hourly water blocks, threads, honest time-box handling
