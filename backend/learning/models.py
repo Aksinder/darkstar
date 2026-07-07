@@ -32,6 +32,23 @@ class SlotObservation(Base):
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=func.now())
 
 
+class SlotDeviceEnergy(Base):
+    """Per-device energy for one observation slot (main_tank / villavagn_tank / EV ...).
+
+    The aggregate water_kwh / ev_charging_kwh columns on SlotObservation cannot
+    attribute a slot's energy to the right device; the savings load-shift streams
+    need the split (e.g. PV-boost hours per tank), so the recorder's per-device
+    dicts are persisted here instead of being dropped at store time.
+    """
+
+    __tablename__ = "slot_device_energy"
+
+    slot_start: Mapped[str] = mapped_column(String, primary_key=True)  # type: ignore[reportUnknownVariableType]
+    device_id: Mapped[str] = mapped_column(String, primary_key=True)  # type: ignore[reportUnknownVariableType]
+    kwh: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0"))  # type: ignore[reportUnknownVariableType]
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=func.now())  # type: ignore[reportUnknownVariableType]
+
+
 class SlotForecast(Base):
     __tablename__ = "slot_forecasts"
 

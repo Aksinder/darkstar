@@ -48,6 +48,7 @@ data/strategy_history.json
 data/hot_water_state.json
 data/fmb_soc_state.json
 data/deferrable_state.json
+data/deferrable_cycles.jsonl
 schedule.json
 data/*.backup*
 *.backup*.db
