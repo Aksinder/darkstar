@@ -599,7 +599,11 @@ class ActionDispatcher:
             else:
                 logger.error("Unknown entity domain: %s", domain)
                 return False
-        except HACallError as e:
+        # ValueError/TypeError: float(value) on a number-domain entity with a
+        # non-numeric configured value (e.g. on_value: "on"). Return False so
+        # the caller emits a failed (loud) ActionResult instead of the config
+        # error escaping and aborting the whole actuation pass.
+        except (HACallError, ValueError, TypeError) as e:
             logger.error("Failed to write to %s: %s", entity_id, e)
             return False
 
@@ -901,8 +905,7 @@ class ActionDispatcher:
                             action_type="water_temp",
                             success=True,
                             message=(
-                                f"Manual ON respected (implicit boost, "
-                                f"{remaining_min} min left)"
+                                f"Manual ON respected (implicit boost, {remaining_min} min left)"
                             ),
                             previous_value=current_state,
                             new_value="on",
@@ -1053,11 +1056,13 @@ class ActionDispatcher:
         # which IS a sink spec (ExcessPVSinkSpec aliases the same dataclass).
         sink_cfg = excess_pv.sinks[0] if excess_pv.sinks else excess_pv.custom_entity
 
-        sink_active = (
-            excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY
-            or sink_cfg.enabled
-            or bool(excess_pv.sinks)
-        )
+        if excess_pv.sinks:
+            # Loader-produced ladder: the rung's own flag is authoritative
+            # (disabled rungs are never actuated — observe-first invariant).
+            sink_active = sink_cfg.enabled
+        else:
+            # Directly-constructed legacy config: build #9 semantics.
+            sink_active = excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY or sink_cfg.enabled
         if not sink_active or not sink_cfg.entity:
             return ActionResult(
                 action_type=f"sink:{sink_cfg.id}",
@@ -1230,7 +1235,9 @@ class ActionDispatcher:
             logger.info(
                 "[SHADOW] Would set climate sink %s %s -> %s", entity, current_mode, desired_mode
             )
-            return _result(True, f"[SHADOW] Would change {current_mode} -> {desired_mode}", skipped=True)
+            return _result(
+                True, f"[SHADOW] Would change {current_mode} -> {desired_mode}", skipped=True
+            )
 
         try:
             ok = await self.ha.call_service(
@@ -1371,8 +1378,9 @@ class ActionDispatcher:
         # 5. Handle Export Switch (F49)
         # If a switch is configured, turn it ON when setting a limit.
         # This ensures that inverter actually enforces the numeric value.
-        switch_entity = self.config.inverter.grid_max_export_power_switch or self._resolve_entity_id(
-            "export_power_limit_switch"
+        switch_entity = (
+            self.config.inverter.grid_max_export_power_switch
+            or self._resolve_entity_id("export_power_limit_switch")
         )
         if success and _is_entity_configured(switch_entity) and switch_entity is not None:
             logger.info("Enabling export power limit switch: %s", switch_entity)

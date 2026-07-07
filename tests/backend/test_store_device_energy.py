@@ -100,6 +100,30 @@ async def test_records_without_device_dicts_write_no_device_rows():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_fallback_rerecord_cannot_wipe_history_value():
+    """Regression (savings review): a mid-quarter re-record whose HA history call
+    failed falls back to an instantaneous power snapshot. The recorder now OMITS
+    the device from the per-device dict on that path (a snapshot is not a slot
+    measurement), so the store keeps the earlier authoritative value instead of
+    last-write-wins zeroing it while the aggregate's >0 guard kept 0.8."""
+    store = await _make_store()
+    try:
+        slot = TZ.localize(datetime(2026, 7, 6, 12, 0))
+        await store.store_slot_observations(
+            pd.DataFrame([_obs_record(slot, water_kwh=0.8, water_heater_energy={"main_tank": 0.8})])
+        )
+        # Fallback re-record: element momentarily off => snapshot aggregate 0.0
+        # and NO per-device dict.
+        await store.store_slot_observations(pd.DataFrame([_obs_record(slot, water_kwh=0.0)]))
+        rows = await store.get_device_energy_rows_between("2026-07-06", "2026-07-07")
+        assert rows == [{"slot_start": slot.isoformat(), "device_id": "main_tank", "kwh": 0.8}]
+        obs = await store.get_observation_rows_between("2026-07-06", "2026-07-07")
+        assert obs[0]["water_kwh"] == 0.8
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_observation_rows_include_water_and_ev_columns():
     """Regression for the savings v1 bias: the row reader must return the columns
     the whole-house baseline reconstruction needs."""

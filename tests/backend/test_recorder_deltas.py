@@ -1672,6 +1672,10 @@ class TestLoadIsolationFromDeferrableLoads:
                     # Fallback: ev=4.0*0.25=1.0, water=2.0*0.25=0.5
                     assert record["ev_charging_kwh"] == pytest.approx(1.0, abs=0.01)
                     assert record["water_kwh"] == pytest.approx(0.5, abs=0.01)
+                    # Snapshot fallback must not write per-device rows (they would
+                    # last-write-wins over authoritative history values).
+                    assert record["ev_charger_energy"] is None
+                    assert record["water_heater_energy"] is None
 
     @pytest.mark.asyncio
     async def test_load_isolation_always_applied_regardless_of_source(self, base_config):
@@ -2170,7 +2174,10 @@ class TestPerDeviceWaterHeaterRecording:
 
     @pytest.mark.asyncio
     async def test_snapshot_fallback_when_no_history(self, base_config):
-        """When history API returns None, falls back to power snapshot per device."""
+        """When history API returns None the AGGREGATE falls back to the power
+        snapshot, but NO per-device value is recorded: a snapshot is not a slot
+        measurement, and the store's last-write-wins device upsert would let a
+        fallback re-record permanently zero an authoritative history value."""
         import tempfile
         from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2228,9 +2235,11 @@ class TestPerDeviceWaterHeaterRecording:
                     df = mock_store.store_slot_observations.call_args[0][0]
                     record = df.iloc[0].to_dict()
 
-                    # Snapshot: 2.0 kW x 0.25 h = 0.5 kWh
+                    # Snapshot: 2.0 kW x 0.25 h = 0.5 kWh — aggregate only.
                     assert record["water_kwh"] == pytest.approx(0.5, abs=0.01)
-                    assert record["water_heater_energy"]["wh1"] == pytest.approx(0.5, abs=0.01)
+                    # Omitted from the per-device dict => the store writes no row,
+                    # so an earlier authoritative value survives a re-record.
+                    assert record["water_heater_energy"] is None
 
 
 class TestSensorGuards:

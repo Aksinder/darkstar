@@ -246,11 +246,12 @@ class LearningStore:
 
                 # Persist the recorder's per-device energy dicts (Task 8.2 —
                 # previously computed and then dropped here). Last write wins ON
-                # PURPOSE, including 0.0: the recorder computes each present
-                # device's slot energy authoritatively, and a legitimately-zero
-                # slot must not resurrect a stale non-zero value (unlike the
-                # aggregate columns' >0 guard above, which protects against
-                # backfill wipes). Devices absent from the dicts write no row.
+                # PURPOSE, including 0.0: the recorder populates these dicts ONLY
+                # from the authoritative HA power-history path (snapshot fallbacks
+                # are omitted from the dicts), so a legitimately-zero slot must
+                # not resurrect a stale non-zero value (unlike the aggregate
+                # columns' >0 guard above, which protects against backfill
+                # wipes). Devices absent from the dicts write no row.
                 device_energy: dict[str, float] = {}
                 for key in ("water_heater_energy", "ev_charger_energy"):
                     dev = record.get(key)  # type: ignore[reportUnknownVariableType]

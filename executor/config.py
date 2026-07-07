@@ -223,6 +223,13 @@ def normalize_excess_pv_sinks(excess_pv_data: dict[str, Any]) -> list[dict[str, 
             "comfort_min_temp": _float_or_none(raw.get("comfort_min_temp")),
         }
 
+    custom_raw = excess_pv_data.get("custom_entity")
+    custom: dict[str, Any] = custom_raw if isinstance(custom_raw, dict) else {}
+    legacy_active = bool(custom.get("enabled", False)) or (
+        str(excess_pv_data.get("sink", "disabled")).lower() == "custom_entity"
+    )
+    legacy_entity = _str_or_none(custom.get("entity"))
+
     raw_sinks = excess_pv_data.get("sinks")
     entries: list[dict[str, Any]] = []
     if isinstance(raw_sinks, list):
@@ -238,14 +245,26 @@ def normalize_excess_pv_sinks(excess_pv_data: dict[str, Any]) -> list[dict[str, 
             sink_id = _str_or_none(raw_dict.get("id")) or entity
             entries.append(_entry(sink_id, raw_dict, enabled=bool(raw_dict.get("enabled", False))))
     if entries:
+        # Fail-loud: a non-empty sinks list REPLACES the legacy block. If the
+        # legacy sink is live and its entity is not a rung, it silently stops
+        # being planned/actuated — potentially left physically ON. Warn on
+        # every load (this normalizer is shared by planner AND executor).
+        # Matching by entity means listing the legacy entity as a disabled
+        # rung is treated as an explicit choice and does not warn.
+        if (
+            legacy_active
+            and legacy_entity is not None
+            and legacy_entity not in {e["entity"] for e in entries}
+        ):
+            logger.warning(
+                "executor.excess_pv.sinks is set and REPLACES the enabled legacy "
+                "custom_entity sink: %s will NO LONGER be planned or actuated "
+                "(it may be left ON) - add it as a rung in sinks[] to keep managing it",
+                legacy_entity,
+            )
         return entries
 
-    custom_raw = excess_pv_data.get("custom_entity")
-    custom: dict[str, Any] = custom_raw if isinstance(custom_raw, dict) else {}
-    legacy_active = bool(custom.get("enabled", False)) or (
-        str(excess_pv_data.get("sink", "disabled")).lower() == "custom_entity"
-    )
-    if legacy_active and _str_or_none(custom.get("entity")) is not None:
+    if legacy_active and legacy_entity is not None:
         return [_entry("custom_entity", custom, enabled=True)]
     return []
 

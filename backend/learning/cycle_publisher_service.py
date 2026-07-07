@@ -538,9 +538,11 @@ async def run_publisher_loop(
         from backend.learning.savings_loadshift import (
             LoadshiftSummary,
             MeasuredRun,
+            WaterShiftSummary,
             compute_appliance_shift,
             compute_water_shift,
-            load_cycle_ledger,
+            enrich_cycle_ledger,
+            water_unattributed_kwh,
         )
         from backend.learning.store import LearningStore
 
@@ -568,7 +570,6 @@ async def run_publisher_loop(
         today_rows = [r for r in d30_rows if str(r["slot_start"]) >= midnight_iso]
         today_dev = [r for r in d30_dev if str(r["slot_start"]) >= midnight_iso]
 
-        ledger = load_cycle_ledger("data/deferrable_cycles.jsonl")
         runs_by_load = {
             aid: [
                 MeasuredRun(c.start.timestamp(), c.end.timestamp(), c.energy_kwh)
@@ -577,6 +578,12 @@ async def run_publisher_loop(
             ]
             for aid, cycles in service.last_cycles.items()
         }
+        # Back-fill measured energy + run window into the ledger while this
+        # tick's detected cycles still cover the done time — the detection pull
+        # is only history_hours (14 d, less with HA recorder purge), so without
+        # the persisted join every older cycle in the 30d window would become
+        # permanently unvalued and the appliance credit would silently decay.
+        ledger = enrich_cycle_ledger("data/deferrable_cycles.jsonl", runs_by_load)
 
         def summarize(
             rows: list[dict[str, Any]],
@@ -588,6 +595,26 @@ async def run_publisher_loop(
                 compute_water_shift(rows, dev_rows, tank_id=tid, element_power_kw=pkw, baseline=bl)
                 for tid, pkw, bl in water_specs
             )
+            if water_specs:
+                # Aggregate water energy missing from every tank's device rows
+                # (recorder snapshot-fallback slots, or historically wiped rows):
+                # compute_water_shift cannot attribute it to a tank, so COUNT it
+                # here as a separate unvalued bucket — coverage must drop instead
+                # of the tank credit silently shrinking at coverage 1.0.
+                water += (
+                    WaterShiftSummary(
+                        tank_id="unattributed_water",
+                        baseline_name="uncovered",
+                        actual_cost_sek=0.0,
+                        baseline_cost_sek=0.0,
+                        credit_sek=0.0,
+                        valued_kwh=0.0,
+                        unvalued_kwh=water_unattributed_kwh(
+                            rows, dev_rows, [tid for tid, _pkw, _bl in water_specs]
+                        ),
+                        n_days=0,
+                    ),
+                )
             apps = tuple(
                 compute_appliance_shift(
                     ledger,

@@ -487,8 +487,11 @@ async def record_observation_from_current_state(
                         charger_power = power_results.get(f"ev_{sensor}") or 0.0
                         device_kwh = charger_power * 0.25
                         ev_charging_kwh += device_kwh
-                        if charger_id:
-                            ev_charger_energy[charger_id] = device_kwh
+                        # A snapshot is not a slot measurement: keep the aggregate
+                        # contribution but do NOT record it per-device — the store's
+                        # device upsert is last-write-wins, so a fallback re-record
+                        # would permanently overwrite an authoritative
+                        # history-derived slot_device_energy value with ~0.
                         logger.debug(f"EV {charger_id}: snapshot fallback={device_kwh:.3f} kWh")
 
     # Calculate water heater energy using power history API
@@ -509,8 +512,8 @@ async def record_observation_from_current_state(
                     heater_power = power_results.get(f"wh_{sensor}") or 0.0
                     device_kwh = heater_power * 0.25
                     water_kwh += device_kwh
-                    if heater_id:
-                        water_heater_energy[heater_id] = device_kwh
+                    # Snapshot fallback: aggregate only, no per-device row (see the
+                    # EV branch above — a re-record must not zero a good value).
                     logger.debug(f"Water {heater_id}: snapshot fallback={device_kwh:.3f} kWh")
 
     # Isolate base load: subtract known deferrable loads from total load.

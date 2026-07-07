@@ -373,22 +373,28 @@ class TestSinkLadder:
         for s in result.slots:
             assert s.custom_entity_active == s.sink_states["rung0"]
 
-    def test_hourly_blocks_keep_sinks_constant_within_hour(self):
-        # 16 quarter-slots = 4 hours with the perf flag on: each rung's state must
-        # be constant within every wall-clock hour (same treatment as water/boost).
-        sinks = [
-            ExcessPVSinkSpec(id="rung0", power_kw=2.0, enabled=True),
-            ExcessPVSinkSpec(id="rung1", power_kw=2.0, enabled=True),
-        ]
-        inp, cfg = self._cfg(sinks, n=16, water_hourly_blocks=True)
+    def test_all_disabled_ladder_suppresses_legacy_fallback(self):
+        # Observe-first rollout: a ladder whose rungs are ALL disabled must win the
+        # dual-read over the legacy custom_entity block. The executor skips disabled
+        # rungs and actuates nothing, so the planner must not resurrect a phantom
+        # "custom_entity" rung — the surplus is exported instead.
+        sinks = [ExcessPVSinkSpec(id="observer", power_kw=1.0, enabled=False)]
+        inp, cfg = self._cfg(
+            sinks,
+            pv=3.0,
+            load=1.0,
+            excess_pv_sink="custom_entity",
+            excess_pv_custom_entity_enabled=True,
+            excess_pv_custom_entity_power_kw=2.0,
+        )
         result = KeplerSolver().solve(inp, cfg)
         assert result.is_optimal
-        for sink_id in ("rung0", "rung1"):
-            for hr in range(4):
-                hour_vals = {
-                    result.slots[t].sink_states[sink_id] for t in range(4 * hr, 4 * hr + 4)
-                }
-                assert len(hour_vals) == 1, f"{sink_id} hour {hr} not constant: {hour_vals}"
+        for s in result.slots:
+            assert not s.custom_entity_active
+            assert not s.sink_states.get("custom_entity")
+            assert "observer" not in s.sink_states, (
+                "a disabled rung gets no solver variable and no reported state"
+            )
 
     def test_legacy_scalar_config_synthesizes_single_rung(self):
         # No excess_pv_sinks list: the legacy scalar fields must synthesize a
@@ -424,3 +430,59 @@ class TestSinkLadder:
         assert active, "legacy scalar path must still activate"
         for s in result.slots:
             assert s.sink_states.get("custom_entity") == s.custom_entity_active
+
+
+class TestSinkNotHourlyBlocked:
+    """Sink binaries stay per-slot even when water_hourly_blocks is on (build #9
+    invariant). Hour-tying the sinks held them OFF until the next hour boundary
+    whenever the SoC gate opened mid-hour."""
+
+    def test_sink_activates_on_first_gated_slot_not_hour_boundary(self):
+        # 8 quarter-slots from 12:00 (two wall-clock hours). Battery starts at 90%
+        # of 16 kWh; max charge 3 kW = 0.75 kWh/slot, so start-of-slot SoC crosses
+        # the 95% gate (15.2 kWh) at slot 2 — mid-hour. Build #9 behavior: the sink
+        # fires from slot 2. An hour-tied sink group would hold it off until slot 4.
+        capacity = 16.0
+        n = 8
+        start = datetime(2025, 6, 1, 12, 0)
+        slots = [
+            KeplerInputSlot(
+                start_time=start + timedelta(minutes=15 * i),
+                end_time=start + timedelta(minutes=15 * (i + 1)),
+                load_kwh=0.25,
+                pv_kwh=2.0,  # big surplus every slot
+                import_price_sek_kwh=1.0,
+                export_price_sek_kwh=0.0,  # below ceiling -> price_ok everywhere
+            )
+            for i in range(n)
+        ]
+        cfg = KeplerConfig(
+            capacity_kwh=capacity,
+            max_charge_power_kw=3.0,
+            max_discharge_power_kw=3.0,
+            charge_efficiency=1.0,
+            discharge_efficiency=1.0,
+            min_soc_percent=0.0,
+            max_soc_percent=100.0,
+            wear_cost_sek_per_kwh=0.01,
+            enable_export=True,
+            max_export_power_kw=10.0,
+            target_soc_kwh=capacity,
+            target_soc_penalty_sek=0.0,
+            excess_pv_slots=[True] * n,
+            # LIVE legacy config shape: scalar custom_entity fields, no sinks list.
+            excess_pv_sink="custom_entity",
+            excess_pv_reward_sek_per_kwh=0.5,
+            excess_pv_soc_threshold_percent=95.0,
+            excess_pv_custom_entity_power_kw=1.0,
+            excess_pv_price_ceiling_sek_per_kwh=0.2,
+            water_hourly_blocks=True,
+        )
+        inp = KeplerInput(slots=slots, initial_soc_kwh=14.4)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        plan = [bool(s.custom_entity_active) for s in result.slots]
+        assert plan == [False, False, True, True, True, True, True, True], (
+            f"sink must activate on the first SoC-gated slot (mid-hour), not the "
+            f"next hour boundary; got {plan}"
+        )
