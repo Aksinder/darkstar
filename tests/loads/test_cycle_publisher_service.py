@@ -70,6 +70,9 @@ async def test_appliance_cycle_published():
     )
     n = await svc.run_once()
     assert n == 4  # 4 sensors per appliance
+    # The detected cycles are retained for the load-shift savings join
+    # (no second history pull needed).
+    assert len(svc.last_cycles["dishwasher"]) == 1
     ids = {s.object_id for s in cap.sensors}
     assert "sensor.darkstar_dishwasher_last_cycle_minutes".removeprefix("sensor.") in ids
     minutes = next(s for s in cap.sensors if s.object_id.endswith("last_cycle_minutes"))
