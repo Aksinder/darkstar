@@ -134,9 +134,12 @@ class ExcessPVSinkType(Enum):
 
 @dataclass
 class ExcessPVCustomEntityConfig:
-    """Custom HA entity configuration for excess PV sink.
+    """One excess-PV sink: an HA entity that soaks surplus PV when told to.
 
-    Supports two actuation styles, chosen automatically by the entity's domain:
+    Historically the single ``executor.excess_pv.custom_entity`` block; now also
+    one rung of the ordered ``executor.excess_pv.sinks`` ladder (see
+    ``ExcessPVSinkSpec`` alias). Supports two actuation styles, chosen
+    automatically by the entity's domain:
 
     * Plain entities (switch/input_boolean/number/...): the executor writes
       ``on_value``/``off_value`` directly (legacy behaviour).
@@ -150,6 +153,7 @@ class ExcessPVCustomEntityConfig:
     export price is at or below the ceiling — the "low or minus price" trigger.
     """
 
+    id: str = "custom_entity"
     entity: str | None = None
     on_value: str = "1"
     off_value: str = "0"
@@ -167,6 +171,10 @@ class ExcessPVCustomEntityConfig:
     price_ceiling_sek_per_kwh: float | None = None
 
 
+# A ladder rung IS the old custom-entity config plus an id — same actuation code.
+ExcessPVSinkSpec = ExcessPVCustomEntityConfig
+
+
 @dataclass
 class ExcessPVConfig:
     """Excess PV dispatch configuration."""
@@ -175,6 +183,71 @@ class ExcessPVConfig:
     boost_reward_sek_per_kwh: float = 0.5
     soc_threshold_percent: float = 95.0
     custom_entity: ExcessPVCustomEntityConfig = field(default_factory=ExcessPVCustomEntityConfig)
+    # Ordered excess-PV sink ladder (list order = priority order, after the
+    # water-heater boost rung). Populated by the loader from
+    # ``executor.excess_pv.sinks`` or synthesized from the legacy custom_entity
+    # block via ``normalize_excess_pv_sinks`` (dual-read, no config migration).
+    sinks: list[ExcessPVSinkSpec] = field(default_factory=lambda: [])
+
+
+def normalize_excess_pv_sinks(excess_pv_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve the ordered excess-PV sink ladder from an ``executor.excess_pv`` dict.
+
+    Shared by the executor config loader AND the planner adapter so both sides see
+    the exact same ladder. Dual-read semantics:
+
+    * ``sinks`` present with at least one valid entry => it wins (list order =
+      priority order). Disabled entries are KEPT (observe-first rollout: the
+      planner skips them, the executor skips them, but the ladder shape is stable).
+    * otherwise, when the legacy ``custom_entity`` block has an entity and is
+      active (``enabled: true`` or ``sink: custom_entity``), synthesize a
+      single-rung ladder from it LOSSLESSLY — a live config keeps behaving
+      byte-identically without migration.
+
+    Returns plain normalized dicts (floats coerced, blanks -> None) so each side
+    can build its own dataclass without importing the other's types.
+    """
+
+    def _entry(sink_id: str, raw: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+        power = _float_or_none(raw.get("power_kw"))
+        return {
+            "id": sink_id,
+            "entity": _str_or_none(raw.get("entity")),
+            "enabled": enabled,
+            "power_kw": power if power is not None else 1.0,
+            "price_ceiling_sek_per_kwh": _float_or_none(raw.get("price_ceiling_sek_per_kwh")),
+            "on_value": str(raw.get("on_value", "1")),
+            "off_value": str(raw.get("off_value", "0")),
+            "climate_mode": str(raw.get("climate_mode", "cool")),
+            "target_temp": _float_or_none(raw.get("target_temp")),
+            "comfort_min_temp": _float_or_none(raw.get("comfort_min_temp")),
+        }
+
+    raw_sinks = excess_pv_data.get("sinks")
+    entries: list[dict[str, Any]] = []
+    if isinstance(raw_sinks, list):
+        for idx, raw in enumerate(cast("list[Any]", raw_sinks)):
+            if not isinstance(raw, dict):
+                logger.warning("executor.excess_pv.sinks[%d] is not a mapping - skipping", idx)
+                continue
+            raw_dict = cast("dict[str, Any]", raw)
+            entity = _str_or_none(raw_dict.get("entity"))
+            if entity is None:
+                logger.warning("executor.excess_pv.sinks[%d] has no entity - skipping", idx)
+                continue
+            sink_id = _str_or_none(raw_dict.get("id")) or entity
+            entries.append(_entry(sink_id, raw_dict, enabled=bool(raw_dict.get("enabled", False))))
+    if entries:
+        return entries
+
+    custom_raw = excess_pv_data.get("custom_entity")
+    custom: dict[str, Any] = custom_raw if isinstance(custom_raw, dict) else {}
+    legacy_active = bool(custom.get("enabled", False)) or (
+        str(excess_pv_data.get("sink", "disabled")).lower() == "custom_entity"
+    )
+    if legacy_active and _str_or_none(custom.get("entity")) is not None:
+        return [_entry("custom_entity", custom, enabled=True)]
+    return []
 
 
 @dataclass
@@ -620,11 +693,27 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
             custom_entity_data.get("price_ceiling_sek_per_kwh")
         ),
     )
+    excess_pv_sinks = [
+        ExcessPVSinkSpec(
+            id=str(d["id"]),
+            entity=cast("str | None", d["entity"]),
+            on_value=str(d["on_value"]),
+            off_value=str(d["off_value"]),
+            power_kw=float(d["power_kw"]),
+            enabled=bool(d["enabled"]),
+            climate_mode=str(d["climate_mode"]),
+            target_temp=cast("float | None", d["target_temp"]),
+            comfort_min_temp=cast("float | None", d["comfort_min_temp"]),
+            price_ceiling_sek_per_kwh=cast("float | None", d["price_ceiling_sek_per_kwh"]),
+        )
+        for d in normalize_excess_pv_sinks(excess_pv_data)
+    ]
     excess_pv = ExcessPVConfig(
         sink=sink_type,
         boost_reward_sek_per_kwh=float(excess_pv_data.get("boost_reward_sek_per_kwh", 0.5)),
         soc_threshold_percent=float(excess_pv_data.get("soc_threshold_percent", 95.0)),
         custom_entity=custom_entity,
+        sinks=excess_pv_sinks,
     )
 
     ec_data: dict[str, Any] = (

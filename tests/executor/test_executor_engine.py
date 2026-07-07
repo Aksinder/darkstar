@@ -1503,3 +1503,49 @@ executor:
                 mock_update.assert_called_once()
                 call_args = mock_update.call_args
                 assert call_args.kwargs["import_price_sek"] == 0.5
+
+
+class TestParseSlotPlanSinks:
+    """_parse_slot_plan: excess-PV sink ladder states + legacy fallback."""
+
+    def _engine(self, temp_schedule, temp_db, sinks):
+        from executor.config import ExcessPVConfig
+
+        with patch("executor.engine.load_executor_config") as mock_config:
+            mock_config.return_value = ExecutorConfig(
+                schedule_path=temp_schedule,
+                timezone="Europe/Stockholm",
+                excess_pv=ExcessPVConfig(sinks=sinks),
+            )
+            with patch("executor.engine.load_yaml") as mock_yaml:
+                mock_yaml.return_value = {}
+                with patch.object(ExecutorEngine, "_get_db_path", return_value=temp_db):
+                    return ExecutorEngine("config.yaml")
+
+    def _sinks(self):
+        from executor.config import ExcessPVSinkSpec
+
+        return [
+            ExcessPVSinkSpec(id="villavagn_ac", entity="climate.villavagn", enabled=True),
+            ExcessPVSinkSpec(id="poolpump", entity="switch.poolpump", enabled=True),
+        ]
+
+    def test_parses_sinks_dict(self, temp_schedule, temp_db):
+        engine = self._engine(temp_schedule, temp_db, self._sinks())
+        slot = engine._parse_slot_plan(
+            {"sinks": {"villavagn_ac": True, "poolpump": 0}, "custom_entity_active": True}
+        )
+        assert slot.sinks == {"villavagn_ac": True, "poolpump": False}
+
+    def test_legacy_slot_maps_custom_entity_to_first_sink(self, temp_schedule, temp_db):
+        # Old schedule file (pre-ladder): only custom_entity_active exists. It must
+        # map to the FIRST configured sink so a rolling deploy keeps actuating it.
+        engine = self._engine(temp_schedule, temp_db, self._sinks())
+        slot = engine._parse_slot_plan({"custom_entity_active": True})
+        assert slot.sinks == {"villavagn_ac": True}
+
+    def test_legacy_slot_without_sinks_config_is_empty(self, temp_schedule, temp_db):
+        engine = self._engine(temp_schedule, temp_db, [])
+        slot = engine._parse_slot_plan({"custom_entity_active": True})
+        assert slot.sinks == {}
+        assert slot.custom_entity_active is True

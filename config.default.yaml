@@ -685,6 +685,33 @@ executor:
       climate_mode: "cool"             # hvac_mode to set when the sink turns ON
       target_temp: ""                  # cooling setpoint applied when ON (blank = leave unit's own)
       comfort_min_temp: ""             # don't cool below this current_temperature (anti-overcool floor)
+    # Prioritized excess-PV sink ladder (ordered list; index = priority rung after
+    # the water-heater boost). When non-empty this list REPLACES the single
+    # custom_entity block above (which stays supported as a legacy fallback — an
+    # existing config keeps working unchanged). Each rung activates only on
+    # forecast excess-PV slots, only above soc_threshold_percent, and (when its
+    # ceiling is set) only in slots whose export price is at or below
+    # price_ceiling_sek_per_kwh. When surplus is scarce the planner fills earlier
+    # rungs first (soft economic priority, no hard chaining); when surplus covers
+    # everything, all enabled rungs run. Per-rung fields match the custom_entity
+    # block plus a unique `id`. enabled: false = observe-first — the planner
+    # ignores the rung and the executor never actuates it; flip per rung when ready.
+    sinks: []
+    # Example:
+    # sinks:
+    #   - id: villavagn_ac
+    #     entity: climate.villavagn
+    #     enabled: false
+    #     power_kw: 1.0
+    #     price_ceiling_sek_per_kwh: 0.20
+    #     climate_mode: cool
+    #     target_temp: 22
+    #     comfort_min_temp: 20
+    #   - id: poolpump
+    #     entity: switch.poolpump
+    #     enabled: false
+    #     power_kw: 0.25
+    #     price_ceiling_sek_per_kwh: 0.20
 
   # ---------------------------------------------------------------------------
   # Real-time EV surplus-follow controller (default OFF). Dials each charger's

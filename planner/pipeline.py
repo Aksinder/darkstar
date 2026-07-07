@@ -644,10 +644,13 @@ class PlannerPipeline:
 
         # Pre-calculate excess PV slot flags from raw forecasts (task 3.1)
         excess_pv_sink = kepler_config.excess_pv_sink
-        # Flags are needed whenever ANY sink can fire — including the independently
-        # enabled custom_entity sink (which may run while sink=water_heater_boost).
+        # Flags are needed whenever ANY sink can fire — the water-heater boost, any
+        # enabled rung of the sink ladder, or the legacy independently-enabled
+        # custom_entity sink (which may run while sink=water_heater_boost).
         excess_pv_active = (
-            excess_pv_sink != "disabled" or kepler_config.excess_pv_custom_entity_enabled
+            excess_pv_sink != "disabled"
+            or kepler_config.excess_pv_custom_entity_enabled
+            or any(s.enabled for s in kepler_config.excess_pv_sinks)
         )
         if excess_pv_active and len(kepler_input.slots) > 0:
             excess_pv_flags = _calculate_excess_pv_flags(
