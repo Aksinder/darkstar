@@ -18,6 +18,7 @@ from planner.errors import PlannerError, PlannerErrorCode
 from .types import (
     DeferrableLoadInput,
     EVChargerInput,
+    ExcessPVSinkSpec,
     KeplerConfig,
     KeplerInput,
     KeplerResult,
@@ -34,6 +35,14 @@ SOLVER_TIME_LIMIT_S = 120
 
 # pulp is untyped; pin the one solution-status constant the guard relies on.
 _LP_SOLUTION_OPTIMAL: int = int(pulp.constants.LpSolutionOptimal)  # type: ignore[reportUnknownMemberType]
+
+# Excess-PV sink ladder: rung i earns reward * (1 - i * EPS) per kWh. Small enough
+# never to flip a real economic decision (2% of the 0.5 SEK/kWh default), large
+# enough that under scarce surplus the solver deterministically fills earlier
+# rungs first. Soft by design — no hard chain constraints (the executor-side
+# comfort floor can veto a rung at runtime; a hard chain would then wrongly
+# starve the rungs below it).
+SINK_PRIORITY_EPSILON = 0.02
 
 
 def solve_is_time_boxed(
@@ -393,16 +402,37 @@ class KeplerSolver:
                         for t in _group[1:]:
                             prob += water_boost[d][t] == water_boost[d][_group[0]]  # type: ignore[operator]
 
+        # Prioritized excess-PV sink ladder (ordered: index = priority rung after the
+        # water-heater boost). The configured list wins; when the adapter did not
+        # populate it, synthesize a single rung from the legacy scalar custom-entity
+        # fields so old callers/configs behave byte-identically.
         custom_entity_enabled = (
             config.excess_pv_sink == "custom_entity" or config.excess_pv_custom_entity_enabled
         )
+        sinks: list[ExcessPVSinkSpec] = [s for s in config.excess_pv_sinks if s.enabled]
+        if not sinks and custom_entity_enabled:
+            sinks = [
+                ExcessPVSinkSpec(
+                    id="custom_entity",
+                    power_kw=config.excess_pv_custom_entity_power_kw,
+                    price_ceiling_sek_per_kwh=config.excess_pv_price_ceiling_sek_per_kwh,
+                    enabled=True,
+                )
+            ]
+
+        def _sink_price_ok(sink: ExcessPVSinkSpec, t: int) -> bool:
+            # Optional per-rung price gate: only soak surplus locally when export
+            # pays at or below the ceiling (incl. negative). Sell it otherwise.
+            return (
+                sink.price_ceiling_sek_per_kwh is None
+                or slots[t].export_price_sek_kwh <= sink.price_ceiling_sek_per_kwh
+            )
 
         # SoC threshold binary: 1 when battery SoC >= threshold% (gates all sink activation)
-        any_sink_active = boost_enabled or custom_entity_enabled
+        any_sink_active = boost_enabled or bool(sinks)
         soc_above_threshold: dict[int, Any]
-        custom_entity_active: dict[int, Any]
         if any_sink_active:
-            # Sinks (boost/custom) are hard-forced to 0 outside excess-PV slots, so
+            # Sinks (boost/ladder) are hard-forced to 0 outside excess-PV slots, so
             # the gating binary is dead weight there — create it only where a sink
             # can actually fire (tonight's live model: 52 of 107 deleted). The
             # constant 0 elsewhere keeps the gate constraints trivially satisfied.
@@ -419,12 +449,40 @@ class KeplerSolver:
         else:
             soc_above_threshold = dict.fromkeys(range(T), 0)
 
-        if custom_entity_enabled:
-            custom_entity_active = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
-                "custom_entity_active", range(T), cat="Binary"
-            )
-        else:
-            custom_entity_active = dict.fromkeys(range(T), 0)
+        # Per-sink activation binaries, created ONLY on flagged + price-ok slots
+        # (constant 0 elsewhere keeps the gates trivially satisfied and the model
+        # small — this also fixes the old all-T custom_entity_active inefficiency).
+        sink_active: dict[str, dict[int, Any]] = {}
+        for sink in sinks:
+            safe_sink = sink.id.replace("-", "_").replace(".", "_")
+            sink_active[sink.id] = {
+                t: (
+                    pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
+                        f"sink_active_{safe_sink}_{t}", cat="Binary"
+                    )
+                    if excess_pv_flags[t] and _sink_price_ok(sink, t)
+                    else 0
+                )
+                for t in range(T)
+            }
+
+        # PERF: extend the hourly decision blocks to the sink binaries (same
+        # rationale as water/boost above). Binaries only exist on flagged +
+        # price-ok slots, so grouping the EXISTING variables by wall-clock hour
+        # implicitly keys each group on (hour, flag, price_ok) — a flag or price
+        # edge inside an hour starts a new group instead of zeroing the hour.
+        if config.water_hourly_blocks and sinks and T > 0:
+            _sink_hour_of: list[Any] = [
+                slots[t].start_time.replace(minute=0, second=0, microsecond=0) for t in range(T)
+            ]
+            for sink in sinks:
+                _sink_groups: defaultdict[Any, list[int]] = defaultdict(list)
+                for t in range(T):
+                    if not isinstance(sink_active[sink.id][t], int):
+                        _sink_groups[_sink_hour_of[t]].append(t)
+                for _sgroup in _sink_groups.values():
+                    for t in _sgroup[1:]:
+                        prob += sink_active[sink.id][t] == sink_active[sink.id][_sgroup[0]]  # type: ignore[operator]
 
         # Objective Function Terms
         total_cost: list[Any] = []
@@ -473,24 +531,18 @@ class KeplerSolver:
                             -BOOST_REWARD_SEK * water_boost[heater.id][t] * heater.power_kw * h
                         )
 
-            # Custom entity: MILP variable gated by excess PV flag and SoC threshold
-            if custom_entity_enabled:
-                # Optional price gate: only soak surplus locally when export pays little
-                # or nothing (export_price <= ceiling, incl. negative). Sell it otherwise.
-                price_ok = (
-                    config.excess_pv_price_ceiling_sek_per_kwh is None
-                    or s.export_price_sek_kwh <= config.excess_pv_price_ceiling_sek_per_kwh
-                )
-                if not excess_pv_flags[t] or not price_ok:
-                    prob += custom_entity_active[t] == 0
-                else:
-                    prob += custom_entity_active[t] <= soc_above_threshold[t]
-                    total_cost.append(
-                        -BOOST_REWARD_SEK
-                        * custom_entity_active[t]
-                        * config.excess_pv_custom_entity_power_kw
-                        * h
-                    )
+            # Sink ladder: gate each rung on the shared SoC threshold and pay a
+            # soft priority-graded reward — rung i earns reward*(1 - i*EPS) per
+            # kWh, so under scarce surplus the solver fills earlier rungs first
+            # and under abundant surplus all rungs run. Off-flag / price-gated
+            # slots hold constant-0 entries, so no gate constraint is needed there.
+            for rung, sink in enumerate(sinks):
+                sink_var: Any = sink_active[sink.id][t]
+                if isinstance(sink_var, int):
+                    continue
+                prob += sink_var <= soc_above_threshold[t]
+                sink_reward = BOOST_REWARD_SEK * (1.0 - rung * SINK_PRIORITY_EPSILON)
+                total_cost.append(-sink_reward * sink_var * sink.power_kw * h)
 
             # SoC threshold gate (after soc[t] is defined via battery dynamics).
             # Placed here so soc[t] is available, then linked to boost/custom above.
@@ -532,10 +584,10 @@ class KeplerSolver:
                 pulp.lpSum(ev_energy[d][t] for d in ev_energy) if ev_any_enabled else 0.0
             )
 
-            # Energy Balance Constraint (water, EV, and custom entity loads added to demand side)
-            custom_entity_load_kwh: Any = (
-                custom_entity_active[t] * config.excess_pv_custom_entity_power_kw * h
-                if custom_entity_enabled
+            # Energy Balance Constraint (water, EV, and sink-ladder loads added to demand side)
+            sink_load_kwh: Any = (
+                pulp.lpSum(sink_active[sk.id][t] * sk.power_kw * h for sk in sinks)
+                if sinks
                 else 0.0
             )
 
@@ -554,7 +606,7 @@ class KeplerSolver:
                 s.load_kwh
                 + water_load_kwh
                 + total_ev_energy_t
-                + custom_entity_load_kwh
+                + sink_load_kwh
                 + deferrable_load_kwh_t
                 + charge[t]
                 + grid_export[t]
@@ -1274,6 +1326,17 @@ class KeplerSolver:
                     deferrable_load_results[load.id] = device_kw
                     total_defl_kw += device_kw
 
+                # Per-sink ladder results (first sink mirrored into the legacy
+                # custom_entity_active flag for old consumers).
+                sink_states: dict[str, bool] = {}
+                for sink in sinks:
+                    _sink_var: Any = sink_active[sink.id][t]
+                    if isinstance(_sink_var, int):
+                        sink_states[sink.id] = False
+                    else:
+                        _sink_val: float | None = pulp.value(_sink_var)  # type: ignore[assignment]
+                        sink_states[sink.id] = _sink_val is not None and _sink_val > 0.5
+
                 wear: float = (
                     (c_val + d_val) * config.wear_cost_sek_per_kwh * 0.5
                     if c_val is not None and d_val is not None
@@ -1301,9 +1364,10 @@ class KeplerSolver:
                         water_heat_kw=w_kw,
                         water_heater_results=water_heater_results,
                         water_heating_boost=water_heating_boost,
-                        custom_entity_active=custom_entity_enabled
-                        and (_cev := pulp.value(custom_entity_active[t])) is not None
-                        and _cev > 0.5,
+                        custom_entity_active=(
+                            sink_states.get(sinks[0].id, False) if sinks else False
+                        ),
+                        sink_states=sink_states,
                         ev_charge_kw=ev_kw,
                         ev_charger_results=ev_charger_results,
                         deferrable_load_kw=total_defl_kw,

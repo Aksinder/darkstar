@@ -100,6 +100,10 @@ class SlotPlan:
     water_heater_plans: dict[str, float] = field(default_factory=lambda: {})
     water_heating_boost: dict[str, bool] = field(default_factory=lambda: {})
     custom_entity_active: bool = False
+    # Excess-PV sink ladder: sink_id -> planned-active this slot. Old schedule
+    # files without the key get {first_sink_id: custom_entity_active} synthesized
+    # at parse time (rolling-deploy compatibility).
+    sinks: dict[str, bool] = field(default_factory=lambda: {})
     export_price_sek_kwh: float = 0.0  # Effective export price for this slot (C3 curtailment)
 
 

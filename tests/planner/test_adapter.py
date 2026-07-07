@@ -663,3 +663,70 @@ class TestKeplerInputConversion:
         assert result.slots[0].pv_kwh == 2.0, (
             f"PV should not be clipped, expected 2.0 kWh, got {result.slots[0].pv_kwh}"
         )
+
+
+class TestExcessPVSinksAdapter:
+    """config_to_kepler_config resolves the excess-PV sink ladder (dual-read)."""
+
+    def _base_config(self, excess_pv):
+        return {
+            "config_version": 2,
+            "system": {
+                "battery": {"capacity_kwh": 10.0, "max_charge_a": 100.0, "max_discharge_a": 100.0}
+            },
+            "executor": {"excess_pv": excess_pv},
+        }
+
+    def test_legacy_custom_entity_synthesizes_single_rung(self):
+        # The LIVE config shape: sink=water_heater_boost + custom_entity enabled —
+        # must produce one enabled rung with the exact same power/ceiling.
+        cfg = config_to_kepler_config(
+            self._base_config(
+                {
+                    "sink": "water_heater_boost",
+                    "custom_entity": {
+                        "enabled": True,
+                        "entity": "climate.villavagn",
+                        "power_kw": 1.0,
+                        "price_ceiling_sek_per_kwh": 0.2,
+                    },
+                }
+            )
+        )
+        assert len(cfg.excess_pv_sinks) == 1
+        sink = cfg.excess_pv_sinks[0]
+        assert sink.id == "custom_entity"
+        assert sink.enabled is True
+        assert sink.power_kw == 1.0
+        assert sink.price_ceiling_sek_per_kwh == 0.2
+        # legacy scalar fields stay populated (fallback consumers)
+        assert cfg.excess_pv_custom_entity_enabled is True
+        assert cfg.excess_pv_custom_entity_power_kw == 1.0
+        assert cfg.excess_pv_price_ceiling_sek_per_kwh == 0.2
+
+    def test_sinks_list_populates_ladder_in_order(self):
+        cfg = config_to_kepler_config(
+            self._base_config(
+                {
+                    "sink": "disabled",
+                    "sinks": [
+                        {"id": "villavagn_ac", "entity": "climate.villavagn", "enabled": True},
+                        {
+                            "id": "poolpump",
+                            "entity": "switch.poolpump",
+                            "enabled": False,
+                            "power_kw": 0.25,
+                            "price_ceiling_sek_per_kwh": 0.2,
+                        },
+                    ],
+                }
+            )
+        )
+        assert [s.id for s in cfg.excess_pv_sinks] == ["villavagn_ac", "poolpump"]
+        assert cfg.excess_pv_sinks[0].enabled is True
+        assert cfg.excess_pv_sinks[1].enabled is False
+        assert cfg.excess_pv_sinks[1].power_kw == 0.25
+
+    def test_no_sinks_when_nothing_configured(self):
+        cfg = config_to_kepler_config(self._base_config({"sink": "disabled"}))
+        assert cfg.excess_pv_sinks == []

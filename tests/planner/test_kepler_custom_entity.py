@@ -4,6 +4,7 @@ import pytest
 
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
+    ExcessPVSinkSpec,
     KeplerConfig,
     KeplerInput,
     KeplerInputSlot,
@@ -265,3 +266,161 @@ class TestCustomEntityIndependentEnable:
         result = KeplerSolver().solve(inp, cfg)
         assert result.is_optimal
         assert not any(s.custom_entity_active for s in result.slots)
+
+
+class TestSinkLadder:
+    """Prioritized excess-PV sink ladder (build #10).
+
+    Ordered rungs share the flag + SoC-gate scaffolding of the legacy single
+    custom_entity slot; priority is SOFT (reward * (1 - i*eps) per kWh), so
+    scarce surplus fills earlier rungs first and abundant surplus runs them all.
+    """
+
+    def _cfg(self, sinks, *, n=8, export_price=0.1, import_price=10.0, pv=1.5, load=1.0, **over):
+        capacity = 10.0
+        initial_soc = capacity * 0.97
+        kwargs = {
+            "capacity_kwh": capacity,
+            "max_charge_power_kw": 5.0,
+            "max_discharge_power_kw": 5.0,
+            "charge_efficiency": 1.0,
+            "discharge_efficiency": 1.0,
+            "min_soc_percent": 0.0,
+            "max_soc_percent": 100.0,
+            "wear_cost_sek_per_kwh": 0.01,
+            "enable_export": True,
+            "max_export_power_kw": 10.0,
+            "target_soc_kwh": initial_soc,
+            "target_soc_penalty_sek": 1000.0,
+            "excess_pv_slots": [True] * n,
+            "excess_pv_sink": "disabled",
+            "excess_pv_reward_sek_per_kwh": 2.0,
+            "excess_pv_soc_threshold_percent": 95.0,
+            "excess_pv_sinks": sinks,
+        }
+        kwargs.update(over)
+        slots = _make_slots(
+            n=n, pv_kwh=pv, load_kwh=load, export_price=export_price, import_price=import_price
+        )
+        return KeplerInput(slots=slots, initial_soc_kwh=initial_soc), KeplerConfig(**kwargs)
+
+    def test_scarce_surplus_fills_first_rung_only(self):
+        # Surplus is 0.5 kWh/slot (2 kW); each rung draws 2 kW. One rung fits the
+        # surplus, two would need 10 SEK/kWh grid import for a ~2 SEK/kWh reward.
+        # The soft priority epsilon must route the surplus to rung 0.
+        sinks = [
+            ExcessPVSinkSpec(id="rung0", power_kw=2.0, enabled=True),
+            ExcessPVSinkSpec(id="rung1", power_kw=2.0, enabled=True),
+        ]
+        inp, cfg = self._cfg(sinks)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert all(s.sink_states["rung0"] for s in result.slots), (
+            "rung 0 (highest priority) must soak the scarce surplus"
+        )
+        assert not any(s.sink_states["rung1"] for s in result.slots), (
+            "rung 1 must NOT run — surplus only covers one rung and importing at "
+            "10 SEK/kWh for a ~2 SEK/kWh reward is a loss"
+        )
+
+    def test_abundant_surplus_runs_all_rungs(self):
+        # Surplus 2.5 kWh/slot (10 kW) covers both 2 kW rungs comfortably.
+        sinks = [
+            ExcessPVSinkSpec(id="rung0", power_kw=2.0, enabled=True),
+            ExcessPVSinkSpec(id="rung1", power_kw=2.0, enabled=True),
+        ]
+        inp, cfg = self._cfg(sinks, pv=3.5, load=1.0)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert all(s.sink_states["rung0"] for s in result.slots)
+        assert all(s.sink_states["rung1"] for s in result.slots)
+
+    def test_per_sink_price_ceiling(self):
+        # Export pays 0.1: rung 0's ceiling (0.05) blocks it, rung 1's (0.2)
+        # permits it — the gate is per-rung, not global.
+        sinks = [
+            ExcessPVSinkSpec(
+                id="rung0", power_kw=2.0, price_ceiling_sek_per_kwh=0.05, enabled=True
+            ),
+            ExcessPVSinkSpec(id="rung1", power_kw=2.0, price_ceiling_sek_per_kwh=0.2, enabled=True),
+        ]
+        inp, cfg = self._cfg(sinks, export_price=0.1)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert not any(s.sink_states["rung0"] for s in result.slots)
+        assert any(s.sink_states["rung1"] for s in result.slots)
+
+    def test_disabled_rung_never_runs(self):
+        sinks = [
+            ExcessPVSinkSpec(id="rung0", power_kw=2.0, enabled=True),
+            ExcessPVSinkSpec(id="observer", power_kw=2.0, enabled=False),
+        ]
+        inp, cfg = self._cfg(sinks, pv=3.5, load=1.0)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        assert all("observer" not in s.sink_states for s in result.slots), (
+            "a disabled rung gets no solver variable and no reported state"
+        )
+
+    def test_first_sink_mirrors_custom_entity_active(self):
+        sinks = [
+            ExcessPVSinkSpec(id="rung0", power_kw=2.0, enabled=True),
+            ExcessPVSinkSpec(id="rung1", power_kw=2.0, enabled=True),
+        ]
+        inp, cfg = self._cfg(sinks)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        for s in result.slots:
+            assert s.custom_entity_active == s.sink_states["rung0"]
+
+    def test_hourly_blocks_keep_sinks_constant_within_hour(self):
+        # 16 quarter-slots = 4 hours with the perf flag on: each rung's state must
+        # be constant within every wall-clock hour (same treatment as water/boost).
+        sinks = [
+            ExcessPVSinkSpec(id="rung0", power_kw=2.0, enabled=True),
+            ExcessPVSinkSpec(id="rung1", power_kw=2.0, enabled=True),
+        ]
+        inp, cfg = self._cfg(sinks, n=16, water_hourly_blocks=True)
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        for sink_id in ("rung0", "rung1"):
+            for hr in range(4):
+                hour_vals = {
+                    result.slots[t].sink_states[sink_id] for t in range(4 * hr, 4 * hr + 4)
+                }
+                assert len(hour_vals) == 1, f"{sink_id} hour {hr} not constant: {hour_vals}"
+
+    def test_legacy_scalar_config_synthesizes_single_rung(self):
+        # No excess_pv_sinks list: the legacy scalar fields must synthesize a
+        # single "custom_entity" rung so old configs behave byte-identically.
+        capacity = 10.0
+        initial_soc = capacity * 0.97
+        cfg = KeplerConfig(
+            capacity_kwh=capacity,
+            max_charge_power_kw=5.0,
+            max_discharge_power_kw=5.0,
+            charge_efficiency=1.0,
+            discharge_efficiency=1.0,
+            min_soc_percent=0.0,
+            max_soc_percent=100.0,
+            wear_cost_sek_per_kwh=0.01,
+            enable_export=True,
+            max_export_power_kw=10.0,
+            target_soc_kwh=initial_soc,
+            target_soc_penalty_sek=1000.0,
+            excess_pv_slots=[True] * 8,
+            excess_pv_sink="custom_entity",
+            excess_pv_reward_sek_per_kwh=2.0,
+            excess_pv_soc_threshold_percent=95.0,
+            excess_pv_custom_entity_power_kw=2.0,
+        )
+        inp = KeplerInput(
+            slots=_make_slots(n=8, pv_kwh=3.0, load_kwh=1.0, export_price=0.1),
+            initial_soc_kwh=initial_soc,
+        )
+        result = KeplerSolver().solve(inp, cfg)
+        assert result.is_optimal
+        active = [s for s in result.slots if s.custom_entity_active]
+        assert active, "legacy scalar path must still activate"
+        for s in result.slots:
+            assert s.sink_states.get("custom_entity") == s.custom_entity_active

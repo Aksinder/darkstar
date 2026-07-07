@@ -22,7 +22,7 @@ from typing import Any
 
 import aiohttp
 
-from .config import ExcessPVCustomEntityConfig, ExecutorConfig
+from .config import ExcessPVSinkSpec, ExecutorConfig
 from .controller import ControllerDecision
 from .profiles import InverterProfile, ModeAction
 
@@ -1037,7 +1037,7 @@ class ActionDispatcher:
         )
 
     async def set_custom_entity(self, value: str) -> ActionResult:
-        """Toggle the excess PV custom entity sink on/off.
+        """Legacy wrapper: actuate the FIRST excess-PV sink (old single-slot API).
 
         Args:
             value: The value to set (on_value or off_value from config).
@@ -1047,34 +1047,70 @@ class ActionDispatcher:
         """
         from .config import ExcessPVSinkType
 
-        start = time.time()
         excess_pv = self.config.excess_pv
+        # The loader populates .sinks (with lossless legacy synthesis); directly
+        # constructed configs (tests, old call sites) may only carry .custom_entity,
+        # which IS a sink spec (ExcessPVSinkSpec aliases the same dataclass).
+        sink_cfg = excess_pv.sinks[0] if excess_pv.sinks else excess_pv.custom_entity
 
         sink_active = (
-            excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY or excess_pv.custom_entity.enabled
+            excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY
+            or sink_cfg.enabled
+            or bool(excess_pv.sinks)
         )
-        if not sink_active or not excess_pv.custom_entity.entity:
+        if not sink_active or not sink_cfg.entity:
             return ActionResult(
-                action_type="custom_entity",
+                action_type=f"sink:{sink_cfg.id}",
                 success=True,
                 message="Custom entity sink not configured",
+                skipped=True,
+                duration_ms=0,
+            )
+        return await self.set_sink(sink_cfg, self._values_match(value, sink_cfg.on_value))
+
+    async def set_sink(self, cfg: ExcessPVSinkSpec, turn_on: bool) -> ActionResult:
+        """Actuate one rung of the excess-PV sink ladder.
+
+        Domain-dispatched: ``climate.*`` entities get hvac_mode/temperature service
+        calls (with the anti-overcool comfort floor); switch/input_boolean entities
+        are turned on/off; everything else gets ``on_value``/``off_value`` written
+        via the matching domain service. Idempotent — a no-op when the entity is
+        already in the desired state — so the executor's every-tick writes are
+        self-healing rather than churn.
+        """
+        start = time.time()
+        entity = cfg.entity
+
+        if not entity:
+            return ActionResult(
+                action_type=f"sink:{cfg.id}",
+                success=True,
+                message=f"Sink {cfg.id} has no entity configured",
                 skipped=True,
                 duration_ms=int((time.time() - start) * 1000),
             )
 
-        entity = excess_pv.custom_entity.entity
+        domain = entity.split(".", 1)[0] if "." in entity else "switch"
 
         # Climate entities (e.g. the villavagn AC as a surplus cooling sink) need
         # hvac_mode/temperature services, not a plain state write. Delegate.
-        if entity.split(".", 1)[0] == "climate":
-            turn_on = self._values_match(value, excess_pv.custom_entity.on_value)
-            return await self._set_climate_sink(entity, turn_on, excess_pv.custom_entity, start)
+        if domain == "climate":
+            return await self._set_climate_sink(entity, turn_on, cfg, start)
+
+        # Switches speak on/off natively — derive the value from the boolean so a
+        # numeric on_value like "1"/"0" can't be mis-coerced (bool("0") is True).
+        if domain in ("switch", "input_boolean"):
+            value: Any = "on" if turn_on else "off"
+            write_value: Any = turn_on
+        else:
+            value = cfg.on_value if turn_on else cfg.off_value
+            write_value = value
 
         current = await self.ha.get_state_value(entity)
 
         if self._values_match(current, value):
             return ActionResult(
-                action_type="custom_entity",
+                action_type=f"sink:{cfg.id}",
                 success=True,
                 message=f"Already at {value}",
                 previous_value=current,
@@ -1086,13 +1122,14 @@ class ActionDispatcher:
 
         if self.shadow_mode:
             logger.info(
-                "[SHADOW] Would set custom entity %s to %s (current: %s)",
+                "[SHADOW] Would set sink %s (%s) to %s (current: %s)",
+                cfg.id,
                 entity,
                 value,
                 current,
             )
             return ActionResult(
-                action_type="custom_entity",
+                action_type=f"sink:{cfg.id}",
                 success=True,
                 message=f"[SHADOW] Would change {current} → {value}",
                 previous_value=current,
@@ -1104,12 +1141,11 @@ class ActionDispatcher:
 
         error_details = None
         try:
-            domain = entity.split(".", 1)[0] if "." in entity else "switch"
-            success = await self._write_entity(entity, value, domain)
+            success = await self._write_entity(entity, write_value, domain)
         except HACallError as e:
             success = False
             error_details = str(e)
-            logger.error("Failed to set custom entity %s: %s", entity, error_details)
+            logger.error("Failed to set sink %s (%s): %s", cfg.id, entity, error_details)
 
         verified_value = None
         verification_success = None
@@ -1119,14 +1155,14 @@ class ActionDispatcher:
         duration = int((time.time() - start) * 1000)
 
         return ActionResult(
-            action_type="custom_entity",
+            action_type=f"sink:{cfg.id}",
             success=success,
             message=(
                 f"Changed {current} → {value}"
                 if success
                 else f"Failed: {error_details}"
                 if error_details
-                else "Failed to set custom entity"
+                else f"Failed to set sink {cfg.id}"
             ),
             previous_value=current,
             new_value=value,
@@ -1141,7 +1177,7 @@ class ActionDispatcher:
         self,
         entity: str,
         turn_on: bool,
-        cfg: ExcessPVCustomEntityConfig,
+        cfg: ExcessPVSinkSpec,
         start: float,
     ) -> ActionResult:
         """Actuate a climate.* excess-PV sink (e.g. the villavagn AC).
@@ -1169,7 +1205,7 @@ class ActionDispatcher:
 
         def _result(success: bool, message: str, *, skipped: bool = False) -> ActionResult:
             return ActionResult(
-                action_type="custom_entity",
+                action_type=f"sink:{cfg.id}",
                 success=success,
                 message=message,
                 previous_value=current_mode,
@@ -1207,7 +1243,7 @@ class ActionDispatcher:
         except HACallError as e:
             logger.error("Failed to set climate sink %s: %s", entity, e)
             return ActionResult(
-                action_type="custom_entity",
+                action_type=f"sink:{cfg.id}",
                 success=False,
                 message=f"Failed: {e}",
                 previous_value=current_mode,

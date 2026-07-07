@@ -15,6 +15,7 @@ import pandas as pd
 from .types import (
     DeferrableLoadInput,
     EVChargerInput,
+    ExcessPVSinkSpec,
     IncentiveBucket,
     KeplerConfig,
     KeplerInput,
@@ -615,11 +616,36 @@ def dynamic_wtp_from_prices(
     return window[lo] * (1.0 - frac) + window[hi] * frac
 
 
+def _excess_pv_cfg(planner_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``executor.excess_pv`` config dict (cast for typing)."""
+    executor_cfg = cast("dict[str, Any]", planner_config.get("executor", {}) or {})
+    return cast("dict[str, Any]", executor_cfg.get("excess_pv", {}) or {})
+
+
 def _excess_pv_custom_cfg(planner_config: dict[str, Any]) -> dict[str, Any]:
     """Return the ``executor.excess_pv.custom_entity`` config dict (cast for typing)."""
-    executor_cfg = cast("dict[str, Any]", planner_config.get("executor", {}) or {})
-    excess_cfg = cast("dict[str, Any]", executor_cfg.get("excess_pv", {}) or {})
-    return cast("dict[str, Any]", excess_cfg.get("custom_entity", {}) or {})
+    return cast("dict[str, Any]", _excess_pv_cfg(planner_config).get("custom_entity", {}) or {})
+
+
+def _excess_pv_sinks(planner_config: dict[str, Any]) -> list[ExcessPVSinkSpec]:
+    """Resolve the ordered excess-PV sink ladder for the solver.
+
+    Uses the SAME normalizer as the executor config loader (dual-read with lossless
+    synthesis from the legacy custom_entity block), so planner and executor always
+    agree on the ladder — including on a live config that still runs the single
+    custom_entity slot.
+    """
+    from executor.config import normalize_excess_pv_sinks
+
+    return [
+        ExcessPVSinkSpec(
+            id=str(d["id"]),
+            power_kw=float(d["power_kw"]),
+            price_ceiling_sek_per_kwh=cast("float | None", d["price_ceiling_sek_per_kwh"]),
+            enabled=bool(d["enabled"]),
+        )
+        for d in normalize_excess_pv_sinks(_excess_pv_cfg(planner_config))
+    ]
 
 
 def _excess_pv_price_ceiling(planner_config: dict[str, Any]) -> float | None:
@@ -861,6 +887,10 @@ def config_to_kepler_config(
         excess_pv_custom_entity_enabled=bool(
             _excess_pv_custom_cfg(planner_config).get("enabled", False)
         ),
+        # Ordered sink ladder (shared normalizer with the executor loader; also
+        # synthesized from the legacy custom_entity block, so the scalar fields
+        # above become fallback-only once this list is non-empty).
+        excess_pv_sinks=_excess_pv_sinks(planner_config),
     )
 
     # Deferrable household loads (dishwasher, washing machine, ...).
@@ -973,7 +1003,8 @@ def kepler_result_to_dataframe(
                 "water_heating_kw": s.water_heat_kw,  # Aggregate (backward compat)
                 "water_heaters": s.water_heater_results,  # Per-device: heater_id -> kW
                 "water_heating_boost": s.water_heating_boost,  # Per-device: heater_id -> bool
-                "custom_entity_active": s.custom_entity_active,  # Whether custom entity should be on
+                "custom_entity_active": s.custom_entity_active,  # First sink (backward compat)
+                "sinks": s.sink_states,  # Per-sink ladder: sink_id -> active
                 "water_from_grid_kwh": 0.0,
                 "water_from_pv_kwh": 0.0,
                 "water_from_battery_kwh": 0.0,
