@@ -39,7 +39,7 @@ _LP_SOLUTION_OPTIMAL: int = int(pulp.constants.LpSolutionOptimal)  # type: ignor
 def solve_is_time_boxed(
     is_optimal: bool,
     sol_status: int,
-    used_cbc: bool,
+    used_solver: str,
     solve_duration_s: float,
     limit_s: float = SOLVER_TIME_LIMIT_S,
 ) -> bool:
@@ -52,13 +52,23 @@ def solve_is_time_boxed(
     time-boxed incumbent and is LpSolutionOptimal (1) only when CBC itself said
     "Optimal" (including "within gap tolerance"). Empirically verified: a 2s-limited
     solve with a 52,594% gap still reports LpStatus "Optimal" — sol_status is the
-    only tell. GLPK's wrapper synthesizes sol_status from the status (always looks
-    proven), so for that path only the wall clock can tell — and solvers exit just
-    UNDER their limit (119.939s of 120), so compare against 95% of the budget.
+    only tell.
+
+    HiGHS (in-process highspy, pulp 3.3.2 apis/highs_api.py status_dict) follows the
+    SAME convention, verified empirically: kTimeLimit WITH an incumbent maps to
+    (LpStatusOptimal, LpSolutionIntegerFeasible); kTimeLimit with NO incumbent trips
+    the +inf-objective minimization check in highs_api and maps to (LpStatusNotSolved,
+    LpSolutionNoSolutionFound); a gapRel stop reports kOptimal -> (Optimal, Optimal),
+    indistinguishable from exact optimal — same as CBC's gapRel convention. So both
+    "cbc" and "highs" use the sol_status test.
+
+    GLPK's wrapper synthesizes sol_status from the status (always looks proven), so
+    for that path only the wall clock can tell — and solvers exit just UNDER their
+    limit (119.939s of 120), so compare against 95% of the budget.
     """
     if not is_optimal:
         return False
-    if used_cbc:
+    if used_solver in ("cbc", "highs"):
         return sol_status != _LP_SOLUTION_OPTIMAL
     return solve_duration_s >= 0.95 * limit_s
 
@@ -1039,7 +1049,7 @@ class KeplerSolver:
             )
         )
 
-        # Solve — CBC first, GLPK fallback
+        # Solve — HiGHS first, CBC fallback, GLPK last resort
         import time
 
         build_start: float = time.time()
@@ -1047,30 +1057,63 @@ class KeplerSolver:
         # Note: pulp.LpProblem construction happened above, so 'build_time' here is mostly
         # just the overhead of writing the LP file in prob.solve()
 
-        used_cbc: bool = True
+        used_solver: str = "highs"
         try:
-            # CBC FIRST. GLPK-first caused the 2026-07-05 cold-tank incident: on the
-            # grown model (~3.4k vars) GLPK hit its 30 s ceiling every single run and
-            # returned an incumbent with ZERO water heating while reporting "Optimal" —
-            # silently shipping garbage plans. pulp's bundled CBC is a far stronger
-            # MILP solver. GLPK stays as the fallback for images where the bundled
-            # CBC binary can't run.
-            # Generous limit: we replan every 15 min — a 2-min solve is acceptable,
-            # a silently-degraded plan is not. gapRel lets CBC stop at a proven
-            # 1%-of-optimal bound instead of chasing the last epsilon. threads:
-            # the bundled CBC honors it (measured 4.3x with 8 threads); on a
-            # 1-2 vCPU box it is harmless.
-            solver_cmd: Any = pulp.PULP_CBC_CMD(
+            # HiGHS FIRST (in-process highspy). Measured on the live 107-slot model:
+            # proves optimality in ~13.6s SINGLE-threaded where CBC needs 12 threads
+            # for 15.7s and can't prove in 120s on one thread — decisive on the
+            # 2-vCPU production VM. `threads` is deliberately OMITTED: it makes no
+            # measured difference for the HiGHS MIP search here, and HiGHS's
+            # process-global scheduler returns kNotset (-> NotSolved) if a later
+            # solve in the same process passes a DIFFERENT thread count.
+            # Missing highspy => prob.solve raises PulpSolverError -> CBC below.
+            solver_cmd: Any = pulp.HiGHS(  # type: ignore[reportUnknownMemberType]
                 msg=False,
                 timeLimit=SOLVER_TIME_LIMIT_S,
                 gapRel=0.01,
-                threads=max(1, os.cpu_count() or 1),
             )
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
-        except Exception:
-            used_cbc = False
-            solver_cmd: Any = pulp.GLPK_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_S)
-            prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
+            _highs_duration: float = time.time() - build_start
+            # A FAST NotSolved is a solver malfunction (e.g. the global-scheduler
+            # thread mismatch, a load error) — prob.solve does NOT raise for it.
+            # Never ship it: fall through and RE-SOLVE with CBC. A slow NotSolved
+            # (real no-incumbent timeout) is handled by the SOLVER_TIMEOUT mapping.
+            if (
+                prob.status == pulp.LpStatusNotSolved  # type: ignore[reportUnknownMemberType]
+                and _highs_duration < 0.9 * SOLVER_TIME_LIMIT_S
+            ):
+                raise RuntimeError(
+                    f"HiGHS returned NotSolved in {_highs_duration:.1f}s "
+                    f"(<0.9x budget) — treating as solver malfunction"
+                )
+        except Exception as highs_exc:
+            # Expected on hosts without highspy — INFO, not WARNING.
+            logger.info("HiGHS unavailable or failed (%s) — solving with CBC", highs_exc)
+            used_solver = "cbc"
+            try:
+                # CBC before GLPK. GLPK-first caused the 2026-07-05 cold-tank
+                # incident: on the grown model (~3.4k vars) GLPK hit its 30 s
+                # ceiling every single run and returned an incumbent with ZERO
+                # water heating while reporting "Optimal" — silently shipping
+                # garbage plans. pulp's bundled CBC is a far stronger MILP solver.
+                # GLPK stays as the last resort for images where the bundled CBC
+                # binary can't run.
+                # Generous limit: we replan every 15 min — a 2-min solve is
+                # acceptable, a silently-degraded plan is not. gapRel lets CBC stop
+                # at a proven 1%-of-optimal bound instead of chasing the last
+                # epsilon. threads: the bundled CBC honors it (measured 4.3x with
+                # 8 threads); on a 1-2 vCPU box it is harmless.
+                solver_cmd = pulp.PULP_CBC_CMD(
+                    msg=False,
+                    timeLimit=SOLVER_TIME_LIMIT_S,
+                    gapRel=0.01,
+                    threads=max(1, os.cpu_count() or 1),
+                )
+                prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
+            except Exception:
+                used_solver = "glpk"
+                solver_cmd = pulp.GLPK_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_S)
+                prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
 
         solve_end: float = time.time()
 
@@ -1109,7 +1152,7 @@ class KeplerSolver:
         # getattr: sol_status is standard PuLP, but test doubles / exotic wrappers
         # may lack it — default to "proven" (old behavior) rather than false-flag.
         _sol_status: int = int(getattr(prob, "sol_status", _LP_SOLUTION_OPTIMAL))  # type: ignore[arg-type]
-        if solve_is_time_boxed(is_optimal, _sol_status, used_cbc, solve_duration):  # type: ignore[arg-type]
+        if solve_is_time_boxed(is_optimal, _sol_status, used_solver, solve_duration):  # type: ignore[arg-type]
             floor_violation_kwh: float = 0.0
             for d in water_min_kwh_violation:
                 if (
@@ -1161,6 +1204,12 @@ class KeplerSolver:
                 raise PlannerError(code=PlannerErrorCode.SOLVER_TIMEOUT, details=details)
             elif prob.status == pulp.LpStatusUndefined:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_UNDEFINED, details=details)
+            elif prob.status == pulp.LpStatusNotSolved:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+                # A fast NotSolved that survived the whole fallback chain used to
+                # slip through here and return a KeplerResult with EMPTY slots
+                # (empirically reproduced) — the executor would happily act on a
+                # plan that schedules nothing. Fail loud instead.
+                raise PlannerError(code=PlannerErrorCode.SOLVER_UNDEFINED, details=details)  # type: ignore[reportUnknownArgumentType]
 
         result_slots: list[KeplerResultSlot] = []
         final_total_cost: float = 0.0
