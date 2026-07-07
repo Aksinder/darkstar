@@ -886,3 +886,161 @@ class TestClimateSink:
         ha.call_service.assert_any_call(
             "climate", "set_hvac_mode", "climate.villavagn", {"hvac_mode": "cool"}
         )
+
+
+class TestSetSink:
+    """ActionDispatcher.set_sink — one rung of the excess-PV sink ladder."""
+
+    def _config(self, sinks):
+        from executor.config import (
+            ControllerConfig,
+            ExcessPVConfig,
+            ExecutorConfig,
+            InverterConfig,
+            NotificationConfig,
+            WaterHeaterConfig,
+        )
+
+        return ExecutorConfig(
+            inverter=InverterConfig(),
+            controller=ControllerConfig(),
+            water_heater=WaterHeaterConfig(),
+            notifications=NotificationConfig(),
+            excess_pv=ExcessPVConfig(sinks=sinks),
+        )
+
+    def _dispatcher(self, ha_client, config, shadow_mode=False):
+        from executor.actions import ActionDispatcher
+
+        return ActionDispatcher(ha_client=ha_client, config=config, shadow_mode=shadow_mode)
+
+    def _switch_sink(self, **over):
+        from executor.config import ExcessPVSinkSpec
+
+        kwargs = {"id": "poolpump", "entity": "switch.poolpump", "power_kw": 0.25, "enabled": True}
+        kwargs.update(over)
+        return ExcessPVSinkSpec(**kwargs)
+
+    def _climate_sink(self, **over):
+        from executor.config import ExcessPVSinkSpec
+
+        kwargs = {
+            "id": "villavagn_ac",
+            "entity": "climate.villavagn",
+            "power_kw": 1.0,
+            "enabled": True,
+            "climate_mode": "cool",
+            "target_temp": 22.0,
+            "comfort_min_temp": 20.0,
+        }
+        kwargs.update(over)
+        return ExcessPVSinkSpec(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_switch_sink_on(self):
+        sink = self._switch_sink()
+        ha = MagicMock()
+        ha.get_state_value = AsyncMock(side_effect=["off", "on"])
+        ha.set_switch = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_sink(sink, True)
+
+        assert result.success and not result.skipped
+        assert result.action_type == "sink:poolpump"
+        # Boolean write path: bool("0") is True, so the dispatcher must pass the
+        # real on/off boolean, never a coerced string.
+        ha.set_switch.assert_called_once_with("switch.poolpump", True)
+        assert result.new_value == "on"
+
+    @pytest.mark.asyncio
+    async def test_switch_sink_off(self):
+        sink = self._switch_sink()
+        ha = MagicMock()
+        ha.get_state_value = AsyncMock(side_effect=["on", "off"])
+        ha.set_switch = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_sink(sink, False)
+
+        assert result.success and not result.skipped
+        ha.set_switch.assert_called_once_with("switch.poolpump", False)
+
+    @pytest.mark.asyncio
+    async def test_switch_sink_idempotent(self):
+        sink = self._switch_sink()
+        ha = MagicMock()
+        ha.get_state_value = AsyncMock(return_value="on")
+        ha.set_switch = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_sink(sink, True)
+
+        assert result.success and result.skipped
+        ha.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_switch_sink_shadow_mode(self):
+        sink = self._switch_sink()
+        ha = MagicMock()
+        ha.get_state_value = AsyncMock(return_value="off")
+        ha.set_switch = AsyncMock(return_value=True)
+        dispatcher = self._dispatcher(ha, self._config([sink]), shadow_mode=True)
+        result = await dispatcher.set_sink(sink, True)
+
+        assert result.success and result.skipped
+        assert "[SHADOW]" in result.message
+        ha.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_climate_sink_on_via_set_sink(self):
+        sink = self._climate_sink()
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "off", "attributes": {"current_temperature": 24.0}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_sink(sink, True)
+
+        assert result.success and not result.skipped
+        assert result.action_type == "sink:villavagn_ac"
+        ha.call_service.assert_any_call(
+            "climate", "set_hvac_mode", "climate.villavagn", {"hvac_mode": "cool"}
+        )
+        ha.call_service.assert_any_call(
+            "climate", "set_temperature", "climate.villavagn", {"temperature": 22.0}
+        )
+
+    @pytest.mark.asyncio
+    async def test_climate_sink_comfort_floor_blocks_via_set_sink(self):
+        # Already at/below the comfort floor (20) → force off, never cool.
+        sink = self._climate_sink()
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "off", "attributes": {"current_temperature": 19.5}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_sink(sink, True)
+
+        assert result.success
+        assert result.new_value == "off"
+        ha.call_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sink_without_entity_is_skipped(self):
+        sink = self._switch_sink(entity=None)
+        ha = MagicMock()
+        result = await self._dispatcher(ha, self._config([sink])).set_sink(sink, True)
+
+        assert result.success and result.skipped
+
+    @pytest.mark.asyncio
+    async def test_legacy_wrapper_uses_first_sink(self):
+        # set_custom_entity must keep working, delegating to sinks[0].
+        sink = self._climate_sink()
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": "off", "attributes": {"current_temperature": 24.0}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_custom_entity("1")
+
+        assert result.success and not result.skipped
+        assert result.action_type == "sink:villavagn_ac"
+        ha.call_service.assert_any_call(
+            "climate", "set_hvac_mode", "climate.villavagn", {"hvac_mode": "cool"}
+        )

@@ -166,6 +166,17 @@ def dataframe_to_json_response(
         custom_val = record.get("custom_entity_active")
         record["custom_entity_active"] = bool(custom_val) if custom_val is not None else False
 
+        # Normalize sinks (excess-PV sink ladder): ensure it's always {str: bool}, not NaN
+        sinks_val = record.get("sinks")
+        if not isinstance(sinks_val, dict):
+            record["sinks"] = {}
+        else:
+            record["sinks"] = {
+                str(k): bool(v)  # type: ignore[misc]
+                for k, v in sinks_val.items()  # type: ignore[union-attr]
+                if isinstance(v, bool | int | float)
+            }
+
         # Normalize ev_chargers: ensure it's always a dict, not NaN for non-solver rows
         ev_chargers_val = record.get("ev_chargers")
         if not isinstance(ev_chargers_val, dict):

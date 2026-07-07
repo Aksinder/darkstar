@@ -192,3 +192,34 @@ class TestWaterHeatersInOutput:
         assert records[2].get("water_heating_kw") == 2.0
         assert "water_heaters" in records[0]
         assert records[0]["water_heaters"] == {"wh1": {"heating_kw": 3.0}}
+
+
+class TestSinksNormalization:
+    """dataframe_to_json_response normalizes the per-slot sinks dict."""
+
+    def _df(self, sinks_value):
+        import pandas as pd
+
+        return pd.DataFrame(
+            [
+                {
+                    "start_time": pd.Timestamp("2099-06-01 12:00"),
+                    "end_time": pd.Timestamp("2099-06-01 12:15"),
+                    "import_kwh": 0.0,
+                    "export_kwh": 0.0,
+                    "sinks": sinks_value,
+                }
+            ]
+        )
+
+    def test_sinks_dict_normalized_to_bools(self):
+        from planner.output.formatter import dataframe_to_json_response
+
+        records = dataframe_to_json_response(self._df({"villavagn_ac": 1, "poolpump": False}))
+        assert records[0]["sinks"] == {"villavagn_ac": True, "poolpump": False}
+
+    def test_missing_or_nan_sinks_becomes_empty_dict(self):
+        from planner.output.formatter import dataframe_to_json_response
+
+        records = dataframe_to_json_response(self._df(float("nan")))
+        assert records[0]["sinks"] == {}

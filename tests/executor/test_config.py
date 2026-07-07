@@ -237,3 +237,173 @@ class TestWaterHeaterDeviceConfig:
         config = load_executor_config(str(config_file))
 
         assert config.water_heater_devices == []
+
+
+class TestNormalizeExcessPVSinks:
+    """Shared dual-read normalizer for the excess-PV sink ladder."""
+
+    def test_sinks_list_wins_and_keeps_order_and_disabled_entries(self):
+        from executor.config import normalize_excess_pv_sinks
+
+        entries = normalize_excess_pv_sinks(
+            {
+                "sink": "water_heater_boost",
+                "custom_entity": {"enabled": True, "entity": "climate.villavagn"},
+                "sinks": [
+                    {
+                        "id": "villavagn_ac",
+                        "entity": "climate.villavagn",
+                        "enabled": True,
+                        "power_kw": 1.0,
+                        "price_ceiling_sek_per_kwh": 0.2,
+                        "climate_mode": "cool",
+                        "target_temp": "22",
+                        "comfort_min_temp": "20",
+                    },
+                    {"id": "poolpump", "entity": "switch.poolpump", "power_kw": 0.25},
+                ],
+            }
+        )
+        assert [e["id"] for e in entries] == ["villavagn_ac", "poolpump"]
+        assert entries[0]["enabled"] is True
+        # live-config string coercion ("22"/"20" arrive as strings from HA)
+        assert entries[0]["target_temp"] == 22.0
+        assert entries[0]["comfort_min_temp"] == 20.0
+        assert entries[0]["price_ceiling_sek_per_kwh"] == 0.2
+        # disabled entries are kept (observe-first rollout)
+        assert entries[1]["enabled"] is False
+        assert entries[1]["power_kw"] == 0.25
+
+    def test_legacy_custom_entity_synthesized_when_enabled(self):
+        # The LIVE config shape: sink=water_heater_boost + custom_entity enabled.
+        from executor.config import normalize_excess_pv_sinks
+
+        entries = normalize_excess_pv_sinks(
+            {
+                "sink": "water_heater_boost",
+                "custom_entity": {
+                    "enabled": True,
+                    "entity": "climate.villavagn",
+                    "power_kw": 1.0,
+                    "price_ceiling_sek_per_kwh": 0.2,
+                    "climate_mode": "cool",
+                    "target_temp": "22",
+                    "comfort_min_temp": "20",
+                },
+            }
+        )
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["id"] == "custom_entity"
+        assert e["entity"] == "climate.villavagn"
+        assert e["enabled"] is True
+        assert e["power_kw"] == 1.0
+        assert e["price_ceiling_sek_per_kwh"] == 0.2
+        assert e["climate_mode"] == "cool"
+        assert e["target_temp"] == 22.0
+        assert e["comfort_min_temp"] == 20.0
+
+    def test_legacy_sink_selector_implies_enabled(self):
+        from executor.config import normalize_excess_pv_sinks
+
+        entries = normalize_excess_pv_sinks(
+            {"sink": "custom_entity", "custom_entity": {"entity": "switch.pool"}}
+        )
+        assert len(entries) == 1
+        assert entries[0]["enabled"] is True
+
+    def test_inactive_legacy_block_yields_no_sinks(self):
+        from executor.config import normalize_excess_pv_sinks
+
+        assert (
+            normalize_excess_pv_sinks(
+                {"sink": "water_heater_boost", "custom_entity": {"entity": "switch.pool"}}
+            )
+            == []
+        )
+        assert normalize_excess_pv_sinks({"sink": "disabled", "custom_entity": {}}) == []
+
+    def test_entries_without_entity_are_skipped(self):
+        from executor.config import normalize_excess_pv_sinks
+
+        entries = normalize_excess_pv_sinks(
+            {"sinks": [{"id": "ghost"}, {"id": "real", "entity": "switch.x", "enabled": True}]}
+        )
+        assert [e["id"] for e in entries] == ["real"]
+
+    def test_id_defaults_to_entity(self):
+        from executor.config import normalize_excess_pv_sinks
+
+        entries = normalize_excess_pv_sinks({"sinks": [{"entity": "switch.bogfilter"}]})
+        assert entries[0]["id"] == "switch.bogfilter"
+
+
+def test_loader_populates_sinks_from_legacy_custom_entity(tmp_path):
+    """load_executor_config synthesizes .sinks from the live-shaped legacy block."""
+    config_file = tmp_path / "config.yaml"
+    config_data = {
+        "executor": {
+            "excess_pv": {
+                "sink": "water_heater_boost",
+                "custom_entity": {
+                    "enabled": True,
+                    "entity": "climate.villavagn",
+                    "power_kw": 1.0,
+                    "price_ceiling_sek_per_kwh": 0.2,
+                    "climate_mode": "cool",
+                    "target_temp": "22",
+                    "comfort_min_temp": "20",
+                },
+            }
+        }
+    }
+    with config_file.open("w") as f:
+        yaml.dump(config_data, f)
+
+    config = load_executor_config(str(config_file))
+
+    assert len(config.excess_pv.sinks) == 1
+    sink = config.excess_pv.sinks[0]
+    assert sink.id == "custom_entity"
+    assert sink.entity == "climate.villavagn"
+    assert sink.enabled is True
+    assert sink.target_temp == 22.0
+    assert sink.comfort_min_temp == 20.0
+    assert sink.price_ceiling_sek_per_kwh == 0.2
+    # legacy block itself still parsed (dual representation, byte-identical deploy)
+    assert config.excess_pv.custom_entity.entity == "climate.villavagn"
+
+
+def test_loader_populates_sinks_from_sinks_list(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_data = {
+        "executor": {
+            "excess_pv": {
+                "sink": "water_heater_boost",
+                "sinks": [
+                    {
+                        "id": "villavagn_ac",
+                        "entity": "climate.villavagn",
+                        "enabled": True,
+                        "power_kw": 1.0,
+                    },
+                    {
+                        "id": "poolpump",
+                        "entity": "switch.poolpump",
+                        "enabled": False,
+                        "power_kw": 0.25,
+                        "price_ceiling_sek_per_kwh": 0.2,
+                    },
+                ],
+            }
+        }
+    }
+    with config_file.open("w") as f:
+        yaml.dump(config_data, f)
+
+    config = load_executor_config(str(config_file))
+
+    assert [s.id for s in config.excess_pv.sinks] == ["villavagn_ac", "poolpump"]
+    assert config.excess_pv.sinks[0].enabled is True
+    assert config.excess_pv.sinks[1].enabled is False
+    assert config.excess_pv.sinks[1].price_ceiling_sek_per_kwh == 0.2
