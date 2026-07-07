@@ -34,13 +34,15 @@ Honesty contract (matches savings.py):
 - EV charging is deliberately NOT credited (the surplus controller has its own
   economics and no arm-time counterfactual) — spelled out in the sensor.
 
-All computation is pure over already-fetched rows; the only I/O helper is the
-JSONL cycle-ledger loader.
+All computation is pure over already-fetched rows; the only I/O helpers are the
+JSONL cycle-ledger loader and its enricher (which persists the run join so old
+cycles stay priceable after the HA detection history ages out).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -60,9 +62,13 @@ __all__ = [
     "compute_appliance_shift",
     "compute_water_shift",
     "dedupe_ledger",
+    "enrich_cycle_ledger",
     "load_cycle_ledger",
     "marginal_price",
+    "water_unattributed_kwh",
 ]
+
+logger = logging.getLogger("darkstar.savings_loadshift")
 
 WATER_BASELINE_FOUR_CHEAPEST = "four_cheapest_hours"
 WATER_BASELINE_DAILY_AVERAGE = "daily_average"
@@ -246,6 +252,38 @@ def compute_water_shift(
     )
 
 
+def water_unattributed_kwh(
+    obs_rows: Sequence[Mapping[str, Any]],
+    device_rows: Iterable[Mapping[str, Any]],
+    tank_ids: Iterable[str],
+) -> float:
+    """Aggregate water energy not attributable to any tank's device rows.
+
+    Per slot: ``max(0, water_kwh - sum(tank device rows))``, summed over the
+    window. ``compute_water_shift`` only sees device rows with kwh>0, so a slot
+    whose per-device value was never recorded (recorder snapshot fallback) or
+    was wiped would otherwise vanish from the per-tank stream while coverage
+    stayed 1.0 — the shortfall must be COUNTED as unvalued, never silently
+    folded (module contract). The caller cannot attribute it to a specific
+    tank, so it is exposed as a separate unattributed bucket.
+    """
+    ids = {str(t) for t in tank_ids}
+    dev_by_slot: dict[str, float] = {}
+    for d in device_rows:
+        if str(d["device_id"]) not in ids:
+            continue  # EV chargers share the table but not the water aggregate
+        slot = str(d["slot_start"])
+        dev_by_slot[slot] = dev_by_slot.get(slot, 0.0) + float(d["kwh"] or 0.0)
+    total = 0.0
+    for r in obs_rows:
+        water = float(r.get("water_kwh") or 0.0)
+        shortfall = water - dev_by_slot.get(str(r["slot_start"]), 0.0)
+        # 1e-9: float-noise tolerance only, not a materiality threshold.
+        if shortfall > 1e-9:
+            total += shortfall
+    return round(total, 4)
+
+
 # ---------------------------------------------------------------------------
 # Stream 2 — deferrable appliances
 # ---------------------------------------------------------------------------
@@ -261,6 +299,11 @@ class CycleLedgerEntry:
     held_by_us_ever: bool = False
     deadline_ts: float | None = None
     measured_kwh: float | None = None
+    # Persisted by enrich_cycle_ledger (the executor only sees instantaneous W):
+    # the matched detected run's window, so the cycle stays priceable after the
+    # ~14-day HA detection history (bounded further by recorder purge) ages out.
+    run_start_ts: float | None = None
+    run_end_ts: float | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +333,25 @@ class ApplianceShiftSummary:
         return self.n_valued_cycles / total if total else 1.0
 
 
+def _opt_float(raw: Mapping[str, Any], key: str) -> float | None:
+    value = raw.get(key)
+    return float(value) if value is not None else None
+
+
+def _entry_from_raw(raw: Mapping[str, Any]) -> CycleLedgerEntry:
+    """Parse one ledger JSON object (raises ValueError/TypeError/KeyError on junk)."""
+    return CycleLedgerEntry(
+        load_id=str(raw["load_id"]),
+        armed_ts=float(raw["armed_ts"]),
+        done_ts=float(raw["done_ts"]),
+        held_by_us_ever=bool(raw.get("held_by_us_ever", False)),
+        deadline_ts=_opt_float(raw, "deadline_ts"),
+        measured_kwh=_opt_float(raw, "measured_kwh"),
+        run_start_ts=_opt_float(raw, "run_start_ts"),
+        run_end_ts=_opt_float(raw, "run_end_ts"),
+    )
+
+
 def load_cycle_ledger(path: str | Path) -> list[CycleLedgerEntry]:
     """Read the append-only JSONL cycle ledger. Missing file -> []. Corrupt lines
     are skipped (a torn write must not take the savings sensor down)."""
@@ -302,23 +364,67 @@ def load_cycle_ledger(path: str | Path) -> list[CycleLedgerEntry]:
         if not line:
             continue
         try:
-            raw: dict[str, Any] = json.loads(line)
-            entries.append(
-                CycleLedgerEntry(
-                    load_id=str(raw["load_id"]),
-                    armed_ts=float(raw["armed_ts"]),
-                    done_ts=float(raw["done_ts"]),
-                    held_by_us_ever=bool(raw.get("held_by_us_ever", False)),
-                    deadline_ts=(
-                        float(raw["deadline_ts"]) if raw.get("deadline_ts") is not None else None
-                    ),
-                    measured_kwh=(
-                        float(raw["measured_kwh"]) if raw.get("measured_kwh") is not None else None
-                    ),
-                )
-            )
+            entries.append(_entry_from_raw(json.loads(line)))
         except (ValueError, TypeError, KeyError):
             continue
+    return entries
+
+
+def enrich_cycle_ledger(
+    path: str | Path,
+    runs_by_load: Mapping[str, Sequence[MeasuredRun]],
+) -> list[CycleLedgerEntry]:
+    """Load the ledger, back-filling energy + run window from detected cycles,
+    and atomically persist the enrichment. Returns the (enriched) entries.
+
+    The executor writes rows with ``measured_kwh=None`` (it only sees
+    instantaneous W); the matching detected cycle exists only inside the
+    ~14-day HA history horizon (less with recorder purge), so without
+    persisting the join every older cycle becomes permanently unvalued and the
+    30d appliance credit decays. One tick of overlap between done-time and the
+    horizon suffices (both the row and the cycle exist at the first publish
+    after done). Idempotent: already-filled rows are skipped. The rewrite is in
+    place (temp file + atomic replace) — an appended superseding row would be
+    dropped by dedupe_ledger's strictly-greater done_ts rule. A failed rewrite
+    is logged, never raised; the enriched entries are still returned so this
+    tick's valuation works regardless.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    entries: list[CycleLedgerEntry] = []
+    out_lines: list[str] = []
+    changed = False
+    for line in p.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            raw: dict[str, Any] = json.loads(stripped)
+            entry = _entry_from_raw(raw)
+        except (ValueError, TypeError, KeyError):
+            out_lines.append(line)  # keep corrupt lines verbatim (loader skips them)
+            continue
+        if entry.measured_kwh is None or entry.run_start_ts is None or entry.run_end_ts is None:
+            run = _match_run(runs_by_load.get(entry.load_id, ()), entry)
+            if run is not None and run.energy_kwh > 0:
+                if raw.get("measured_kwh") is None:
+                    raw["measured_kwh"] = run.energy_kwh
+                if raw.get("run_start_ts") is None:
+                    raw["run_start_ts"] = run.start_ts
+                if raw.get("run_end_ts") is None:
+                    raw["run_end_ts"] = run.end_ts
+                entry = _entry_from_raw(raw)
+                changed = True
+        entries.append(entry)
+        out_lines.append(json.dumps(raw))
+    if changed:
+        try:
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+            tmp.replace(p)  # atomic on POSIX
+        except OSError as exc:
+            logger.warning("Cycle-ledger enrichment rewrite failed: %s", exc)
     return entries
 
 
@@ -411,11 +517,12 @@ def compute_appliance_shift(
 
     A cycle is attributed to the window its ``done_ts`` falls in (completion day
     — a cross-midnight cycle is credited once, on the day it finished). Only
-    measured energy counts: a cycle with no matching measured run, or whose arm/
-    run window is not fully priced by the observation rows, lands in
-    ``unvalued_cycles``. Cycles Darkstar never held naturally score 0 (arm window
-    == run window); deadline-pressure runs that cost MORE than the arm press
-    would have go negative — unclamped.
+    measured energy counts: a cycle with no matching measured run (live or
+    persisted), or whose arm/run window is not fully priced by the observation
+    rows, lands in ``unvalued_cycles``. Cycles Darkstar never held
+    (``held_by_us_ever`` False) score exactly 0 by construction — their
+    armed_ts is never priced; deadline-pressure runs that cost MORE than the
+    arm press would have go negative — unclamped.
     """
     slots = _slot_ts_index(obs_rows)
     actual = 0.0
@@ -431,6 +538,16 @@ def compute_appliance_shift(
             continue
 
         run = _match_run(runs, entry)
+        if (
+            run is None
+            and entry.run_start_ts is not None
+            and entry.run_end_ts is not None
+            and entry.measured_kwh is not None
+        ):
+            # Durable fallback: enrich_cycle_ledger persisted the matched run at
+            # done time, so cycles older than the detection horizon stay priced
+            # (prices are durable too — 30d slot observations in the learning DB).
+            run = MeasuredRun(entry.run_start_ts, entry.run_end_ts, entry.measured_kwh)
         energy = entry.measured_kwh if entry.measured_kwh is not None else None
         if run is not None and energy is None:
             energy = run.energy_kwh
@@ -438,11 +555,24 @@ def compute_appliance_shift(
             unvalued += 1
             continue
 
+        actual_cost = _window_cost(slots, run.start_ts, run.end_ts, energy, slot_hours)
+        if not entry.held_by_us_ever:
+            # Contract enforced by construction: a cycle Darkstar never held
+            # scores exactly 0 — never priced against its armed_ts, which for a
+            # chain-merged back-to-back reload can be a DIFFERENT programme's
+            # arm press (fabricated credit either sign otherwise).
+            if actual_cost is None:
+                unvalued += 1
+                continue
+            baseline += actual_cost
+            actual += actual_cost
+            n_valued += 1
+            continue
+
         run_duration = run.end_ts - run.start_ts
         baseline_cost = _window_cost(
             slots, entry.armed_ts, entry.armed_ts + run_duration, energy, slot_hours
         )
-        actual_cost = _window_cost(slots, run.start_ts, run.end_ts, energy, slot_hours)
         if baseline_cost is None or actual_cost is None:
             unvalued += 1
             continue

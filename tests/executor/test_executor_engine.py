@@ -1508,14 +1508,17 @@ executor:
 class TestParseSlotPlanSinks:
     """_parse_slot_plan: excess-PV sink ladder states + legacy fallback."""
 
-    def _engine(self, temp_schedule, temp_db, sinks):
+    def _engine(self, temp_schedule, temp_db, sinks, custom_entity=None):
         from executor.config import ExcessPVConfig
 
+        excess_kwargs = {"sinks": sinks}
+        if custom_entity is not None:
+            excess_kwargs["custom_entity"] = custom_entity
         with patch("executor.engine.load_executor_config") as mock_config:
             mock_config.return_value = ExecutorConfig(
                 schedule_path=temp_schedule,
                 timezone="Europe/Stockholm",
-                excess_pv=ExcessPVConfig(sinks=sinks),
+                excess_pv=ExcessPVConfig(**excess_kwargs),
             )
             with patch("executor.engine.load_yaml") as mock_yaml:
                 mock_yaml.return_value = {}
@@ -1537,15 +1540,144 @@ class TestParseSlotPlanSinks:
         )
         assert slot.sinks == {"villavagn_ac": True, "poolpump": False}
 
-    def test_legacy_slot_maps_custom_entity_to_first_sink(self, temp_schedule, temp_db):
+    def test_legacy_slot_maps_custom_entity_by_id_not_position(self, temp_schedule, temp_db):
         # Old schedule file (pre-ladder): only custom_entity_active exists. It must
-        # map to the FIRST configured sink so a rolling deploy keeps actuating it.
-        engine = self._engine(temp_schedule, temp_db, self._sinks())
+        # map to the rung whose id is "custom_entity" — NOT to sinks[0], which in a
+        # migrated multi-rung ladder can be a different physical device.
+        from executor.config import ExcessPVSinkSpec
+
+        sinks = [
+            ExcessPVSinkSpec(id="poolpump", entity="switch.poolpump", enabled=True),
+            ExcessPVSinkSpec(id="custom_entity", entity="climate.villavagn", enabled=True),
+        ]
+        engine = self._engine(temp_schedule, temp_db, sinks)
+        slot = engine._parse_slot_plan({"custom_entity_active": True})
+        assert slot.sinks == {"custom_entity": True}
+
+    def test_legacy_slot_maps_custom_entity_by_entity_match(self, temp_schedule, temp_db):
+        # No rung named "custom_entity", but a rung's entity matches the legacy
+        # custom_entity block — identity match wins over position.
+        from executor.config import ExcessPVCustomEntityConfig, ExcessPVSinkSpec
+
+        sinks = [
+            ExcessPVSinkSpec(id="poolpump", entity="switch.poolpump", enabled=True),
+            ExcessPVSinkSpec(id="villavagn_ac", entity="climate.villavagn", enabled=True),
+        ]
+        legacy = ExcessPVCustomEntityConfig(entity="climate.villavagn", enabled=True)
+        engine = self._engine(temp_schedule, temp_db, sinks, custom_entity=legacy)
         slot = engine._parse_slot_plan({"custom_entity_active": True})
         assert slot.sinks == {"villavagn_ac": True}
+
+    def test_legacy_slot_single_rung_maps_without_id_match(self, temp_schedule, temp_db):
+        # Single-rung ladder: mapping is unambiguous even without an identity match.
+        from executor.config import ExcessPVSinkSpec
+
+        sinks = [ExcessPVSinkSpec(id="villavagn_ac", entity="climate.villavagn", enabled=True)]
+        engine = self._engine(temp_schedule, temp_db, sinks)
+        slot = engine._parse_slot_plan({"custom_entity_active": True})
+        assert slot.sinks == {"villavagn_ac": True}
+
+    def test_legacy_slot_ambiguous_multi_rung_leaves_sinks_off(
+        self, temp_schedule, temp_db, caplog
+    ):
+        # Multi-rung ladder with no identifiable legacy rung: never guess a device.
+        # All sinks stay off (safe direction) and the drop is logged loudly.
+        import logging
+
+        engine = self._engine(temp_schedule, temp_db, self._sinks())
+        with caplog.at_level(logging.WARNING, logger="executor.engine"):
+            slot = engine._parse_slot_plan({"custom_entity_active": True})
+        assert slot.sinks == {}
+        assert any(
+            "no configured sink matches the legacy custom_entity rung" in r.message
+            for r in caplog.records
+        )
 
     def test_legacy_slot_without_sinks_config_is_empty(self, temp_schedule, temp_db):
         engine = self._engine(temp_schedule, temp_db, [])
         slot = engine._parse_slot_plan({"custom_entity_active": True})
         assert slot.sinks == {}
         assert slot.custom_entity_active is True
+
+
+class TestSinkActuationIsolation:
+    """One rung's exception must not abort sibling rungs or the inverter actuation."""
+
+    @pytest.fixture
+    def engine(self, temp_schedule, temp_db):
+        from executor.config import ExcessPVConfig, ExcessPVSinkSpec
+
+        with patch("executor.engine.load_executor_config") as mock_config:
+            config = ExecutorConfig(
+                enabled=True,
+                schedule_path=temp_schedule,
+                timezone="Europe/Stockholm",
+                automation_toggle_entity="input_boolean.automation",
+                inverter=InverterConfig(),
+                water_heater=WaterHeaterConfig(),
+                notifications=NotificationConfig(),
+                controller=ControllerConfig(),
+                excess_pv=ExcessPVConfig(
+                    sinks=[
+                        ExcessPVSinkSpec(id="bad_rung", entity="number.bad", enabled=True),
+                        ExcessPVSinkSpec(id="poolpump", entity="switch.poolpump", enabled=True),
+                    ]
+                ),
+            )
+            mock_config.return_value = config
+
+            with patch("executor.engine.load_yaml") as mock_yaml:
+                mock_yaml.return_value = {"input_sensors": {}}
+                with patch.object(ExecutorEngine, "_get_db_path", return_value=temp_db):
+                    engine = ExecutorEngine("config.yaml")
+
+                    mock_ha = MagicMock(spec=HAClient)
+
+                    def side_effect_get_state(entity_id):
+                        if "input_boolean" in entity_id or "automation" in entity_id:
+                            return "on"
+                        if "soc" in entity_id:
+                            return "50"
+                        return "0.0"
+
+                    mock_ha.get_state_value.side_effect = side_effect_get_state
+                    engine.ha_client = mock_ha
+
+                    from executor.actions import ActionDispatcher
+
+                    engine.dispatcher = ActionDispatcher(mock_ha, config, shadow_mode=False)
+                    yield engine
+
+    @pytest.mark.asyncio
+    async def test_rung_exception_does_not_abort_siblings_or_profile(self, engine, temp_schedule):
+        from unittest.mock import AsyncMock
+
+        from executor.actions import ActionResult
+
+        tz = pytz.timezone("Europe/Stockholm")
+        slot_start = datetime.now(tz) - timedelta(minutes=5)
+        schedule = make_schedule([make_slot(slot_start, soc_target=50)])
+        with Path(temp_schedule).open("w", encoding="utf-8") as f:
+            json.dump(schedule, f)
+
+        ok_result = ActionResult(
+            action_type="sink:poolpump", success=True, message="ok", entity_id="switch.poolpump"
+        )
+        engine.dispatcher.set_sink = AsyncMock(
+            side_effect=[ValueError("could not convert string to float: 'on'"), ok_result]
+        )
+        engine.dispatcher.execute = AsyncMock(return_value=[])
+
+        result = await engine.run_once()
+
+        # Both rungs were attempted despite rung 1 raising ...
+        assert engine.dispatcher.set_sink.call_count == 2
+        # ... and the inverter/battery profile actuation still ran.
+        engine.dispatcher.execute.assert_awaited_once()
+        # The bad rung surfaced as a loud failed action, not a silent skip.
+        failed = [
+            a
+            for a in result["actions"]
+            if a.get("type") == "sink:bad_rung" and not a.get("success")
+        ]
+        assert failed and not failed[0].get("skipped")

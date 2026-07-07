@@ -1476,7 +1476,21 @@ class ExecutorEngine:
                                 if is_fallback
                                 else original_slot.sinks.get(sink_cfg.id, False)
                             )
-                            sink_result = await self.dispatcher.set_sink(sink_cfg, sink_on)
+                            # Exception-isolated per rung: one misconfigured
+                            # rung must not abort sibling rungs or the inverter
+                            # profile actuation below. The failed ActionResult
+                            # stays loud via recent_errors + the ws broadcast.
+                            try:
+                                sink_result = await self.dispatcher.set_sink(sink_cfg, sink_on)
+                            except Exception as sink_exc:
+                                logger.error("Sink %s actuation error: %s", sink_cfg.id, sink_exc)
+                                sink_result = ActionResult(
+                                    action_type=f"sink:{sink_cfg.id}",
+                                    success=False,
+                                    message=f"Sink actuation failed: {sink_exc!s}",
+                                    entity_id=sink_cfg.entity,
+                                    error_details=str(sink_exc),
+                                )
                             action_results.append(sink_result)
 
                     # Real-time EV surplus controller (variable charge current, default OFF).
@@ -1752,15 +1766,39 @@ class ExecutorEngine:
         custom_entity_active = bool(slot_data.get("custom_entity_active", False))
 
         # Parse per-sink ladder states. Old schedule files (pre-ladder) only carry
-        # custom_entity_active — map it to the first configured sink so a rolling
-        # deploy keeps actuating the legacy single sink correctly.
+        # custom_entity_active — map it to the legacy sink BY IDENTITY (id, then
+        # entity match against the legacy custom_entity block), never by position:
+        # a migrated multi-rung ladder may have a different device at index 0.
         raw_sinks = slot_data.get("sinks")
         sinks: dict[str, bool] = {}
         if isinstance(raw_sinks, dict):
             for k, v in raw_sinks.items():  # type: ignore[union-attr]
                 sinks[str(k)] = bool(v)  # type: ignore[arg-type]
         elif self.config.excess_pv.sinks:
-            sinks = {self.config.excess_pv.sinks[0].id: custom_entity_active}
+            legacy_entity = self.config.excess_pv.custom_entity.entity
+            legacy_rung = next(
+                (
+                    s
+                    for s in self.config.excess_pv.sinks
+                    if s.id == "custom_entity"
+                    or (legacy_entity is not None and s.entity == legacy_entity)
+                ),
+                None,
+            )
+            if legacy_rung is not None:
+                sinks = {legacy_rung.id: custom_entity_active}
+            elif len(self.config.excess_pv.sinks) == 1:
+                # Single-rung ladder: mapping is unambiguous even without an id match.
+                sinks = {self.config.excess_pv.sinks[0].id: custom_entity_active}
+            else:
+                # Multi-rung ladder with no identifiable legacy rung: leave all sinks
+                # off for this stale pre-ladder slot (safe direction) and say so.
+                logger.warning(
+                    "Pre-ladder schedule slot carries custom_entity_active=%s but no "
+                    "configured sink matches the legacy custom_entity rung - leaving "
+                    "all sinks off until the next plan regenerates",
+                    custom_entity_active,
+                )
 
         return SlotPlan(
             charge_kw=charge_kw,

@@ -46,6 +46,15 @@ _STATE_FILE = "data/deferrable_state.json"
 _LEDGER_FILE = "data/deferrable_cycles.jsonl"
 # Reserved key for chain-tracking metadata inside the state file (not a load id).
 _CHAINS_KEY = "_chains"
+# The cycle detectors merge measured runs separated by <20 min (cycle_learning's
+# fixed merge_gap_minutes=20.0). A silent re-arm whose gap from the PHYSICAL stop
+# (~ last_done_ts - done_delay_s) exceeds this is detected as a SEPARATE run, so
+# the ledger chain must split too — otherwise the new run inherits the previous
+# programme's armed_ts (fabricated shift credit) and its done row erases the
+# previous one via the (load_id, armed_ts) dedupe. At the default done_delay_s=300
+# the silent-rearm horizon (done_delay_s + rearm_cooldown_s = 1200 s) equals this
+# gap, so the split can only trigger when done_delay_s > 300.
+_CYCLE_MERGE_GAP_S = 1200.0
 
 
 def _f(v: Any) -> float | None:
@@ -376,15 +385,24 @@ class DeferrableApplianceController:
                     "held_ever": bool(new_state.held_by_us),
                     "deadline_ts": self._deadline_ts(app, now_dt, new_state.start_ts),
                 }
-            elif new_state.pending and not prev.pending and app.id not in self._chains:
-                # Continuation re-arm after chain state was lost (restart/wipe):
+            elif new_state.pending and not prev.pending:
+                # Silent continuation re-arm. Keep the first-press chain ONLY
+                # while cycle detection will merge the runs into one; past the
+                # merge gap the runs split, and inheriting the old armed_ts would
+                # price a distinct (never-deferred) programme against the previous
+                # arm anchor. Also fresh when chain state was lost (restart/wipe):
                 # no original press is known — record the resume honestly rather
                 # than inventing an earlier timestamp.
-                self._chains[app.id] = {
-                    "armed_ts": new_state.start_ts,
-                    "held_ever": bool(new_state.held_by_us),
-                    "deadline_ts": self._deadline_ts(app, now_dt, new_state.start_ts),
-                }
+                runs_will_split = (
+                    prev.last_done_ts is not None
+                    and (now_ts - (prev.last_done_ts - app.power.done_delay_s)) > _CYCLE_MERGE_GAP_S
+                )
+                if app.id not in self._chains or runs_will_split:
+                    self._chains[app.id] = {
+                        "armed_ts": new_state.start_ts,
+                        "held_ever": bool(new_state.held_by_us),
+                        "deadline_ts": self._deadline_ts(app, now_dt, new_state.start_ts),
+                    }
 
             # Forecast recommendation (duration-aware) for an armed cycle.
             action, window_start = "run", None
@@ -462,7 +480,10 @@ class DeferrableApplianceController:
                         "held_by_us_ever": bool((chain or {}).get("held_ever", False)),
                         "deadline_ts": (chain or {}).get("deadline_ts"),
                         # Not cheaply available here (only instantaneous W reads);
-                        # the savings reader joins energy from cycle detection.
+                        # the publisher back-fills measured_kwh + run window from
+                        # cycle detection at the first publish after done
+                        # (savings_loadshift.enrich_cycle_ledger), so the row
+                        # stays priceable beyond the detection history horizon.
                         "measured_kwh": None,
                     }
                 )

@@ -477,6 +477,51 @@ class TestCycleLedger:
         assert rows[1]["armed_ts"] == pytest.approx(t2 + 3.0)
 
     @pytest.mark.asyncio
+    async def test_silent_rearm_past_merge_gap_starts_fresh_chain(self, tmp_path):
+        """Savings-review regression: with done_delay_s > 300 a silent re-arm can
+        land >20 min after the PHYSICAL stop — the cycle detectors then split the
+        runs, so the chain must split too. Inheriting the old armed_ts would price
+        a never-deferred reload against the previous programme's arm anchor
+        (fabricated credit) and erase the previous row via (load_id, armed_ts)
+        dedupe."""
+        full = _full_cfg()
+        full["deferrable_loads"][0]["done_delay_s"] = 600
+        cfg = parse_deferrable_runtime_config(full)
+        now = datetime.now(TZ)
+        cfg.schedule_path = _write_schedule(tmp_path, [0.5] * 96, now)
+        ctrl = DeferrableApplianceController(
+            cfg,
+            state_file=str(tmp_path / "state.json"),
+            ledger_file=str(tmp_path / "cycles.jsonl"),
+        )
+        ha = FakeHA(
+            {
+                "sensor.tvattmaskin_power": "2000",
+                "switch.tvattmaskin": "on",
+                "input_boolean.washing_machine_override": "off",
+            }
+        )
+        t = now.timestamp()
+        await ctrl.run(ha, t, now, shadow=False)
+        await ctrl.run(ha, t + 3.0, now, shadow=False)  # armed #1
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t + 400.0, now, shadow=False)  # physical stop ~ t+400
+        await ctrl.run(ha, t + 1001.0, now, shadow=False)  # done #1 (600 s delay)
+        # Reload 700 s after done: silent (within the 900 s cooldown) but ~22 min
+        # after the physical stop => detectors WILL split the runs.
+        ha.states["sensor.tvattmaskin_power"] = "2000"
+        await ctrl.run(ha, t + 1701.0, now, shadow=False)
+        await ctrl.run(ha, t + 1704.5, now, shadow=False)  # silent re-arm
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t + 1800.0, now, shadow=False)
+        await ctrl.run(ha, t + 2401.0, now, shadow=False)  # done #2
+        rows = self._rows(tmp_path / "cycles.jsonl")
+        assert len(rows) == 2
+        assert rows[0]["armed_ts"] == pytest.approx(t + 3.0)
+        # Fresh anchor: NOT inherited, so dedupe keeps both physical programmes.
+        assert rows[1]["armed_ts"] == pytest.approx(t + 1704.5)
+
+    @pytest.mark.asyncio
     async def test_held_by_us_ever_true_when_plug_was_held(self, tmp_path):
         """Actuating mode: armed+defer holds the plug OFF; when the cycle later
         completes, the ledger row must record that Darkstar shifted it."""

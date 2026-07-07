@@ -1,5 +1,6 @@
 """Tests for the load-shift savings streams (backend/learning/savings_loadshift.py)."""
 
+import json
 from datetime import datetime
 
 import pytest
@@ -16,8 +17,10 @@ from backend.learning.savings_loadshift import (
     compute_appliance_shift,
     compute_water_shift,
     dedupe_ledger,
+    enrich_cycle_ledger,
     load_cycle_ledger,
     marginal_price,
+    water_unattributed_kwh,
 )
 
 TZ = pytz.timezone("Europe/Stockholm")
@@ -194,6 +197,51 @@ class TestWaterCoverage:
         assert s.n_days == 0
 
 
+class TestWaterUnattributed:
+    """Aggregate-vs-device cross-check: water energy with no (or a zero-wiped)
+    device row is invisible to compute_water_shift (it only sees kwh>0 rows), so
+    the shortfall must be COUNTED as unvalued instead of coverage staying 1.0
+    while the tank credit silently shrinks."""
+
+    def _obs(self, hour, water, quarter=0):
+        return {"slot_start": _slot_start(hour, quarter), "water_kwh": water}
+
+    def test_missing_device_row_counts_as_shortfall(self):
+        obs = [self._obs(12, 0.8), self._obs(13, 0.4)]
+        devs = [_dev(13, 0.4)]
+        assert water_unattributed_kwh(obs, devs, ["main_tank"]) == pytest.approx(0.8)
+
+    def test_zero_wiped_device_row_counts_as_shortfall(self):
+        obs = [self._obs(12, 0.8)]
+        devs = [_dev(12, 0.0)]
+        assert water_unattributed_kwh(obs, devs, ["main_tank"]) == pytest.approx(0.8)
+
+    def test_fully_attributed_window_has_no_shortfall(self):
+        obs = [self._obs(12, 0.8)]
+        devs = [_dev(12, 0.5), _dev(12, 0.3, tank="villavagn_tank")]
+        assert water_unattributed_kwh(obs, devs, ["main_tank", "villavagn_tank"]) == 0.0
+
+    def test_ev_device_rows_do_not_cover_water_energy(self):
+        obs = [self._obs(12, 0.8)]
+        devs = [{"slot_start": _slot_start(12), "device_id": "easee", "kwh": 0.8}]
+        assert water_unattributed_kwh(obs, devs, ["main_tank"]) == pytest.approx(0.8)
+
+    def test_shortfall_surfaces_as_zero_coverage_bucket(self):
+        """The publisher exposes the shortfall as a synthetic zero-credit summary
+        whose coverage drops below 1.0 — the honest signal for wiped slots."""
+        s = WaterShiftSummary(
+            tank_id="unattributed_water",
+            baseline_name="uncovered",
+            actual_cost_sek=0.0,
+            baseline_cost_sek=0.0,
+            credit_sek=0.0,
+            valued_kwh=0.0,
+            unvalued_kwh=0.8,
+            n_days=0,
+        )
+        assert s.coverage == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Appliances
 # ---------------------------------------------------------------------------
@@ -318,6 +366,53 @@ class TestApplianceShift:
         s = compute_appliance_shift([entry], [run], rows, load_id="washer")
         assert s.n_valued_cycles + s.unvalued_cycles == 0
 
+    def test_unheld_chain_merged_reload_cannot_fabricate_credit(self):
+        """Kept-after-done chains can hand a back-to-back reload the PREVIOUS
+        programme's armed_ts. A cycle Darkstar never held must score exactly 0
+        by construction, even when its inherited arm anchor points at a
+        pricier window than the actual run."""
+        rows = _flat_slots(T0, 8, lambda h: 2.0 if h < 2 else 0.5)
+        entry = _entry(T0, T0 + 3 * H + 300, held=False)  # inherited anchor at 2.0-zone
+        run = MeasuredRun(T0 + 2 * H, T0 + 3 * H, 1.0)  # never-deferred reload at 0.5
+        s = compute_appliance_shift([entry], [run], rows, load_id="washer")
+        assert s.credit_sek == pytest.approx(0.0)
+        assert s.baseline_cost_sek == pytest.approx(s.actual_cost_sek)
+        assert s.actual_cost_sek == pytest.approx(0.5)
+        assert s.n_valued_cycles == 1
+
+    def test_old_cycle_priced_from_persisted_run_when_detection_aged_out(self):
+        """A cycle older than the 14-day detection horizon has no live
+        MeasuredRun; the enriched ledger fields must keep it priceable so the
+        30d credit does not structurally decay."""
+        rows = _flat_slots(T0, 8, lambda h: 2.0 if h < 2 else 0.5)
+        entry = CycleLedgerEntry(
+            load_id="washer",
+            armed_ts=T0,
+            done_ts=T0 + 4 * H + 600,
+            held_by_us_ever=True,
+            measured_kwh=1.0,
+            run_start_ts=T0 + 3 * H,
+            run_end_ts=T0 + 4 * H,
+        )
+        s = compute_appliance_shift([entry], [], rows, load_id="washer")
+        assert s.n_valued_cycles == 1
+        assert s.credit_sek == pytest.approx(1.5)
+
+    def test_persisted_window_without_energy_stays_unvalued(self):
+        """Partial enrichment must never invent energy (honesty contract)."""
+        rows = _flat_slots(T0, 8, lambda h: 1.0)
+        entry = CycleLedgerEntry(
+            load_id="washer",
+            armed_ts=T0,
+            done_ts=T0 + 2 * H,
+            held_by_us_ever=True,
+            run_start_ts=T0 + H,
+            run_end_ts=T0 + 2 * H,
+        )
+        s = compute_appliance_shift([entry], [], rows, load_id="washer")
+        assert s.unvalued_cycles == 1
+        assert s.n_valued_cycles == 0
+
 
 class TestLedger:
     def test_dedupe_collapses_continuations_keeping_last_done(self):
@@ -354,6 +449,79 @@ class TestLedger:
 
     def test_load_cycle_ledger_missing_file(self, tmp_path):
         assert load_cycle_ledger(tmp_path / "nope.jsonl") == []
+
+    def test_load_cycle_ledger_parses_persisted_run_window(self, tmp_path):
+        p = tmp_path / "cycles.jsonl"
+        p.write_text(
+            json.dumps(
+                {
+                    "load_id": "washer",
+                    "armed_ts": 100.0,
+                    "done_ts": 200.0,
+                    "measured_kwh": 1.2,
+                    "run_start_ts": 120.0,
+                    "run_end_ts": 180.0,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (entry,) = load_cycle_ledger(p)
+        assert entry.measured_kwh == pytest.approx(1.2)
+        assert entry.run_start_ts == pytest.approx(120.0)
+        assert entry.run_end_ts == pytest.approx(180.0)
+
+
+class TestLedgerEnrichment:
+    """enrich_cycle_ledger: persist the run join at the first publish after done
+    so cycles stay priceable after the HA detection history ages out."""
+
+    def _raw(self, **over):
+        row = {
+            "load_id": "washer",
+            "armed_ts": T0,
+            "done_ts": T0 + 2 * H,
+            "held_by_us_ever": True,
+            "deadline_ts": None,
+            "measured_kwh": None,
+        }
+        row.update(over)
+        return row
+
+    def test_enrich_persists_energy_and_run_window(self, tmp_path):
+        p = tmp_path / "cycles.jsonl"
+        p.write_text(json.dumps(self._raw()) + "\nnot json at all\n", encoding="utf-8")
+        runs = {"washer": [MeasuredRun(T0 + H, T0 + 2 * H, 1.2)]}
+        (entry,) = enrich_cycle_ledger(p, runs)
+        assert entry.measured_kwh == pytest.approx(1.2)
+        assert entry.run_start_ts == pytest.approx(T0 + H)
+        assert entry.run_end_ts == pytest.approx(T0 + 2 * H)
+        # Persisted: a later tick with NO live runs still sees the join.
+        (reloaded,) = load_cycle_ledger(p)
+        assert reloaded.measured_kwh == pytest.approx(1.2)
+        assert reloaded.run_end_ts == pytest.approx(T0 + 2 * H)
+        # Corrupt lines survive the rewrite verbatim.
+        assert "not json at all" in p.read_text(encoding="utf-8")
+
+    def test_enrich_is_idempotent(self, tmp_path):
+        p = tmp_path / "cycles.jsonl"
+        p.write_text(json.dumps(self._raw()) + "\n", encoding="utf-8")
+        enrich_cycle_ledger(p, {"washer": [MeasuredRun(T0 + H, T0 + 2 * H, 1.2)]})
+        first = p.read_text(encoding="utf-8")
+        # A different overlapping run later must NOT overwrite the filled join.
+        enrich_cycle_ledger(p, {"washer": [MeasuredRun(T0, T0 + 2 * H, 9.9)]})
+        assert p.read_text(encoding="utf-8") == first
+
+    def test_enrich_without_match_leaves_file_untouched(self, tmp_path):
+        p = tmp_path / "cycles.jsonl"
+        original = json.dumps(self._raw()) + "\n"
+        p.write_text(original, encoding="utf-8")
+        (entry,) = enrich_cycle_ledger(p, {})
+        assert entry.measured_kwh is None
+        assert p.read_text(encoding="utf-8") == original
+
+    def test_enrich_missing_file_returns_empty(self, tmp_path):
+        assert enrich_cycle_ledger(tmp_path / "nope.jsonl", {}) == []
 
 
 class TestSensors:

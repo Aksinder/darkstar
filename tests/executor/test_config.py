@@ -323,6 +323,46 @@ class TestNormalizeExcessPVSinks:
         )
         assert normalize_excess_pv_sinks({"sink": "disabled", "custom_entity": {}}) == []
 
+    def test_sinks_list_dropping_live_legacy_sink_warns_loudly(self, caplog):
+        # Mixed config: sinks[] is set but the still-enabled legacy custom_entity
+        # sink's entity is not a rung. The ladder must be unchanged (sinks REPLACES
+        # the legacy block) but the silent drop of a live actuated load must warn.
+        import logging
+
+        from executor.config import normalize_excess_pv_sinks
+
+        with caplog.at_level(logging.WARNING, logger="executor.config"):
+            entries = normalize_excess_pv_sinks(
+                {
+                    "sink": "water_heater_boost",
+                    "custom_entity": {"enabled": True, "entity": "climate.villavagn"},
+                    "sinks": [{"entity": "switch.poolpump", "enabled": False}],
+                }
+            )
+        # Ladder is unchanged: only the configured rung, legacy NOT appended.
+        assert [e["entity"] for e in entries] == ["switch.poolpump"]
+        assert any(
+            "REPLACES" in r.message and "climate.villavagn" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_sinks_list_containing_legacy_entity_does_not_warn(self, caplog):
+        # Listing the legacy entity as a rung (even disabled) is an explicit
+        # user choice - no warning.
+        import logging
+
+        from executor.config import normalize_excess_pv_sinks
+
+        with caplog.at_level(logging.WARNING, logger="executor.config"):
+            entries = normalize_excess_pv_sinks(
+                {
+                    "custom_entity": {"enabled": True, "entity": "climate.villavagn"},
+                    "sinks": [{"entity": "climate.villavagn", "enabled": False}],
+                }
+            )
+        assert len(entries) == 1
+        assert not any("REPLACES" in r.message for r in caplog.records)
+
     def test_entries_without_entity_are_skipped(self):
         from executor.config import normalize_excess_pv_sinks
 

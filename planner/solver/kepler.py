@@ -38,8 +38,11 @@ _LP_SOLUTION_OPTIMAL: int = int(pulp.constants.LpSolutionOptimal)  # type: ignor
 
 # Excess-PV sink ladder: rung i earns reward * (1 - i * EPS) per kWh. Small enough
 # never to flip a real economic decision (2% of the 0.5 SEK/kWh default), large
-# enough that under scarce surplus the solver deterministically fills earlier
-# rungs first. Soft by design — no hard chain constraints (the executor-side
+# enough that a PROVEN-optimal solve fills earlier rungs first under scarce
+# surplus. NOTE: the adjacent-rung differential (~0.01 SEK/kWh at the 0.5 default
+# reward) is far below the gapRel=0.01 stop and any time-boxed incumbent gap, so
+# rung ordering is best-effort on early-stopped solves — a within-gap "Optimal"
+# may permute rungs. Soft by design — no hard chain constraints (the executor-side
 # comfort floor can veto a rung at runtime; a hard chain would then wrongly
 # starve the rungs below it).
 SINK_PRIORITY_EPSILON = 0.02
@@ -410,7 +413,11 @@ class KeplerSolver:
             config.excess_pv_sink == "custom_entity" or config.excess_pv_custom_entity_enabled
         )
         sinks: list[ExcessPVSinkSpec] = [s for s in config.excess_pv_sinks if s.enabled]
-        if not sinks and custom_entity_enabled:
+        # Synthesize only when NO ladder list was supplied at all. An all-disabled
+        # ladder (observe-first rollout) must win the dual-read: the executor skips
+        # disabled rungs and actuates nothing, so the planner must schedule nothing —
+        # resurrecting the legacy rung here would make plan and reality diverge.
+        if not config.excess_pv_sinks and custom_entity_enabled:
             sinks = [
                 ExcessPVSinkSpec(
                     id="custom_entity",
@@ -466,23 +473,13 @@ class KeplerSolver:
                 for t in range(T)
             }
 
-        # PERF: extend the hourly decision blocks to the sink binaries (same
-        # rationale as water/boost above). Binaries only exist on flagged +
-        # price-ok slots, so grouping the EXISTING variables by wall-clock hour
-        # implicitly keys each group on (hour, flag, price_ok) — a flag or price
-        # edge inside an hour starts a new group instead of zeroing the hour.
-        if config.water_hourly_blocks and sinks and T > 0:
-            _sink_hour_of: list[Any] = [
-                slots[t].start_time.replace(minute=0, second=0, microsecond=0) for t in range(T)
-            ]
-            for sink in sinks:
-                _sink_groups: defaultdict[Any, list[int]] = defaultdict(list)
-                for t in range(T):
-                    if not isinstance(sink_active[sink.id][t], int):
-                        _sink_groups[_sink_hour_of[t]].append(t)
-                for _sgroup in _sink_groups.values():
-                    for t in _sgroup[1:]:
-                        prob += sink_active[sink.id][t] == sink_active[sink.id][_sgroup[0]]  # type: ignore[operator]
+        # Sink binaries are deliberately NOT hourly-blocked: build #9 solved the
+        # live model with per-slot custom_entity binaries on ALL T slots, and the
+        # flagged+price-ok restriction above already makes this model strictly
+        # smaller. Hour-tying the sinks held the villavagn AC off until the hour
+        # boundary when the SoC gate opened mid-hour (per-slot gate at the
+        # soc_above_threshold constraint below is endogenous — it cannot key the
+        # groups), a live-config behavior change vs build #9.
 
         # Objective Function Terms
         total_cost: list[Any] = []
@@ -1110,6 +1107,14 @@ class KeplerSolver:
         # just the overhead of writing the LP file in prob.solve()
 
         used_solver: str = "highs"
+        # Per-attempt timer: solve_is_time_boxed, the SOLVER_TIMEOUT mapping and the
+        # degraded-quality WARNING all reason about the solver that produced
+        # prob.status, so they must see the LAST attempt's duration — not the
+        # cumulative chain (a slow HiGHS malfunction followed by a fast proven GLPK
+        # solve must not be labeled time-boxed). Reset AFTER constructing each
+        # solver command: on hosts without highspy the exception comes from
+        # pulp.HiGHS(...) itself and construction must not count against the clock.
+        attempt_start: float = build_start
         try:
             # HiGHS FIRST (in-process highspy). Measured on the live 107-slot model:
             # proves optimality in ~13.6s SINGLE-threaded where CBC needs 12 threads
@@ -1124,8 +1129,9 @@ class KeplerSolver:
                 timeLimit=SOLVER_TIME_LIMIT_S,
                 gapRel=0.01,
             )
+            attempt_start = time.time()
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
-            _highs_duration: float = time.time() - build_start
+            _highs_duration: float = time.time() - attempt_start
             # A FAST NotSolved is a solver malfunction (e.g. the global-scheduler
             # thread mismatch, a load error) — prob.solve does NOT raise for it.
             # Never ship it: fall through and RE-SOLVE with CBC. A slow NotSolved
@@ -1161,10 +1167,12 @@ class KeplerSolver:
                     gapRel=0.01,
                     threads=max(1, os.cpu_count() or 1),
                 )
+                attempt_start = time.time()
                 prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
             except Exception:
                 used_solver = "glpk"
                 solver_cmd = pulp.GLPK_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_S)
+                attempt_start = time.time()
                 prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
 
         solve_end: float = time.time()
@@ -1174,7 +1182,11 @@ class KeplerSolver:
         is_optimal: bool = status == "Optimal"
 
         # Log Performance Metrics
-        solve_duration: float = solve_end - build_start  # This is just the solve() call duration
+        # solve_duration covers ONLY the final solver attempt (the one that produced
+        # prob.status); total_duration covers the whole fallback chain including the
+        # LP-write overhead inside prob.solve().
+        solve_duration: float = solve_end - attempt_start
+        total_duration: float = solve_end - build_start
         # Count stats
         var_count: int = len(prob.variables())  # type: ignore[reportUnknownMemberType,arg-type]
         const_count: int = len(prob.constraints)  # type: ignore[reportUnknownMemberType,arg-type]
@@ -1229,6 +1241,7 @@ class KeplerSolver:
                     details={
                         "solver_status": status,
                         "solve_duration_s": round(solve_duration, 3),
+                        "chain_duration_s": round(total_duration, 3),
                         "reason": "time-boxed incumbent violates water comfort floors",
                         "floor_violation_kwh": round(floor_violation_kwh, 2),
                     },
@@ -1246,8 +1259,13 @@ class KeplerSolver:
             prob.writeLP("kepler_debug.lp")  # type: ignore[reportUnknownMemberType]
             print(f"Solver failed: {status}. LP written to kepler_debug.lp")
 
-            # Map PuLP status to structured PlannerError
-            details = {"solver_status": status, "solve_duration_s": round(solve_duration, 3)}
+            # Map PuLP status to structured PlannerError. solve_duration_s is the
+            # final attempt only; chain_duration_s is the whole fallback chain.
+            details = {
+                "solver_status": status,
+                "solve_duration_s": round(solve_duration, 3),
+                "chain_duration_s": round(total_duration, 3),
+            }
             if prob.status == pulp.LpStatusInfeasible:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_INFEASIBLE, details=details)
             elif solve_duration >= 0.95 * SOLVER_TIME_LIMIT_S:
@@ -1256,11 +1274,14 @@ class KeplerSolver:
                 raise PlannerError(code=PlannerErrorCode.SOLVER_TIMEOUT, details=details)
             elif prob.status == pulp.LpStatusUndefined:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_UNDEFINED, details=details)
-            elif prob.status == pulp.LpStatusNotSolved:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+            else:
                 # A fast NotSolved that survived the whole fallback chain used to
                 # slip through here and return a KeplerResult with EMPTY slots
                 # (empirically reproduced) — the executor would happily act on a
-                # plan that schedules nothing. Fail loud instead.
+                # plan that schedules nothing. Fail loud instead. Unconditional
+                # else: also catches LpStatusUnbounded and any future status, so
+                # no non-optimal outcome can ship an empty plan silently
+                # (details carries solver_status for diagnosis).
                 raise PlannerError(code=PlannerErrorCode.SOLVER_UNDEFINED, details=details)  # type: ignore[reportUnknownArgumentType]
 
         result_slots: list[KeplerResultSlot] = []
@@ -1382,7 +1403,7 @@ class KeplerSolver:
             logger_perf.info(
                 "Kepler Solved: %d slots in %.3fs (Vars: %d, Const: %d) | Cost: %.2f SEK",
                 T,
-                solve_duration,
+                total_duration,
                 var_count,
                 const_count,
                 final_total_cost,

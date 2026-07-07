@@ -1029,6 +1029,36 @@ class TestSetSink:
         assert result.success and result.skipped
 
     @pytest.mark.asyncio
+    async def test_number_sink_non_numeric_on_value_fails_without_raising(self):
+        # A number-domain rung misconfigured with switch-style on_value ("on"):
+        # float("on") must surface as a failed ActionResult, never an exception
+        # that would abort sibling rungs and the inverter actuation.
+        sink = self._switch_sink(
+            id="heater", entity="number.heater_power", on_value="on", off_value="off"
+        )
+        ha = MagicMock()
+        ha.get_state_value = AsyncMock(return_value="0")
+        ha.set_number = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_sink(sink, True)
+
+        assert not result.success and not result.skipped
+        ha.set_number.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_wrapper_skips_disabled_first_sink(self):
+        # Observe-first ladder shape: sinks[0].enabled=False must NEVER be
+        # actuated via the legacy wrapper (regression: `or bool(sinks)` made
+        # the enabled check dead code).
+        sink = self._switch_sink(enabled=False)
+        ha = MagicMock()
+        ha.get_state_value = AsyncMock(return_value="off")
+        ha.set_switch = AsyncMock(return_value=True)
+        result = await self._dispatcher(ha, self._config([sink])).set_custom_entity("1")
+
+        assert result.success and result.skipped
+        ha.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_legacy_wrapper_uses_first_sink(self):
         # set_custom_entity must keep working, delegating to sinks[0].
         sink = self._climate_sink()
