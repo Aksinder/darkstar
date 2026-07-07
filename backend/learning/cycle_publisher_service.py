@@ -174,6 +174,9 @@ class DeferrablePublisherService:
         self._state_path = state_path
         # tank_id -> persisted state dict, loaded once and applied lazily per tank.
         self._persisted: dict[str, dict[str, float]] = self._load_states()
+        # Last detected cycles per appliance, kept so the load-shift savings can
+        # join measured run windows/energy WITHOUT a second 14-day history pull.
+        self.last_cycles: dict[str, list[DetectedCycle]] = {}
 
     # -- appliances ---------------------------------------------------------
 
@@ -192,6 +195,7 @@ class DeferrablePublisherService:
     async def _run_appliance(self, app: TrackedAppliance, today: date) -> list[PublishedSensor]:
         rows = await self._fetch_history(app.signal_entity, self._history_hours)
         cycles = self._detect(app, rows)
+        self.last_cycles[app.id] = cycles
         stats = CycleStats.from_cycles(
             cycles,
             seed_duration_min=app.seed_duration_min,
@@ -410,6 +414,7 @@ async def run_publisher_loop(
         make_ha_headers,
     )
     from backend.learning.cycle_publisher import (
+        build_loadshift_sensors,
         build_realism_sensors,
         build_savings_sensors,
         build_unknown_load_sensor,
@@ -506,6 +511,103 @@ async def run_publisher_loop(
         history_hours=history_hours,
     )
 
+    # Load-shift savings (savings v2): tanks credited per-device from
+    # slot_device_energy, appliances from the deferrable cycle ledger joined with
+    # the cycles this service ALREADY detects each tick (no extra HA pulls).
+    # Per-tank baseline is configurable (water_heaters[].savings_baseline);
+    # default is the pre-Darkstar four-cheapest-hours automation.
+    water_specs = [
+        (
+            str(wh["id"]),
+            float(wh.get("power_kw", 3.0)),
+            str(wh.get("savings_baseline", "four_cheapest_hours")),
+        )
+        for wh in cast("list[dict[str, Any]]", config.get("water_heaters", []) or [])
+        if wh.get("id") and wh.get("enabled", True)
+    ]
+
+    async def publish_loadshift() -> None:
+        """Publish sensor.darkstar_loadshift_today/_30d (see savings_loadshift.py).
+
+        Pure computation over already-fetched DB rows + this tick's detected
+        cycles; skipped silently when the learning DB is absent — observability,
+        never a blocker.
+        """
+        import pytz
+
+        from backend.learning.savings_loadshift import (
+            LoadshiftSummary,
+            MeasuredRun,
+            compute_appliance_shift,
+            compute_water_shift,
+            load_cycle_ledger,
+        )
+        from backend.learning.store import LearningStore
+
+        if not water_specs and not appliances:
+            return
+        learning_cfg: dict[str, Any] = config.get("learning", {}) or {}
+        db_path = str(learning_cfg.get("sqlite_path", "data/planner_learning.db"))
+        if not Path(db_path).exists():
+            return
+        tz = pytz.timezone(str(config.get("timezone", "Europe/Stockholm")))
+        now = datetime.now(tz)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_30d = now - timedelta(days=30)
+        store = LearningStore(db_path, tz)
+        try:
+            d30_rows = await store.get_observation_rows_between(
+                start_30d.isoformat(), now.isoformat()
+            )
+            d30_dev = await store.get_device_energy_rows_between(
+                start_30d.isoformat(), now.isoformat()
+            )
+        finally:
+            await store.close()
+        midnight_iso = midnight.isoformat()
+        today_rows = [r for r in d30_rows if str(r["slot_start"]) >= midnight_iso]
+        today_dev = [r for r in d30_dev if str(r["slot_start"]) >= midnight_iso]
+
+        ledger = load_cycle_ledger("data/deferrable_cycles.jsonl")
+        runs_by_load = {
+            aid: [
+                MeasuredRun(c.start.timestamp(), c.end.timestamp(), c.energy_kwh)
+                for c in cycles
+                if c.complete and c.energy_kwh > 0
+            ]
+            for aid, cycles in service.last_cycles.items()
+        }
+
+        def summarize(
+            rows: list[dict[str, Any]],
+            dev_rows: list[dict[str, Any]],
+            w_start_ts: float,
+            w_end_ts: float,
+        ) -> LoadshiftSummary:
+            water = tuple(
+                compute_water_shift(rows, dev_rows, tank_id=tid, element_power_kw=pkw, baseline=bl)
+                for tid, pkw, bl in water_specs
+            )
+            apps = tuple(
+                compute_appliance_shift(
+                    ledger,
+                    runs_by_load.get(app.id, []),
+                    rows,
+                    load_id=app.id,
+                    window_start_ts=w_start_ts,
+                    window_end_ts=w_end_ts,
+                )
+                for app in appliances
+            )
+            return LoadshiftSummary(water=water, appliances=apps)
+
+        sensors = build_loadshift_sensors(
+            summarize(today_rows, today_dev, midnight.timestamp(), now.timestamp()),
+            summarize(d30_rows, d30_dev, start_30d.timestamp(), now.timestamp()),
+        )
+        if sensors:
+            await publish(sensors)
+
     # Optional: publish the already-computed residual (total minus metered controllable) so the
     # unmetered "unknown" load is visible/trended. Reuses LoadDisaggregator (no new disaggregation).
     disaggregator = None
@@ -525,7 +627,8 @@ async def run_publisher_loop(
         if not total_kw or total_kw <= 0.0:
             logger.debug(
                 "Unknown-load: total-load read from %s invalid (%s); holding last value",
-                load_power_entity, total_kw,
+                load_power_entity,
+                total_kw,
             )
             return
         controllable_kw = await disaggregator.update_current_power()
@@ -563,6 +666,10 @@ async def run_publisher_loop(
             await publish_savings()
         except Exception as exc:
             logger.debug("Savings publish skipped: %s", exc)
+        try:
+            await publish_loadshift()
+        except Exception as exc:
+            logger.debug("Load-shift savings publish skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
 

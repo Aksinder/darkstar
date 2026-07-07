@@ -383,3 +383,139 @@ class TestActuation:
         })
         await ctrl.run(ha, now.timestamp(), now, shadow=False)
         assert not any(c[1] in ("turn_on", "turn_off") for c in ha.calls)
+
+
+class TestCycleLedger:
+    """The append-only arm->done ledger (savings v2 input)."""
+
+    def _ctrl(self, tmp_path, prices, observe_only=True, **states):
+        cfg = parse_deferrable_runtime_config(_full_cfg(observe_only=observe_only))
+        now = datetime.now(TZ)
+        cfg.schedule_path = _write_schedule(tmp_path, prices, now)
+        ctrl = DeferrableApplianceController(
+            cfg,
+            state_file=str(tmp_path / "state.json"),
+            ledger_file=str(tmp_path / "cycles.jsonl"),
+        )
+        ha = FakeHA({
+            "sensor.tvattmaskin_power": "2000", "switch.tvattmaskin": "on",
+            "input_boolean.washing_machine_override": "off",
+            **states,
+        })
+        return ctrl, ha, now, tmp_path / "cycles.jsonl"
+
+    def _rows(self, path):
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    @pytest.mark.asyncio
+    async def test_done_writes_row_with_armed_ts_before_state_clear(self, tmp_path):
+        ctrl, ha, now, ledger = self._ctrl(tmp_path, [0.5] * 60)
+        t = now.timestamp()
+        await ctrl.run(ha, t, now, shadow=False)
+        await ctrl.run(ha, t + 3.0, now, shadow=False)  # armed
+        # Cycle finishes: low power sustained past done_delay_s (300 s).
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t + 400.0, now, shadow=False)  # below_since starts
+        await ctrl.run(ha, t + 701.0, now, shadow=False)  # done fires
+        rows = self._rows(ledger)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["load_id"] == "washer"
+        assert row["armed_ts"] == pytest.approx(t + 3.0)  # captured before the clear
+        assert row["done_ts"] == pytest.approx(t + 701.0)
+        assert row["held_by_us_ever"] is False
+        assert row["measured_kwh"] is None
+        # Soft deadline anchored to arming: window_hours (14 h) from armed_ts.
+        assert row["deadline_ts"] == pytest.approx(t + 3.0 + 14 * 3600.0)
+
+    @pytest.mark.asyncio
+    async def test_continuation_keeps_first_armed_ts(self, tmp_path):
+        """A re-arm within rearm_cooldown_s is the same physical programme: its
+        done row must carry the FIRST armed_ts so the reader can collapse both
+        rows into one cycle."""
+        ctrl, ha, now, ledger = self._ctrl(tmp_path, [0.5] * 60)
+        t = now.timestamp()
+        await ctrl.run(ha, t, now, shadow=False)
+        await ctrl.run(ha, t + 3.0, now, shadow=False)  # genuine arm
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t + 400.0, now, shadow=False)
+        await ctrl.run(ha, t + 701.0, now, shadow=False)  # done #1 (soak pause)
+        # Programme resumes within the 900 s cooldown => silent continuation arm.
+        ha.states["sensor.tvattmaskin_power"] = "2000"
+        await ctrl.run(ha, t + 720.0, now, shadow=False)
+        await ctrl.run(ha, t + 724.0, now, shadow=False)  # re-armed, no event
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t + 800.0, now, shadow=False)
+        await ctrl.run(ha, t + 1101.0, now, shadow=False)  # done #2
+        rows = self._rows(ledger)
+        assert len(rows) == 2
+        assert rows[0]["armed_ts"] == rows[1]["armed_ts"] == pytest.approx(t + 3.0)
+        assert rows[1]["done_ts"] > rows[0]["done_ts"]
+
+    @pytest.mark.asyncio
+    async def test_new_cycle_after_cooldown_gets_fresh_armed_ts(self, tmp_path):
+        ctrl, ha, now, ledger = self._ctrl(tmp_path, [0.5] * 200)
+        t = now.timestamp()
+        await ctrl.run(ha, t, now, shadow=False)
+        await ctrl.run(ha, t + 3.0, now, shadow=False)
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t + 400.0, now, shadow=False)
+        await ctrl.run(ha, t + 701.0, now, shadow=False)  # done #1
+        # Next load starts well past rearm_cooldown_s (900 s): a genuine new cycle.
+        t2 = t + 701.0 + 1000.0
+        ha.states["sensor.tvattmaskin_power"] = "2000"
+        await ctrl.run(ha, t2, now, shadow=False)
+        await ctrl.run(ha, t2 + 3.0, now, shadow=False)  # armed (new chain)
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t2 + 100.0, now, shadow=False)
+        await ctrl.run(ha, t2 + 401.0, now, shadow=False)  # done #2
+        rows = self._rows(ledger)
+        assert len(rows) == 2
+        assert rows[0]["armed_ts"] == pytest.approx(t + 3.0)
+        assert rows[1]["armed_ts"] == pytest.approx(t2 + 3.0)
+
+    @pytest.mark.asyncio
+    async def test_held_by_us_ever_true_when_plug_was_held(self, tmp_path):
+        """Actuating mode: armed+defer holds the plug OFF; when the cycle later
+        completes, the ledger row must record that Darkstar shifted it."""
+        prices = [0.8, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0] + [0.3] * 16
+        ctrl, ha, now, ledger = self._ctrl(tmp_path, prices, observe_only=False)
+        t = now.timestamp()
+        await ctrl.run(ha, t, now, shadow=False)
+        await ctrl.run(ha, t + 3.0, now, shadow=False)  # armed -> deferred, plug off
+        assert ha.states["switch.tvattmaskin"] == "off"
+        # Window arrives: cheap-now schedule resumes the plug.
+        ctrl.cfg.schedule_path = _write_schedule(tmp_path, [0.1] * 24, datetime.now(TZ))
+        await ctrl.run(ha, t + 60.0, now, shadow=False)
+        assert ha.states["switch.tvattmaskin"] == "on"
+        # Machine runs and finishes.
+        ha.states["sensor.tvattmaskin_power"] = "2000"
+        await ctrl.run(ha, t + 120.0, now, shadow=False)
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl.run(ha, t + 200.0, now, shadow=False)
+        await ctrl.run(ha, t + 501.0, now, shadow=False)  # done
+        rows = self._rows(ledger)
+        assert len(rows) == 1
+        assert rows[0]["held_by_us_ever"] is True
+
+    @pytest.mark.asyncio
+    async def test_chain_survives_state_file_roundtrip(self, tmp_path):
+        """A restart between arm and done must not lose the chain's armed_ts."""
+        ctrl, ha, now, ledger = self._ctrl(tmp_path, [0.5] * 60)
+        t = now.timestamp()
+        await ctrl.run(ha, t, now, shadow=False)
+        await ctrl.run(ha, t + 3.0, now, shadow=False)  # armed; state+chain saved
+        # New controller instance (simulated restart) loads the persisted chain.
+        ctrl2 = DeferrableApplianceController(
+            ctrl.cfg,
+            state_file=str(tmp_path / "state.json"),
+            ledger_file=str(tmp_path / "cycles.jsonl"),
+        )
+        ha.states["sensor.tvattmaskin_power"] = "0"
+        await ctrl2.run(ha, t + 400.0, now, shadow=False)
+        await ctrl2.run(ha, t + 701.0, now, shadow=False)  # done
+        rows = self._rows(ledger)
+        assert len(rows) == 1
+        assert rows[0]["armed_ts"] == pytest.approx(t + 3.0)
