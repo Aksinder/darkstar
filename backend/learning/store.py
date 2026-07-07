@@ -85,6 +85,8 @@ class LearningStore:
                     "export_kwh": row.export_kwh,
                     "pv_kwh": row.pv_kwh,
                     "load_kwh": row.load_kwh,
+                    "water_kwh": row.water_kwh,
+                    "ev_charging_kwh": row.ev_charging_kwh,
                     "import_price_sek_kwh": row.import_price_sek_kwh,
                     "export_price_sek_kwh": row.export_price_sek_kwh,
                 }
