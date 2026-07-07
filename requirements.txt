@@ -10,7 +10,10 @@ lightgbm>=4.0.0
 nordpool>=0.2
 open-meteo-solar-forecast
 pandas>=2.0.0
-pulp>=2.9.0,<4.0.0
+# pulp floor 3.0: older wrappers had a buggier HiGHS status mapping
+# (verified against pulp 3.3.2 apis/highs_api.py).
+pulp>=3.0.0,<4.0.0
+highspy>=1.15.1,<2.0.0
 pydantic>=2.0.0
 python-dateutil>=2.8.0
 python-json-logger>=2.0.7

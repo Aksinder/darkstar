@@ -67,6 +67,25 @@ class DeferrableLoadInput:
 
 
 @dataclass
+class ExcessPVSinkSpec:
+    """One rung of the prioritized excess-PV sink ladder (solver view).
+
+    Ladder order (the list index in ``KeplerConfig.excess_pv_sinks``) is the
+    priority: earlier rungs earn a slightly higher per-kWh reward, so under
+    scarce surplus the solver fills them first. Only the fields the MILP needs
+    live here — entity/actuation details stay executor-side.
+    """
+
+    id: str
+    power_kw: float = 1.0
+    # Optional export-price ceiling (SEK/kWh): the rung may only activate in slots
+    # where export_price <= ceiling (incl. negative) — soak surplus locally only
+    # when exporting pays little or nothing. None => no price gate.
+    price_ceiling_sek_per_kwh: float | None = None
+    enabled: bool = False
+
+
+@dataclass
 class LoadPriority:
     """Resolved per-load willingness-to-pay (WTP) parameters.
 
@@ -186,6 +205,11 @@ class KeplerConfig:
     # sell it otherwise. None => no price gate (legacy behaviour). This is what makes the
     # villavagn-AC cooling sink fire on "low or minus price" rather than on any surplus.
     excess_pv_price_ceiling_sek_per_kwh: float | None = None
+    # Prioritized excess-PV sink ladder (ordered: index = priority rung after the
+    # water-heater boost). When non-empty this replaces the legacy scalar
+    # custom-entity fields above; when empty the solver synthesizes a single rung
+    # from them so old callers/configs behave byte-identically.
+    excess_pv_sinks: list[ExcessPVSinkSpec] = field(default_factory=lambda: [])
 
     # Deferrable household loads (dishwasher, washing machine, ...)
     deferrable_loads: list[DeferrableLoadInput] = field(default_factory=lambda: [])
@@ -297,7 +321,10 @@ class KeplerResultSlot:
     water_heating_boost: dict[str, bool] = field(
         default_factory=lambda: {}
     )  # Per-device: heater_id -> boost active
-    custom_entity_active: bool = False  # Whether custom entity sink should be on
+    custom_entity_active: bool = False  # First-sink activation (backward compat mirror)
+    sink_states: dict[str, bool] = field(
+        default_factory=lambda: {}
+    )  # Per-sink: sink_id -> active this slot
     deferrable_load_kw: float = 0.0  # Aggregate deferrable-load power this slot
     deferrable_load_results: dict[str, float] = field(
         default_factory=lambda: {}

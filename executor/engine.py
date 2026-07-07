@@ -1459,27 +1459,25 @@ class ExecutorEngine:
                             water_result = await self.dispatcher.set_water_temp(decision.water_temp)
                             action_results.append(water_result)
 
-                    # Control Excess PV Custom Entity (7.2-7.4)
-                    from executor.config import ExcessPVSinkType
-
-                    if (
-                        self.config.excess_pv.sink == ExcessPVSinkType.CUSTOM_ENTITY
-                        or self.config.excess_pv.custom_entity.enabled
-                    ):
+                    # Control the excess-PV sink ladder (7.2-7.4). The loader
+                    # synthesizes .sinks from the legacy custom_entity block, so
+                    # this loop covers both schema generations. Disabled rungs are
+                    # never actuated (observe-first rollout).
+                    if self.config.excess_pv.sinks:
                         is_fallback = (
                             override.override_needed
                             and override.override_type.value == "slot_failure_fallback"
                         )
-                        if is_fallback:
-                            custom_value = self.config.excess_pv.custom_entity.off_value
-                        else:
-                            custom_value = (
-                                self.config.excess_pv.custom_entity.on_value
-                                if original_slot.custom_entity_active
-                                else self.config.excess_pv.custom_entity.off_value
+                        for sink_cfg in self.config.excess_pv.sinks:
+                            if not sink_cfg.enabled:
+                                continue
+                            sink_on = (
+                                False
+                                if is_fallback
+                                else original_slot.sinks.get(sink_cfg.id, False)
                             )
-                        custom_result = await self.dispatcher.set_custom_entity(custom_value)
-                        action_results.append(custom_result)
+                            sink_result = await self.dispatcher.set_sink(sink_cfg, sink_on)
+                            action_results.append(sink_result)
 
                     # Real-time EV surplus controller (variable charge current, default OFF).
                     # Isolated so a transient HA read can never break the main actuation.
@@ -1753,6 +1751,17 @@ class ExecutorEngine:
         # Parse custom entity active flag
         custom_entity_active = bool(slot_data.get("custom_entity_active", False))
 
+        # Parse per-sink ladder states. Old schedule files (pre-ladder) only carry
+        # custom_entity_active — map it to the first configured sink so a rolling
+        # deploy keeps actuating the legacy single sink correctly.
+        raw_sinks = slot_data.get("sinks")
+        sinks: dict[str, bool] = {}
+        if isinstance(raw_sinks, dict):
+            for k, v in raw_sinks.items():  # type: ignore[union-attr]
+                sinks[str(k)] = bool(v)  # type: ignore[arg-type]
+        elif self.config.excess_pv.sinks:
+            sinks = {self.config.excess_pv.sinks[0].id: custom_entity_active}
+
         return SlotPlan(
             charge_kw=charge_kw,
             discharge_kw=discharge_kw,
@@ -1767,6 +1776,7 @@ class ExecutorEngine:
             water_heater_plans=water_heater_plans,
             water_heating_boost=water_heating_boost,
             custom_entity_active=custom_entity_active,
+            sinks=sinks,
             export_price_sek_kwh=float(slot_data.get("export_price_sek_kwh", 0.0) or 0.0),
         )
 
