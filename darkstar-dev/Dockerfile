@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # GLPK solver for PuLP (Kepler optimizer)
     glpk-utils \
     libglpk-dev \
+    # OpenMP runtime for highspy (HiGHS primary solver); its manylinux wheel
+    # links libgomp.so.1, absent from python:3.12-slim -> import fails -> CBC fallback
+    libgomp1 \
     # Build dependencies for any packages that need compilation
     gcc \
     g++ \
