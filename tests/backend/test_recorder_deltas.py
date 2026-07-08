@@ -2386,3 +2386,218 @@ class TestSensorGuards:
 
         assert len(ev_charger_sensors) == 1
         assert "ev_sensor.ev_power" in [name for name, _ in power_reads]
+
+
+class TestPVEnergyFromPowerHistory:
+    """PV energy prefers pv_power history integration, then cumulative, then snapshot.
+
+    On sites where total_pv_production only counts part of the array (e.g. a Sungrow-only
+    kWh counter that omits an AC-coupled Fronius), integrating the combined pv_power sensor
+    over the slot window is the only path that captures full production.
+    """
+
+    @pytest.fixture
+    def pv_config(self):
+        return {
+            "timezone": "Europe/Stockholm",
+            "learning": {"sqlite_path": ":memory:"},
+            "input_sensors": {
+                "pv_power": "sensor.pv_power",
+                "load_power": "sensor.load_power",
+                "grid_power": "sensor.grid_power",
+                "battery_power": "sensor.battery_power",
+                "battery_soc": "sensor.battery_soc",
+                "total_pv_production": "sensor.total_pv_production",
+                "total_load_consumption": "sensor.total_load_consumption",
+            },
+            "system": {
+                "grid_meter_type": "net",
+                "has_battery": True,
+                "grid": {"max_power_kw": 20.0},
+            },
+            "water_heaters": [],
+            "ev_chargers": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_pv_uses_power_history_when_available(self, pv_config):
+        """(a) pv_power history returns a value -> pv_kwh uses it (over cumulative)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            state_store = RecorderStateStore(state_file)
+            state_store.load()
+            now = datetime.now(pytz.timezone("Europe/Stockholm"))
+            prev_time = now - timedelta(minutes=15)
+            # Seed prev cumulative so the cumulative path WOULD yield 1.25 kWh — the test
+            # proves history (3.0) wins over that competing value.
+            state_store._state = {
+                "pv_total": {"value": 100.0, "timestamp": prev_time.isoformat()},
+                "load_total": {"value": 50.0, "timestamp": prev_time.isoformat()},
+            }
+            state_store.save()
+
+            async def mock_get_ha_sensor_kw_normalized(entity):
+                return {
+                    "sensor.pv_power": 5.0,
+                    "sensor.load_power": 3.0,
+                    "sensor.grid_power": 1.0,
+                    "sensor.battery_power": 0.0,
+                }.get(entity, 0.0)
+
+            async def mock_get_ha_sensor_float(entity):
+                return {
+                    "sensor.total_pv_production": 101.25,  # cumulative would give +1.25
+                    "sensor.total_load_consumption": 50.75,
+                    "sensor.battery_soc": 50.0,
+                }.get(entity)
+
+            async def mock_history(entity_id, start, end):
+                # Combined PV (Sungrow DC + Fronius AC) integrated over the slot.
+                return 3.0 if entity_id == "sensor.pv_power" else None
+
+            with (
+                patch(
+                    "backend.recorder.get_ha_sensor_kw_normalized",
+                    side_effect=mock_get_ha_sensor_kw_normalized,
+                ),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
+                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=pv_config, state_store=state_store
+                    )
+
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+
+                    # History wins over the cumulative delta (1.25) and snapshot (1.25).
+                    assert record["pv_kwh"] == pytest.approx(3.0, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_pv_falls_back_to_cumulative_when_history_none(self, pv_config):
+        """(b) history returns None -> falls back to cumulative delta."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            state_store = RecorderStateStore(state_file)
+            state_store.load()
+            now = datetime.now(pytz.timezone("Europe/Stockholm"))
+            prev_time = now - timedelta(minutes=15)
+            state_store._state = {
+                "pv_total": {"value": 100.0, "timestamp": prev_time.isoformat()},
+                "load_total": {"value": 50.0, "timestamp": prev_time.isoformat()},
+            }
+            state_store.save()
+
+            async def mock_get_ha_sensor_kw_normalized(entity):
+                return {
+                    "sensor.pv_power": 5.0,  # snapshot would give 1.25 — must NOT be used here
+                    "sensor.load_power": 3.0,
+                    "sensor.grid_power": 1.0,
+                    "sensor.battery_power": 0.0,
+                }.get(entity, 0.0)
+
+            async def mock_get_ha_sensor_float(entity):
+                return 50.0 if entity == "sensor.battery_soc" else None
+
+            async def mock_get_ha_entity_state(entity):
+                # Cumulative counter read path (value + unit) — delta = 101.5 - 100 = 1.5 kWh.
+                return {
+                    "sensor.total_pv_production": {
+                        "state": "101.5",
+                        "attributes": {"unit_of_measurement": "kWh"},
+                        "last_updated": now.isoformat(),
+                    },
+                    "sensor.total_load_consumption": {
+                        "state": "50.75",
+                        "attributes": {"unit_of_measurement": "kWh"},
+                        "last_updated": now.isoformat(),
+                    },
+                }.get(entity)
+
+            async def mock_history(entity_id, start, end):
+                return None  # history unavailable for all entities
+
+            with (
+                patch(
+                    "backend.recorder.get_ha_sensor_kw_normalized",
+                    side_effect=mock_get_ha_sensor_kw_normalized,
+                ),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
+                patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
+                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=pv_config, state_store=state_store
+                    )
+
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+
+                    # Cumulative delta (1.5), not the snapshot (1.25).
+                    assert record["pv_kwh"] == pytest.approx(1.5, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_pv_falls_back_to_snapshot_when_neither_available(self, pv_config):
+        """(c) neither history nor cumulative -> terminal power snapshot (pv_kw * 0.25)."""
+        # No cumulative PV counter configured.
+        pv_config["input_sensors"].pop("total_pv_production", None)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            state_store = RecorderStateStore(state_file)
+            state_store.load()
+
+            async def mock_get_ha_sensor_kw_normalized(entity):
+                return {
+                    "sensor.pv_power": 4.0,  # snapshot: 4.0 * 0.25 = 1.0 kWh
+                    "sensor.load_power": 2.0,
+                    "sensor.grid_power": 1.0,
+                    "sensor.battery_power": 0.0,
+                }.get(entity, 0.0)
+
+            async def mock_get_ha_sensor_float(entity):
+                return 50.0 if entity == "sensor.battery_soc" else None
+
+            async def mock_history(entity_id, start, end):
+                return None  # history unavailable
+
+            with (
+                patch(
+                    "backend.recorder.get_ha_sensor_kw_normalized",
+                    side_effect=mock_get_ha_sensor_kw_normalized,
+                ),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
+                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=pv_config, state_store=state_store
+                    )
+
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+
+                    assert record["pv_kwh"] == pytest.approx(1.0, abs=0.01)
