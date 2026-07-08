@@ -2482,6 +2482,71 @@ class TestPVEnergyFromPowerHistory:
                     assert record["pv_kwh"] == pytest.approx(3.0, abs=0.01)
 
     @pytest.mark.asyncio
+    async def test_pv_history_zero_is_valid_not_fallback(self, pv_config):
+        """(a2) history returns 0.0 (clear night: real zero, not missing data) ->
+        pv_kwh records 0.0 and does NOT fall back to the cumulative delta. Guards
+        against a future refactor to a truthy check (`if pv_history_kwh:`) that would
+        silently record a wrong non-zero PV every night."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            state_store = RecorderStateStore(state_file)
+            state_store.load()
+            now = datetime.now(pytz.timezone("Europe/Stockholm"))
+            prev_time = now - timedelta(minutes=15)
+            # Seed prev cumulative so the fallback WOULD yield 1.25 kWh — the test proves
+            # history's real 0.0 wins over that competing non-zero value.
+            state_store._state = {
+                "pv_total": {"value": 100.0, "timestamp": prev_time.isoformat()},
+                "load_total": {"value": 50.0, "timestamp": prev_time.isoformat()},
+            }
+            state_store.save()
+
+            async def mock_get_ha_sensor_kw_normalized(entity):
+                return {
+                    "sensor.pv_power": 5.0,  # snapshot would give 1.25 — must NOT be used
+                    "sensor.load_power": 3.0,
+                    "sensor.grid_power": 1.0,
+                    "sensor.battery_power": 0.0,
+                }.get(entity, 0.0)
+
+            async def mock_get_ha_sensor_float(entity):
+                return {
+                    "sensor.total_pv_production": 101.25,  # cumulative would give +1.25
+                    "sensor.total_load_consumption": 50.75,
+                    "sensor.battery_soc": 50.0,
+                }.get(entity)
+
+            async def mock_history(entity_id, start, end):
+                # Real integrated zero for PV (night); other sensors have no history.
+                return 0.0 if entity_id == "sensor.pv_power" else None
+
+            with (
+                patch(
+                    "backend.recorder.get_ha_sensor_kw_normalized",
+                    side_effect=mock_get_ha_sensor_kw_normalized,
+                ),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
+                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=pv_config, state_store=state_store
+                    )
+
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+
+                    # Real 0.0 is valid data — recorded as 0, NOT the cumulative 1.25.
+                    assert record["pv_kwh"] == pytest.approx(0.0, abs=0.001)
+
+    @pytest.mark.asyncio
     async def test_pv_falls_back_to_cumulative_when_history_none(self, pv_config):
         """(b) history returns None -> falls back to cumulative delta."""
         with tempfile.TemporaryDirectory() as tmpdir:
