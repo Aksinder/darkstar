@@ -107,6 +107,161 @@ class TestPoaIrradiance:
         assert poa == 0.0
 
 
+class TestPoaIrradianceDniDhi:
+    """Tests for the corrected DNI/DHI transposition path in _calculate_poa_irradiance."""
+
+    def _morning_ne_geometry(self):
+        """Solar geometry for the validated clear morning (Gotland, 2026-07-08 07:00)."""
+        tz = pytz.timezone("Europe/Stockholm")
+        dt = tz.localize(datetime(2026, 7, 8, 7, 0, 0))
+        pos = _calculate_solar_position(57.6097, 18.4146, dt)
+        solar_elevation = pos["elevation"]
+        # South-convention solar azimuth as used by calculate_physics_pv
+        solar_azimuth = pos["azimuth"] - 180.0
+        # NE array: HA azimuth 50 -> South-convention (50 % 360) - 180
+        panel_azimuth = (50 % 360) - 180
+        return solar_elevation, solar_azimuth, panel_azimuth
+
+    def test_dni_dhi_fixes_low_morning_sun(self):
+        """DNI/DHI path reproduces the validated morning POA (~2x the buggy GHI path).
+
+        Clear morning, low elevation (~20°), NE array (tilt 30, HA az 50):
+        Open-Meteo GHI=179, DNI=257, DHI=108. The buggy GHI-only transposition
+        understates POA; the DNI/DHI path recovers the beam geometry.
+        """
+        elev, saz, paz = self._morning_ne_geometry()
+
+        new_poa = _calculate_poa_irradiance(
+            radiation_w_m2=179.0,
+            panel_tilt=30.0,
+            panel_azimuth=paz,
+            solar_elevation=elev,
+            solar_azimuth=saz,
+            dni_w_m2=257.0,
+            dhi_w_m2=108.0,
+        )
+        old_poa = _calculate_poa_irradiance(
+            radiation_w_m2=179.0,
+            panel_tilt=30.0,
+            panel_azimuth=paz,
+            solar_elevation=elev,
+            solar_azimuth=saz,
+        )
+
+        # Validated against Open-Meteo GTI (~278 W/m²); allow a generous band.
+        assert 260.0 < new_poa < 310.0, f"Expected ~285 W/m² POA, got {new_poa}"
+        # The bug understated morning POA ~2-3x.
+        assert new_poa > 2.0 * old_poa, f"new={new_poa} not >2x old={old_poa}"
+
+    def test_dni_dhi_overcast_no_phantom_beam(self):
+        """Diffuse-only (DNI=0) overcast POA must not exceed GHI (no phantom beam)."""
+        elev, saz, paz = self._morning_ne_geometry()
+
+        poa = _calculate_poa_irradiance(
+            radiation_w_m2=100.0,  # GHI
+            panel_tilt=30.0,
+            panel_azimuth=paz,
+            solar_elevation=elev,
+            solar_azimuth=saz,
+            dni_w_m2=0.0,
+            dhi_w_m2=100.0,
+        )
+        assert poa > 0.0
+        assert poa <= 100.0, f"Diffuse-only POA {poa} should not exceed GHI 100"
+
+    def test_dni_dhi_zero_returns_zero(self):
+        """Both DNI and DHI zero -> no POA even if GHI is passed."""
+        elev, saz, paz = self._morning_ne_geometry()
+        poa = _calculate_poa_irradiance(
+            radiation_w_m2=50.0,
+            panel_tilt=30.0,
+            panel_azimuth=paz,
+            solar_elevation=elev,
+            solar_azimuth=saz,
+            dni_w_m2=0.0,
+            dhi_w_m2=0.0,
+        )
+        assert poa == 0.0
+
+    def test_none_dni_dhi_matches_legacy_path(self):
+        """Regression: with DNI/DHI omitted, the legacy GHI transposition is unchanged."""
+        elev, saz, paz = self._morning_ne_geometry()
+
+        # Legacy path via omitted DNI/DHI
+        legacy = _calculate_poa_irradiance(
+            radiation_w_m2=179.0,
+            panel_tilt=30.0,
+            panel_azimuth=paz,
+            solar_elevation=elev,
+            solar_azimuth=saz,
+        )
+        # Recompute the legacy formula inline to pin the exact behaviour.
+        import math
+
+        diffuse_fraction = 0.2 if elev > 15.0 else 0.4
+        dni = 179.0 * (1.0 - diffuse_fraction)
+        dhi = 179.0 * diffuse_fraction
+        cos_aoi = max(
+            0.0,
+            math.sin(math.radians(elev)) * math.cos(math.radians(30.0))
+            + math.cos(math.radians(elev))
+            * math.sin(math.radians(30.0))
+            * math.cos(math.radians(saz) - math.radians(paz)),
+        )
+        expected = dni * cos_aoi + dhi * (1.0 + math.cos(math.radians(30.0))) / 2.0
+        assert abs(legacy - expected) < 1e-9, f"legacy={legacy} expected={expected}"
+
+    def test_calculate_physics_pv_dni_dhi_raises_morning(self):
+        """calculate_physics_pv with DNI/DHI yields higher morning PV than GHI-only."""
+        tz = pytz.timezone("Europe/Stockholm")
+        dt = tz.localize(datetime(2026, 7, 8, 7, 0, 0))
+        arrays = [{"name": "NE", "kwp": 4.0, "tilt": 30.0, "azimuth": 50.0}]
+
+        with_dni, _ = calculate_physics_pv(
+            radiation_w_m2=179.0,
+            solar_arrays=arrays,
+            slot_start=dt,
+            latitude=57.6097,
+            longitude=18.4146,
+            dni_w_m2=257.0,
+            dhi_w_m2=108.0,
+        )
+        without_dni, _ = calculate_physics_pv(
+            radiation_w_m2=179.0,
+            solar_arrays=arrays,
+            slot_start=dt,
+            latitude=57.6097,
+            longitude=18.4146,
+        )
+        assert with_dni is not None and without_dni is not None
+        assert with_dni > without_dni
+
+    def test_calculate_physics_pv_nan_dni_falls_back(self):
+        """NaN DNI/DHI degrade to the legacy GHI path (no NaN output)."""
+        tz = pytz.timezone("Europe/Stockholm")
+        dt = tz.localize(datetime(2026, 7, 8, 7, 0, 0))
+        arrays = [{"name": "NE", "kwp": 4.0, "tilt": 30.0, "azimuth": 50.0}]
+
+        nan_result, _ = calculate_physics_pv(
+            radiation_w_m2=179.0,
+            solar_arrays=arrays,
+            slot_start=dt,
+            latitude=57.6097,
+            longitude=18.4146,
+            dni_w_m2=float("nan"),
+            dhi_w_m2=float("nan"),
+        )
+        legacy_result, _ = calculate_physics_pv(
+            radiation_w_m2=179.0,
+            solar_arrays=arrays,
+            slot_start=dt,
+            latitude=57.6097,
+            longitude=18.4146,
+        )
+        assert nan_result is not None
+        assert nan_result == legacy_result
+
+
 class TestCalculatePhysicsPv:
     """Tests for calculate_physics_pv function."""
 

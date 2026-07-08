@@ -100,11 +100,24 @@ def _calculate_poa_irradiance(
     panel_azimuth: float,
     solar_elevation: float,
     solar_azimuth: float,
+    dni_w_m2: float | None = None,
+    dhi_w_m2: float | None = None,
+    albedo: float = 0.2,
 ) -> float:
     """
     Calculate Plane of Array (POA) irradiance from horizontal radiation.
 
-    Uses isotropic diffuse model for simplicity.
+    Uses an isotropic diffuse (sky + ground) transposition model.
+
+    Preferred path: when native DNI (direct normal) and DHI (diffuse horizontal)
+    are supplied, the beam component is DNI*cos(aoi) directly. DNI already carries
+    the 1/sin(elevation) geometry, so no manual division is needed — this fixes the
+    low-morning-sun under-forecast that the GHI-only fallback below produces (it
+    wrongly treated the horizontal beam component of GHI as DNI).
+
+    Backward-compat fallback: when DNI/DHI are absent (None), the legacy
+    GHI-transposition path runs unchanged so existing callers/deployments behave
+    exactly as before.
 
     Args:
         radiation_w_m2: Global horizontal irradiance (GHI) in W/m²
@@ -112,30 +125,50 @@ def _calculate_poa_irradiance(
         panel_azimuth: Panel azimuth in degrees (0=South, 90=West, -90=East)
         solar_elevation: Solar elevation angle in degrees
         solar_azimuth: Solar azimuth in degrees (0=South, positive=West)
+        dni_w_m2: Direct normal irradiance in W/m² (Open-Meteo native); enables
+            the corrected transposition path when provided together with dhi_w_m2.
+        dhi_w_m2: Diffuse horizontal irradiance in W/m² (Open-Meteo native).
+        albedo: Ground reflectance for the ground-reflected term (default 0.2).
 
     Returns:
         POA irradiance in W/m²
     """
-    if radiation_w_m2 <= 0 or solar_elevation <= 0:
+    if solar_elevation <= 0:
         return 0.0
 
-    # Convert to radians
     panel_tilt_rad = math.radians(panel_tilt)
     panel_azimuth_rad = math.radians(panel_azimuth)
     solar_elevation_rad = math.radians(solar_elevation)
     solar_azimuth_rad = math.radians(solar_azimuth)
+
+    # Angle of incidence between the sun and the panel normal (same formula both
+    # paths — it was already correct; only the DNI/DHI derivation was wrong).
+    cos_aoi = math.sin(solar_elevation_rad) * math.cos(panel_tilt_rad) + math.cos(
+        solar_elevation_rad
+    ) * math.sin(panel_tilt_rad) * math.cos(solar_azimuth_rad - panel_azimuth_rad)
+    cos_aoi = max(0.0, cos_aoi)
+
+    # --- Corrected path: native DNI + DHI decomposition ---
+    if dni_w_m2 is not None and dhi_w_m2 is not None:
+        if dni_w_m2 <= 0 and dhi_w_m2 <= 0:
+            return 0.0
+        poa_beam = dni_w_m2 * cos_aoi
+        poa_diffuse = dhi_w_m2 * (1.0 + math.cos(panel_tilt_rad)) / 2.0
+        # Ground-reflected term (small); uses GHI when available.
+        poa_ground = 0.0
+        if radiation_w_m2 > 0:
+            poa_ground = radiation_w_m2 * albedo * (1.0 - math.cos(panel_tilt_rad)) / 2.0
+        return max(0.0, poa_beam + poa_diffuse + poa_ground)
+
+    # --- Legacy fallback: transpose from GHI only (behaviour unchanged) ---
+    if radiation_w_m2 <= 0:
+        return 0.0
 
     # Simple diffuse fraction model (clear sky approximation)
     # For more accuracy, use Perez model or similar
     diffuse_fraction = 0.2 if solar_elevation > 15.0 else 0.4
     dni = radiation_w_m2 * (1.0 - diffuse_fraction)
     dhi = radiation_w_m2 * diffuse_fraction
-
-    # Angle of incidence
-    cos_aoi = math.sin(solar_elevation_rad) * math.cos(panel_tilt_rad) + math.cos(
-        solar_elevation_rad
-    ) * math.sin(panel_tilt_rad) * math.cos(solar_azimuth_rad - panel_azimuth_rad)
-    cos_aoi = max(0.0, cos_aoi)
 
     # Sky diffuse on tilted surface (isotropic model)
     sky_diffuse = dhi * (1.0 + math.cos(panel_tilt_rad)) / 2.0
@@ -154,6 +187,8 @@ def calculate_physics_pv(
     longitude: float,
     efficiency: float = 0.85,
     slot_hours: float = 0.25,
+    dni_w_m2: float | None = None,
+    dhi_w_m2: float | None = None,
 ) -> tuple[float | None, list[dict[str, Any]]]:
     """
     Calculate physics-based PV estimate using panel orientation and solar position.
@@ -171,6 +206,12 @@ def calculate_physics_pv(
         longitude: Location longitude in degrees
         efficiency: System efficiency factor (default 0.85)
         slot_hours: Duration of the time slot in hours (default 0.25)
+        dni_w_m2: Optional direct normal irradiance in W/m² (Open-Meteo native).
+            When both dni_w_m2 and dhi_w_m2 are provided the per-array POA uses the
+            corrected DNI/DHI transposition; otherwise it falls back to the legacy
+            GHI-only transposition. GHI (radiation_w_m2) is still required for the
+            None/<=0 guard and the ground-reflected term.
+        dhi_w_m2: Optional diffuse horizontal irradiance in W/m² (Open-Meteo native).
 
     Returns:
         Tuple of (total_kwh, per_array_list) where per_array_list contains
@@ -178,6 +219,14 @@ def calculate_physics_pv(
     """
     if radiation_w_m2 is None or radiation_w_m2 <= 0 or not solar_arrays:
         return None, []
+
+    # Normalise NaN (e.g. missing weather columns forwarded as float('nan')) to None
+    # so a missing DNI/DHI degrades to the legacy GHI transposition rather than
+    # producing a NaN POA.
+    if dni_w_m2 is not None and math.isnan(dni_w_m2):
+        dni_w_m2 = None
+    if dhi_w_m2 is not None and math.isnan(dhi_w_m2):
+        dhi_w_m2 = None
 
     # Calculate solar position
     try:
@@ -215,13 +264,15 @@ def calculate_physics_pv(
         panel_azimuth_ha = float(arr.get("azimuth", 180.0) or 180.0)
         panel_azimuth = (panel_azimuth_ha % 360) - 180
 
-        # Calculate POA irradiance
+        # Calculate POA irradiance (uses DNI/DHI when available, else GHI fallback)
         poa = _calculate_poa_irradiance(
             radiation_w_m2,
             panel_tilt,
             panel_azimuth,
             solar_elevation,
             solar_azimuth,
+            dni_w_m2=dni_w_m2,
+            dhi_w_m2=dhi_w_m2,
         )
 
         # Convert to kWh
@@ -334,6 +385,10 @@ def get_weather_series(
         "temperature_2m",
         "cloud_cover",
         "shortwave_radiation",
+        # Native beam/diffuse components for the corrected POA transposition.
+        # DNI already carries the 1/sin(elevation) geometry (fixes morning PV).
+        "direct_normal_irradiance",
+        "diffuse_radiation",
     ]
     if extra_params:
         hourly_params.extend(extra_params)
@@ -375,6 +430,8 @@ def get_weather_series(
     temps: list[Any] = hourly.get("temperature_2m") or []
     clouds: list[Any] = hourly.get("cloud_cover") or []
     sw_rad: list[Any] = hourly.get("shortwave_radiation") or []
+    dni: list[Any] = hourly.get("direct_normal_irradiance") or []
+    dhi: list[Any] = hourly.get("diffuse_radiation") or []
 
     if not times:
         return pd.DataFrame(dtype="float64")
@@ -391,6 +448,10 @@ def get_weather_series(
         data["cloud_cover_pct"] = clouds
     if sw_rad and len(sw_rad) == len(times):
         data["shortwave_radiation_w_m2"] = sw_rad
+    if dni and len(dni) == len(times):
+        data["dni_w_m2"] = dni
+    if dhi and len(dhi) == len(times):
+        data["dhi_w_m2"] = dhi
 
     # Extract any extra parameters
     if extra_params:
@@ -593,6 +654,8 @@ def calculate_physics_for_slots(
     for slot in slots:
         slot_start_raw = slot.get("slot_start")
         radiation = slot.get("shortwave_radiation_w_m2")
+        dni = slot.get("dni_w_m2")
+        dhi = slot.get("dhi_w_m2")
 
         # Parse slot_start if it's a string
         if isinstance(slot_start_raw, str):
@@ -612,6 +675,8 @@ def calculate_physics_for_slots(
             slot_start=slot_start,
             latitude=latitude,
             longitude=longitude,
+            dni_w_m2=dni,
+            dhi_w_m2=dhi,
         )
 
         results.append(
