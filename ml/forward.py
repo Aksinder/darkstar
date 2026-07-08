@@ -290,6 +290,7 @@ async def generate_forward_slots(
     # physics until that retrain. Default true preserves the upstream hybrid behaviour.
     forecasting_cfg: dict[str, Any] = engine.config.get("forecasting", {}) or {}
     pv_residual_enabled = bool(forecasting_cfg.get("pv_residual_enabled", True))
+    pv_forced_physics_only = False
     if not pv_residual_enabled and has_pv_models:
         logger.info(
             "⚠️ PV residual disabled (forecasting.pv_residual_enabled=false): "
@@ -297,6 +298,7 @@ async def generate_forward_slots(
             "(interim until min-date retrain)."
         )
         has_pv_models = False
+        pv_forced_physics_only = True
 
     # --- LOAD INFERENCE (or fallback) ---
     if has_load_models:
@@ -438,8 +440,10 @@ async def generate_forward_slots(
 
         logger.info("✅ PV: Using hybrid mode (physics + ML residual)")
     else:
-        # PHYSICS-ONLY MODE: No ML models, use physics directly
-        logger.warning("⚠️ PV models not available, using physics-only mode")
+        # PHYSICS-ONLY MODE: use physics directly (either no ML models, or the
+        # pv_residual_enabled gate intentionally disabled them — already logged above).
+        if not pv_forced_physics_only:
+            logger.warning("⚠️ PV models not available, using physics-only mode")
         for q in quantiles:
             # Apply uncertainty bands around physics
             if q == "p10":
