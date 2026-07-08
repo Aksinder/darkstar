@@ -415,8 +415,30 @@ async def record_observation_from_current_state(
         # Fallback to power snapshot
         return power_kw * 0.25, False
 
-    # Calculate PV energy
-    pv_kwh, _ = await calculate_energy_from_cumulative("total_pv_production", pv_kw, "pv_total")
+    # Calculate PV energy.
+    # PRIMARY: integrate the pv_power sensor over the slot window (same as EV/water below).
+    # On sites where the cumulative total_pv_production counter only covers part of the array
+    # (e.g. a Sungrow-only kWh counter that omits an AC-coupled Fronius), pv_power is the
+    # correct COMBINED power and history-integration captures the full production. Fall back to
+    # the cumulative counter (then its own power-snapshot terminal) when pv_power is not
+    # configured or its history is unavailable.
+    pv_kwh: float
+    pv_power_entity = input_sensors.get("pv_power")
+    pv_history_kwh = (
+        await get_energy_from_power_history(str(pv_power_entity), slot_start, slot_end)
+        if pv_power_entity
+        else None
+    )
+    if pv_history_kwh is not None and pv_history_kwh >= 0:
+        pv_kwh = pv_history_kwh
+        logger.debug(f"PV: history energy={pv_kwh:.3f} kWh (pv_power={pv_power_entity})")
+    else:
+        pv_kwh, used_cumulative_pv = await calculate_energy_from_cumulative(
+            "total_pv_production", pv_kw, "pv_total"
+        )
+        logger.debug(
+            f"PV: {'cumulative' if used_cumulative_pv else 'snapshot'} energy={pv_kwh:.3f} kWh"
+        )
 
     # Calculate load energy
     load_kwh, used_cumulative_load = await calculate_energy_from_cumulative(
