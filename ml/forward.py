@@ -71,7 +71,6 @@ _EXPECTED_LOAD_FEATURES = [
 _EXPECTED_PV_FEATURES = [*_EXPECTED_LOAD_FEATURES, "physics_forecast_kwh"]
 
 
-
 def _load_models(models_dir: str = "data/ml/models") -> dict[str, lgb.Booster]:
     """Load trained LightGBM models for AURORA forward inference (Probabilistic).
 
@@ -208,8 +207,16 @@ async def generate_forward_slots(
     if not weather_df.empty:
         df = df.merge(weather_df, left_on="slot_start", right_index=True, how="left")
 
-    # Ensure ALL weather columns exist (even if empty) to match trained model feature count
-    for col in ("temp_c", "cloud_cover_pct", "shortwave_radiation_w_m2"):
+    # Ensure ALL weather columns exist (even if empty) to match trained model feature count.
+    # dni_w_m2/dhi_w_m2 are PHYSICS inputs (not ML features) — included here only so a missing
+    # weather fetch degrades to the legacy GHI transposition instead of raising KeyError below.
+    for col in (
+        "temp_c",
+        "cloud_cover_pct",
+        "shortwave_radiation_w_m2",
+        "dni_w_m2",
+        "dhi_w_m2",
+    ):
         if col not in df.columns:
             df[col] = float("nan")
         df[col] = df[col].astype("float64")
@@ -273,6 +280,25 @@ async def generate_forward_slots(
     # REV PERS2: Fallback logic when no ML models available
     has_load_models = any(f"load_{q}" in models for q in quantiles)
     has_pv_models = any(f"pv_{q}" in models for q in quantiles)
+
+    # Config-gated physics-only PV (atomicity fix for the DNI/DHI physics correction).
+    # The live PV residual models were trained with residual = actual - physics_OLD
+    # (the under-forecasting GHI transposition). Once physics is corrected but before a
+    # min-date retrain re-learns the residual, adding the stale positive residual on top
+    # of the raised physics would DOUBLE-correct and over-forecast mornings. Setting
+    # forecasting.pv_residual_enabled: false forces the physics-only band on the corrected
+    # physics until that retrain. Default true preserves the upstream hybrid behaviour.
+    forecasting_cfg: dict[str, Any] = engine.config.get("forecasting", {}) or {}
+    pv_residual_enabled = bool(forecasting_cfg.get("pv_residual_enabled", True))
+    pv_forced_physics_only = False
+    if not pv_residual_enabled and has_pv_models:
+        logger.info(
+            "⚠️ PV residual disabled (forecasting.pv_residual_enabled=false): "
+            "running physics-only on corrected physics; PV residual models NOT applied "
+            "(interim until min-date retrain)."
+        )
+        has_pv_models = False
+        pv_forced_physics_only = True
 
     # --- LOAD INFERENCE (or fallback) ---
     if has_load_models:
@@ -350,6 +376,8 @@ async def generate_forward_slots(
             slot_start=slot_ts,
             latitude=physics_lat,
             longitude=physics_lon,
+            dni_w_m2=row.get("dni_w_m2"),
+            dhi_w_m2=row.get("dhi_w_m2"),
         )
         physics_series.loc[idx] = physics_kwh if physics_kwh is not None else 0.0  # type: ignore[reportIndexIssue]
 
@@ -412,8 +440,10 @@ async def generate_forward_slots(
 
         logger.info("✅ PV: Using hybrid mode (physics + ML residual)")
     else:
-        # PHYSICS-ONLY MODE: No ML models, use physics directly
-        logger.warning("⚠️ PV models not available, using physics-only mode")
+        # PHYSICS-ONLY MODE: use physics directly (either no ML models, or the
+        # pv_residual_enabled gate intentionally disabled them — already logged above).
+        if not pv_forced_physics_only:
+            logger.warning("⚠️ PV models not available, using physics-only mode")
         for q in quantiles:
             # Apply uncertainty bands around physics
             if q == "p10":
@@ -446,7 +476,9 @@ async def generate_forward_slots(
 
     # Repair applies only when all 3 quantile models were predicted (not default-zero placeholders)
     _load_all_q = all(f"load_{q}" in models for q in quantiles)
-    _pv_all_q = all(f"pv_{q}" in models for q in quantiles)
+    # has_pv_models may have been forced False by the physics-only gate above, in which
+    # case the physics-only bands (already monotonic) are used rather than model output.
+    _pv_all_q = has_pv_models and all(f"pv_{q}" in models for q in quantiles)
 
     # --- STORE RESULTS ---
     forecasts: list[dict[str, Any]] = []

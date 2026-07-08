@@ -103,5 +103,145 @@ class TestAuroraForward(unittest.IsolatedAsyncioTestCase):
         print("✅ Aurora forward pass multi-array integration verified!")
 
 
+class TestAuroraForwardPvResidualGate(unittest.IsolatedAsyncioTestCase):
+    """forecasting.pv_residual_enabled=false must force physics-only and bypass PV models."""
+
+    def _make_engine(self, pv_residual_enabled: bool) -> MagicMock:
+        engine = MagicMock(spec=LearningEngine)
+        engine.store_forecasts = AsyncMock()
+        engine.timezone = pytz.UTC
+        engine.db_path = "fake_db.db"
+        engine.config = {
+            "timezone": "UTC",
+            "system": {
+                "location": {"latitude": 59.3, "longitude": 18.1},
+                "solar_arrays": [{"kwp": 10.0, "tilt": 30.0, "azimuth": 180.0}],
+            },
+            "forecasting": {"pv_residual_enabled": pv_residual_enabled},
+        }
+        return engine
+
+    def _weather_frame(self, slot_start):
+        return pd.DataFrame(
+            {
+                "temp_c": [20.0] * 8,
+                "cloud_cover_pct": [10.0] * 8,
+                "shortwave_radiation_w_m2": [800.0] * 8,
+                "dni_w_m2": [700.0] * 8,
+                "dhi_w_m2": [150.0] * 8,
+            },
+            index=pd.date_range(slot_start, periods=8, freq="15min", tz="UTC"),
+        )
+
+    def _mock_pv_models(self):
+        """Return a dict of load+pv booster mocks; pv predict is a spy we assert on."""
+        models: dict[str, MagicMock] = {}
+        for q in ("p10", "p50", "p90"):
+            load_booster = MagicMock()
+            load_booster.predict = MagicMock(return_value=[0.5] * 8)
+            models[f"load_{q}"] = load_booster
+            pv_booster = MagicMock()
+            pv_booster.predict = MagicMock(return_value=[0.0] * 8)
+            models[f"pv_{q}"] = pv_booster
+        return models
+
+    @patch("ml.forward.datetime")
+    @patch("ml.forward.get_learning_engine")
+    @patch("ml.forward._load_models")
+    @patch("ml.forward.async_get_weather_series")
+    @patch("ml.forward.get_vacation_mode_series")
+    @patch("ml.forward.get_alarm_armed_series")
+    @patch("backend.astro.SunCalculator")
+    @patch("ml.forward.determine_graduation_level")
+    async def test_physics_only_when_disabled(
+        self,
+        mock_grad_level,
+        mock_sun,
+        mock_alarm,
+        mock_vacation,
+        mock_weather,
+        mock_models,
+        mock_get_engine,
+        mock_datetime,
+    ):
+        fixed_now = datetime(2024, 6, 15, 12, 0, tzinfo=pytz.UTC)
+        mock_datetime.now.return_value = fixed_now
+        mock_datetime.side_effect = datetime
+        mock_grad_level.return_value = (2, "graduate", 30.0)
+
+        engine = self._make_engine(pv_residual_enabled=False)
+        mock_get_engine.return_value = engine
+
+        mock_sun_instance = MagicMock()
+        mock_sun_instance.is_sun_up.return_value = True
+        mock_sun.return_value = mock_sun_instance
+
+        models = self._mock_pv_models()
+        mock_models.return_value = models
+
+        slot_start = fixed_now.replace(minute=0, second=0, microsecond=0)
+        mock_weather.return_value = self._weather_frame(slot_start)
+        mock_vacation.return_value = pd.Series(0.0, index=mock_weather.return_value.index)
+        mock_alarm.return_value = pd.Series(0.0, index=mock_weather.return_value.index)
+
+        await generate_forward_slots(horizon_hours=2, forecast_version="test")
+
+        # PV residual models must NOT be applied in physics-only mode.
+        for q in ("p10", "p50", "p90"):
+            models[f"pv_{q}"].predict.assert_not_called()
+
+        args, _ = engine.store_forecasts.call_args
+        forecasts = args[0]
+        self.assertGreater(len(forecasts), 0)
+        # Physics-only p50 == physics base; p90 == physics * 1.2 (bands around physics).
+        first = forecasts[0]
+        self.assertGreater(first["pv_forecast_kwh"], 0.0)
+        self.assertAlmostEqual(first["pv_p90"], first["pv_forecast_kwh"] * 1.2, places=4)
+
+    @patch("ml.forward.datetime")
+    @patch("ml.forward.get_learning_engine")
+    @patch("ml.forward._load_models")
+    @patch("ml.forward.async_get_weather_series")
+    @patch("ml.forward.get_vacation_mode_series")
+    @patch("ml.forward.get_alarm_armed_series")
+    @patch("backend.astro.SunCalculator")
+    @patch("ml.forward.determine_graduation_level")
+    async def test_hybrid_when_enabled(
+        self,
+        mock_grad_level,
+        mock_sun,
+        mock_alarm,
+        mock_vacation,
+        mock_weather,
+        mock_models,
+        mock_get_engine,
+        mock_datetime,
+    ):
+        fixed_now = datetime(2024, 6, 15, 12, 0, tzinfo=pytz.UTC)
+        mock_datetime.now.return_value = fixed_now
+        mock_datetime.side_effect = datetime
+        mock_grad_level.return_value = (2, "graduate", 30.0)
+
+        engine = self._make_engine(pv_residual_enabled=True)
+        mock_get_engine.return_value = engine
+
+        mock_sun_instance = MagicMock()
+        mock_sun_instance.is_sun_up.return_value = True
+        mock_sun.return_value = mock_sun_instance
+
+        models = self._mock_pv_models()
+        mock_models.return_value = models
+
+        slot_start = fixed_now.replace(minute=0, second=0, microsecond=0)
+        mock_weather.return_value = self._weather_frame(slot_start)
+        mock_vacation.return_value = pd.Series(0.0, index=mock_weather.return_value.index)
+        mock_alarm.return_value = pd.Series(0.0, index=mock_weather.return_value.index)
+
+        await generate_forward_slots(horizon_hours=2, forecast_version="test")
+
+        # Default (enabled) applies the PV residual models.
+        models["pv_p50"].predict.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()

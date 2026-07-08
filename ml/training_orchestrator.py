@@ -125,7 +125,9 @@ def get_training_status() -> dict[str, Any]:
 
 
 async def train_all_models(
-    min_samples: int = 100, training_type: str = "automatic"
+    min_samples: int = 100,
+    training_type: str = "automatic",
+    min_date: datetime | None = None,
 ) -> dict[str, Any]:
     """
     Train all ML models (AURORA main) with safety features.
@@ -200,8 +202,9 @@ async def train_all_models(
             },
         )
 
-        # train_models is heavy and synchronous, offload to thread
-        await asyncio.to_thread(train_models, min_samples=min_samples)
+        # train_models is heavy and synchronous, offload to thread.
+        # min_date defaults to None -> no lower-bound filter (unchanged behaviour).
+        await asyncio.to_thread(train_models, min_samples=min_samples, min_date=min_date)
 
         # Check if main models were actually created/updated
         main_models: list[Path] = list(MODELS_DIR.glob("*model*.lgb"))

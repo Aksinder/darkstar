@@ -270,7 +270,11 @@ def _save_model(
     print(f"Saved model to {path}")
 
 
-def train_models(min_samples: int = 100, recency_half_life_days: float = 30.0) -> None:
+def train_models(
+    min_samples: int = 100,
+    recency_half_life_days: float = 30.0,
+    min_date: datetime | None = None,
+) -> None:
     cfg = TrainingConfig(min_samples=min_samples, recency_half_life_days=recency_half_life_days)
 
     print("--- Starting AURORA Training (Rev K16: Hybrid PV with Physics Residuals) ---")
@@ -285,12 +289,21 @@ def train_models(min_samples: int = 100, recency_half_life_days: float = 30.0) -
 
     now = datetime.now(engine.timezone)
 
-    print(
-        "Training window: loading all available historical data "
-        f"with recency weighting (half-life={cfg.recency_half_life_days} days).",
-    )
+    if min_date is not None:
+        print(
+            f"Training window: loading observations with slot_start >= {min_date.isoformat()} "
+            f"with recency weighting (half-life={cfg.recency_half_life_days} days).",
+        )
+    else:
+        print(
+            "Training window: loading all available historical data "
+            f"with recency weighting (half-life={cfg.recency_half_life_days} days).",
+        )
 
-    observations = _load_slot_observations(engine, end_time=now)
+    # min_date defaults to None -> no lower-bound filter (unchanged behaviour). When set
+    # it filters slot_observations to slot_start >= min_date, used to exclude pre-clean
+    # history (e.g. the Fronius-undercounted period before the recorder fix).
+    observations = _load_slot_observations(engine, start_time=min_date, end_time=now)
     if observations.empty:
         print("Error: No valid (non-zero load) observations found.")
         print("Action: Check if data_activator has run or if sensors are reporting 0.")
