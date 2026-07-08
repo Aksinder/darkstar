@@ -102,6 +102,10 @@ async def get_forecast_slots(
                 slot_start=ts_idx,  # type: ignore[arg-defined]
                 latitude=latitude,
                 longitude=longitude,
+                # Match the forecast's corrected physics so the dashboard decomposition
+                # (physics vs ml_residual) is consistent with final.pv_kwh.
+                dni_w_m2=row_data.get("dni_w_m2"),
+                dhi_w_m2=row_data.get("dhi_w_m2"),
             )
             physics_data[ts_str] = {
                 "physics_kwh": physics_kwh if physics_kwh is not None else 0.0,
