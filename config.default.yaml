@@ -493,6 +493,13 @@ price_forecast:
 # Forecasting Adjustments (Aurora ML tuning)
 forecasting:
   active_forecast_version: "aurora"
+  pv_residual_enabled: true            # true (default): hybrid PV = physics base + trained ML
+                                       # residual. false: run PHYSICS-ONLY (physics * p10/p50/p90
+                                       # bands) and skip the PV residual models entirely. Set false
+                                       # as an interim after a physics correction (e.g. the DNI/DHI
+                                       # transposition fix) until the PV residual models are retrained
+                                       # on data computed with the new physics — otherwise the stale
+                                       # residual double-corrects and over-forecasts.
   pv_confidence_percent: 83.0          # PV forecast scaling (100 = trust forecast fully)
   pv_p10_weight: 0.0                   # 0 = legacy scalar haircut above. >0 (e.g. 0.3-0.5):
                                        # blend each slot toward Aurora's own pessimistic p10
