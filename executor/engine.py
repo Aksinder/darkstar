@@ -773,7 +773,9 @@ class ExecutorEngine:
                 ] or [None]  # legacy single-heater fallback
                 for target in targets:
                     task: asyncio.Task[Any] = loop.create_task(
-                        self.dispatcher.set_water_temp(boost_temp, target)
+                        self.dispatcher.set_water_temp(
+                            boost_temp, target, bypass_dwell=True
+                        )
                     )
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
@@ -800,16 +802,25 @@ class ExecutorEngine:
 
         if was_active:
             logger.info("Water boost cancelled by user")
-            # Set water temp back to normal
+            # Set water temp back to normal — per device (the global target_entity is
+            # empty on multi-tank configs, so a single untargeted call is a silent no-op
+            # and the cancelled boost would keep heating). Mirror the boost-apply loop.
             if self.dispatcher:
                 try:
                     # Schedule async water temp setting
                     loop = asyncio.get_running_loop()
-                    task: asyncio.Task[Any] = loop.create_task(
-                        self.dispatcher.set_water_temp(self.config.water_heater.temp_off)
-                    )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
+                    off_temp = self.config.water_heater.temp_off
+                    targets: list[str | None] = [
+                        d.target_entity for d in (self.config.water_heater_devices or [])
+                    ] or [None]  # legacy single-heater fallback
+                    for target in targets:
+                        task: asyncio.Task[Any] = loop.create_task(
+                            self.dispatcher.set_water_temp(
+                                off_temp, target, bypass_dwell=True
+                            )
+                        )
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
                 except RuntimeError:
                     logger.warning("Could not reset water temp: no running event loop")
                 except Exception as e:
@@ -1435,15 +1446,32 @@ class ExecutorEngine:
                                 water_result = await self.dispatcher.set_water_temp(
                                     self.config.water_heater.temp_boost,
                                     device.target_entity,
+                                    bypass_dwell=True,
                                 )
                                 action_results.append(water_result)
                         elif boost_active and getattr(
                             self.config.water_heater, "target_entity", None
                         ):
                             water_result = await self.dispatcher.set_water_temp(
-                                self.config.water_heater.temp_boost
+                                self.config.water_heater.temp_boost,
+                                bypass_dwell=True,
                             )
                             action_results.append(water_result)
+                        elif override.override_needed and self.config.water_heater_devices:
+                            # An active override (safety slot-failure-fallback / force_stop)
+                            # forces water OFF but leaves decision.water_temps empty, so the
+                            # per-device plan branch below is skipped and the legacy branch
+                            # targets the empty global entity — a silent no-op on multi-tank
+                            # configs (the heaters keep running). Route the override's water
+                            # decision through the per-device path so EVERY tank is actually
+                            # actuated, bypassing the dwell for an immediate forced OFF.
+                            for device in self.config.water_heater_devices:
+                                water_result = await self.dispatcher.set_water_temp(
+                                    decision.water_temp,
+                                    device.target_entity,
+                                    bypass_dwell=True,
+                                )
+                                action_results.append(water_result)
                         elif decision.water_temps and self.config.water_heater_devices:
                             # New multi-device format: control each heater independently
                             for device in self.config.water_heater_devices:
@@ -1455,8 +1483,14 @@ class ExecutorEngine:
                                 )
                                 action_results.append(water_result)
                         elif getattr(self.config.water_heater, "target_entity", None):
-                            # Legacy fallback: old-format schedule or single heater
-                            water_result = await self.dispatcher.set_water_temp(decision.water_temp)
+                            # Legacy fallback: old-format schedule or single heater.
+                            # An active override (safety slot-failure-fallback OFF or
+                            # force_stop) must bypass the dwell so a forced OFF is
+                            # honored immediately; normal plan calls respect the dwell.
+                            water_result = await self.dispatcher.set_water_temp(
+                                decision.water_temp,
+                                bypass_dwell=override.override_needed,
+                            )
                             action_results.append(water_result)
 
                     # Control the excess-PV sink ladder (7.2-7.4). The loader

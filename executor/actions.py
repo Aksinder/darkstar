@@ -530,6 +530,12 @@ class ActionDispatcher:
         # restart forgets an active window (bounded downside — the plan resumes).
         self._last_water_cmd: dict[str, str] = {}
         self._manual_on_until: dict[str, float] = {}
+        # Anti-short-cycle dwell: wall-clock time.time() of the last relay state
+        # CHANGE we actually commanded, keyed by target_entity (per-switch, so
+        # switch.vvb and switch.villavagn_vvb are independent). Empty at cold start
+        # => the first flip per entity is always allowed immediately; only
+        # subsequent flips within the dwell window are gated.
+        self._last_water_switch_ts: dict[str, float] = {}
 
     def _resolve_entity_id(self, key: str) -> str | None:
         """
@@ -813,13 +819,24 @@ class ActionDispatcher:
             duration_ms=duration_ms,
         )
 
-    async def set_water_temp(self, target: int, target_entity: str | None = None) -> ActionResult:
+    async def set_water_temp(
+        self,
+        target: int,
+        target_entity: str | None = None,
+        *,
+        bypass_dwell: bool = False,
+    ) -> ActionResult:
         """Set water heater target temperature.
 
         Args:
             target: Target temperature in °C
             target_entity: HA entity to control. If None, falls back to
                            config.water_heater.target_entity (legacy single-heater path).
+            bypass_dwell: When True, skip the anti-short-cycle min-on/min-off dwell
+                          gate (switch/input_boolean targets only). Used by boost
+                          (force ON) and safety/override (force OFF) paths that must
+                          actuate immediately. Normal plan-driven calls leave this
+                          False so the dwell caps toggling.
         """
         start = time.time()
         # Use passed entity; fall back to legacy single-entity config for backward compat
@@ -868,6 +885,10 @@ class ActionDispatcher:
                     # plan-off is OURS to enforce) and clear any manual window.
                     self._last_water_cmd[entity] = "on"
                     self._manual_on_until.pop(entity, None)
+                    # Seed the dwell epoch if we have none (e.g. after an add-on
+                    # restart where reality already matches the plan) so the eventual
+                    # OFF has a valid time-since-change to measure against.
+                    self._last_water_switch_ts.setdefault(entity, time.time())
                 return ActionResult(
                     action_type="water_temp",
                     success=True,
@@ -916,6 +937,54 @@ class ActionDispatcher:
                         )
                     # Window expired: clear it and fall through to enforce OFF.
                     self._manual_on_until.pop(entity, None)
+            # Anti-short-cycle dwell gate: a flip is needed (current != desired).
+            # Hold the relay in its current state until it has dwelled long enough,
+            # unless a boost (force ON) or safety/override (force OFF) bypasses it.
+            # This bounds the toggle rate regardless of why the plan flip-flopped
+            # (mid-slot replan relocation, marginal WTP flip-flop, external toggles,
+            # verification retries). Placed AFTER the ratify and manual-ON blocks so
+            # those short-circuit first and are never double-handled.
+            if not bypass_dwell:
+                last_ts = self._last_water_switch_ts.get(entity)
+                if last_ts is not None:
+                    if current_state == "on":
+                        # About to turn OFF: honor minimum ON time.
+                        required_s = (
+                            float(getattr(self.config.water_heater, "min_on_minutes", 0.0) or 0.0)
+                            * 60.0
+                        )
+                    else:
+                        # About to turn ON: honor minimum OFF time.
+                        required_s = (
+                            float(getattr(self.config.water_heater, "min_off_minutes", 0.0) or 0.0)
+                            * 60.0
+                        )
+                    elapsed = time.time() - last_ts
+                    if required_s > 0 and elapsed < required_s:
+                        remaining_min = int((required_s - elapsed) / 60)
+                        logger.info(
+                            "Water heater %s dwell hold: %d min left before %s "
+                            "(current=%s, min_on=%.0f min, min_off=%.0f min)",
+                            entity,
+                            remaining_min,
+                            desired_state,
+                            current_state,
+                            float(getattr(self.config.water_heater, "min_on_minutes", 0.0) or 0.0),
+                            float(getattr(self.config.water_heater, "min_off_minutes", 0.0) or 0.0),
+                        )
+                        return ActionResult(
+                            action_type="water_temp",
+                            success=True,
+                            message=(
+                                f"Dwell hold: {remaining_min} min left before {desired_state}"
+                            ),
+                            previous_value=current_state,
+                            new_value=current_state,
+                            entity_id=entity,
+                            skipped=True,
+                            duration_ms=int((time.time() - start) * 1000),
+                            error_details=None,
+                        )
             if self.shadow_mode:
                 logger.info(
                     "[SHADOW] Would switch water heater %s %s (%s°C)",
@@ -942,6 +1011,8 @@ class ActionDispatcher:
                 switch_error = str(exc)
             if switch_ok:
                 self._last_water_cmd[entity] = desired_state
+                # Record the dwell epoch on every actual commanded state change.
+                self._last_water_switch_ts[entity] = time.time()
                 if desired_state == "on":
                     self._manual_on_until.pop(entity, None)
             return ActionResult(
