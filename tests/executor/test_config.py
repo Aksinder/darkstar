@@ -238,6 +238,37 @@ class TestWaterHeaterDeviceConfig:
 
         assert config.water_heater_devices == []
 
+    def test_dwell_minutes_default(self, tmp_path):
+        """Build #15: min_on/min_off dwell default to 30.0 / 15.0 when unset."""
+        config_file = tmp_path / "config.yaml"
+        config_data = {"executor": {}}
+        with config_file.open("w") as f:
+            yaml.dump(config_data, f)
+
+        config = load_executor_config(str(config_file))
+
+        assert config.water_heater.min_on_minutes == 30.0
+        assert config.water_heater.min_off_minutes == 15.0
+
+    def test_dwell_minutes_loaded_from_config(self, tmp_path):
+        """Build #15: executor.water_heater.min_on/off_minutes are parsed."""
+        config_file = tmp_path / "config.yaml"
+        config_data = {
+            "executor": {
+                "water_heater": {
+                    "min_on_minutes": 20,
+                    "min_off_minutes": 10,
+                }
+            },
+        }
+        with config_file.open("w") as f:
+            yaml.dump(config_data, f)
+
+        config = load_executor_config(str(config_file))
+
+        assert config.water_heater.min_on_minutes == 20.0
+        assert config.water_heater.min_off_minutes == 10.0
+
 
 class TestNormalizeExcessPVSinks:
     """Shared dual-read normalizer for the excess-PV sink ladder."""

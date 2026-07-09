@@ -118,6 +118,15 @@ class WaterHeaterGlobalConfig:
     # many minutes instead of reverting on the next tick. 0 = legacy (plan always
     # wins). Anything the executor commanded itself is still enforced normally.
     manual_on_respect_minutes: float = 90.0
+    # Anti-short-cycle dwell (switch/input_boolean targets only): minimum time the
+    # relay must stay in a state before a plan-driven flip to the other state is
+    # allowed. min_on holds a just-turned-ON relay ON (so a burst delivers
+    # meaningful kWh and the Shelly relay is not hammered); min_off holds a
+    # just-turned-OFF relay OFF (kills re-ignition thrash). Bypassed by boost
+    # (force ON) and safety/override (force OFF). Worst-case toggle rate is bounded
+    # to 1 cycle / (min_on + min_off). 0 disables the respective gate.
+    min_on_minutes: float = 30.0
+    min_off_minutes: float = 15.0
 
 
 # Backward compatibility alias
@@ -525,6 +534,12 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 "manual_on_respect_minutes",
                 WaterHeaterGlobalConfig.manual_on_respect_minutes,
             )
+        ),
+        min_on_minutes=float(
+            water_data.get("min_on_minutes", WaterHeaterGlobalConfig.min_on_minutes)
+        ),
+        min_off_minutes=float(
+            water_data.get("min_off_minutes", WaterHeaterGlobalConfig.min_off_minutes)
         ),
     )
 
