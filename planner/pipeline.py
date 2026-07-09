@@ -423,6 +423,33 @@ class PlannerPipeline:
             except Exception as e:
                 logger.warning("Failed to determine per-device forced water slots: %s", e)
 
+        # Build #16 plan-stability anchor: extract EVERY previously-planned ON slot per
+        # heater (not just the in-progress run the mid-block lock captures). These
+        # wall-clock timestamps are later mapped to future_df indices and price-gated,
+        # then handed to Kepler as a soft "stay put" reward that kills the degenerate
+        # block walk on flat price bands. Keyed on WALL-CLOCK time (start_time), so the
+        # same clock hour survives the per-replan future_df re-slice, and independent of
+        # heated_today so it persists across the day-bucket boundary.
+        anchor_water_by_heater: dict[str, set[pd.Timestamp]] = {
+            d: set() for d in enabled_heater_ids
+        }
+        if previous_schedule and enabled_heater_ids:
+            try:
+                for slot_s in previous_schedule:
+                    slot_water_heaters: dict[str, Any] = slot_s.get("water_heaters", {})
+                    if not slot_water_heaters:
+                        continue
+                    start_raw = slot_s.get("start_time")
+                    if not start_raw:
+                        continue
+                    ts_anchor = pd.Timestamp(start_raw).astimezone(tz)  # type: ignore[arg-type]
+                    for heater_id in enabled_heater_ids:
+                        slot_heater: dict[str, Any] = slot_water_heaters.get(heater_id, {})
+                        if float(slot_heater.get("heating_kw", 0.0)) > 0:
+                            anchor_water_by_heater[heater_id].add(ts_anchor)
+            except Exception as e:
+                logger.warning("Failed to extract previous-plan anchor slots: %s", e)
+
         # 3. Strategy (S-Index & Safety Margins)
         s_index_debug: dict[str, Any] = {}
         effective_load_margin = 1.0
@@ -599,6 +626,28 @@ class PlannerPipeline:
                     len(indices),
                 )
 
+        # Build #16: map previous-plan anchor timestamps (wall-clock) to future_df
+        # indices. Because future_df is re-sliced from now every replan, a given clock
+        # hour lands on a different index each time — mapping by timestamp here is what
+        # makes the anchor WALL-CLOCK-KEYED (stable across the re-slice). The price-gate
+        # (drop the anchor when a genuinely cheaper position exists) lives in Kepler,
+        # next to the objective it protects.
+        anchor_on_slots_by_heater: dict[str, list[int]] = {}
+        for heater_id, anchor_ts in anchor_water_by_heater.items():
+            if not anchor_ts:
+                continue
+            a_indices: list[int] = []
+            for idx, (ts, _) in enumerate(future_df.iterrows()):
+                if ts in anchor_ts:
+                    a_indices.append(idx)
+            if a_indices:
+                anchor_on_slots_by_heater[heater_id] = a_indices
+                logger.info(
+                    "Plan-stability anchor: heater %s anchoring %d future slots",
+                    heater_id,
+                    len(a_indices),
+                )
+
         # Build per-device water heater states for the adapter (task 3.3)
         water_heater_states: list[dict[str, Any]] = []
         for heater_id in enabled_heater_ids:
@@ -607,6 +656,7 @@ class PlannerPipeline:
                     "id": heater_id,
                     "heated_today_kwh": water_heated_today_by_id.get(heater_id, 0.0),
                     "force_on_slots": force_on_slots_by_heater.get(heater_id),
+                    "anchor_on_slots": anchor_on_slots_by_heater.get(heater_id),
                 }
             )
 

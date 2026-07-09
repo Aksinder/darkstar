@@ -1473,13 +1473,33 @@ class ExecutorEngine:
                                 )
                                 action_results.append(water_result)
                         elif decision.water_temps and self.config.water_heater_devices:
-                            # New multi-device format: control each heater independently
+                            # New multi-device format: control each heater independently.
+                            # Build #16: also feed the block-commit latch — the planned
+                            # block length (to hold ON across a mid-block plan flip) and
+                            # the measured heated_today + daily floor (over-heat guard).
+                            heated_today_map = await self._heated_today_by_device()
+                            min_kwh_map = {
+                                str(wh.get("id", "")): float(
+                                    wh.get("min_kwh_per_day", 0.0) or 0.0
+                                )
+                                for wh in cast(
+                                    "list[dict[str, Any]]",
+                                    self._full_config.get("water_heaters", []),
+                                )
+                            }
                             for device in self.config.water_heater_devices:
                                 temp = decision.water_temps.get(
                                     device.id, self.config.water_heater.temp_off
                                 )
+                                commit_minutes = self._planned_water_block_minutes(
+                                    device.id, now
+                                )
                                 water_result = await self.dispatcher.set_water_temp(
-                                    temp, device.target_entity
+                                    temp,
+                                    device.target_entity,
+                                    commit_minutes=commit_minutes,
+                                    heated_today_kwh=heated_today_map.get(device.id),
+                                    min_kwh_per_day=min_kwh_map.get(device.id),
                                 )
                                 action_results.append(water_result)
                         elif getattr(self.config.water_heater, "target_entity", None):
@@ -1746,6 +1766,102 @@ class ExecutorEngine:
 
         # No matching slot found
         return None, None
+
+    def _planned_water_block_minutes(self, device_id: str, now: datetime) -> float | None:
+        """Build #16: length (minutes) of the water block THIS device is in right now.
+
+        Reads schedule.json, finds the slot containing ``now``, and counts the
+        contiguous forward run of slots where this device's ``heating_kw`` > 0. Returns
+        the run length in minutes, or None when the device is not heating now / no
+        schedule (the executor then falls back to min_on for the commit length).
+        """
+        schedule_path = self.config.schedule_path
+        if not Path(schedule_path).exists():
+            return None
+        try:
+            with Path(schedule_path).open(encoding="utf-8") as f:
+                schedule = json.load(f).get("schedule", [])
+        except Exception:
+            return None
+        if not schedule:
+            return None
+
+        tz = pytz.timezone(self.config.timezone)
+
+        def _dev_on(slot_data: dict[str, Any]) -> bool:
+            whs = slot_data.get("water_heaters")
+            if not isinstance(whs, dict):
+                return False
+            hd: Any = cast("dict[str, Any]", whs).get(device_id)
+            if isinstance(hd, dict):
+                return float(cast("dict[str, Any]", hd).get("heating_kw", 0.0) or 0.0) > 0
+            if hd is not None:
+                return float(hd or 0.0) > 0
+            return False
+
+        # Locate the current slot and walk the contiguous ON run forward.
+        run_minutes = 0.0
+        in_run = False
+        for slot_data in schedule:
+            start_str = slot_data.get("start_time")
+            end_str = slot_data.get("end_time_kepler") or slot_data.get("end_time")
+            if not start_str:
+                continue
+            try:
+                start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                start = tz.localize(start) if start.tzinfo is None else start.astimezone(tz)
+                if end_str:
+                    end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                    end = tz.localize(end) if end.tzinfo is None else end.astimezone(tz)
+                    if end <= start:
+                        end = start + timedelta(minutes=15)
+                else:
+                    end = start + timedelta(minutes=15)
+            except Exception:
+                continue
+
+            slot_minutes = (end - start).total_seconds() / 60.0
+            if not in_run:
+                # Wait until we reach the slot containing 'now'.
+                if start <= now < end:
+                    if not _dev_on(slot_data):
+                        return None  # device not heating in the current slot
+                    in_run = True
+                    run_minutes += slot_minutes
+                continue
+            # Already inside the run: extend while the device stays ON.
+            if _dev_on(slot_data):
+                run_minutes += slot_minutes
+            else:
+                break
+
+        return run_minutes if in_run and run_minutes > 0 else None
+
+    async def _heated_today_by_device(self) -> dict[str, float]:
+        """Build #16 over-heat guard input: MEASURED per-tank kWh already delivered in
+        the current day-bucket.
+
+        Reuses the backend's cold-shower-safe accessor (store-summed, clamped to
+        min_kwh). Cached for 60s so the per-tick actuation loop does not thrash the
+        learning store. Best-effort: any failure returns an empty dict, which simply
+        disables the guard (commits still latch — the safe direction, since the floor is
+        never held OFF; the only downside of a missing guard is a marginally longer
+        block)."""
+        cache = getattr(self, "_heated_today_cache", None)
+        cache_ts = getattr(self, "_heated_today_cache_ts", 0.0)
+        if cache is not None and (time.time() - cache_ts) < 60.0:
+            return cache
+        result: dict[str, float] = {}
+        try:
+            from backend.core.ha_client import get_water_heated_today_by_tank
+
+            result = await get_water_heated_today_by_tank(self._full_config)
+        except Exception as exc:
+            logger.debug("heated_today fetch failed (guard disabled this tick): %s", exc)
+            result = {}
+        self._heated_today_cache = result
+        self._heated_today_cache_ts = time.time()
+        return result
 
     def _parse_slot_plan(self, slot_data: dict[str, Any]) -> SlotPlan:
         """Parse a schedule slot into a SlotPlan object."""
