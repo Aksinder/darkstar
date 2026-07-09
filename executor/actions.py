@@ -536,6 +536,15 @@ class ActionDispatcher:
         # => the first flip per entity is always allowed immediately; only
         # subsequent flips within the dwell window are gated.
         self._last_water_switch_ts: dict[str, float] = {}
+        # Build #16 block-commit latch: wall-clock time.time() UNTIL which a
+        # just-started heating block is committed ON, keyed by target_entity. Set on a
+        # rising edge (OFF->ON) to the planned block length (falls back to min_on) so a
+        # momentary plan OFF mid-block cannot chop the block into fragments (the planner
+        # "walk" safety net). Boost/safety pass bypass_dwell=True and thus break the
+        # commit; a rising edge is NOT committed once the daily floor is already met
+        # (over-heat guard). In-memory: an add-on restart forgets an active commit
+        # (bounded downside — min_on still bounds the block).
+        self._water_commit_until: dict[str, float] = {}
 
     def _resolve_entity_id(self, key: str) -> str | None:
         """
@@ -825,6 +834,9 @@ class ActionDispatcher:
         target_entity: str | None = None,
         *,
         bypass_dwell: bool = False,
+        commit_minutes: float | None = None,
+        heated_today_kwh: float | None = None,
+        min_kwh_per_day: float | None = None,
     ) -> ActionResult:
         """Set water heater target temperature.
 
@@ -833,10 +845,22 @@ class ActionDispatcher:
             target_entity: HA entity to control. If None, falls back to
                            config.water_heater.target_entity (legacy single-heater path).
             bypass_dwell: When True, skip the anti-short-cycle min-on/min-off dwell
-                          gate (switch/input_boolean targets only). Used by boost
-                          (force ON) and safety/override (force OFF) paths that must
-                          actuate immediately. Normal plan-driven calls leave this
-                          False so the dwell caps toggling.
+                          gate AND the block-commit latch (switch/input_boolean targets
+                          only). Used by boost (force ON) and safety/override (force OFF)
+                          paths that must actuate immediately. Normal plan-driven calls
+                          leave this False so the dwell caps toggling.
+            commit_minutes: Build #16 — planned length (minutes) of the heating block
+                          this call belongs to, sourced from the current schedule slot's
+                          contiguous ON run. On a rising edge (OFF->ON) the relay is
+                          committed ON for this long so a mid-block plan OFF cannot chop
+                          the block. None => fall back to min_on_minutes.
+            heated_today_kwh: Build #16 over-heat guard — MEASURED energy already
+                          delivered to THIS heater in the current day-bucket. Combined
+                          with ``min_kwh_per_day``: once the daily floor is met, a rising
+                          edge is NOT committed (so a met-floor block is not held ON
+                          longer than the plan wants). None => guard inactive.
+            min_kwh_per_day: Build #16 — this heater's daily minimum (the cold-shower
+                          floor). See ``heated_today_kwh``.
         """
         start = time.time()
         # Use passed entity; fall back to legacy single-entity config for backward compat
@@ -945,6 +969,39 @@ class ActionDispatcher:
             # verification retries). Placed AFTER the ratify and manual-ON blocks so
             # those short-circuit first and are never double-handled.
             if not bypass_dwell:
+                # Build #16 block-commit latch: once a heating block has started, hold
+                # the relay ON for the planned block length even if the plan momentarily
+                # flips OFF (the planner-walk safety net). Checked BEFORE the min-on/off
+                # dwell so a committed block is never cut short by a marginal plan flip.
+                # Boost/safety pass bypass_dwell=True and so are never blocked here — the
+                # floor and forced-OFF overrides always win.
+                commit_until = self._water_commit_until.get(entity)
+                if (
+                    commit_until is not None
+                    and desired_state == "off"
+                    and current_state == "on"
+                    and time.time() < commit_until
+                ):
+                    remaining_min = int((commit_until - time.time()) / 60)
+                    logger.info(
+                        "Water heater %s block-commit hold: %d min left in committed "
+                        "block (plan wants OFF)",
+                        entity,
+                        remaining_min,
+                    )
+                    return ActionResult(
+                        action_type="water_temp",
+                        success=True,
+                        message=(
+                            f"Block-commit hold: {remaining_min} min left before OFF"
+                        ),
+                        previous_value=current_state,
+                        new_value=current_state,
+                        entity_id=entity,
+                        skipped=True,
+                        duration_ms=int((time.time() - start) * 1000),
+                        error_details=None,
+                    )
                 last_ts = self._last_water_switch_ts.get(entity)
                 if last_ts is not None:
                     if current_state == "on":
@@ -1015,6 +1072,52 @@ class ActionDispatcher:
                 self._last_water_switch_ts[entity] = time.time()
                 if desired_state == "on":
                     self._manual_on_until.pop(entity, None)
+                    # Build #16: rising edge (OFF->ON). Latch a block commitment so a
+                    # mid-block plan OFF cannot chop this block — UNLESS the daily floor
+                    # is already met (over-heat guard: don't hold a met-floor top-up ON
+                    # longer than the plan wants). When bypass_dwell (boost) we still
+                    # record the epoch but do NOT commit — boost is re-asserted every
+                    # tick and must never trap the relay past its own logic.
+                    floor_met = (
+                        heated_today_kwh is not None
+                        and min_kwh_per_day is not None
+                        and min_kwh_per_day > 0
+                        and heated_today_kwh >= min_kwh_per_day
+                    )
+                    if not bypass_dwell and not floor_met:
+                        min_on_s = (
+                            float(
+                                getattr(self.config.water_heater, "min_on_minutes", 0.0) or 0.0
+                            )
+                            * 60.0
+                        )
+                        block_s = (
+                            commit_minutes * 60.0
+                            if commit_minutes is not None and commit_minutes > 0
+                            else 0.0
+                        )
+                        # Only latch an EXTENDED commit when the planned block is longer
+                        # than the min_on the dwell ALREADY guarantees. A shorter/absent
+                        # block length needs no separate latch — the min_on dwell is the
+                        # documented "fall back to min_on" hold, and latching a second
+                        # min_on-length commit on its own clock would only duplicate it.
+                        if block_s > min_on_s:
+                            self._water_commit_until[entity] = time.time() + block_s
+                            logger.info(
+                                "Water heater %s block-commit latched: holding ON for "
+                                "%.0f min (planned block > min_on)",
+                                entity,
+                                block_s / 60.0,
+                            )
+                        else:
+                            self._water_commit_until.pop(entity, None)
+                    else:
+                        # Floor met (or boost): no commit — let the plan/dwell govern OFF.
+                        self._water_commit_until.pop(entity, None)
+                else:
+                    # Commanded OFF (block ended / plan OFF after commit expiry): clear
+                    # the commitment so the min_off dwell governs the next ON.
+                    self._water_commit_until.pop(entity, None)
             return ActionResult(
                 action_type="water_temp",
                 success=switch_ok,

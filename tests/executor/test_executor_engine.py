@@ -1148,7 +1148,7 @@ class TestControlWaterHeatersPerDevice:
     @pytest.mark.asyncio
     async def test_each_heater_gets_independent_ha_call(self, engine, temp_schedule):
         """Each configured water heater device gets its own set_water_temp call."""
-        from unittest.mock import AsyncMock, call
+        from unittest.mock import AsyncMock
 
         from executor.actions import ActionResult
 
@@ -1183,14 +1183,16 @@ class TestControlWaterHeatersPerDevice:
         # Two separate calls — one per device
         assert engine.dispatcher.set_water_temp.call_count == 2
         calls = engine.dispatcher.set_water_temp.call_args_list
-        # Both heaters should be set to normal (heating planned)
-        assert call(60, "input_number.wh1_target") in calls
-        assert call(60, "input_number.wh2_target") in calls
+        # Both heaters should be set to normal (heating planned). Build #16 adds
+        # block-commit kwargs, so match on the positional (temp, entity) pair.
+        positional = [(c.args[0], c.args[1]) for c in calls]
+        assert (60, "input_number.wh1_target") in positional
+        assert (60, "input_number.wh2_target") in positional
 
     @pytest.mark.asyncio
     async def test_heater_off_when_not_planned(self, engine, temp_schedule):
         """Heater with no planned kW gets temp_off temperature."""
-        from unittest.mock import AsyncMock, call
+        from unittest.mock import AsyncMock
 
         from executor.actions import ActionResult
 
@@ -1223,8 +1225,9 @@ class TestControlWaterHeatersPerDevice:
         await engine.run_once()
 
         calls = engine.dispatcher.set_water_temp.call_args_list
-        assert call(60, "input_number.wh1_target") in calls
-        assert call(40, "input_number.wh2_target") in calls
+        positional = [(c.args[0], c.args[1]) for c in calls]
+        assert (60, "input_number.wh1_target") in positional
+        assert (40, "input_number.wh2_target") in positional
 
     @pytest.mark.asyncio
     async def test_old_format_schedule_sets_all_devices_to_off(self, engine, temp_schedule):
@@ -1233,7 +1236,7 @@ class TestControlWaterHeatersPerDevice:
         When the schedule has no per-device breakdown, water_heater_plans is empty,
         so controller sets all devices to temp_off and still makes per-device HA calls.
         """
-        from unittest.mock import AsyncMock, call
+        from unittest.mock import AsyncMock
 
         from executor.actions import ActionResult
 
@@ -1265,8 +1268,9 @@ class TestControlWaterHeatersPerDevice:
         # Both devices controlled, set to temp_off (no per-device plan available)
         assert engine.dispatcher.set_water_temp.call_count == 2
         calls = engine.dispatcher.set_water_temp.call_args_list
-        assert call(40, "input_number.wh1_target") in calls
-        assert call(40, "input_number.wh2_target") in calls
+        positional = [(c.args[0], c.args[1]) for c in calls]
+        assert (40, "input_number.wh1_target") in positional
+        assert (40, "input_number.wh2_target") in positional
 
     @pytest.mark.asyncio
     async def test_clear_water_boost_turns_off_every_device(self, engine):

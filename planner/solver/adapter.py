@@ -88,6 +88,9 @@ def build_water_heater_inputs(
         state = state_by_id.get(heater_id, {})
         heated_today = float(state.get("heated_today_kwh", 0.0))
         force_on_slots: list[int] | None = state.get("force_on_slots")
+        # Build #16: previous-plan anchor slots (already mapped to future_df indices
+        # and price-gated in the pipeline). None/empty => no anchor for this heater.
+        anchor_on_slots: list[int] | None = state.get("anchor_on_slots")
 
         result.append(
             WaterHeaterInput(
@@ -98,6 +101,7 @@ def build_water_heater_inputs(
                 min_spacing_hours=spacing_hours,
                 force_on_slots=force_on_slots if force_on_slots else None,
                 heated_today_kwh=heated_today,
+                anchor_on_slots=anchor_on_slots if anchor_on_slots else None,
             )
         )
 
@@ -852,6 +856,19 @@ def config_to_kepler_config(
         ),
         defer_up_to_hours=float(wh_cfg.get("defer_up_to_hours", 0.0)),
         water_hourly_blocks=bool(wh_cfg.get("hourly_blocks", True)),
+        # Build #16 plan-stability anchor bonus (öre-scale). Default 0.05 SEK/slot:
+        # over a typical 3-6 slot block that is ~0.6-1.2 SEK total. It must EXCEED the
+        # solver's within-gap slack (gapRel 0.01 x a tens-of-SEK objective ~= 0.2-0.5 SEK,
+        # possibly wider under the 120s time-box) or the time-boxed incumbent ignores it
+        # and the walk persists — so 0.05/slot was too small; 0.2/slot clears it. Still
+        # far below the WTP credit (SEK-scale/kWh) and reliability penalty (~thousands),
+        # and the PV-aware per-block price-gate (kepler) drops it whenever a genuine
+        # cheaper position beats the anchored one by more than the bonus, so a real price
+        # change relocates the block. The executor block-commit is the robust relay
+        # backstop if a time-boxed incumbent still ignores the anchor on a hard model.
+        water_anchor_bonus_sek_per_slot=float(
+            wh_cfg.get("anchor_bonus_sek_per_slot", 0.2)
+        ),
         # Rev E4: Export Toggle
         enable_export=bool(planner_config.get("export", {}).get("enable_export", True)),
         # Export SoC Floor: minimum SoC required to allow grid export
