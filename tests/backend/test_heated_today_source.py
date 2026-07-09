@@ -112,8 +112,12 @@ async def test_measured_store_rows_credited_and_overcredit_clamped():
 
 
 @pytest.mark.asyncio
-async def test_power_history_fallback_when_no_store_rows():
-    """No store rows for a tank => integrate its power sensor; still clamped."""
+async def test_no_store_rows_credits_zero_not_powerhistory():
+    """COLD-SHOWER SAFETY: no store rows for a tank => credit 0.0 (safe over-heat).
+    The long-window power-history integral (which can OVER-estimate over a multi-hour
+    bucket -> zero the reliability floor -> cold shower) must NEVER be used for
+    crediting. Proven by asserting get_energy_from_power_history is not awaited even
+    though the store returned no rows and a fallback value was available."""
     with (
         patch("backend.learning.store.LearningStore", return_value=_mock_store([])),
         patch.object(
@@ -122,65 +126,45 @@ async def test_power_history_fallback_when_no_store_rows():
     ):
         result = await get_water_heated_today_by_tank(_config())
 
-    assert result["main_tank"] == pytest.approx(2.5)
-    assert result["villavagn_tank"] == pytest.approx(2.5)
-    # Fallback integrated over the day-bucket window (start, now).
-    assert gefph.await_count == 2
-    args, _ = gefph.await_args_list[0]
-    assert args[0] in ("sensor.house_vvb_real_power", "sensor.villavagn_vvb_power")
-    assert isinstance(args[1], datetime) and isinstance(args[2], datetime)
-
-
-@pytest.mark.asyncio
-async def test_power_history_none_falls_back_to_zero_safe():
-    """Store empty AND power history unavailable => 0.0 (safe over-heat, not under-heat)."""
-    with (
-        patch("backend.learning.store.LearningStore", return_value=_mock_store([])),
-        patch.object(ha_client, "get_energy_from_power_history", AsyncMock(return_value=None)),
-    ):
-        result = await get_water_heated_today_by_tank(_config())
-
     assert result["main_tank"] == 0.0
     assert result["villavagn_tank"] == 0.0
+    gefph.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_store_error_falls_back_to_power_history_then_zero():
-    """Store read raises => per-tank power-history fallback; if that errors too => 0.0."""
+async def test_store_error_credits_zero_safe():
+    """Store read raises (e.g. SQLite lock contention) => seen_ids empty => every tank
+    credits 0.0 (safe over-heat). No power-history over-estimate can leak in."""
     with (
         patch("backend.learning.store.LearningStore", return_value=_mock_store(raise_exc=True)),
         patch.object(
-            ha_client,
-            "get_energy_from_power_history",
-            AsyncMock(side_effect=RuntimeError("HA down")),
-        ),
+            ha_client, "get_energy_from_power_history", AsyncMock(return_value=99.0)
+        ) as gefph,
     ):
         result = await get_water_heated_today_by_tank(_config())
 
     assert result["main_tank"] == 0.0
     assert result["villavagn_tank"] == 0.0
+    gefph.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_store_construction_failure_falls_back_to_zero():
-    """A failure constructing the store => per-tank power-history fallback, then 0.0."""
-    # Store construction failure is caught inside the store try-block, so tanks
-    # fall through to power-history; force that to also fail for a clean 0.0.
+async def test_store_construction_failure_credits_zero_safe():
+    """A failure constructing the store => every tank credits 0.0 (safe over-heat)."""
     with (
         patch(
             "backend.learning.store.LearningStore",
             side_effect=RuntimeError("cannot open db"),
         ),
         patch.object(
-            ha_client,
-            "get_energy_from_power_history",
-            AsyncMock(side_effect=RuntimeError("HA down")),
-        ),
+            ha_client, "get_energy_from_power_history", AsyncMock(return_value=99.0)
+        ) as gefph,
     ):
         result = await get_water_heated_today_by_tank(_config())
 
     assert result["main_tank"] == 0.0
     assert result["villavagn_tank"] == 0.0
+    gefph.assert_not_awaited()
 
 
 @pytest.mark.asyncio

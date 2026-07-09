@@ -307,15 +307,16 @@ async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, fl
     """MEASURED, per-tank water energy already delivered in the current day-bucket.
 
     COLD-SHOWER-SAFE by construction:
-      * SOURCE is measured, per-tank: summed from the learning store's
+      * SOURCE is measured, per-tank: summed ONLY from the learning store's
         ``slot_device_energy`` rows (savings-v2, device_id == heater id) over the
-        current day-bucket. When a tank has NO rows in the bucket (store empty/sparse
-        for it) we fall back to integrating that tank's power sensor via
-        ``get_energy_from_power_history`` over the same window.
+        current day-bucket. That sum is integrated per 15-min slot by the recorder and
+        cannot exceed what actually ran. We deliberately do NOT fall back to a direct
+        power-history integral over the (multi-hour) bucket: mean-of-samples x a long
+        window can OVER-estimate, and over-crediting would zero the reliability floor.
       * CONSERVATIVE: every value is clamped to ``[0, min_kwh_per_day]`` so a big
         draw-day can never credit MORE than the daily floor (which would zero the
-        cold-shower backstop). On ANY uncertainty/error the tank credits 0.0 — i.e.
-        the current safe OVER-heating behaviour, never under-heating.
+        cold-shower backstop). When a tank has NO store rows (sparse DB / store read
+        failed), it credits 0.0 — the safe OVER-heating direction, never under-heating.
 
     Returns ``{heater_id: heated_today_kwh}`` for enabled heaters; empty on failure.
     """
@@ -358,42 +359,31 @@ async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, fl
                 with contextlib.suppress(Exception):
                     await store.close()
 
-        # 2) Per-tank: use store sum, else integrate the power sensor; then clamp.
+        # 2) Per-tank: credit ONLY the store's summed per-slot measured energy, clamped.
+        # The store sum cannot exceed what actually ran (it is integrated per 15-min slot
+        # by the recorder). A direct power-history integral over the whole multi-hour
+        # bucket, by contrast, can OVER-estimate (mean-of-samples x long duration), and
+        # over-crediting would drive kepler's day_min to 0 and zero the reliability floor
+        # -> cold shower. So a tank with NO store rows (sparse DB, or the store read
+        # raised above leaving seen_ids empty) credits 0.0 = the safe OVER-heat direction,
+        # never under-heat. Do NOT reintroduce a long-window power-history fallback here.
         for wh in water_heaters:
             hid = str(wh.get("id", ""))
             if not hid:
                 continue
             min_kwh = float(wh.get("min_kwh_per_day", 0.0) or 0.0)
-            source = "store"
-            measured: float | None
             if hid in seen_ids:
-                measured = measured_by_id.get(hid, 0.0)
+                credited = max(0.0, min(measured_by_id.get(hid, 0.0), min_kwh))
+                source = "store"
             else:
-                source = "power_history"
-                measured = None
-                sensor = wh.get("sensor")
-                if sensor:
-                    try:
-                        measured = await get_energy_from_power_history(
-                            str(sensor), bucket_start, now
-                        )
-                    except Exception as exc:
-                        logger.warning("heated_today[%s]: power history failed (%s)", hid, exc)
-                        measured = None
-
-            if measured is None:
-                credited = 0.0  # safe fallback: over-heat, never under-heat
-                source = "fallback_0"
-            else:
-                credited = max(0.0, min(float(measured), min_kwh))
+                credited = 0.0  # no trusted measurement -> over-heat, never under-heat
+                source = "no_store_rows"
 
             result[hid] = credited
             logger.info(
-                "heated_today[%s]: credited=%.3f kWh (measured=%s, min_kwh=%.2f, "
-                "bucket_start=%s, source=%s)",
+                "heated_today[%s]: credited=%.3f kWh (min_kwh=%.2f, bucket_start=%s, source=%s)",
                 hid,
                 credited,
-                f"{measured:.3f}" if measured is not None else "None",
                 min_kwh,
                 bucket_start.isoformat(),
                 source,
