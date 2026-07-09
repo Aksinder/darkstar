@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import logging
+import math
 import re
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
@@ -276,6 +278,122 @@ async def get_ha_bool(entity_id: str) -> bool:
     return is_true
 
 
+def _water_day_bucket_start(now: datetime, defer_hours: float, tz: Any) -> datetime:
+    """Start of the water day-bucket that ``now`` belongs to, matching kepler.
+
+    kepler (planner/solver/kepler.py:888-893) buckets each slot by its LOCAL date,
+    moving slots whose local hour is < ``defer_up_to_hours`` into the PREVIOUS day.
+    Equivalently the day boundary is at wall-clock hour ``ceil(defer_hours)`` local
+    (00:00 when defer_hours == 0). This applies the identical rule to ``now`` so the
+    heated-today window is exactly the current bucket [boundary_hour:00, now], never
+    a naive local-midnight window when defer differs.
+    """
+    boundary_hour = math.ceil(defer_hours) if defer_hours > 0 else 0
+    boundary_hour = max(0, min(23, boundary_hour))
+    bucket_date = now.date()
+    if defer_hours > 0 and now.hour < defer_hours:
+        bucket_date = bucket_date - timedelta(days=1)
+    naive = datetime(
+        bucket_date.year, bucket_date.month, bucket_date.day, boundary_hour, 0, 0
+    )
+    # pytz tz => use localize; stdlib/zoneinfo tz => replace(tzinfo=...)
+    localize = getattr(tz, "localize", None)
+    if callable(localize):
+        return cast("datetime", localize(naive))
+    return naive.replace(tzinfo=tz)
+
+
+async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, float]:
+    """MEASURED, per-tank water energy already delivered in the current day-bucket.
+
+    COLD-SHOWER-SAFE by construction:
+      * SOURCE is measured, per-tank: summed ONLY from the learning store's
+        ``slot_device_energy`` rows (savings-v2, device_id == heater id) over the
+        current day-bucket. That sum is integrated per 15-min slot by the recorder and
+        cannot exceed what actually ran. We deliberately do NOT fall back to a direct
+        power-history integral over the (multi-hour) bucket: mean-of-samples x a long
+        window can OVER-estimate, and over-crediting would zero the reliability floor.
+      * CONSERVATIVE: every value is clamped to ``[0, min_kwh_per_day]`` so a big
+        draw-day can never credit MORE than the daily floor (which would zero the
+        cold-shower backstop). When a tank has NO store rows (sparse DB / store read
+        failed), it credits 0.0 — the safe OVER-heating direction, never under-heating.
+
+    Returns ``{heater_id: heated_today_kwh}`` for enabled heaters; empty on failure.
+    """
+    result: dict[str, float] = {}
+    try:
+        water_heaters = [
+            wh for wh in config.get("water_heaters", []) if wh.get("enabled", True)
+        ]
+        if not water_heaters:
+            return {}
+
+        wh_cfg = config.get("water_heating", {})
+        defer_hours = float(wh_cfg.get("defer_up_to_hours", 0.0) or 0.0)
+        tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+        now = datetime.now(tz)
+        bucket_start = _water_day_bucket_start(now, defer_hours, tz)
+
+        # 1) Preferred source: measured per-tank rows from the learning store.
+        seen_ids: set[str] = set()
+        measured_by_id: dict[str, float] = {}
+        db_path = config.get("learning", {}).get("sqlite_path", "data/planner_learning.db")
+        store: Any = None
+        try:
+            from backend.learning.store import LearningStore
+
+            store = LearningStore(db_path, tz)
+            rows = await store.get_device_energy_rows_between(
+                bucket_start.isoformat(), now.isoformat()
+            )
+            for r in rows:
+                did = str(r.get("device_id", ""))
+                if not did:
+                    continue
+                measured_by_id[did] = measured_by_id.get(did, 0.0) + float(r.get("kwh", 0.0) or 0.0)
+                seen_ids.add(did)
+        except Exception as exc:  # store unavailable => fall back per-tank below
+            logger.warning("heated_today: slot_device_energy read failed (%s); using power history", exc)
+        finally:
+            if store is not None:
+                with contextlib.suppress(Exception):
+                    await store.close()
+
+        # 2) Per-tank: credit ONLY the store's summed per-slot measured energy, clamped.
+        # The store sum cannot exceed what actually ran (it is integrated per 15-min slot
+        # by the recorder). A direct power-history integral over the whole multi-hour
+        # bucket, by contrast, can OVER-estimate (mean-of-samples x long duration), and
+        # over-crediting would drive kepler's day_min to 0 and zero the reliability floor
+        # -> cold shower. So a tank with NO store rows (sparse DB, or the store read
+        # raised above leaving seen_ids empty) credits 0.0 = the safe OVER-heat direction,
+        # never under-heat. Do NOT reintroduce a long-window power-history fallback here.
+        for wh in water_heaters:
+            hid = str(wh.get("id", ""))
+            if not hid:
+                continue
+            min_kwh = float(wh.get("min_kwh_per_day", 0.0) or 0.0)
+            if hid in seen_ids:
+                credited = max(0.0, min(measured_by_id.get(hid, 0.0), min_kwh))
+                source = "store"
+            else:
+                credited = 0.0  # no trusted measurement -> over-heat, never under-heat
+                source = "no_store_rows"
+
+            result[hid] = credited
+            logger.info(
+                "heated_today[%s]: credited=%.3f kWh (min_kwh=%.2f, bucket_start=%s, source=%s)",
+                hid,
+                credited,
+                min_kwh,
+                bucket_start.isoformat(),
+                source,
+            )
+        return result
+    except Exception as exc:
+        logger.warning("heated_today crediting failed; falling back to 0.0 for all tanks: %s", exc)
+        return {}
+
+
 async def get_initial_state(
     config_path: str = "config.yaml",
     ev_plugged_in_override: bool | None = None,
@@ -324,7 +442,20 @@ async def get_initial_state(
     battery_kwh = capacity_kwh * battery_soc_percent / 100.0
 
     system_config = config.get("system", {})
+    # Per-tank MEASURED heated-today (kepler credits this against min_kwh_per_day so
+    # it stops re-inserting the full daily floor every replan — the "walking block"
+    # root cause). Cold-shower-safe: clamped per tank and 0.0 on any uncertainty.
+    water_heater_states: list[dict[str, Any]] = []
     water_heated_today_kwh = 0.0
+    try:
+        heated_by_id = await get_water_heated_today_by_tank(config)
+        for hid, kwh in heated_by_id.items():
+            water_heater_states.append({"id": hid, "heated_today_kwh": kwh})
+        water_heated_today_kwh = sum(heated_by_id.values())
+    except Exception as exc:
+        logger.warning("heated_today: initial-state crediting failed, using 0.0: %s", exc)
+        water_heater_states = []
+        water_heated_today_kwh = 0.0
 
     # Per-device EV state fetching
     has_ev_charger = system_config.get("has_ev_charger", False)
@@ -590,6 +721,9 @@ async def get_initial_state(
         "battery_kwh": battery_kwh,
         "battery_cost_sek_per_kwh": battery_cost_sek_per_kwh,
         "water_heated_today_kwh": water_heated_today_kwh,
+        # Per-tank measured heated-today (pipeline consumes this into
+        # water_heated_today_by_id; kepler subtracts it from min_kwh_per_day).
+        "water_heater_states": water_heater_states,
         # Legacy scalar fields (backward compat)
         "ev_soc_percent": ev_soc_percent,
         "ev_plugged_in": ev_plugged_in,

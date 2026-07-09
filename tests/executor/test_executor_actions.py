@@ -392,6 +392,11 @@ class TestSetWaterTemp:
             water_heater=WaterHeaterConfig(
                 temp_normal=50,
                 temp_off=40,
+                # Anti-short-cycle dwell OFF by default here so these tests keep
+                # exercising ratify/ownership/enforcement behaviour in isolation.
+                # The dedicated dwell tests (TestWaterDwell) set explicit values.
+                min_on_minutes=0.0,
+                min_off_minutes=0.0,
             ),
             water_heater_devices=[
                 WaterHeaterDeviceConfig(
@@ -732,6 +737,234 @@ class TestSetWaterTemp:
 
         # Assert HA write was attempted
         ha_client.set_input_number.assert_called_once_with("input_number.water_heater_target", 50.0)
+
+
+class TestWaterDwell:
+    """Build #15 PART A: anti-short-cycle min-on/min-off dwell on switch targets.
+
+    Reproduces the overnight short-cycling (ON 02:00:17 -> OFF 02:03:10) and proves
+    the dwell suppresses it, while boost/safety bypass and manual-ON respect keep
+    their precedence and a genuine sustained change still wins after the dwell.
+    """
+
+    def _config(self, min_on: float = 30.0, min_off: float = 15.0, manual_respect: float = 90.0):
+        from executor.config import (
+            ControllerConfig,
+            ExecutorConfig,
+            InverterConfig,
+            NotificationConfig,
+            WaterHeaterConfig,
+            WaterHeaterDeviceConfig,
+        )
+
+        return ExecutorConfig(
+            inverter=InverterConfig(),
+            controller=ControllerConfig(),
+            water_heater=WaterHeaterConfig(
+                temp_normal=60,
+                temp_off=40,
+                temp_boost=70,
+                min_on_minutes=min_on,
+                min_off_minutes=min_off,
+                manual_on_respect_minutes=manual_respect,
+            ),
+            water_heater_devices=[
+                WaterHeaterDeviceConfig(
+                    id="main",
+                    name="Main Heater",
+                    target_entity="switch.vvb",
+                    power_kw=3.0,
+                )
+            ],
+            notifications=NotificationConfig(),
+        )
+
+    def _dispatcher(self, current_state: str, **cfg_over):
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value=current_state)
+        ha_client.set_switch = AsyncMock(return_value=True)
+        dispatcher = ActionDispatcher(
+            ha_client=ha_client, config=self._config(**cfg_over), shadow_mode=False
+        )
+        return dispatcher, ha_client
+
+    @pytest.mark.asyncio
+    async def test_dwell_holds_on_against_early_off(self):
+        """Relay ON (executor-owned) turned OFF 3 min later => HELD (no set_switch).
+
+        This is the exact 02:00:17 ON -> 02:03:10 OFF flip from the incident.
+        """
+        import time
+
+        dispatcher, ha_client = self._dispatcher("on")
+        # Executor owns the ON (so manual-ON respect does NOT intercept) and it just
+        # turned on ~3 min ago.
+        dispatcher._last_water_cmd["switch.vvb"] = "on"
+        dispatcher._last_water_switch_ts["switch.vvb"] = time.time() - 3 * 60
+
+        result = await dispatcher.set_water_temp(40, "switch.vvb")  # plan flips OFF
+
+        assert result.success is True
+        assert result.skipped is True
+        assert "Dwell hold" in result.message
+        ha_client.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dwell_holds_off_against_early_on(self):
+        """Relay OFF 5 min ago, min_off=15 => an ON flip is HELD."""
+        import time
+
+        dispatcher, ha_client = self._dispatcher("off")
+        dispatcher._last_water_cmd["switch.vvb"] = "off"
+        dispatcher._last_water_switch_ts["switch.vvb"] = time.time() - 5 * 60
+
+        result = await dispatcher.set_water_temp(60, "switch.vvb")  # plan flips ON
+
+        assert result.success is True
+        assert result.skipped is True
+        assert "Dwell hold" in result.message
+        ha_client.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dwell_allows_flip_after_min_on(self):
+        """Once min_on has elapsed a sustained OFF change wins."""
+        import time
+
+        dispatcher, ha_client = self._dispatcher("on")
+        dispatcher._last_water_cmd["switch.vvb"] = "on"
+        # ON happened 31 min ago; min_on=30 => elapsed.
+        dispatcher._last_water_switch_ts["switch.vvb"] = time.time() - 31 * 60
+
+        result = await dispatcher.set_water_temp(40, "switch.vvb")
+
+        assert result.success is True
+        assert result.skipped is False
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", False)
+
+    @pytest.mark.asyncio
+    async def test_oscillating_plan_bounded_to_one_toggle(self):
+        """An oscillating 60/40/60/40 plan within one dwell window => <=1 relay flip."""
+        from executor.actions import ActionDispatcher
+
+        state = {"v": "off"}
+
+        async def _get(_entity):
+            return state["v"]
+
+        async def _set(_entity, on):
+            state["v"] = "on" if on else "off"
+            return True
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(side_effect=_get)
+        ha_client.set_switch = AsyncMock(side_effect=_set)
+        dispatcher = ActionDispatcher(
+            ha_client=ha_client, config=self._config(), shadow_mode=False
+        )
+
+        # Cold start: first ON flips immediately; every later flip is dwell-held.
+        for target in (60, 40, 60, 40, 60, 40):
+            await dispatcher.set_water_temp(target, "switch.vvb")
+
+        assert ha_client.set_switch.await_count == 1  # only the initial ON
+        assert state["v"] == "on"
+
+    @pytest.mark.asyncio
+    async def test_boost_bypasses_dwell(self):
+        """A boost (bypass_dwell=True) turns the relay ON even inside min_off."""
+        import time
+
+        dispatcher, ha_client = self._dispatcher("off")
+        dispatcher._last_water_cmd["switch.vvb"] = "off"
+        dispatcher._last_water_switch_ts["switch.vvb"] = time.time()  # just turned off
+
+        result = await dispatcher.set_water_temp(70, "switch.vvb", bypass_dwell=True)
+
+        assert result.skipped is False
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", True)
+
+    @pytest.mark.asyncio
+    async def test_safety_off_bypasses_dwell(self):
+        """A safety/override OFF (bypass_dwell=True) turns off even inside min_on."""
+        import time
+
+        dispatcher, ha_client = self._dispatcher("on")
+        dispatcher._last_water_cmd["switch.vvb"] = "on"  # executor-owned ON
+        dispatcher._last_water_switch_ts["switch.vvb"] = time.time()  # just turned on
+
+        result = await dispatcher.set_water_temp(40, "switch.vvb", bypass_dwell=True)
+
+        assert result.skipped is False
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", False)
+
+    @pytest.mark.asyncio
+    async def test_manual_on_respect_wins_over_dwell(self):
+        """A HUMAN's ON (not executor-owned) is respected first; dwell never runs."""
+        import time
+
+        dispatcher, ha_client = self._dispatcher("on")
+        # We never commanded this ON => manual. Seed a dwell epoch to prove the dwell
+        # branch is not what produces the skip.
+        dispatcher._last_water_switch_ts["switch.vvb"] = time.time() - 999 * 60
+
+        result = await dispatcher.set_water_temp(40, "switch.vvb")
+
+        assert result.skipped is True
+        assert "Manual ON respected" in result.message
+        assert "Dwell hold" not in result.message
+        ha_client.set_switch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cold_start_first_flip_immediate(self):
+        """Empty _last_water_switch_ts => the first flip actuates with no delay."""
+        dispatcher, ha_client = self._dispatcher("off")
+        assert dispatcher._last_water_switch_ts == {}
+
+        result = await dispatcher.set_water_temp(60, "switch.vvb")
+
+        assert result.skipped is False
+        ha_client.set_switch.assert_awaited_once_with("switch.vvb", True)
+
+    @pytest.mark.asyncio
+    async def test_contiguous_block_not_starved_by_dwell(self):
+        """min_kwh floor is never starved: a contiguous ON block (plan keeps
+        commanding ON while the relay is already ON) produces only idempotent
+        already-equal skips, never a dwell skip, and the eventual OFF after min_on
+        is honored so exactly the planned energy is delivered then cleanly stops."""
+        import time
+
+        from executor.actions import ActionDispatcher
+
+        state = {"v": "off"}
+
+        async def _get(_entity):
+            return state["v"]
+
+        async def _set(_entity, on):
+            state["v"] = "on" if on else "off"
+            return True
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(side_effect=_get)
+        ha_client.set_switch = AsyncMock(side_effect=_set)
+        dispatcher = ActionDispatcher(
+            ha_client=ha_client, config=self._config(), shadow_mode=False
+        )
+
+        # Tick 1: plan ON, relay off => flip ON (delivers the block).
+        r1 = await dispatcher.set_water_temp(60, "switch.vvb")
+        assert r1.skipped is False and state["v"] == "on"
+        # Ticks 2-3: plan still ON, relay already on => idempotent skip, NOT dwell.
+        for _ in range(2):
+            r = await dispatcher.set_water_temp(60, "switch.vvb")
+            assert r.skipped is True
+            assert "Dwell hold" not in r.message
+        # After min_on elapses the plan-OFF is honored (block ends cleanly).
+        dispatcher._last_water_switch_ts["switch.vvb"] = time.time() - 31 * 60
+        r_off = await dispatcher.set_water_temp(40, "switch.vvb")
+        assert r_off.skipped is False and state["v"] == "off"
 
 
 class TestClimateSink:

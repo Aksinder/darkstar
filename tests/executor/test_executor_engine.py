@@ -1268,6 +1268,77 @@ class TestControlWaterHeatersPerDevice:
         assert call(40, "input_number.wh1_target") in calls
         assert call(40, "input_number.wh2_target") in calls
 
+    @pytest.mark.asyncio
+    async def test_clear_water_boost_turns_off_every_device(self, engine):
+        """Cancelling a boost turns OFF EVERY configured tank with bypass_dwell.
+
+        Regression: the immediate-OFF used to target the empty global target_entity
+        and was a silent no-op on multi-tank configs (a cancelled boost kept heating).
+        """
+        import asyncio as _asyncio
+        from unittest.mock import AsyncMock, call
+
+        from executor.actions import ActionResult
+
+        engine.dispatcher.set_water_temp = AsyncMock(
+            return_value=ActionResult(action_type="water_temp", success=True)
+        )
+        tz = pytz.timezone("Europe/Stockholm")
+        engine._water_boost_until = datetime.now(tz) + timedelta(minutes=60)
+
+        engine.clear_water_boost()
+        # clear_water_boost schedules the OFF calls as background tasks.
+        if engine._background_tasks:
+            await _asyncio.gather(*list(engine._background_tasks))
+
+        calls = engine.dispatcher.set_water_temp.call_args_list
+        assert call(40, "input_number.wh1_target", bypass_dwell=True) in calls
+        assert call(40, "input_number.wh2_target", bypass_dwell=True) in calls
+
+    @pytest.mark.asyncio
+    async def test_override_force_off_actuates_every_device(self, engine, temp_schedule):
+        """An override that forces water OFF (slot-failure-fallback) actuates EVERY tank
+        with bypass_dwell, instead of no-op'ing on the empty global target_entity.
+
+        Regression: multi-tank configs were never force-stopped because the override OFF
+        only reached the legacy scalar path (decision.water_temps is empty on overrides).
+        """
+        from unittest.mock import AsyncMock, call
+
+        from executor.actions import ActionResult
+
+        engine._has_water_heater = True
+        # A schedule whose only slot has already ended -> no slot covers now ->
+        # slot_failure_fallback override forces water OFF.
+        tz = pytz.timezone("Europe/Stockholm")
+        now = datetime.now(tz)
+        stale_start = now - timedelta(hours=2)
+        stale_end = stale_start + timedelta(minutes=15)
+        slot = {
+            "start_time": stale_start.isoformat(),
+            "end_time": stale_end.isoformat(),
+            "end_time_kepler": stale_end.isoformat(),
+            "battery_charge_kw": 0.0,
+            "battery_discharge_kw": 0.0,
+            "export_kwh": 0.0,
+            "water_heating_kw": 0.0,
+            "soc_target_percent": 50,
+            "projected_soc_percent": 45,
+        }
+        with Path(temp_schedule).open("w", encoding="utf-8") as f:
+            json.dump(make_schedule([slot]), f)
+
+        engine.dispatcher.set_water_temp = AsyncMock(
+            return_value=ActionResult(action_type="water_temp", success=True)
+        )
+
+        await engine.run_once()
+
+        calls = engine.dispatcher.set_water_temp.call_args_list
+        # Every device forced OFF (temp_off=40) immediately (bypass_dwell=True).
+        assert call(40, "input_number.wh1_target", bypass_dwell=True) in calls
+        assert call(40, "input_number.wh2_target", bypass_dwell=True) in calls
+
     async def test_get_status_includes_water_heater_plans(self, engine, temp_schedule):
         """get_status() returns water_heater_plans in current_slot_plan."""
         from executor.override import SystemState
