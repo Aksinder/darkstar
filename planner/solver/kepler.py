@@ -993,52 +993,78 @@ class KeplerSolver:
             # below the WTP credit and reliability penalty, so real economics dominate.
             anchor_bonus: float = config.water_anchor_bonus_sek_per_slot
             if anchor_bonus > 0:
-                import_prices_sorted: list[float] = sorted(
-                    slots[t].import_price_sek_kwh for t in range(T)
-                )
+                # PV-AWARE effective cost of heating one slot's worth of energy at t:
+                # PV surplus (pv - load) is consumed first at its opportunity cost (the
+                # export price forgone), the remainder is grid import. This mirrors how
+                # the objective actually prices a heating slot, so the gate does NOT
+                # mis-judge the midday PV plateau — where import price is high but heating
+                # is essentially free from surplus — as "expensive" and wrongly drop the
+                # anchor there (that plateau is the DOMINANT walk regime). Deterministic
+                # (pure Python), so immune to the 120s HiGHS time-box.
+                def _slot_heat_cost(t: int, kwh: float) -> float:
+                    surplus = max(0.0, slots[t].pv_kwh - slots[t].load_kwh)
+                    pv_used = min(surplus, kwh)
+                    grid = kwh - pv_used
+                    return (
+                        pv_used * slots[t].export_price_sek_kwh
+                        + grid * slots[t].import_price_sek_kwh
+                    )
+
                 for heater in water_heaters:
                     d = heater.id
                     if not heater.anchor_on_slots:
                         continue
-                    anchor_in: list[int] = [t for t in heater.anchor_on_slots if 0 <= t < T]
-                    n_anchor: int = len(anchor_in)
-                    if n_anchor == 0:
+                    anchor_in: list[int] = sorted(
+                        t for t in heater.anchor_on_slots if 0 <= t < T
+                    )
+                    if not anchor_in:
                         continue
                     kwh_per_slot_a: float = heater.power_kw * avg_slot_hours
-                    # Grid-energy cost of the block at the anchored position vs at the
-                    # n_anchor cheapest slots in the horizon (import price is the marginal
-                    # driver of the flat-band walk; a conservative proxy that ignores PV).
-                    anchored_cost: float = (
-                        sum(slots[t].import_price_sek_kwh for t in anchor_in) * kwh_per_slot_a
+                    costs_sorted: list[float] = sorted(
+                        _slot_heat_cost(t, kwh_per_slot_a) for t in range(T)
                     )
-                    cheapest_cost: float = (
-                        sum(import_prices_sorted[:n_anchor]) * kwh_per_slot_a
-                    )
-                    bonus_total: float = anchor_bonus * n_anchor
-                    if anchored_cost - cheapest_cost > bonus_total:
+                    # Gate each CONTIGUOUS block independently: one relocatable block
+                    # must not drop the anchor for the others (nor couple a cross-day pair).
+                    blocks: list[list[int]] = []
+                    block: list[int] = [anchor_in[0]]
+                    for t in anchor_in[1:]:
+                        if t == block[-1] + 1:
+                            block.append(t)
+                        else:
+                            blocks.append(block)
+                            block = [t]
+                    blocks.append(block)
+                    for blk in blocks:
+                        k = len(blk)
+                        anchored_cost = sum(_slot_heat_cost(t, kwh_per_slot_a) for t in blk)
+                        cheapest_cost = sum(costs_sorted[:k])
+                        bonus_total = anchor_bonus * k
+                        if anchored_cost - cheapest_cost > bonus_total:
+                            logger.info(
+                                "Plan-stability anchor DROPPED for %s block@slot%d: "
+                                "anchored=%.3f vs cheapest=%.3f SEK (delta > bonus %.3f) "
+                                "— price moved, block free to relocate",
+                                d,
+                                blk[0],
+                                anchored_cost,
+                                cheapest_cost,
+                                bonus_total,
+                            )
+                            continue
+                        # KEEP: reward staying ON at the anchored slots (negative cost).
+                        anchor_reward_terms.append(
+                            -anchor_bonus * pulp.lpSum(water_heat[d][t] for t in blk)
+                        )
                         logger.info(
-                            "Plan-stability anchor DROPPED for %s: anchored=%.3f SEK vs "
-                            "cheapest=%.3f SEK (delta > bonus %.3f SEK) — price moved, "
-                            "block free to relocate",
+                            "Plan-stability anchor KEPT for %s block@slot%d: %d slots, "
+                            "bonus %.3f/slot (anchored=%.3f vs cheapest=%.3f SEK)",
                             d,
+                            blk[0],
+                            k,
+                            anchor_bonus,
                             anchored_cost,
                             cheapest_cost,
-                            bonus_total,
                         )
-                        continue
-                    # KEEP: reward staying ON at the anchored slots (negative cost).
-                    anchor_reward_terms.append(
-                        -anchor_bonus * pulp.lpSum(water_heat[d][t] for t in anchor_in)
-                    )
-                    logger.info(
-                        "Plan-stability anchor KEPT for %s: %d slots, bonus %.3f SEK/slot "
-                        "(anchored=%.3f SEK vs cheapest=%.3f SEK)",
-                        d,
-                        n_anchor,
-                        anchor_bonus,
-                        anchored_cost,
-                        cheapest_cost,
-                    )
 
         # Effekttariff: monthly peak demand charge on the hourly-mean grid import
         # (timmedelvärde). One peak variable PER CALENDAR MONTH in the horizon: the
