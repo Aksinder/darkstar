@@ -879,6 +879,10 @@ class KeplerSolver:
         # Water Heating Constraints — per-device (tasks 2.4-2.6)
         gap_violation_penalty: float = 0.0
         sorted_days: list[Any] = []  # Initialize to avoid unbound error
+        # Build #16: collected per-slot anchor REWARD terms (negative cost) for heaters
+        # whose previous-plan position survives the price-gate below. Added to the
+        # objective next to the symmetry breaker. Empty => no anchor active.
+        anchor_reward_terms: list[Any] = []
         if water_enabled:
             avg_slot_hours: float = sum(slot_hours) / len(slot_hours) if slot_hours else 0.25
 
@@ -965,6 +969,76 @@ class KeplerSolver:
                             + water_start[d][t] * M  # type: ignore[operator]
                             <= M
                         )
+
+            # Build #16: price-gated previous-plan anchor (the plan-stability root fix).
+            # For each heater carrying an anchor (its previous-plan ON slots, already
+            # wall-clock-mapped to this future_df by the pipeline), reward keeping the
+            # block where it was — UNLESS a genuinely cheaper position exists.
+            #
+            # WHY it stops the walk: on a flat/degenerate price band many block positions
+            # are within the solver's gapRel tolerance, so the time-boxed incumbent lands
+            # on a different wall-clock hour each replan (the 1e-5 symmetry-breaker is
+            # ~3000x too small to bite). The öre-scale anchor makes "stay put" strictly
+            # cheaper among those tied positions, so the block holds.
+            #
+            # WHY it still relocates on a real price change: the PRICE-GATE below is
+            # computed in Python from the import-price vector (deterministic, immune to
+            # the 120s time-box). If the n cheapest slots beat the anchored slots by MORE
+            # than the total bonus on offer, the anchor is DROPPED entirely for that
+            # heater and the block moves freely.
+            #
+            # COLD-SHOWER SAFETY: this only ever adds a REWARD to water_heat[d][t]==1 at a
+            # subset of slots. It cannot reduce the daily-minimum sum, so it NEVER lowers
+            # day_min / touches the floor (kepler.py day_min_kwh above). It is strictly
+            # below the WTP credit and reliability penalty, so real economics dominate.
+            anchor_bonus: float = config.water_anchor_bonus_sek_per_slot
+            if anchor_bonus > 0:
+                import_prices_sorted: list[float] = sorted(
+                    slots[t].import_price_sek_kwh for t in range(T)
+                )
+                for heater in water_heaters:
+                    d = heater.id
+                    if not heater.anchor_on_slots:
+                        continue
+                    anchor_in: list[int] = [t for t in heater.anchor_on_slots if 0 <= t < T]
+                    n_anchor: int = len(anchor_in)
+                    if n_anchor == 0:
+                        continue
+                    kwh_per_slot_a: float = heater.power_kw * avg_slot_hours
+                    # Grid-energy cost of the block at the anchored position vs at the
+                    # n_anchor cheapest slots in the horizon (import price is the marginal
+                    # driver of the flat-band walk; a conservative proxy that ignores PV).
+                    anchored_cost: float = (
+                        sum(slots[t].import_price_sek_kwh for t in anchor_in) * kwh_per_slot_a
+                    )
+                    cheapest_cost: float = (
+                        sum(import_prices_sorted[:n_anchor]) * kwh_per_slot_a
+                    )
+                    bonus_total: float = anchor_bonus * n_anchor
+                    if anchored_cost - cheapest_cost > bonus_total:
+                        logger.info(
+                            "Plan-stability anchor DROPPED for %s: anchored=%.3f SEK vs "
+                            "cheapest=%.3f SEK (delta > bonus %.3f SEK) — price moved, "
+                            "block free to relocate",
+                            d,
+                            anchored_cost,
+                            cheapest_cost,
+                            bonus_total,
+                        )
+                        continue
+                    # KEEP: reward staying ON at the anchored slots (negative cost).
+                    anchor_reward_terms.append(
+                        -anchor_bonus * pulp.lpSum(water_heat[d][t] for t in anchor_in)
+                    )
+                    logger.info(
+                        "Plan-stability anchor KEPT for %s: %d slots, bonus %.3f SEK/slot "
+                        "(anchored=%.3f SEK vs cheapest=%.3f SEK)",
+                        d,
+                        n_anchor,
+                        anchor_bonus,
+                        anchored_cost,
+                        cheapest_cost,
+                    )
 
         # Effekttariff: monthly peak demand charge on the hourly-mean grid import
         # (timmedelvärde). One peak variable PER CALENDAR MONTH in the horizon: the
@@ -1062,6 +1136,11 @@ class KeplerSolver:
                 if water_enabled
                 else 0.0
             )
+            # Build #16: price-gated previous-plan anchor reward (negative cost). Öre-scale
+            # "stay put" bonus that beats the flat-band ties the 1e-5 term is too weak to
+            # settle; already price-gated per heater above, so a genuine price change has
+            # dropped it. Never touches the daily-minimum floor (reward-only).
+            + (pulp.lpSum(anchor_reward_terms) if anchor_reward_terms else 0.0)
             # Per-device reliability penalties (task 2.9)
             + (
                 pulp.lpSum(

@@ -28,6 +28,15 @@ class WaterHeaterInput:
     min_spacing_hours: float
     force_on_slots: list[int] | None = None
     heated_today_kwh: float = 0.0
+    # Build #16 plan-stability anchor: the solver-slot indices where THIS heater was
+    # planned ON in the previous schedule, mapped to the CURRENT future_df by
+    # wall-clock time (so the same clock hour maps to the correct new index every
+    # replan). Rewards keeping the block where it was (see
+    # water_anchor_bonus_sek_per_slot) to kill the degenerate-tie "block walk" on
+    # flat price bands. None/empty => no anchor (first plan, or the price-gate in the
+    # pipeline dropped it because a genuinely cheaper position exists). NEVER feeds the
+    # daily-minimum floor — it only settles ties among equally-cheap positions.
+    anchor_on_slots: list[int] | None = None
 
 
 @dataclass
@@ -169,6 +178,17 @@ class KeplerConfig:
     )
     water_block_start_penalty_sek: float = 0.0  # Penalty per block start (global)
     defer_up_to_hours: float = 0.0  # Allow heating until N hours into next day (global)
+    # Build #16 plan-stability anchor bonus (SEK per solver slot). When > 0, each
+    # water slot that was ON in the previous schedule (WaterHeaterInput.anchor_on_slots)
+    # earns this bonus for staying ON — making "stay put" the tie-winner among
+    # economically-equal block positions. Öre-scale by design: ABOVE the 1e-5
+    # symmetry-breaker (so it actually bites, unlike that term) yet WELL BELOW the WTP
+    # credit / reliability penalty (so real economics always dominate). The pipeline
+    # ALSO price-gates the anchor (drops it when a candidate position beats the anchored
+    # one by more than the total bonus), so a genuine price change still relocates a
+    # not-yet-started block. 0.0 = disabled (unit-test default); the production adapter
+    # turns it on.
+    water_anchor_bonus_sek_per_slot: float = 0.0
     # PERF: tie water heat/boost binaries together within each wall-clock hour.
     # Kills the temporal near-symmetry (overnight cheap band, midday PV plateau)
     # that makes branch-and-bound explode — measured 8x faster solves for ~0.1%
