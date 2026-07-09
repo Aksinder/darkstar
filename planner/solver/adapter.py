@@ -857,12 +857,17 @@ def config_to_kepler_config(
         defer_up_to_hours=float(wh_cfg.get("defer_up_to_hours", 0.0)),
         water_hourly_blocks=bool(wh_cfg.get("hourly_blocks", True)),
         # Build #16 plan-stability anchor bonus (öre-scale). Default 0.05 SEK/slot:
-        # over a typical 4-6 slot block that is ~0.2-0.3 SEK total — enough to beat the
-        # sub-öre flat-band position differences that drive the block walk, yet far
-        # below the WTP credit (SEK-scale) and reliability penalty (~thousands). The
-        # pipeline price-gates it per heater so a genuine price change still relocates.
+        # over a typical 3-6 slot block that is ~0.6-1.2 SEK total. It must EXCEED the
+        # solver's within-gap slack (gapRel 0.01 x a tens-of-SEK objective ~= 0.2-0.5 SEK,
+        # possibly wider under the 120s time-box) or the time-boxed incumbent ignores it
+        # and the walk persists — so 0.05/slot was too small; 0.2/slot clears it. Still
+        # far below the WTP credit (SEK-scale/kWh) and reliability penalty (~thousands),
+        # and the PV-aware per-block price-gate (kepler) drops it whenever a genuine
+        # cheaper position beats the anchored one by more than the bonus, so a real price
+        # change relocates the block. The executor block-commit is the robust relay
+        # backstop if a time-boxed incumbent still ignores the anchor on a hard model.
         water_anchor_bonus_sek_per_slot=float(
-            wh_cfg.get("anchor_bonus_sek_per_slot", 0.05)
+            wh_cfg.get("anchor_bonus_sek_per_slot", 0.2)
         ),
         # Rev E4: Export Toggle
         enable_export=bool(planner_config.get("export", {}).get("enable_export", True)),

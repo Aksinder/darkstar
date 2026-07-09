@@ -132,6 +132,33 @@ def test_anchor_survives_drifted_but_equal_cost_inputs():
     )
 
 
+def test_pv_plateau_block_kept_despite_lower_import_nonpv_slots():
+    """FINDING-1 REGRESSION (PV-aware price-gate): on the midday PV plateau, import price
+    is HIGH but heating is ~free (PV surplus). An import-price-only gate would judge the
+    plateau block as 'expensive' vs a low-import overnight slot and DROP the anchor,
+    letting the block jam to the EARLIEST plateau slot. The PV-aware gate correctly sees
+    the plateau as cheapest and KEEPS the block at its previous position."""
+    solver = KeplerSolver()
+    slots = _slots(count=48, import_price=1.0)
+    # Low IMPORT price, no PV [0..3] — cheapest by import price, but NOT by real cost.
+    for i in range(0, 4):
+        slots[i].import_price_sek_kwh = 0.5
+    # PV plateau [20..27]: HIGH import (2.0) but PV surplus -> heating ~free (export 0.05).
+    for i in range(20, 28):
+        slots[i].import_price_sek_kwh = 2.0
+        slots[i].pv_kwh = 5.0  # surplus 4.5 kWh >> kwh_per_slot (1.0) -> PV-covered
+        slots[i].export_price_sek_kwh = 0.05
+    res = solver.solve(
+        KeplerInput(slots=slots, initial_soc_kwh=5.0),
+        _config(_heater(anchor_on_slots=[23, 24], min_kwh_per_day=2.0), anchor_bonus=0.2),
+    )
+    assert res.is_optimal
+    on = _on_slots(res)
+    # Kept at the anchored plateau position; an import-only gate would have dropped the
+    # anchor and jammed the block to the earliest plateau slot [20, 21].
+    assert on == [23, 24], f"PV-aware anchor did not hold the plateau block: {on}"
+
+
 def test_genuine_cheaper_position_relocates_not_yet_started_block():
     """A real price drop bigger than the total bonus DROPS the anchor (price-gate) and
     the block relocates to the cheap window."""
