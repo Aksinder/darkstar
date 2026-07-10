@@ -42,6 +42,25 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _str_list(value: Any) -> list[str]:
+    """Normalize a config value into a list of non-empty entity-id strings.
+
+    Accepts a YAML list/tuple, a single scalar (wrapped into a one-element list),
+    or None/blank (=> empty list). Blank/None elements are dropped. Used for
+    ``control_pause_entities`` so both ``foo`` and ``[foo, bar]`` parse cleanly.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if isinstance(value, (list, tuple)):
+        items = cast("list[Any]", value)
+        return [s for s in (_str_or_none(i) for i in items) if s is not None]
+    s = _str_or_none(value)
+    return [s] if s is not None else []
+
+
 def _parse_departure_time(value: Any) -> str | None:
     """Parse departure time from config value.
 
@@ -178,6 +197,12 @@ class ExcessPVCustomEntityConfig:
     comfort_min_temp: float | None = None  # skip ON if current_temperature <= this
     # Planner-side export-price ceiling (SEK/kWh); None => no price gate.
     price_ceiling_sek_per_kwh: float | None = None
+    # Control-pause: HA input_boolean entity ids that put this sink HANDS-OFF. The
+    # sink is PAUSED (executor skips all actuation, leaving whatever a human set)
+    # if ANY listed entity reads state "on". Used to hand the villavagn AC to a
+    # renter. Empty => always managed. Fail-safe: an unreadable entity is treated
+    # as NOT paused (normal control). See dispatcher.is_control_paused.
+    control_pause_entities: list[str] = field(default_factory=lambda: [])
 
 
 # A ladder rung IS the old custom-entity config plus an id — same actuation code.
@@ -230,6 +255,7 @@ def normalize_excess_pv_sinks(excess_pv_data: dict[str, Any]) -> list[dict[str, 
             "climate_mode": str(raw.get("climate_mode", "cool")),
             "target_temp": _float_or_none(raw.get("target_temp")),
             "comfort_min_temp": _float_or_none(raw.get("comfort_min_temp")),
+            "control_pause_entities": _str_list(raw.get("control_pause_entities")),
         }
 
     custom_raw = excess_pv_data.get("custom_entity")
@@ -286,6 +312,13 @@ class WaterHeaterDeviceConfig:
     name: str = ""
     target_entity: str | None = None
     power_kw: float = 3.0
+    # Control-pause: HA input_boolean entity ids that put this heater HANDS-OFF.
+    # The device is PAUSED (executor skips all actuation — plan, boost, and forced
+    # OFF — leaving whatever a human set) if ANY listed entity reads state "on".
+    # Used to hand the villavagn VVB to a renter. Empty (e.g. main_tank) => always
+    # managed. Fail-safe: an unreadable entity is treated as NOT paused (normal
+    # control). See dispatcher.is_control_paused.
+    control_pause_entities: list[str] = field(default_factory=lambda: [])
 
 
 DEFAULT_PENALTY_LEVELS = {
@@ -559,6 +592,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 name=str(heater.get("name", heater_id)),
                 target_entity=target_ent,
                 power_kw=float(heater.get("power_kw", WaterHeaterDeviceConfig.power_kw)),
+                control_pause_entities=_str_list(heater.get("control_pause_entities")),
             )
         )
 
@@ -739,6 +773,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
             target_temp=cast("float | None", d["target_temp"]),
             comfort_min_temp=cast("float | None", d["comfort_min_temp"]),
             price_ceiling_sek_per_kwh=cast("float | None", d["price_ceiling_sek_per_kwh"]),
+            control_pause_entities=cast("list[str]", d["control_pause_entities"]),
         )
         for d in normalize_excess_pv_sinks(excess_pv_data)
     ]
