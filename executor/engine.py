@@ -204,6 +204,11 @@ class ExecutorEngine:
         self._last_boost_state: dict[str, Any] | None = None  # Track changes for WebSocket
         self._last_boost_broadcast: float = 0.0  # Timestamp of last periodic broadcast
 
+        # Control-pause (rent-out hands-off): keys of devices/sinks whose pause we
+        # have already logged this episode, so the INFO line fires ONCE per pause
+        # (not every tick). Cleared per key when the device becomes unpaused again.
+        self._control_pause_logged: set[str] = set()
+
         # Override notification deduplication (Issue 3 fix)
         self._last_override_type: str | None = None
 
@@ -768,14 +773,22 @@ class ExecutorEngine:
             try:
                 loop = asyncio.get_running_loop()
                 boost_temp = self.config.water_heater.temp_boost
-                targets: list[str | None] = [
-                    d.target_entity for d in (self.config.water_heater_devices or [])
-                ] or [None]  # legacy single-heater fallback
-                for target in targets:
-                    task: asyncio.Task[Any] = loop.create_task(
-                        self.dispatcher.set_water_temp(
-                            boost_temp, target, bypass_dwell=True
+                devices = self.config.water_heater_devices or []
+                if devices:
+                    # Per-device: a control-paused device (rent-out hands-off) is skipped
+                    # so the boost button cannot turn a renter's tank ON.
+                    for dev in devices:
+                        task: asyncio.Task[Any] = loop.create_task(
+                            self._apply_water_temp_gated(
+                                boost_temp, dev, log_key=f"boost:{dev.id}"
+                            )
                         )
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
+                else:
+                    # Legacy single-heater fallback (no per-device pause).
+                    task = loop.create_task(
+                        self.dispatcher.set_water_temp(boost_temp, None, bypass_dwell=True)
                     )
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
@@ -810,14 +823,22 @@ class ExecutorEngine:
                     # Schedule async water temp setting
                     loop = asyncio.get_running_loop()
                     off_temp = self.config.water_heater.temp_off
-                    targets: list[str | None] = [
-                        d.target_entity for d in (self.config.water_heater_devices or [])
-                    ] or [None]  # legacy single-heater fallback
-                    for target in targets:
-                        task: asyncio.Task[Any] = loop.create_task(
-                            self.dispatcher.set_water_temp(
-                                off_temp, target, bypass_dwell=True
+                    devices = self.config.water_heater_devices or []
+                    if devices:
+                        # Per-device: a control-paused device (rent-out hands-off) is
+                        # skipped so a boost-cancel cannot turn a renter's tank OFF.
+                        for dev in devices:
+                            task: asyncio.Task[Any] = loop.create_task(
+                                self._apply_water_temp_gated(
+                                    off_temp, dev, log_key=f"clearboost:{dev.id}"
+                                )
                             )
+                            self._background_tasks.add(task)
+                            task.add_done_callback(self._background_tasks.discard)
+                    else:
+                        # Legacy single-heater fallback (no per-device pause).
+                        task = loop.create_task(
+                            self.dispatcher.set_water_temp(off_temp, None, bypass_dwell=True)
                         )
                         self._background_tasks.add(task)
                         task.add_done_callback(self._background_tasks.discard)
@@ -1066,6 +1087,52 @@ class ExecutorEngine:
         )
 
         return next_boundary
+
+    async def _device_control_paused(
+        self,
+        entities: list[str],
+        log_key: str,
+        log_name: str,
+        cache: dict[str, bool],
+    ) -> bool:
+        """Per-device control-pause gate (rent-out hands-off) with once-per-episode log.
+
+        Returns True when the device should be LEFT ALONE — the caller must skip ALL
+        actuation for it (plan, boost, and forced OFF alike), leaving whatever state a
+        human set. Fail-safe: an unreadable pause entity reads as NOT paused so a glitch
+        never strands a device. The INFO line fires once per pause episode; it re-arms
+        when the device becomes unpaused again.
+        """
+        if not self.dispatcher:
+            return False
+        paused_via = await self.dispatcher.control_pause_entity(entities, cache)
+        if paused_via is not None:
+            if log_key not in self._control_pause_logged:
+                self._control_pause_logged.add(log_key)
+                logger.info(
+                    "%s control paused via %s - leaving manual", log_name, paused_via
+                )
+            return True
+        # Episode ended: allow a future pause on this device to log again.
+        self._control_pause_logged.discard(log_key)
+        return False
+
+    async def _apply_water_temp_gated(
+        self, temp: float, device: Any, *, log_key: str
+    ) -> None:
+        """Set a water device's temp UNLESS it is control-paused (rent-out hands-off).
+
+        Used by the manual boost apply/cancel paths (the _tick loops gate inline). A
+        paused device is left exactly as the human set it — boost neither forces it ON
+        nor does a cancel force it OFF.
+        """
+        if self.dispatcher is None:
+            return
+        if device.control_pause_entities and await self._device_control_paused(
+            device.control_pause_entities, log_key, str(device.id), {}
+        ):
+            return
+        await self.dispatcher.set_water_temp(temp, device.target_entity, bypass_dwell=True)
 
     async def _tick(self) -> dict[str, Any]:
         """
@@ -1432,6 +1499,10 @@ class ExecutorEngine:
             # 6. Execute actions
             action_results: list[ActionResult] = []
             if self.dispatcher:
+                # Per-tick control-pause cache (rent-out hands-off): each input_boolean
+                # is read at most once per tick even when shared across devices — the
+                # villavagn master toggle gates both the VVB and the AC sink.
+                pause_cache: dict[str, bool] = {}
                 # REV UI11 Phase 7: Execute async actions
                 try:
                     # Control Water Heater Temperature (per-device)
@@ -1443,6 +1514,15 @@ class ExecutorEngine:
                         boost_active = self._water_boost_active()
                         if boost_active and self.config.water_heater_devices:
                             for device in self.config.water_heater_devices:
+                                # A control-paused device is hands-off: boost must NOT
+                                # force it ON either — leave it to the human.
+                                if await self._device_control_paused(
+                                    device.control_pause_entities,
+                                    f"water:{device.id}",
+                                    device.id,
+                                    pause_cache,
+                                ):
+                                    continue
                                 water_result = await self.dispatcher.set_water_temp(
                                     self.config.water_heater.temp_boost,
                                     device.target_entity,
@@ -1466,6 +1546,15 @@ class ExecutorEngine:
                             # decision through the per-device path so EVERY tank is actually
                             # actuated, bypassing the dwell for an immediate forced OFF.
                             for device in self.config.water_heater_devices:
+                                # A control-paused device is hands-off: even a safety
+                                # forced-OFF must not command it — leave it to the human.
+                                if await self._device_control_paused(
+                                    device.control_pause_entities,
+                                    f"water:{device.id}",
+                                    device.id,
+                                    pause_cache,
+                                ):
+                                    continue
                                 water_result = await self.dispatcher.set_water_temp(
                                     decision.water_temp,
                                     device.target_entity,
@@ -1488,6 +1577,15 @@ class ExecutorEngine:
                                 )
                             }
                             for device in self.config.water_heater_devices:
+                                # Rent-out hands-off: skip a control-paused device
+                                # entirely (do NOT command on OR off).
+                                if await self._device_control_paused(
+                                    device.control_pause_entities,
+                                    f"water:{device.id}",
+                                    device.id,
+                                    pause_cache,
+                                ):
+                                    continue
                                 temp = decision.water_temps.get(
                                     device.id, self.config.water_heater.temp_off
                                 )
@@ -1524,6 +1622,15 @@ class ExecutorEngine:
                         )
                         for sink_cfg in self.config.excess_pv.sinks:
                             if not sink_cfg.enabled:
+                                continue
+                            # Rent-out hands-off: a control-paused sink (e.g. the
+                            # villavagn AC via climate.villavagn) is left to the human.
+                            if await self._device_control_paused(
+                                sink_cfg.control_pause_entities,
+                                f"sink:{sink_cfg.id}",
+                                sink_cfg.id,
+                                pause_cache,
+                            ):
                                 continue
                             sink_on = (
                                 False
