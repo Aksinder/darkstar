@@ -546,6 +546,65 @@ class ActionDispatcher:
         # (bounded downside — min_on still bounds the block).
         self._water_commit_until: dict[str, float] = {}
 
+    async def _read_control_pause(self, entity_id: str) -> bool:
+        """Read one control-pause entity: True only if it is definitively 'on'.
+
+        Fail-safe direction: None (missing), 'unavailable'/'unknown', or any read
+        error => False (NOT paused = normal control), so a transient HA glitch on a
+        local input_boolean never silently strands a device unmanaged.
+        """
+        try:
+            value = await self.ha.get_state_value(entity_id)
+        except Exception as exc:  # fail-safe: any read error => not paused (normal control)
+            logger.warning(
+                "control_pause read failed for %s (%s) - treating as NOT paused",
+                entity_id,
+                exc,
+            )
+            return False
+        if value is None:
+            return False
+        return str(value).strip().lower() == "on"
+
+    async def control_pause_entity(
+        self,
+        entities: list[str] | None,
+        cache: dict[str, bool] | None = None,
+    ) -> str | None:
+        """Return the first control-pause entity that is 'on' (PAUSED), else None.
+
+        A device wired with ``control_pause_entities`` is PAUSED (hands-off — the
+        executor skips all actuation and leaves whatever a human set) if ANY of its
+        entities reads state ``on``. Unreadable/unknown entities are treated as NOT
+        paused (see :meth:`_read_control_pause`).
+
+        ``cache`` (optional, per-tick) memoizes each entity's paused-ness so an
+        input_boolean shared across several devices (e.g. the villavagn master
+        toggle gating both the VVB and the AC sink) is read at most once per tick.
+        """
+        if not entities:
+            return None
+        for entity_id in entities:
+            if not entity_id:
+                continue
+            if cache is not None and entity_id in cache:
+                paused = cache[entity_id]
+            else:
+                paused = await self._read_control_pause(entity_id)
+                if cache is not None:
+                    cache[entity_id] = paused
+            if paused:
+                return entity_id
+        return None
+
+    async def is_control_paused(
+        self,
+        entities: list[str] | None,
+        cache: dict[str, bool] | None = None,
+    ) -> bool:
+        """True if any of ``entities`` is definitively 'on'. See control_pause_entity."""
+        return (await self.control_pause_entity(entities, cache)) is not None
+
     def _resolve_entity_id(self, key: str) -> str | None:
         """
         Resolve entity key to actual HA entity ID.
