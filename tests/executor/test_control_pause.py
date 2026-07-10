@@ -10,6 +10,7 @@ Covers three layers:
    unpaused sibling (main_tank) is unaffected.
 """
 
+import asyncio
 import contextlib
 import json
 import tempfile
@@ -406,3 +407,47 @@ class TestEngineForcedOffBranch:
         called = _water_entities_called(engine)
         assert "switch.vvb" in called
         assert "switch.villavagn_vvb" not in called
+
+
+@pytest.mark.asyncio
+class TestManualBoostApiPauseGate:
+    """The manual boost API (immediate apply/cancel) must also honor the pause gate,
+    not just the per-tick re-assertion — else pressing boost during a rental would turn
+    the renter's tank ON (or a cancel would force it OFF)."""
+
+    async def _drain(self, engine):
+        if engine._background_tasks:
+            await asyncio.gather(*list(engine._background_tasks))
+
+    async def test_boost_apply_skips_paused_villavagn(self, temp_schedule, temp_db):
+        engine = _build_engine(temp_schedule, temp_db, paused_on={MASTER})
+        engine.set_water_boost(duration_minutes=60)
+        await self._drain(engine)
+        called = _water_entities_called(engine)
+        assert "switch.vvb" in called  # main_tank boosted
+        assert "switch.villavagn_vvb" not in called  # paused villavagn left alone
+
+    async def test_boost_apply_individual_pause_skips_villavagn(self, temp_schedule, temp_db):
+        engine = _build_engine(temp_schedule, temp_db, paused_on={PAUSE_VVB})
+        engine.set_water_boost(duration_minutes=60)
+        await self._drain(engine)
+        called = _water_entities_called(engine)
+        assert "switch.vvb" in called
+        assert "switch.villavagn_vvb" not in called
+
+    async def test_clear_boost_skips_paused_villavagn(self, temp_schedule, temp_db):
+        engine = _build_engine(temp_schedule, temp_db, paused_on={PAUSE_VVB})
+        engine._water_boost_until = datetime.now(TZ) + timedelta(minutes=60)
+        engine.clear_water_boost()
+        await self._drain(engine)
+        called = _water_entities_called(engine)
+        assert "switch.vvb" in called  # main_tank reset to normal/off
+        assert "switch.villavagn_vvb" not in called  # paused villavagn left alone
+
+    async def test_boost_apply_unpaused_actuates_both(self, temp_schedule, temp_db):
+        engine = _build_engine(temp_schedule, temp_db, paused_on=set())
+        engine.set_water_boost(duration_minutes=60)
+        await self._drain(engine)
+        called = _water_entities_called(engine)
+        assert "switch.vvb" in called
+        assert "switch.villavagn_vvb" in called

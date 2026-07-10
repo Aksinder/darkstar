@@ -773,14 +773,22 @@ class ExecutorEngine:
             try:
                 loop = asyncio.get_running_loop()
                 boost_temp = self.config.water_heater.temp_boost
-                targets: list[str | None] = [
-                    d.target_entity for d in (self.config.water_heater_devices or [])
-                ] or [None]  # legacy single-heater fallback
-                for target in targets:
-                    task: asyncio.Task[Any] = loop.create_task(
-                        self.dispatcher.set_water_temp(
-                            boost_temp, target, bypass_dwell=True
+                devices = self.config.water_heater_devices or []
+                if devices:
+                    # Per-device: a control-paused device (rent-out hands-off) is skipped
+                    # so the boost button cannot turn a renter's tank ON.
+                    for dev in devices:
+                        task: asyncio.Task[Any] = loop.create_task(
+                            self._apply_water_temp_gated(
+                                boost_temp, dev, log_key=f"boost:{dev.id}"
+                            )
                         )
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
+                else:
+                    # Legacy single-heater fallback (no per-device pause).
+                    task = loop.create_task(
+                        self.dispatcher.set_water_temp(boost_temp, None, bypass_dwell=True)
                     )
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
@@ -815,14 +823,22 @@ class ExecutorEngine:
                     # Schedule async water temp setting
                     loop = asyncio.get_running_loop()
                     off_temp = self.config.water_heater.temp_off
-                    targets: list[str | None] = [
-                        d.target_entity for d in (self.config.water_heater_devices or [])
-                    ] or [None]  # legacy single-heater fallback
-                    for target in targets:
-                        task: asyncio.Task[Any] = loop.create_task(
-                            self.dispatcher.set_water_temp(
-                                off_temp, target, bypass_dwell=True
+                    devices = self.config.water_heater_devices or []
+                    if devices:
+                        # Per-device: a control-paused device (rent-out hands-off) is
+                        # skipped so a boost-cancel cannot turn a renter's tank OFF.
+                        for dev in devices:
+                            task: asyncio.Task[Any] = loop.create_task(
+                                self._apply_water_temp_gated(
+                                    off_temp, dev, log_key=f"clearboost:{dev.id}"
+                                )
                             )
+                            self._background_tasks.add(task)
+                            task.add_done_callback(self._background_tasks.discard)
+                    else:
+                        # Legacy single-heater fallback (no per-device pause).
+                        task = loop.create_task(
+                            self.dispatcher.set_water_temp(off_temp, None, bypass_dwell=True)
                         )
                         self._background_tasks.add(task)
                         task.add_done_callback(self._background_tasks.discard)
@@ -1100,6 +1116,23 @@ class ExecutorEngine:
         # Episode ended: allow a future pause on this device to log again.
         self._control_pause_logged.discard(log_key)
         return False
+
+    async def _apply_water_temp_gated(
+        self, temp: float, device: Any, *, log_key: str
+    ) -> None:
+        """Set a water device's temp UNLESS it is control-paused (rent-out hands-off).
+
+        Used by the manual boost apply/cancel paths (the _tick loops gate inline). A
+        paused device is left exactly as the human set it — boost neither forces it ON
+        nor does a cancel force it OFF.
+        """
+        if self.dispatcher is None:
+            return
+        if device.control_pause_entities and await self._device_control_paused(
+            device.control_pause_entities, log_key, str(device.id), {}
+        ):
+            return
+        await self.dispatcher.set_water_temp(temp, device.target_entity, bypass_dwell=True)
 
     async def _tick(self) -> dict[str, Any]:
         """
