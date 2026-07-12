@@ -312,3 +312,28 @@ def test_persists_across_day_bucket_boundary_independent_of_heated_today():
     idx = pd.date_range("2026-01-16T00:00", periods=24, freq="30min", tz=tz)
     mapped = _map_to_indices(anchor, list(idx))
     assert "wh1" in mapped and len(mapped["wh1"]) == 2
+
+
+def test_anchor_mapping_matches_by_epoch_across_tz_representations():
+    """REGRESSION for the dead-anchor bug (build #18): the REAL pipeline mapped anchor
+    slots to future_df indices with ``ts in anchor_ts`` (tz-aware Timestamp
+    set-membership). When future_df's index and the previous schedule's
+    ``.astimezone(tz)`` anchor timestamps carry different tz objects, set-membership
+    silently never matched -> anchor_on_slots always empty -> the whole plan-stability
+    anchor was dead (0 'anchoring N slots' logs in production). The fix matches on the
+    epoch instant (Timestamp.value, tz-independent). This locks that behaviour, mirroring
+    planner/pipeline.py exactly."""
+    import pytz
+
+    tz = pytz.timezone("Europe/Stockholm")
+    # future_df index in UTC — a DIFFERENT tz representation than the local anchors.
+    future_idx = pd.date_range("2026-07-11T22:00:00Z", periods=8, freq="15min", tz="UTC")
+    # anchor timestamps built the pipeline's way: parse ISO-with-offset + astimezone(tz).
+    anchor_ts = {
+        pd.Timestamp("2026-07-12T00:30:00+02:00").astimezone(tz),  # == 22:30Z -> slot 2
+        pd.Timestamp("2026-07-12T00:45:00+02:00").astimezone(tz),  # == 22:45Z -> slot 3
+    }
+    # Production fix: epoch-value matching.
+    anchor_epochs = {t.value for t in anchor_ts}
+    matched = [i for i, ts in enumerate(future_idx) if ts.value in anchor_epochs]
+    assert matched == [2, 3], matched
