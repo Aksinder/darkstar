@@ -680,7 +680,10 @@ class HealthChecker:
             "grid_export_power": not is_net_metering,
             # Cumulative sensors (REQUIRED for forecasting/ML - F65)
             "total_load_consumption": is_learning_enabled,
-            "total_pv_production": is_learning_enabled,
+            # The recorder integrates pv_power over each slot when this cumulative
+            # counter is absent (a Sungrow-only kWh counter omits an AC-coupled
+            # Fronius), so pv_power satisfies the PV energy requirement on its own.
+            "total_pv_production": is_learning_enabled and not bool(input_sensors.get("pv_power")),
             "total_grid_import": is_learning_enabled,
             "total_grid_export": is_learning_enabled,
             "total_battery_charge": is_learning_enabled,
@@ -771,6 +774,12 @@ class HealthChecker:
             missing_cumulative = [
                 s for s in cumulative_sensors if s not in input_sensors or not input_sensors.get(s)
             ]
+            # The recorder integrates the pv_power sensor over each slot when the
+            # total_pv_production cumulative counter is absent, so pv_power on its own
+            # is a valid (and on split-inverter sites, more accurate) PV energy source.
+            # Don't warn about the missing counter when pv_power is configured.
+            if "total_pv_production" in missing_cumulative and input_sensors.get("pv_power"):
+                missing_cumulative.remove("total_pv_production")
             if missing_cumulative:
                 issues.append(
                     HealthIssue(
@@ -778,10 +787,11 @@ class HealthChecker:
                         severity="warning",
                         message="Forecasting may use inaccurate fallback data",
                         guidance=(
-                            f"Learning/forecasting is enabled but missing cumulative sensors: "
+                            f"Learning/forecasting is enabled but missing energy sensors: "
                             f"{', '.join(missing_cumulative)}. "
-                            f"Forecasting will fall back to dummy sine wave profiles. "
-                            f"Add these sensors to input_sensors for accurate forecasts."
+                            f"Forecasting will fall back to lower-accuracy profiles. "
+                            f"Add these sensors (or the matching power sensor) to input_sensors "
+                            f"for accurate forecasts."
                         ),
                     )
                 )

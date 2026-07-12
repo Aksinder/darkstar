@@ -403,3 +403,76 @@ def test_health_no_energy_sensor_warnings():
 
     energy_sensor_issues = [i for i in issues if "energy sensor" in i.message.lower()]
     assert len(energy_sensor_issues) == 0
+
+
+def _pv_energy_config(*, pv_power: str | None, total_pv_production: str) -> dict:
+    """Learning-on config with all cumulative counters present except PV, which is
+    controlled by the args (pv_power power sensor + total_pv_production counter)."""
+    input_sensors = {
+        "battery_soc": "sensor.battery_soc",
+        "grid_power": "sensor.grid_power",
+        "load_power": "sensor.load_power",
+        "total_load_consumption": "sensor.total_consumed_energy",
+        "total_pv_production": total_pv_production,
+        "total_grid_import": "sensor.total_imported_energy",
+        "total_grid_export": "sensor.total_exported_energy",
+        "total_battery_charge": "sensor.total_battery_charge",
+        "total_battery_discharge": "sensor.total_battery_discharge",
+    }
+    if pv_power is not None:
+        input_sensors["pv_power"] = pv_power
+    return {
+        "system": {
+            "has_battery": True,
+            "has_water_heater": False,
+            "has_solar": True,
+            "grid_meter_type": "net",
+        },
+        "learning": {"enable": True},
+        "input_sensors": input_sensors,
+    }
+
+
+async def _fallback_warning_issues(config: dict) -> list:
+    """Run check_entities with all HA entities existing; return the F65 fallback-data
+    warnings only."""
+    from backend.health import HealthChecker
+
+    checker = HealthChecker.__new__(HealthChecker)
+    checker._config = config
+    checker._secrets = {"home_assistant": {"url": "http://ha:8123", "token": "t"}}
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"state": "10.5", "attributes": {}}
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client_class.return_value = mock_client
+
+        issues = await checker.check_entities()
+
+    return [i for i in issues if "inaccurate fallback" in i.message.lower()]
+
+
+@pytest.mark.asyncio
+async def test_no_pv_fallback_warning_when_pv_power_present():
+    """REGRESSION: pv_power integration satisfies the PV energy requirement, so an
+    empty total_pv_production must NOT trip the 'inaccurate fallback data' warning
+    (the recorder integrates pv_power per slot — build #13)."""
+    config = _pv_energy_config(pv_power="sensor.solpaneler", total_pv_production="")
+    warnings = await _fallback_warning_issues(config)
+    assert warnings == [], f"unexpected fallback warning: {[w.guidance for w in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_pv_fallback_warning_when_both_pv_sources_missing():
+    """When BOTH the cumulative counter and pv_power are absent there is no PV energy
+    source, so the warning SHOULD fire and name total_pv_production."""
+    config = _pv_energy_config(pv_power=None, total_pv_production="")
+    warnings = await _fallback_warning_issues(config)
+    assert len(warnings) == 1
+    assert "total_pv_production" in warnings[0].guidance
+    assert "sine wave" not in warnings[0].guidance.lower()
