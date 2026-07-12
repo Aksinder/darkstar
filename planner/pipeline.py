@@ -636,9 +636,16 @@ class PlannerPipeline:
         for heater_id, anchor_ts in anchor_water_by_heater.items():
             if not anchor_ts:
                 continue
+            # Match on the epoch instant (Timestamp.value, ns since UTC epoch), NOT
+            # `ts in anchor_ts` set-membership: two tz-aware pandas Timestamps at the
+            # SAME instant but built with different tz objects (future_df's index vs the
+            # previous schedule's .astimezone(tz)) hash differently, so set-membership
+            # silently NEVER matches — which left anchor_on_slots always empty and the
+            # whole plan-stability anchor dead. Epoch value is tz-independent.
+            anchor_epochs: set[int] = {t.value for t in anchor_ts}
             a_indices: list[int] = []
             for idx, (ts, _) in enumerate(future_df.iterrows()):
-                if ts in anchor_ts:
+                if ts.value in anchor_epochs:  # type: ignore[attr-defined]
                     a_indices.append(idx)
             if a_indices:
                 anchor_on_slots_by_heater[heater_id] = a_indices
