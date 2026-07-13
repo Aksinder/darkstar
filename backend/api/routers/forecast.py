@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytz
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
 
@@ -521,6 +521,167 @@ async def forecast_eval(days: int = 7) -> dict[str, Any]:
         return {"versions": versions, "days_back": days}
     except Exception as e:
         logger.exception("Forecast eval failed")
+        raise HTTPException(500, str(e)) from e
+
+
+def _aggregate_bias_rows(
+    rows: list[tuple[str, str, float | None, float | None, float | None, float | None]],
+    hour_start: int,
+    hour_end: int,
+) -> dict[str, Any]:
+    """Aggregate joined forecast/actual rows into signed-bias + MAE stats.
+
+    rows: (slot_start_iso, forecast_version, pv_forecast, load_forecast,
+           pv_actual, load_actual). slot_start is a LOCAL-offset ISO string
+    (the store normalizes every writer to the engine timezone), so the local
+    hour is chars 11:13 and the local date chars 0:10 — no tz math needed.
+
+    bias = mean(forecast - actual): POSITIVE = over-forecast. This is the
+    Phase 1b validation signal — after the DNI/DHI physics fix + clean
+    retrain, morning (hour_start..hour_end) PV bias should sit near 0, and
+    per-day rows let a human check that low-production (cloudy) mornings
+    are not over-forecast.
+    """
+
+    def _stats(pairs: list[tuple[float, float]]) -> dict[str, Any]:
+        if not pairs:
+            return {"n": 0, "mae": None, "bias": None}
+        errs = [f - a for f, a in pairs]
+        return {
+            "n": len(pairs),
+            "mae": round(sum(abs(e) for e in errs) / len(errs), 4),
+            "bias": round(sum(errs) / len(errs), 4),
+        }
+
+    versions: dict[str, Any] = {}
+    by_version: dict[str, list[tuple[str, float | None, float | None, float | None, float | None]]] = {}
+    for slot, version, pv_f, load_f, pv_a, load_a in rows:
+        by_version.setdefault(version, []).append((slot, pv_f, load_f, pv_a, load_a))
+
+    for version, vrows in by_version.items():
+        pv_all: list[tuple[float, float]] = []
+        load_all: list[tuple[float, float]] = []
+        pv_window: list[tuple[float, float]] = []
+        pv_by_hour: dict[int, list[tuple[float, float]]] = {}
+        window_by_day: dict[str, list[tuple[float, float]]] = {}
+
+        for slot, pv_f, load_f, pv_a, load_a in vrows:
+            try:
+                hour = int(slot[11:13])
+            except (ValueError, IndexError):
+                continue
+            day = slot[:10]
+            if pv_f is not None and pv_a is not None:
+                pair = (float(pv_f), float(pv_a))
+                pv_all.append(pair)
+                pv_by_hour.setdefault(hour, []).append(pair)
+                if hour_start <= hour <= hour_end:
+                    pv_window.append(pair)
+                    window_by_day.setdefault(day, []).append(pair)
+            if load_f is not None and load_a is not None:
+                load_all.append((float(load_f), float(load_a)))
+
+        versions[version] = {
+            "overall": {
+                "pv": _stats(pv_all),
+                "load": _stats(load_all),
+            },
+            "window_pv": _stats(pv_window),
+            "by_hour_pv": [
+                {"hour": h, **_stats(pv_by_hour[h])} for h in sorted(pv_by_hour)
+            ],
+            "window_pv_by_day": [
+                {
+                    "date": d,
+                    **_stats(pairs),
+                    # Sum of actual production in the window: LOW value = cloudy
+                    # morning. Validation step (d): those rows must not show a
+                    # strongly positive bias (over-forecast).
+                    "actual_pv_kwh": round(sum(a for _f, a in pairs), 3),
+                }
+                for d, pairs in sorted(window_by_day.items())
+            ],
+        }
+
+    return versions
+
+
+@forecast_router.get("/bias")
+async def forecast_bias(
+    days: int = Query(7, ge=1, le=90),
+    hour_start: int = Query(4, ge=0, le=23),
+    hour_end: int = Query(11, ge=0, le=23),
+) -> dict[str, Any]:
+    """Signed forecast bias + MAE, segmented by local hour-of-day and day.
+
+    The Phase 1b validation instrument: after retraining the PV residual on
+    clean data and re-enabling pv_residual_enabled, morning PV bias
+    (hours hour_start..hour_end, local) should move toward ~0, aurora's
+    window MAE should beat the naive baseline's, and per-day rows should
+    show no over-forecast on cloudy mornings (low actual_pv_kwh days).
+
+    NOTE: slot_forecasts keeps ONE row per (slot, version) — the LAST issued
+    forecast (upsert), i.e. short-lead nowcast semantics, same as /eval.
+    """
+    if hour_end < hour_start:
+        raise HTTPException(400, "hour_end must be >= hour_start")
+    try:
+        engine = get_learning_engine()
+        if not engine or not hasattr(engine, "store"):
+            raise ValueError("Engine not ready")
+
+        tz = getattr(engine, "timezone", _get_timezone())
+        now = datetime.now(tz)
+        start_iso = (now - timedelta(days=days)).isoformat()
+        now_iso = now.isoformat()
+
+        async with engine.store.AsyncSession() as session:
+            stmt = (
+                select(
+                    SlotForecast.slot_start,
+                    SlotForecast.forecast_version,
+                    SlotForecast.pv_forecast_kwh,
+                    SlotForecast.load_forecast_kwh,
+                    SlotObservation.pv_kwh,
+                    SlotObservation.load_kwh,
+                )
+                .join(SlotObservation, SlotObservation.slot_start == SlotForecast.slot_start)
+                .where(
+                    SlotObservation.slot_start >= start_iso,
+                    SlotObservation.slot_start < now_iso,
+                    SlotForecast.forecast_version.in_(["baseline_7_day_avg", "aurora"]),
+                )
+            )
+            rows = [tuple(r) for r in (await session.execute(stmt)).all()]
+
+        versions = _aggregate_bias_rows(rows, hour_start, hour_end)
+
+        # Convenience verdict for the Phase 1b checklist; raw stats above are
+        # the source of truth.
+        aurora_win = (versions.get("aurora") or {}).get("window_pv") or {}
+        base_win = (versions.get("baseline_7_day_avg") or {}).get("window_pv") or {}
+        comparison: dict[str, Any] = {
+            "window_bias_pv_aurora": aurora_win.get("bias"),
+            "window_mae_pv_aurora": aurora_win.get("mae"),
+            "window_mae_pv_baseline": base_win.get("mae"),
+            "aurora_beats_baseline_window_pv": (
+                aurora_win["mae"] < base_win["mae"]
+                if aurora_win.get("mae") is not None and base_win.get("mae") is not None
+                else None
+            ),
+        }
+
+        return {
+            "days_back": days,
+            "window_hours": {"start": hour_start, "end": hour_end},
+            "bias_sign": "positive = over-forecast (forecast - actual)",
+            "versions": versions,
+            "comparison": comparison,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Forecast bias eval failed")
         raise HTTPException(500, str(e)) from e
 
 
