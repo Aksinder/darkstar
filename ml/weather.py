@@ -9,8 +9,9 @@ import copy
 import json
 import math
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pandas as pd
 import pytz
@@ -18,9 +19,6 @@ import requests
 import yaml
 
 from utils.time_utils import dst_safe_localize
-
-if TYPE_CHECKING:
-    from datetime import datetime
 
 
 def _calculate_solar_position(
@@ -217,16 +215,20 @@ def calculate_physics_pv(
         Tuple of (total_kwh, per_array_list) where per_array_list contains
         dicts with 'name', 'kwh', 'poa_w_m2' keys. Returns (None, []) if no data.
     """
-    if radiation_w_m2 is None or radiation_w_m2 <= 0 or not solar_arrays:
-        return None, []
-
-    # Normalise NaN (e.g. missing weather columns forwarded as float('nan')) to None
-    # so a missing DNI/DHI degrades to the legacy GHI transposition rather than
-    # producing a NaN POA.
+    # Normalise NaN (missing weather rows forwarded as float('nan')) to None BEFORE
+    # the guard: NaN slips past `<= 0` and used to flow through the legacy POA path
+    # where max(0.0, nan) clamped it to 0.0 — i.e. "no weather data" silently became
+    # "zero production physics". None here means "no basis for a physics estimate";
+    # callers decide (inference substitutes 0.0, training drops the row).
+    if radiation_w_m2 is not None and math.isnan(radiation_w_m2):
+        radiation_w_m2 = None
     if dni_w_m2 is not None and math.isnan(dni_w_m2):
         dni_w_m2 = None
     if dhi_w_m2 is not None and math.isnan(dhi_w_m2):
         dhi_w_m2 = None
+
+    if radiation_w_m2 is None or radiation_w_m2 <= 0 or not solar_arrays:
+        return None, []
 
     # Calculate solar position
     try:
@@ -405,6 +407,15 @@ def get_weather_series(
         if now_ts - cached_ts < _CACHE_TTL_SECONDS:
             return cached_df.copy()
 
+    # Derive past_days from the requested window instead of a fixed 1-day hindcast.
+    # Training calls request weeks of history (e.g. the post-recorder-fix clean window
+    # starting 2026-07-09); with past_days=1 every slot older than yesterday 00:00 got
+    # NaN weather, which silently zeroed the physics baseline for those rows. The
+    # forecast API serves up to 92 past days; anything older stays NaN and callers
+    # must treat those rows as "no weather" (train.py drops them from PV training).
+    today_local = datetime.now(tz).date()
+    past_days = max(1, min((today_local - start_date_obj).days, 92))
+
     try:
         # Always use forecast API with past_days + forecast_days for complete coverage
         url = "https://api.open-meteo.com/v1/forecast"
@@ -412,13 +423,14 @@ def get_weather_series(
             "latitude": latitude,
             "longitude": longitude,
             "hourly": hourly_param_str,
-            "past_days": 1,  # Yesterday's hindcast
+            "past_days": past_days,
             "forecast_days": forecast_days,
             "timezone": timezone_name,
         }
 
-        # Reduced timeout from 20s to 5s to fail fast
-        response = requests.get(url, params=params, timeout=5)
+        # Fail fast on the common 1-day fetch; allow more headroom for multi-week
+        # training windows (larger payload, same single request).
+        response = requests.get(url, params=params, timeout=5 if past_days <= 2 else 15)
         response.raise_for_status()
         payload: dict[str, Any] = response.json()  # type: ignore[assignment]
     except Exception as exc:  # pragma: no cover - defensive logging

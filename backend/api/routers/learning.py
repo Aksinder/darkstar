@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException, Query
@@ -21,6 +22,35 @@ def _get_learning_engine() -> Any:
     from backend.learning import get_learning_engine
 
     return get_learning_engine()
+
+
+def _parse_min_date(raw: str) -> datetime:
+    """Parse a training-window lower bound (ISO date or datetime).
+
+    A bare date ("2026-07-09") or a naive datetime is localized to the learning
+    engine's timezone; an explicitly tz-aware value is CONVERTED to the engine
+    timezone — slot_start is stored as local-offset ISO strings and filtered by
+    lexical comparison, so the bound must be rendered in the same offset to be
+    chronologically correct. Raises HTTPException(400) on unparseable input
+    (including the empty string).
+    """
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid min_date {raw!r}; expected ISO date/datetime like '2026-07-09'.",
+        ) from exc
+
+    tz = getattr(_get_learning_engine(), "timezone", None)
+    if parsed.tzinfo is None:
+        if tz is not None:
+            # pytz tzinfo exposes localize(); stdlib tzinfo does not.
+            localize = getattr(tz, "localize", None)
+            parsed = localize(parsed) if callable(localize) else parsed.replace(tzinfo=tz)
+    elif tz is not None:
+        parsed = parsed.astimezone(tz)
+    return parsed
 
 
 @router.get(
@@ -86,15 +116,37 @@ async def learning_history(limit: int = Query(20, ge=1, le=100)) -> dict[str, An
     summary="Trigger ML Training",
     description="Trigger manual ML model retraining now.",
 )
-async def learning_train() -> dict[str, Any]:
+async def learning_train(
+    min_date: str | None = Query(
+        None,
+        description=(
+            "Optional GLOBAL lower bound (ISO date or datetime, e.g. '2026-07-09') "
+            "for the training window — applies to load AND PV models alike; use it "
+            "for experiments only. For the persistent PV clean-data floor use the "
+            "forecasting.pv_training_min_date config key instead: it bounds PV "
+            "residual training on every path (nightly, UI, this endpoint) while "
+            "load models keep their full clean history. Omit for the default run."
+        ),
+    ),
+) -> dict[str, Any]:
     """Trigger ML model retraining manually using the unified orchestrator."""
     try:
         from ml.training_orchestrator import train_all_models
 
-        logger.info("Manual training triggered via API")
+        # `is not None` (not truthiness): an empty-but-present value
+        # (?min_date= — blank UI field, unset shell variable) must 400 loudly,
+        # not silently fall back to a full-history retrain.
+        parsed_min_date = _parse_min_date(min_date) if min_date is not None else None
+
+        logger.info(
+            "Manual training triggered via API (min_date=%s)",
+            parsed_min_date.isoformat() if parsed_min_date else None,
+        )
 
         # train_all_models is async and handles locking/logging
-        raw_result = await train_all_models(training_type="manual")
+        raw_result = await train_all_models(
+            training_type="manual", min_date=parsed_min_date
+        )
         result: dict[str, Any] = raw_result
 
         if result.get("status") == "busy":

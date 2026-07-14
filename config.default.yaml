@@ -500,6 +500,22 @@ forecasting:
                                        # transposition fix) until the PV residual models are retrained
                                        # on data computed with the new physics — otherwise the stale
                                        # residual double-corrects and over-forecasts.
+  pv_training_min_date: null           # PV clean-data floor (ISO date string, e.g. "2026-07-09"):
+                                       # PV residual training ignores slot_observations before this
+                                       # date on EVERY training path (nightly automatic, dashboard,
+                                       # API, CLI). Set it when PV energy actuals before some date
+                                       # are known-bad (e.g. a recorder bug undercounting production)
+                                       # so later retrains can't silently reintroduce them. Load
+                                       # models are NOT affected — their history stays fully used.
+                                       # null = no floor.
+                                       # NOTES: (1) read at add-on START — set it BEFORE the restart
+                                       # that precedes a retrain (a config save alone does not reach
+                                       # the running learning engine). (2) An unparseable value fails
+                                       # ALL nightly training loudly (by design: better stale models
+                                       # than a dirty PV retrain) — check the training history if
+                                       # models stop refreshing. (3) Training weather comes from the
+                                       # Open-Meteo forecast API (max 92 past days), so PV training
+                                       # is effectively a 92-day sliding window regardless of floor.
   pv_confidence_percent: 83.0          # PV forecast scaling (100 = trust forecast fully)
   pv_p10_weight: 0.0                   # 0 = legacy scalar haircut above. >0 (e.g. 0.3-0.5):
                                        # blend each slot toward Aurora's own pessimistic p10
