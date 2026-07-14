@@ -10,7 +10,7 @@ import argparse
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -270,12 +270,65 @@ def _save_model(
     print(f"Saved model to {path}")
 
 
+def _resolve_pv_training_min_date(engine: LearningEngine) -> datetime | None:
+    """Read the persistent PV clean-data floor from config.
+
+    forecasting.pv_training_min_date marks the first date with trustworthy PV
+    energy actuals (e.g. 2026-07-09, the first full day after the recorder
+    started integrating combined Sungrow+Fronius PV). It bounds PV residual
+    training ONLY — load history predates it and is clean, so load models keep
+    the full window. Reading it from config (not a per-call argument) means
+    EVERY training path — nightly automatic, dashboard button, /api/learning/run,
+    CLI — respects the floor; a one-shot API parameter would be clobbered by the
+    next automatic retrain.
+
+    Accepts an ISO date/datetime string or a YAML-parsed date. Naive values are
+    localized to the engine timezone. Returns None (no floor) when unset, and
+    treats an unparseable value as fatal-loud (raise) rather than silently
+    training on dirty data.
+    """
+    raw = (engine.config.get("forecasting", {}) or {}).get("pv_training_min_date")
+    if raw is None or raw == "":
+        return None
+
+    if isinstance(raw, datetime):
+        parsed = raw
+    elif isinstance(raw, date):
+        # YAML parses unquoted dates (pv_training_min_date: 2026-07-09) as date
+        parsed = datetime(raw.year, raw.month, raw.day)
+    else:
+        parsed = datetime.fromisoformat(str(raw))
+
+    if parsed.tzinfo is None:
+        localize = getattr(engine.timezone, "localize", None)
+        parsed = (
+            localize(parsed) if callable(localize) else parsed.replace(tzinfo=engine.timezone)
+        )
+    return parsed
+
+
 def train_models(
     min_samples: int = 100,
     recency_half_life_days: float = 30.0,
     min_date: datetime | None = None,
-) -> None:
+) -> dict[str, Any]:
+    """Train load + PV models; returns a summary of what was ACTUALLY trained.
+
+    The return dict lets callers (training_orchestrator) report real results
+    instead of globbing the models dir — which listed stale pre-existing files
+    as "trained" even when this function wrote nothing.
+    """
     cfg = TrainingConfig(min_samples=min_samples, recency_half_life_days=recency_half_life_days)
+
+    result: dict[str, Any] = {
+        "models_saved": [],
+        "load_samples": 0,
+        "pv_samples": 0,
+        "pv_rows_dropped_no_physics": 0,
+        "min_date": min_date.isoformat() if min_date else None,
+        "pv_training_min_date": None,
+        "error": None,
+    }
 
     print("--- Starting AURORA Training (Rev K16: Hybrid PV with Physics Residuals) ---")
 
@@ -285,7 +338,18 @@ def train_models(
         print(f"Loaded LearningEngine with DB at: {engine.db_path}")
     except Exception as exc:
         print(f"Error: Could not initialize LearningEngine. {exc}")
-        return
+        result["error"] = f"LearningEngine init failed: {exc}"
+        return result
+
+    # Persistent PV clean-data floor. Fail LOUD on a mis-typed value — silently
+    # ignoring it would retrain the PV residual on the dirty pre-fix history.
+    try:
+        pv_min_date = _resolve_pv_training_min_date(engine)
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid forecasting.pv_training_min_date in config: {exc}"
+        ) from exc
+    result["pv_training_min_date"] = pv_min_date.isoformat() if pv_min_date else None
 
     now = datetime.now(engine.timezone)
 
@@ -307,7 +371,8 @@ def train_models(
     if observations.empty:
         print("Error: No valid (non-zero load) observations found.")
         print("Action: Check if data_activator has run or if sensors are reporting 0.")
-        return
+        result["error"] = "No valid observations in the requested window"
+        return result
 
     # Get time range from observations for feature enrichment
     obs_start = observations["slot_start"].min()
@@ -337,8 +402,16 @@ def train_models(
         for col in ("temp_c", "cloud_cover_pct", "shortwave_radiation_w_m2"):
             observations[col] = np.nan
 
-    # Ensure numeric dtypes for LightGBM
-    for col in ("temp_c", "cloud_cover_pct", "shortwave_radiation_w_m2"):
+    # Ensure numeric dtypes for LightGBM. dni_w_m2/dhi_w_m2 are physics inputs
+    # (not ML features) but are coerced here so the physics call below sees clean
+    # floats/NaN rather than object dtype when the weather merge is sparse.
+    for col in (
+        "temp_c",
+        "cloud_cover_pct",
+        "shortwave_radiation_w_m2",
+        "dni_w_m2",
+        "dhi_w_m2",
+    ):
         if col in observations.columns:
             observations[col] = pd.to_numeric(observations[col], errors="coerce")
 
@@ -400,6 +473,7 @@ def train_models(
         y_load = load_df["load_kwh"].astype(float)
         # Extract sample weights for load training samples (label-safe .loc)
         load_weights = sample_weights.loc[load_df.index].to_numpy()
+        result["load_samples"] = len(X_load)
         print(f"Training load models on {len(X_load)} samples...")
 
         for q_name, alpha in quantiles.items():
@@ -411,11 +485,13 @@ def train_models(
                 suffix = f"_{q_name}"
                 filename = cfg.load_model_name.replace(".lgb", f"{suffix}.lgb")
                 _save_model(model, cfg.models_dir / filename, feature_names=feature_cols)
+                result["models_saved"].append(filename)
 
                 if q_name == "p50":
                     _save_model(
                         model, cfg.models_dir / cfg.load_model_name, feature_names=feature_cols
                     )
+                    result["models_saved"].append(cfg.load_model_name)
     else:
         print("Warning: No valid load_kwh samples found; skipping load models.")
 
@@ -423,12 +499,29 @@ def train_models(
     # HYBRID PV: Train on residuals (actual - physics) with sun-up filter
     pv_df = observations.dropna(subset=["pv_kwh"]).copy()
 
+    # PV-ONLY clean-data floor (forecasting.pv_training_min_date). PV energy
+    # actuals before the floor are untrustworthy (e.g. the recorder omitted the
+    # Fronius half pre-2026-07-09), but load history is clean — so the floor is
+    # applied HERE rather than to the shared observation window, and load models
+    # above keep the full history.
+    if pv_min_date is not None and not pv_df.empty:
+        pre_floor_count = len(pv_df)
+        pv_df = pv_df[pv_df["slot_start"] >= pv_min_date].copy()
+        floor_dropped = pre_floor_count - len(pv_df)
+        if floor_dropped > 0:
+            print(
+                f"PV clean-data floor {pv_min_date.isoformat()}: excluded "
+                f"{floor_dropped} pre-floor rows from PV training "
+                "(load models keep the full window)"
+            )
+
     # Apply sun-up filter: only train on slots with radiation > 10 OR actual PV > 0.01
     # This excludes nighttime slots (radiation=0, pv=0) which provide no learning signal
     if "shortwave_radiation_w_m2" in pv_df.columns:
+        pre_sunup_count = len(pv_df)
         sun_up_mask = (pv_df["shortwave_radiation_w_m2"] > 10) | (pv_df["pv_kwh"] > 0.01)
         pv_df = pv_df[sun_up_mask].copy()
-        filtered_count = len(observations.dropna(subset=["pv_kwh"])) - len(pv_df)
+        filtered_count = pre_sunup_count - len(pv_df)
         if filtered_count > 0:
             print(f"Filtered {filtered_count} nighttime/zero-production slots from PV training")
 
@@ -449,20 +542,48 @@ def train_models(
 
         if solar_arrays:
             # Calculate physics forecast for each slot
-            physics_kwh_list: list[float] = []
+            physics_kwh_list: list[float | None] = []
             for _idx, row in pv_df.iterrows():
                 slot_start = row["slot_start"]
                 radiation = row.get("shortwave_radiation_w_m2")
+                # Wire Open-Meteo native DNI/DHI so TRAINING physics matches
+                # INFERENCE physics (ml/forward.py uses the same DNI/DHI path).
+                # calculate_physics_pv normalizes NaN inputs to None internally:
+                # DNI/DHI missing but GHI present -> legacy GHI transposition;
+                # GHI missing too -> physics None (handled below).
+                dni = row.get("dni_w_m2")
+                dhi = row.get("dhi_w_m2")
                 physics_kwh, _ = calculate_physics_pv(
                     radiation_w_m2=radiation,
                     solar_arrays=solar_arrays,  # type: ignore[arg-type]
                     slot_start=slot_start,
                     latitude=latitude,
                     longitude=longitude,
+                    dni_w_m2=dni,
+                    dhi_w_m2=dhi,
                 )
-                physics_kwh_list.append(physics_kwh if physics_kwh is not None else 0.0)
+                physics_kwh_list.append(physics_kwh)
 
-            pv_df["physics_kwh"] = physics_kwh_list
+            pv_df["physics_kwh"] = pd.Series(
+                physics_kwh_list, index=pv_df.index, dtype="float64"
+            )
+
+            # Drop rows with NO physics baseline (physics None). Causes: weather
+            # fetch could not cover the slot (radiation NaN), or radiation <= 0
+            # while production was recorded (sensor-inconsistent dawn/dusk row).
+            # Substituting 0.0 would train residual = full actual PV against zero
+            # physics — a regime inference never produces — and poison the
+            # residual model. Slots with radiation > 0 but sun below the horizon
+            # return 0.0 (a real physics value) and are kept.
+            missing_physics = pv_df["physics_kwh"].isna()
+            if missing_physics.any():
+                n_missing = int(missing_physics.sum())
+                result["pv_rows_dropped_no_physics"] = n_missing
+                print(
+                    f"Excluding {n_missing}/{len(pv_df)} PV slots without a physics "
+                    "baseline (weather gap or radiation<=0 -> no valid residual target)"
+                )
+                pv_df = pv_df[~missing_physics].copy()
 
             # Calculate residual target: actual - physics
             pv_df["pv_residual"] = pv_df["pv_kwh"] - pv_df["physics_kwh"]
@@ -493,6 +614,7 @@ def train_models(
         y_pv = pv_df["pv_residual"].astype(float)
         # Extract sample weights for PV training samples (label-safe .loc)
         pv_weights = sample_weights.loc[pv_df.index].to_numpy()
+        result["pv_samples"] = len(X_pv)
         print(f"Training PV models on {len(X_pv)} samples (residual mode)...")
 
         for q_name, alpha in quantiles.items():
@@ -504,11 +626,13 @@ def train_models(
                 suffix = f"_{q_name}"
                 filename = cfg.pv_model_name.replace(".lgb", f"{suffix}.lgb")
                 _save_model(model, cfg.models_dir / filename, feature_names=pv_feature_cols)
+                result["models_saved"].append(filename)
 
                 if q_name == "p50":
                     _save_model(
                         model, cfg.models_dir / cfg.pv_model_name, feature_names=pv_feature_cols
                     )
+                    result["models_saved"].append(cfg.pv_model_name)
     else:
         print("Warning: No non-null pv_kwh samples found; skipping PV models.")
 
@@ -518,13 +642,27 @@ def train_models(
     try:
         import json
 
+        # Report what was ACTUALLY saved (not df-emptiness): _train_regressor
+        # returns None below min_samples, in which case no file was written and
+        # the pre-existing models remain live.
         run_metrics = {
-            "load_models_trained": not load_df.empty,
-            "pv_models_trained": not pv_df.empty,
+            "load_models_trained": any(
+                "load_model" in name for name in result["models_saved"]
+            ),
+            "pv_models_trained": any(
+                "pv_model" in name for name in result["models_saved"]
+            ),
+            "load_samples": result["load_samples"],
+            "pv_samples": result["pv_samples"],
+            "pv_rows_dropped_no_physics": result["pv_rows_dropped_no_physics"],
         }
+        # Record the training window for auditability: which data a model was
+        # trained on must be reconstructable from learning_runs.
         run_params = {
             "recency_half_life_days": cfg.recency_half_life_days,
             "min_samples": cfg.min_samples,
+            "min_date": result["min_date"],
+            "pv_training_min_date": result["pv_training_min_date"],
         }
 
         with sqlite3.connect(engine.db_path) as conn:
@@ -548,6 +686,8 @@ def train_models(
             print("Logged learning run to DB.")
     except Exception as e:
         print(f"Failed to log learning run: {e}")
+
+    return result
 
 
 if __name__ == "__main__":

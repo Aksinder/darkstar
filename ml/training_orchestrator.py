@@ -183,6 +183,9 @@ async def train_all_models(
         "trained_models": [],
         "duration_seconds": 0,
     }
+    # Populated by train_models; referenced in finally for the DB run log even
+    # when training raised before returning.
+    train_result: dict[str, Any] = {}
 
     try:
         # 1. Backup
@@ -203,17 +206,32 @@ async def train_all_models(
         )
 
         # train_models is heavy and synchronous, offload to thread.
-        # min_date defaults to None -> no lower-bound filter (unchanged behaviour).
-        await asyncio.to_thread(train_models, min_samples=min_samples, min_date=min_date)
+        # min_date defaults to None -> no lower-bound filter (unchanged behaviour);
+        # the PV clean-data floor (forecasting.pv_training_min_date) is read from
+        # config inside train_models and applies to every training path.
+        train_result = await asyncio.to_thread(
+            train_models, min_samples=min_samples, min_date=min_date
+        )
 
-        # Check if main models were actually created/updated
-        main_models: list[Path] = list(MODELS_DIR.glob("*model*.lgb"))
-        results["trained_models"] = [f.name for f in main_models]
+        # Report the files train_models ACTUALLY saved this run. (Globbing the
+        # models dir here used to list stale pre-existing .lgb files as
+        # "trained" even when the window filtered down to nothing.)
+        saved_models: list[str] = list(train_result.get("models_saved", []))
+        results["trained_models"] = saved_models
+        results["training_detail"] = train_result
 
-        if not main_models:
-            logger.warning("[ML-TRAIN] Main model training did not produce any models.")
+        # Surface train_models' soft failures (engine init / empty window) in the
+        # run ledger: status stays "success" (price training still proceeds) but
+        # error_message must record WHY main training produced nothing.
+        if train_result.get("error"):
+            results["error"] = train_result["error"]
+
+        if not saved_models:
+            logger.warning(
+                f"[ML-TRAIN] Main model training wrote NO models (detail: {train_result})"
+            )
         else:
-            logger.info(f"[ML-TRAIN] Main models trained: {len(main_models)} found")
+            logger.info(f"[ML-TRAIN] Main models trained: {len(saved_models)} written")
 
         # 2b. Train Price Forecast Model
         logger.info("[ML-TRAIN] Training Price Forecast Model...")
@@ -310,15 +328,31 @@ async def train_all_models(
             status: str = results["status"]
             trained_models: list[str] = results["trained_models"]
             error_msg: str | None = results.get("error")
+            # Main-model accounting must exclude the price model: price success
+            # appends to trained_models AFTER main training, which used to mask
+            # partial_failure when the main trainer wrote nothing.
+            main_saved: list[str] = list(train_result.get("models_saved") or [])
             await store.log_learning_run(
                 status=status,
                 result_metrics={
-                    "main_models_count": len(trained_models),
+                    "main_models_count": len(main_saved),
+                    "load_samples": train_result.get("load_samples"),
+                    "pv_samples": train_result.get("pv_samples"),
+                    "pv_rows_dropped_no_physics": train_result.get(
+                        "pv_rows_dropped_no_physics"
+                    ),
+                },
+                # Record the training window so runs are auditable: which data
+                # window produced the live models must be reconstructable.
+                params={
+                    "min_samples": min_samples,
+                    "min_date": min_date.isoformat() if min_date else None,
+                    "pv_training_min_date": train_result.get("pv_training_min_date"),
                 },
                 training_type=training_type,
                 models_trained=trained_models,
                 duration_seconds=int(duration),
-                partial_failure=status == "success" and not trained_models,
+                partial_failure=status == "success" and not main_saved,
                 error_message=error_msg,
             )
         except Exception as db_err:

@@ -40,7 +40,65 @@ def test_learning_train_success(client):
         assert data["status"] == "success"
         assert "model1.lgb" in data["trained_models"]
 
-        mock_train.assert_called_once_with(training_type="manual")
+        mock_train.assert_called_once_with(training_type="manual", min_date=None)
+
+
+def test_learning_train_with_min_date(client):
+    """A min_date query param is parsed and forwarded to the orchestrator."""
+    with patch("ml.training_orchestrator.train_all_models", new_callable=AsyncMock) as mock_train:
+        mock_train.return_value = {"status": "success", "trained_models": []}
+
+        response = client.post("/api/learning/train?min_date=2026-07-09")
+        assert response.status_code == 200
+
+        mock_train.assert_called_once()
+        kwargs = mock_train.call_args.kwargs
+        assert kwargs["training_type"] == "manual"
+        passed = kwargs["min_date"]
+        assert passed is not None
+        # Parsed to the clean-window start; naive input is localized (tz-aware).
+        assert passed.year == 2026 and passed.month == 7 and passed.day == 9
+        assert passed.tzinfo is not None
+
+
+def test_learning_train_invalid_min_date(client):
+    """An unparseable min_date returns 400 without invoking training."""
+    with patch("ml.training_orchestrator.train_all_models", new_callable=AsyncMock) as mock_train:
+        response = client.post("/api/learning/train?min_date=not-a-date")
+        assert response.status_code == 400
+        assert "min_date" in response.json()["detail"]
+        mock_train.assert_not_called()
+
+
+def test_learning_train_empty_min_date_rejected(client):
+    """?min_date= (present but empty — blank UI field, unset shell variable)
+    must 400 loudly, NOT silently fall back to a full-history retrain."""
+    with patch("ml.training_orchestrator.train_all_models", new_callable=AsyncMock) as mock_train:
+        response = client.post("/api/learning/train?min_date=")
+        assert response.status_code == 400
+        assert "min_date" in response.json()["detail"]
+        mock_train.assert_not_called()
+
+
+def test_learning_train_aware_min_date_converted_to_engine_tz(client):
+    """A tz-aware min_date with a foreign offset is CONVERTED to the engine
+    timezone (conftest mock engine: UTC) — slot_start is stored as local-offset
+    ISO strings and filtered lexically, so the bound must be rendered in the
+    same offset to stay chronologically correct."""
+    with patch("ml.training_orchestrator.train_all_models", new_callable=AsyncMock) as mock_train:
+        mock_train.return_value = {"status": "success", "trained_models": []}
+
+        # +05:00 input ('+' must be %2B-encoded in a query string);
+        # 2026-07-09T05:00:00+05:00 == 2026-07-09T00:00:00+00:00 (engine tz UTC).
+        response = client.post(
+            "/api/learning/train?min_date=2026-07-09T05:00:00%2B05:00"
+        )
+        assert response.status_code == 200
+
+        passed = mock_train.call_args.kwargs["min_date"]
+        assert passed is not None and passed.tzinfo is not None
+        # Same instant, re-rendered in the engine timezone — not the caller's offset.
+        assert passed.isoformat() == "2026-07-09T00:00:00+00:00"
 
 
 def test_learning_train_busy(client):

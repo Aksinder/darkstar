@@ -94,15 +94,33 @@ async def test_train_all_models_flow(mock_get_engine, mock_train_main, setup_tes
     mock_engine.db_path = "data/test_learning.db"
     mock_get_engine.return_value = mock_engine
 
-    # Create a dummy model file so the orchestrator thinks training succeeded
-    (setup_test_dirs / "load_model.lgb").touch()
+    # trained_models must reflect what train_models REPORTS having saved this
+    # run — not whatever .lgb files happen to sit in the models dir (the old
+    # glob listed stale pre-existing files as "trained").
+    mock_train_main.return_value = {
+        "models_saved": ["load_model_p50.lgb", "load_model.lgb"],
+        "load_samples": 500,
+        "pv_samples": 400,
+        "pv_rows_dropped_no_physics": 0,
+        "min_date": None,
+        "pv_training_min_date": None,
+        "error": None,
+    }
+    # A stale file on disk must NOT appear in trained_models.
+    (setup_test_dirs / "pv_model.lgb").touch()
 
     res = await training_orchestrator.train_all_models()
 
     assert res["status"] == "success", f"Training failed: {res.get('error')}"
     assert "load_model.lgb" in res["trained_models"]
+    assert "pv_model.lgb" not in res["trained_models"]  # stale file ignored
     assert mock_train_main.called
     assert mock_store.log_learning_run.called
+    # The run log records the training window for auditability.
+    log_kwargs = mock_store.log_learning_run.call_args.kwargs
+    assert "params" in log_kwargs
+    assert log_kwargs["params"]["min_date"] is None
+    assert log_kwargs["params"]["pv_training_min_date"] is None
 
 
 @pytest.mark.asyncio
