@@ -12,7 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import lightgbm as lgb
 import numpy as np
@@ -287,10 +287,12 @@ def _resolve_pv_training_min_date(engine: LearningEngine) -> datetime | None:
     treats an unparseable value as fatal-loud (raise) rather than silently
     training on dirty data.
     """
-    raw = (engine.config.get("forecasting", {}) or {}).get("pv_training_min_date")
+    forecasting_cfg: dict[str, Any] = engine.config.get("forecasting", {}) or {}
+    raw: Any = forecasting_cfg.get("pv_training_min_date")
     if raw is None or raw == "":
         return None
 
+    parsed: datetime
     if isinstance(raw, datetime):
         parsed = raw
     elif isinstance(raw, date):
@@ -301,8 +303,9 @@ def _resolve_pv_training_min_date(engine: LearningEngine) -> datetime | None:
 
     if parsed.tzinfo is None:
         localize = getattr(engine.timezone, "localize", None)
-        parsed = (
-            localize(parsed) if callable(localize) else parsed.replace(tzinfo=engine.timezone)
+        parsed = cast(
+            "datetime",
+            localize(parsed) if callable(localize) else parsed.replace(tzinfo=engine.timezone),
         )
     return parsed
 
