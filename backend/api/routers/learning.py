@@ -47,7 +47,10 @@ def _parse_min_date(raw: str) -> datetime:
         if tz is not None:
             # pytz tzinfo exposes localize(); stdlib tzinfo does not.
             localize = getattr(tz, "localize", None)
-            parsed = localize(parsed) if callable(localize) else parsed.replace(tzinfo=tz)
+            parsed = cast(
+                "datetime",
+                localize(parsed) if callable(localize) else parsed.replace(tzinfo=tz),
+            )
     elif tz is not None:
         parsed = parsed.astimezone(tz)
     return parsed

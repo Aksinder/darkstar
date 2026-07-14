@@ -658,15 +658,19 @@ async def forecast_bias(
 
         # Convenience verdict for the Phase 1b checklist; raw stats above are
         # the source of truth.
-        aurora_win = (versions.get("aurora") or {}).get("window_pv") or {}
-        base_win = (versions.get("baseline_7_day_avg") or {}).get("window_pv") or {}
+        aurora_all: dict[str, Any] = versions.get("aurora") or {}
+        base_all: dict[str, Any] = versions.get("baseline_7_day_avg") or {}
+        aurora_win: dict[str, Any] = aurora_all.get("window_pv") or {}
+        base_win: dict[str, Any] = base_all.get("window_pv") or {}
+        aurora_mae: float | None = aurora_win.get("mae")
+        base_mae: float | None = base_win.get("mae")
         comparison: dict[str, Any] = {
             "window_bias_pv_aurora": aurora_win.get("bias"),
-            "window_mae_pv_aurora": aurora_win.get("mae"),
-            "window_mae_pv_baseline": base_win.get("mae"),
+            "window_mae_pv_aurora": aurora_mae,
+            "window_mae_pv_baseline": base_mae,
             "aurora_beats_baseline_window_pv": (
-                aurora_win["mae"] < base_win["mae"]
-                if aurora_win.get("mae") is not None and base_win.get("mae") is not None
+                aurora_mae < base_mae
+                if aurora_mae is not None and base_mae is not None
                 else None
             ),
         }
