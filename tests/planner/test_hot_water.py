@@ -142,3 +142,42 @@ def test_apply_state_ignores_missing_keys_and_clamps():
     est.apply_state({"stored_kwh": 999.0})  # over capacity -> clamped; other keys untouched
     assert est.stored_kwh == pytest.approx(tank.capacity_kwh())
     assert est.learned_draw_kw == pytest.approx(est.prior_draw_kw)
+
+
+# -- switch-aware draw gating (only count the learned draw down when the switch is OFF) --
+
+
+def test_switch_off_counts_learned_draw_down():
+    """Switch OFF + idle => the tank genuinely coasts: standing loss AND learned draw."""
+    est = HotWaterEstimator.from_temperature(_tank(), 70.0, prior_draw_kw=1.0)
+    before = est.stored_kwh
+    est.update(dt_minutes=60, heating_kw=0.0, switch_on=False)  # idle 1 h, switch cut
+    # ~0.1 kWh standing loss + 1.0 kWh learned draw.
+    assert before - est.stored_kwh > 0.9
+
+
+def test_switch_on_idle_holds_no_learned_draw():
+    """Switch ON + idle element => thermostat satisfied => hold. Only standing loss, no draw."""
+    est = HotWaterEstimator.from_temperature(_tank(), 70.0, prior_draw_kw=1.0)
+    before = est.stored_kwh
+    est.update(dt_minutes=60, heating_kw=0.0, switch_on=True)  # idle 1 h, switch on/maintained
+    drop = before - est.stored_kwh
+    # Standing loss only (~0.1 kWh); the 1.0 kWh learned draw must NOT be applied.
+    assert 0.0 < drop < 0.5
+
+
+def test_switch_none_matches_legacy_off_behaviour():
+    """Unknown switch state (default) stays on the safe side: draw depletes, same as OFF."""
+    est_none = HotWaterEstimator.from_temperature(_tank(), 70.0, prior_draw_kw=1.0)
+    est_off = HotWaterEstimator.from_temperature(_tank(), 70.0, prior_draw_kw=1.0)
+    est_none.update(dt_minutes=60, heating_kw=0.0)  # switch_on defaults to None
+    est_off.update(dt_minutes=60, heating_kw=0.0, switch_on=False)
+    assert est_none.stored_kwh == pytest.approx(est_off.stored_kwh)
+
+
+def test_switch_on_still_adds_energy_while_heating():
+    """The switch flag only gates the idle draw; a drawing element still charges the tank."""
+    est = HotWaterEstimator.from_temperature(_tank(), 40.0, prior_draw_kw=1.0)
+    before = est.stored_kwh
+    est.update(dt_minutes=60, heating_kw=3.0, switch_on=True)
+    assert est.stored_kwh > before

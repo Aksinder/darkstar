@@ -122,7 +122,11 @@ class HotWaterEstimator:
     # -- update -------------------------------------------------------------
 
     def update(
-        self, dt_minutes: float, heating_kw: float, t_ambient_c: float | None = None
+        self,
+        dt_minutes: float,
+        heating_kw: float,
+        t_ambient_c: float | None = None,
+        switch_on: bool | None = None,
     ) -> None:
         """Advance the observer by one step.
 
@@ -130,6 +134,21 @@ class HotWaterEstimator:
             dt_minutes: elapsed time since the previous update.
             heating_kw: measured element power this step (kW).
             t_ambient_c: optional ambient override for this step.
+            switch_on: known relay state of the tank's switch, when available.
+                - ``True``: the element is powered, so its built-in thermostat is free to
+                  maintain the tank. An idle element then means "thermostat satisfied =
+                  tank at setpoint", so the learned DRAW must NOT deplete the estimate —
+                  any tap or loss is replaced internally. We only "count down" once the
+                  switch is cut.
+                - ``False``: the switch is off, so the tank genuinely coasts and is tapped
+                  down by the learned draw (on top of the standing loss).
+                - ``None`` (default): switch state unknown — fall back to the legacy
+                  behaviour (draw depletes whenever the element is idle), so callers that
+                  don't wire the switch, and an unreadable switch, stay on the safe side
+                  (never over-estimate a "full" tank).
+                Caveat: a heavy draw that briefly outpaces a small element while the switch
+                is ON can make this hold "full" for a moment; it self-corrects at the next
+                thermostat-satisfied cutoff.
         """
         if dt_minutes <= 0:
             return
@@ -147,8 +166,13 @@ class HotWaterEstimator:
             self._energy_in_since_anchor_kwh += heating_kw * dt_h
         else:
             # Learned hot-water draw depletes the tank between heating runs (the dominant
-            # down-force; standing loss alone is a few %/day and looks frozen).
-            self.stored_kwh -= self.learned_draw_kw * dt_h
+            # down-force; standing loss alone is a few %/day and looks frozen). But it only
+            # applies when the tank is NOT being maintained: with the switch confirmed ON,
+            # an idle element means the thermostat is satisfied (tank at setpoint), so any
+            # tap is replaced internally and the estimate must hold. Deplete only when the
+            # switch is OFF or its state is unknown (legacy/safe default).
+            if switch_on is not True:
+                self.stored_kwh -= self.learned_draw_kw * dt_h
             # Element just switched off after a real heat-up => thermostat satisfied => full.
             if self._heating_run_min >= self.full_anchor_after_min:
                 self._anchor_full_and_learn(ambient)
