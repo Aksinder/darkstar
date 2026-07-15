@@ -1,3 +1,7 @@
+## dev-20260715.0846 — 2026-07-15 08:48
+
+- feat(hot-water): switch-aware fill estimator — count draw down only when the switch is OFF
+
 ## dev-20260714.2144 — 2026-07-14 21:46
 
 - Merge pull request #3 from Aksinder/fix/pv-training-clean-floor
