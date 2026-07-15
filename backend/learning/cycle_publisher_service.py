@@ -59,6 +59,9 @@ logger = logging.getLogger("darkstar.cycle_publisher_service")
 # Injected I/O signatures.
 FetchHistory = Callable[[str, int], Awaitable[list[dict[str, Any]]]]
 FetchFloat = Callable[[str], Awaitable[float | None]]
+# Returns True only when the entity is confidently "on"; False for off/unavailable/error
+# (so an unreadable switch stays on the safe side — the estimate keeps counting down).
+FetchSwitch = Callable[[str], Awaitable[bool]]
 Publish = Callable[[list[PublishedSensor]], Awaitable[int]]
 
 
@@ -133,6 +136,11 @@ class TrackedTank:
     t_max_c: float = 85.0
     ua_w_per_k: float = 2.0
     power_scale: float = 1.0
+    # Relay/switch entity that powers the element (e.g. ``switch.vvb``). When set, the
+    # estimator uses its state to distinguish "switch ON + element idle = thermostat
+    # satisfied = full" from "switch OFF = draining", so the learned draw only counts
+    # down while the switch is off. None => estimator falls back to power-only (legacy).
+    target_entity: str | None = None
     # Prior average hot-water draw (kW) until the estimator self-calibrates from a full->full
     # window. Right-size per tank (a small cabin tank draws far less than a house tank) so the
     # initial estimate doesn't drain implausibly fast before the first learn.
@@ -154,6 +162,7 @@ class DeferrablePublisherService:
         fetch_float: FetchFloat,
         publish: Publish,
         *,
+        fetch_switch: FetchSwitch | None = None,
         history_hours: int = 336,  # 14 days
         now_fn: Callable[[], datetime] | None = None,
         state_path: str | None = "data/hot_water_state.json",
@@ -162,6 +171,7 @@ class DeferrablePublisherService:
         self.tanks = list(tanks)
         self._fetch_history = fetch_history
         self._fetch_float = fetch_float
+        self._fetch_switch = fetch_switch
         self._publish = publish
         self._history_hours = history_hours
         self._now_fn = now_fn or datetime.now
@@ -278,8 +288,15 @@ class DeferrablePublisherService:
         raw_power_w = await self._fetch_float(tank.power_entity)
         heating_kw = max(0.0, (raw_power_w or 0.0) * tank.power_scale) / 1000.0
 
+        # Known switch state lets the estimator hold "full" while the switch is on and the
+        # thermostat is idle, and only count the learned draw down once the switch is cut.
+        # Unwired switch or no fetcher => None => legacy power-only behaviour.
+        switch_on: bool | None = None
+        if tank.target_entity and self._fetch_switch is not None:
+            switch_on = await self._fetch_switch(tank.target_entity)
+
         if dt_minutes > 0:
-            est.update(dt_minutes, heating_kw)
+            est.update(dt_minutes, heating_kw, switch_on=switch_on)
             self._tank_heating_kwh_today[tank.id] = self._tank_heating_kwh_today.get(
                 tank.id, 0.0
             ) + heating_kw * (dt_minutes / 60.0)
@@ -380,6 +397,7 @@ def build_tracked_from_config(
                 power_scale=float(cfg.get("power_scale", 1.0)),
                 prior_draw_kw=float(cfg.get("prior_draw_kw", 0.15)),
                 object_id_prefix=str(cfg.get("sensor_prefix", "darkstar_")),
+                target_entity=(str(cfg["target_entity"]) if cfg.get("target_entity") else None),
             )
         )
     return appliances, tanks
@@ -409,6 +427,7 @@ async def run_publisher_loop(
 
     from backend.core import secrets
     from backend.core.ha_client import (
+        get_ha_bool,
         get_ha_sensor_float,
         get_ha_sensor_kw_normalized,
         make_ha_headers,
@@ -508,6 +527,7 @@ async def run_publisher_loop(
         fetch_history,
         get_ha_sensor_float,
         publish,
+        fetch_switch=get_ha_bool,
         history_hours=history_hours,
     )
 
