@@ -31,7 +31,12 @@ logger = logging.getLogger("darkstar.kepler")
 # Solver wall-clock budget (seconds). Replans run every 15 min, so a long solve is
 # affordable; a silently time-boxed one is not (see the CBC-first comment at the
 # solve call — GLPK at its old 30 s ceiling shipped garbage plans labeled Optimal).
-SOLVER_TIME_LIMIT_S = 120
+# 120→240 (2026-07-22): the degenerate summer water-heating MILP straddles 120 s on
+# the 2-vCPU box (heavy-tailed B&B; the 2026-07-15 seven-hour SOLVER_TIMEOUT freeze) —
+# 240 s gives the strong solver headroom and still fits the 15-min cadence even with
+# the CBC fallback chained after it (worst case ~8 min). Scheduler backoff already
+# tolerates 240 ([60, 120, 240, 300]).
+SOLVER_TIME_LIMIT_S = 240
 
 # pulp is untyped; pin the one solution-status constant the guard relies on.
 _LP_SOLUTION_OPTIMAL: int = int(pulp.constants.LpSolutionOptimal)  # type: ignore[reportUnknownMemberType]
@@ -94,6 +99,66 @@ def _phase_fraction_list(fractions: dict[str, float] | None) -> list[float] | No
     if total <= 0:
         return None
     return [v / total for v in vals]
+
+
+# Keep only this many failed-solve dumps; each is a few hundred KB.
+_SOLVER_DUMP_KEEP = 5
+
+
+def _dump_failed_solve_instance(
+    input_data: KeplerInput,
+    config: KeplerConfig,
+    *,
+    reason: str,
+    status: str,
+    sol_status: int,
+    used_solver: str,
+    solve_duration_s: float,
+    chain_duration_s: float,
+    extra: dict[str, Any] | None = None,
+) -> str | None:
+    """Persist the exact solver input + outcome of a FAILED solve for offline replay.
+
+    The 2026-07-15 SOLVER_TIMEOUT freeze could not be root-caused at the instance
+    level because the failing KeplerInput was discarded with the error and the log
+    ring had rotated. This dump is the missing evidence: re-running the artifact
+    offline distinguishes a no-incumbent timeout from a comfort-violating incumbent
+    and validates any solver-tuning fix against the REAL instance. Best-effort —
+    a dump failure must never mask the PlannerError being raised.
+    """
+    try:
+        import dataclasses
+        import json
+        import time as _time
+        from pathlib import Path
+
+        # Env-overridable so the test suite (whose solver tests intentionally fail
+        # solves) never writes into — or evicts real incident dumps from — the
+        # production data/ directory. tests/planner/conftest.py points this at tmp.
+        dump_dir = Path(os.environ.get("DARKSTAR_SOLVER_DUMP_DIR", "data/solver_dumps"))
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        path = dump_dir / f"kepler_fail_{_time.strftime('%Y%m%dT%H%M%S')}.json"
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "status": status,
+            "sol_status": sol_status,
+            "used_solver": used_solver,
+            "solve_duration_s": round(solve_duration_s, 3),
+            "chain_duration_s": round(chain_duration_s, 3),
+            "time_limit_s": SOLVER_TIME_LIMIT_S,
+            **(extra or {}),
+            "config": dataclasses.asdict(config),
+            "input": dataclasses.asdict(input_data),
+        }
+        path.write_text(json.dumps(payload, default=str))
+        # Retention: newest _SOLVER_DUMP_KEEP only (name-sorted == time-sorted).
+        for old in sorted(dump_dir.glob("kepler_fail_*.json"))[:-_SOLVER_DUMP_KEEP]:
+            old.unlink(missing_ok=True)
+        logger.warning("Failed solve instance persisted to %s for offline replay", path)
+        return str(path)
+    except Exception as exc:
+        logger.warning("Could not persist failed solve instance: %s", exc)
+        return None
 
 
 class KeplerSolver:
@@ -1237,17 +1302,30 @@ class KeplerSolver:
             attempt_start = time.time()
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
             _highs_duration: float = time.time() - attempt_start
+            # Any NotSolved falls through to CBC — prob.solve does NOT raise for it.
             # A FAST NotSolved is a solver malfunction (e.g. the global-scheduler
-            # thread mismatch, a load error) — prob.solve does NOT raise for it.
-            # Never ship it: fall through and RE-SOLVE with CBC. A slow NotSolved
-            # (real no-incumbent timeout) is handled by the SOLVER_TIMEOUT mapping.
-            if (
-                prob.status == pulp.LpStatusNotSolved  # type: ignore[reportUnknownMemberType]
-                and _highs_duration < 0.9 * SOLVER_TIME_LIMIT_S
-            ):
+            # thread mismatch, a load error). A SLOW NotSolved is a real no-incumbent
+            # timeout; before 2026-07-22 it skipped the fallback and went straight to
+            # the SOLVER_TIMEOUT mapping — the 2026-07-15 freeze ran 7 h on a stale
+            # plan that way. CBC is the weaker solver on this box, so it is a safety
+            # net, not a rescue: its incumbent still passes the comfort-floor
+            # tripwire below, so worst case remains "keep the previous plan", never
+            # a garbage plan shipped.
+            if prob.status == pulp.LpStatusNotSolved:  # type: ignore[reportUnknownMemberType]
+                if _highs_duration < 0.9 * SOLVER_TIME_LIMIT_S:
+                    raise RuntimeError(
+                        f"HiGHS returned NotSolved in {_highs_duration:.1f}s "
+                        f"(<0.9x budget) — treating as solver malfunction"
+                    )
+                logger.warning(
+                    "HiGHS found NO incumbent within its %ds budget (%.1fs) — "
+                    "retrying with CBC as a safety net",
+                    SOLVER_TIME_LIMIT_S,
+                    _highs_duration,
+                )
                 raise RuntimeError(
-                    f"HiGHS returned NotSolved in {_highs_duration:.1f}s "
-                    f"(<0.9x budget) — treating as solver malfunction"
+                    f"HiGHS no-incumbent timeout ({_highs_duration:.1f}s of "
+                    f"{SOLVER_TIME_LIMIT_S}s) — retrying with CBC"
                 )
         except Exception as highs_exc:
             # Expected on hosts without highspy — INFO, not WARNING.
@@ -1341,6 +1419,17 @@ class KeplerSolver:
                     "the previous one).",
                     floor_violation_kwh,
                 )
+                _dump_path = _dump_failed_solve_instance(
+                    input_data,
+                    config,
+                    reason="tripwire_comfort_floor_violation",
+                    status=str(status),  # type: ignore[reportUnknownArgumentType]
+                    sol_status=_sol_status,
+                    used_solver=used_solver,
+                    solve_duration_s=solve_duration,
+                    chain_duration_s=total_duration,
+                    extra={"floor_violation_kwh": round(floor_violation_kwh, 2)},
+                )
                 raise PlannerError(
                     code=PlannerErrorCode.SOLVER_TIMEOUT,
                     details={
@@ -1349,6 +1438,7 @@ class KeplerSolver:
                         "chain_duration_s": round(total_duration, 3),
                         "reason": "time-boxed incumbent violates water comfort floors",
                         "floor_violation_kwh": round(floor_violation_kwh, 2),
+                        "dump_path": _dump_path,
                     },
                 )
             status = f"{status} (time-boxed incumbent, gap unproven)"
@@ -1364,12 +1454,27 @@ class KeplerSolver:
             prob.writeLP("kepler_debug.lp")  # type: ignore[reportUnknownMemberType]
             print(f"Solver failed: {status}. LP written to kepler_debug.lp")
 
+            # Persist the exact failing instance BEFORE it is discarded with the
+            # error, so it can be replayed offline (see _dump_failed_solve_instance).
+            _fail_dump_path = _dump_failed_solve_instance(
+                input_data,
+                config,
+                reason="not_optimal",
+                status=str(status),  # type: ignore[reportUnknownArgumentType]
+                sol_status=_sol_status,
+                used_solver=used_solver,
+                solve_duration_s=solve_duration,
+                chain_duration_s=total_duration,
+                extra={"var_count": var_count, "const_count": const_count},
+            )
+
             # Map PuLP status to structured PlannerError. solve_duration_s is the
             # final attempt only; chain_duration_s is the whole fallback chain.
             details = {
-                "solver_status": status,
+                "solver_status": str(status),
                 "solve_duration_s": round(solve_duration, 3),
                 "chain_duration_s": round(total_duration, 3),
+                "dump_path": _fail_dump_path,
             }
             if prob.status == pulp.LpStatusInfeasible:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_INFEASIBLE, details=details)
