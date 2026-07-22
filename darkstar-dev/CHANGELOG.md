@@ -1,3 +1,7 @@
+## dev-20260722.1658 — 2026-07-22 17:01
+
+- fix(solver): CBC fallback on slow no-incumbent timeout + failing-instance dump + 240s budget
+
 ## dev-20260715.0846 — 2026-07-15 08:48
 
 - feat(hot-water): switch-aware fill estimator — count draw down only when the switch is OFF
