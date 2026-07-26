@@ -1,3 +1,7 @@
+## dev-20260726.1316 — 2026-07-26 13:17
+
+- fix(planner): UTC-aware retry timestamps — naive-local stalled replanning for hours
+
 ## dev-20260722.1658 — 2026-07-22 17:01
 
 - fix(solver): CBC fallback on slow no-incumbent timeout + failing-instance dump + 240s budget
