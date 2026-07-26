@@ -1,11 +1,10 @@
 """E2E test: retry policy sequence — config-blocking → settings_saved → success."""
-from datetime import datetime, timedelta
-from unittest.mock import patch, MagicMock, AsyncMock
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from backend.services.planner_service import PlannerService, PlannerResult
-from planner.errors import PlannerError, PlannerErrorCode
+from backend.services.planner_service import PlannerService
+from planner.errors import PlannerErrorCode
 
 
 @pytest.mark.asyncio
@@ -23,7 +22,7 @@ async def test_config_blocking_then_settings_saved_then_success():
     svc.clear_retry_suspension()
     assert svc._retry_suspended is False
     assert svc._next_retry_at is not None
-    assert svc._next_retry_at <= datetime.now() + timedelta(seconds=1)
+    assert svc._next_retry_at <= datetime.now(UTC) + timedelta(seconds=1)
 
     # Simulate successful run
     svc._on_success()

@@ -8,7 +8,7 @@ for running inside the FastAPI process without blocking the event loop.
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -85,11 +85,19 @@ class PlannerService:
             return None
         if self._next_retry_at is None:
             return None
-        remaining = (self._next_retry_at - datetime.now()).total_seconds()
+        remaining = (self._next_retry_at - datetime.now(UTC)).total_seconds()
         return max(0, int(remaining))
 
     def _apply_retry_policy(self, code: PlannerErrorCode) -> None:
-        now = datetime.now()
+        # UTC-aware: the scheduler treats a NAIVE _next_retry_at as UTC
+        # (scheduler_service.py: `.replace(tzinfo=UTC)`), so a naive LOCAL
+        # timestamp was read as a wall-clock-identical UTC one and pushed every
+        # retry the local UTC offset into the future (+2 h on CEST). That
+        # silently suspended replanning for hours — it stretched the 2026-07-15
+        # SOLVER_TIMEOUT freeze (SOLVER_TIMEOUT is transient, so every failure
+        # re-armed the broken backoff) and stalled the planner after each config
+        # save via clear_retry_suspension().
+        now = datetime.now(UTC)
         if is_warning_only(code):
             # Warning-only: treat as success for retry purposes
             return
@@ -107,7 +115,7 @@ class PlannerService:
     def clear_retry_suspension(self) -> None:
         """Clear retry suspension and schedule an immediate retry."""
         self._retry_suspended = False
-        self._next_retry_at = datetime.now()
+        self._next_retry_at = datetime.now(UTC)
 
     async def _emit_progress(self, phase: str) -> None:
         """Emit progress event via WebSocket."""
