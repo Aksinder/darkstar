@@ -115,6 +115,46 @@ async def learning_history(limit: int = Query(20, ge=1, le=100)) -> dict[str, An
 
 
 @router.post(
+    "/api/learning/repair_observations",
+    summary="Repair corrupted observation slots from HA statistics",
+    description=(
+        "Rebuild artifact observation slots (load_kwh <= 0.001 or missing) from HA "
+        "long-term statistics — PV from the combined power sensor's hourly mean, "
+        "grid/battery from cumulative-counter deltas, load from the energy balance. "
+        "Fixes the 2026-08 recorder skip-guard corruption. dry_run=true (default) "
+        "only reports what would be written."
+    ),
+)
+async def learning_repair_observations(
+    start_date: str = Query(..., description="Window start, ISO date or datetime"),
+    end_date: str | None = Query(None, description="Window end (exclusive); default now"),
+    dry_run: bool = Query(True, description="Report only; write nothing"),
+) -> dict[str, Any]:
+    """Repair artifact/missing observation slots from HA long-term statistics."""
+    from datetime import UTC as _UTC
+
+    from backend.core.secrets import load_yaml
+    from backend.learning.repair import repair_observations
+
+    try:
+        start = _parse_min_date(start_date)
+        end = _parse_min_date(end_date) if end_date else datetime.now(tz=start.tzinfo)
+        start_utc = start.astimezone(_UTC)
+        end_utc = end.astimezone(_UTC)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad date: {e}") from e
+
+    try:
+        config = load_yaml("config.yaml")
+        return await repair_observations(config, start_utc, end_utc, dry_run=dry_run)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Observation repair failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post(
     "/api/learning/train",
     summary="Trigger ML Training",
     description="Trigger manual ML model retraining now.",

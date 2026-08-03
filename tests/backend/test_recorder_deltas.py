@@ -1280,10 +1280,92 @@ class TestLoadIsolationFromDeferrableLoads:
 
                     assert record["ev_charging_kwh"] == pytest.approx(2.0, abs=0.01)
                     assert record["water_kwh"] == pytest.approx(1.0, abs=0.01)
-                    assert record["load_kwh"] == 0.0
+                    # 2026-08 balance-rescue: a clamped-to-zero base load is exactly the
+                    # kind of impossible value the energy-balance rescue replaces — the
+                    # record now carries the balance-derived base load instead of a fake
+                    # 0.0 (which would poison training and eval like the skip-guard did).
+                    assert record["load_kwh"] > 0.0
+                    assert "load_rescued" in str(record.get("quality_flags", ""))
 
                     warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
                     assert any("Negative base load" in w for w in warning_calls)
+
+    @pytest.mark.asyncio
+    async def test_zero_load_glitch_records_with_balance_rescue(self, base_config):
+        """REGRESSION (2026-08 incident): a glitched load_power=0 read must NOT skip the
+        observation — PV/grid/battery are healthy, so the slot is recorded with a
+        balance-derived load instead. The old skip → zero-backfill chain corrupted every
+        strong-export midday and produced the phantom forecast-MAE regression."""
+        config = base_config.copy()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            state_store = RecorderStateStore(state_file)
+            state_store.load()
+            now = datetime.now(pytz.timezone("Europe/Stockholm"))
+            prev_time = now - timedelta(minutes=15)
+            state_store._state = {
+                "pv_total": {"value": 100.0, "timestamp": prev_time.isoformat()},
+            }
+            state_store.save()
+
+            async def mock_get_ha_sensor_kw_normalized(entity):
+                return {
+                    "sensor.pv_power": 6.0,
+                    "sensor.load_power": 0.0,  # the Sungrow glitch
+                    "sensor.grid_power": -4.0,  # exporting 4 kW
+                    "sensor.battery_power": -1.0,  # charging 1 kW
+                }.get(entity, 0.0)
+
+            async def mock_get_ha_sensor_float(entity):
+                if entity == "sensor.battery_soc":
+                    return 80.0
+                return None
+
+            async def mock_get_ha_entity_state(entity):
+                return {
+                    "sensor.total_pv_production": {
+                        "state": "101.5",
+                        "attributes": {"unit_of_measurement": "kWh"},
+                        "last_updated": now.isoformat(),
+                    },
+                }.get(entity)
+
+            with (
+                patch(
+                    "backend.recorder.get_ha_sensor_kw_normalized",
+                    side_effect=mock_get_ha_sensor_kw_normalized,
+                ),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
+                patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
+                patch(
+                    "backend.recorder.get_energy_from_power_history",
+                    new_callable=AsyncMock,
+                    return_value=None,
+                ),
+                patch("backend.recorder.get_current_slot_prices", return_value=None),
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=config, state_store=state_store
+                    )
+
+                    # The observation was RECORDED (old behavior: skipped entirely).
+                    mock_store.store_slot_observations.assert_called_once()
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+
+                    # PV from the cumulative delta, untouched by the glitch.
+                    assert record["pv_kwh"] == pytest.approx(1.5, abs=0.01)
+                    # load = pv 1.5 + import 0 - export 1.0 + dis 0 - cha 0.25 = 0.25
+                    assert record["load_kwh"] == pytest.approx(0.25, abs=0.01)
+                    assert "load_rescued" in str(record.get("quality_flags", ""))
 
     @pytest.mark.asyncio
     async def test_power_snapshot_fallback_uses_base_load(self, base_config):

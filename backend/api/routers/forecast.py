@@ -501,6 +501,11 @@ async def forecast_eval(days: int = 7) -> dict[str, Any]:
                     SlotObservation.slot_start >= start_iso,
                     SlotObservation.slot_start < now_iso,
                     SlotForecast.forecast_version.in_(["baseline_7_day_avg", "aurora"]),
+                    # Exclude recorder artifacts: a skipped-then-zero-backfilled slot has
+                    # load_kwh == 0.0, which a real house never does over 15 min. Scoring
+                    # forecasts against those fake zeros produced the 2026-08-03 phantom
+                    # "MAE regression" (aurora 0.80 vs truth-healthy forecasts).
+                    SlotObservation.load_kwh > 0.001,
                 )
                 .group_by(SlotForecast.forecast_version)
             )
@@ -650,6 +655,8 @@ async def forecast_bias(
                     SlotObservation.slot_start >= start_iso,
                     SlotObservation.slot_start < now_iso,
                     SlotForecast.forecast_version.in_(["baseline_7_day_avg", "aurora"]),
+                    # Same artifact exclusion as /eval — see the comment there.
+                    SlotObservation.load_kwh > 0.001,
                 )
             )
             rows = [tuple(r) for r in (await session.execute(stmt)).all()]

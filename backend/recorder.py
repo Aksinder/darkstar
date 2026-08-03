@@ -336,21 +336,24 @@ async def record_observation_from_current_state(
     total_load_kw: float = power_results.get("load_power") or 0.0
     battery_kw: float = power_results.get("battery_power") or 0.0
 
-    # Reject a glitched/frozen total-load read. The Sungrow modbus load_power register
-    # intermittently returns 0 (≈1% of reads, plus occasional multi-hour freezes) while
-    # PV/grid/battery stay valid. A whole house is never truly at 0 W, so a 0 read is a bad
-    # sensor sample — recording it would poison the Aurora base-load training set and feed the
-    # planner a false 0 load. Skip this observation; the next tick records normally once the
-    # register recovers (fix the root cause on the Sungrow/modbus side).
-    # Only guard when a load_power sensor is actually configured: a deployment with no dedicated
-    # load sensor (load derived elsewhere) must not skip every observation forever.
-    if input_sensors.get("load_power") and total_load_kw <= 0.0:
+    # Detect a glitched/frozen total-load read. The Sungrow modbus load_power register
+    # intermittently returns 0 (≈1% of reads) and FREEZES AT 0 FOR HOURS during strong
+    # export, while PV/grid/battery stay valid. A whole house is never truly at 0 W, so a
+    # 0 read is a bad sensor sample. The old guard SKIPPED the whole observation here —
+    # which threw away perfectly good PV/grid/battery data for entire sunny middays (the
+    # 2026-08-03 "MAE regression" incident: gap-backfill then zero-filled the skipped
+    # slots and every eval joined against fake pv=0 rows). Instead: keep recording, and
+    # RESCUE the load from the slot's energy balance further down (all other channels are
+    # healthy through these glitches, so load = pv + import - export ± battery holds).
+    # Only flag when a load_power sensor is actually configured: a deployment with no
+    # dedicated load sensor (load derived elsewhere) is not a glitch.
+    load_read_invalid = bool(input_sensors.get("load_power")) and total_load_kw <= 0.0
+    if load_read_invalid:
         logger.warning(
-            "Recorder: load_power read invalid (%.3f kW) — skipping observation "
-            "(Sungrow modbus glitch; PV/grid/battery unaffected)",
+            "Recorder: load_power read invalid (%.3f kW) — recording anyway, load will "
+            "be balance-derived (Sungrow modbus glitch; PV/grid/battery unaffected)",
             total_load_kw,
         )
-        return
 
     # Disaggregate loads if disaggregator is provided (REV // ML2)
     controllable_kw = 0.0
@@ -555,6 +558,27 @@ async def record_observation_from_current_state(
     batt_discharge_kwh = (battery_kw * 0.25) if battery_kw > 0 else 0.0
     batt_charge_kwh = (abs(battery_kw) * 0.25) if battery_kw < 0 else 0.0
 
+    # Balance-rescue the load when the load register glitched (read invalid above) or the
+    # cumulative load counter ALSO froze (delta ≈ 0 while the house demonstrably ran).
+    # Energy conservation over the slot: total_load = pv + import - export + discharge -
+    # charge; base load = total - EV - water (same isolation as the normal path). All the
+    # balance inputs come from channels that stay healthy through the Sungrow load-register
+    # glitch, so this records a REAL value instead of skipping the slot (pre-2026-08 the
+    # skip → zero-filled backfill rows poisoned eval and starved training of every
+    # strong-export slot — the highest-PV data the residual model most needs).
+    load_rescued = False
+    balance_total_kwh = pv_kwh + import_kwh - export_kwh + batt_discharge_kwh - batt_charge_kwh
+    balance_base_kwh = max(0.0, balance_total_kwh - ev_charging_kwh - water_kwh)
+    if (load_read_invalid or load_kwh <= 0.001) and balance_base_kwh > 0.02:
+        logger.info(
+            "Recorder: load balance-rescued to %.3f kWh (sensor said %.3f, read_invalid=%s)",
+            balance_base_kwh,
+            load_kwh,
+            load_read_invalid,
+        )
+        load_kwh = balance_base_kwh
+        load_rescued = True
+
     # Battery
     soc_entity = input_sensors.get("battery_soc")
     soc_percent = None
@@ -621,6 +645,8 @@ async def record_observation_from_current_state(
         "export_price_sek_kwh": export_price,
         "created_at": datetime.now(UTC).isoformat(),
     }
+    if load_rescued:
+        record["quality_flags"] = json.dumps({"load_rescued": "energy_balance"})
 
     logger.info(
         f"Recording observation for {slot_start}: SOC={soc_percent}% "
