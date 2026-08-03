@@ -239,7 +239,16 @@ class LearningStore:
                         "export_price_sek_kwh": func.coalesce(
                             stmt.excluded.export_price_sek_kwh, SlotObservation.export_price_sek_kwh
                         ),
-                        "quality_flags": stmt.excluded.quality_flags,
+                        # Preserve existing provenance flags when the incoming record
+                        # carries none — a flag-less writer (e.g. the gap backfill)
+                        # must not reset a load_rescued/repaired tag to "{}".
+                        "quality_flags": case(
+                            (
+                                stmt.excluded.quality_flags != "{}",
+                                stmt.excluded.quality_flags,
+                            ),
+                            else_=SlotObservation.quality_flags,
+                        ),
                     },
                 )
                 await session.execute(stmt)

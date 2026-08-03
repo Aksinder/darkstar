@@ -355,8 +355,13 @@ async def record_observation_from_current_state(
             total_load_kw,
         )
 
-    # Disaggregate loads if disaggregator is provided (REV // ML2)
+    # Disaggregate loads if disaggregator is provided (REV // ML2).
+    # Skip during a glitched load read: calculate_base_load(0.0, controllable) would
+    # increment the disaggregator's negative-base-load quality counter on every
+    # export-season glitch tick — a sensor fault, not a disaggregation failure.
     controllable_kw = 0.0
+    if disaggregator and load_read_invalid:
+        disaggregator = None
     if disaggregator:
         controllable_kw = await disaggregator.update_current_power()
         load_kw = disaggregator.calculate_base_load(total_load_kw, controllable_kw)
@@ -569,7 +574,13 @@ async def record_observation_from_current_state(
     load_rescued = False
     balance_total_kwh = pv_kwh + import_kwh - export_kwh + batt_discharge_kwh - batt_charge_kwh
     balance_base_kwh = max(0.0, balance_total_kwh - ev_charging_kwh - water_kwh)
-    if (load_read_invalid or load_kwh <= 0.001) and balance_base_kwh > 0.02:
+    # A transient 0-read with a HEALTHY cumulative-counter delta must keep the
+    # measured value — the counter is the better instrument. Rescue only when the
+    # measurement itself is absent/zero: read invalid WITHOUT a cumulative source,
+    # or a ~zero energy result (frozen counter delta / zero snapshot).
+    if (
+        (load_read_invalid and not used_cumulative_load) or load_kwh <= 0.001
+    ) and balance_base_kwh > 0.02:
         logger.info(
             "Recorder: load balance-rescued to %.3f kWh (sensor said %.3f, read_invalid=%s)",
             balance_base_kwh,
@@ -645,8 +656,15 @@ async def record_observation_from_current_state(
         "export_price_sek_kwh": export_price,
         "created_at": datetime.now(UTC).isoformat(),
     }
-    if load_rescued:
-        record["quality_flags"] = json.dumps({"load_rescued": "energy_balance"})
+    # Provenance: tag rescued rows AND unrescued-but-invalid reads (the latter so a
+    # later repair/analysis can find them even though eval/train filters exclude them).
+    if load_rescued or load_read_invalid:
+        flags: dict[str, Any] = {}
+        if load_rescued:
+            flags["load_rescued"] = "energy_balance"
+        if load_read_invalid:
+            flags["load_read_invalid"] = True
+        record["quality_flags"] = json.dumps(flags)
 
     logger.info(
         f"Recording observation for {slot_start}: SOC={soc_percent}% "
