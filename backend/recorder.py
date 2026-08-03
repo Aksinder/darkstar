@@ -560,8 +560,18 @@ async def record_observation_from_current_state(
         load_kwh = base_load_kwh
 
     # Standard inverter convention: positive = discharge, negative = charge
-    batt_discharge_kwh = (battery_kw * 0.25) if battery_kw > 0 else 0.0
-    batt_charge_kwh = (abs(battery_kw) * 0.25) if battery_kw < 0 else 0.0
+    batt_discharge_kw = battery_kw if battery_kw > 0 else 0.0
+    batt_charge_kw = abs(battery_kw) if battery_kw < 0 else 0.0
+    # Prefer the cumulative charge/discharge counters over the single power snapshot —
+    # a burst charge inside the slot is invisible to an instantaneous read. These delta
+    # calls consume/advance RecorderStateStore state, so they must run every tick here
+    # in the main path (not only when the balance-rescue below fires).
+    batt_charge_kwh, _ = await calculate_energy_from_cumulative(
+        "total_battery_charge", batt_charge_kw, "battery_charge_total"
+    )
+    batt_discharge_kwh, _ = await calculate_energy_from_cumulative(
+        "total_battery_discharge", batt_discharge_kw, "battery_discharge_total"
+    )
 
     # Balance-rescue the load when the load register glitched (read invalid above) or the
     # cumulative load counter ALSO froze (delta ≈ 0 while the house demonstrably ran).
