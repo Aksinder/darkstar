@@ -1,3 +1,7 @@
+## dev-20260803.1915 — 2026-08-03 19:17
+
+- Merge remote-tracking branch 'fork/main' into deploy-main
+
 ## dev-20260803.1906 — 2026-08-03 19:09
 
 - fix(recorder): balance-rescue load instead of skipping + statistics repair of corrupted history
