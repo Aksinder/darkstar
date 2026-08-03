@@ -99,6 +99,26 @@ class TestControllerFollowPlan:
         assert decision.mode_intent == "export"
         assert decision.source == "plan"
 
+    def test_export_blocked_at_soc_floor(self, controller):
+        """R1 runtime guard: export intent at/below the SoC floor downgrades to
+        self_consumption — the MILP floor alone cannot protect against stale plans
+        or SoC drift between replans (Sungrow Forced discharge runs to BMS cutoff)."""
+        slot = SlotPlan(export_kw=5.0, discharge_kw=5.0)
+        state = SystemState(current_soc_percent=20.0)  # default floor is 20
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "self_consumption"
+
+    def test_export_allowed_just_above_soc_floor(self, controller):
+        """Just above the floor the export intent goes through unchanged."""
+        slot = SlotPlan(export_kw=5.0, discharge_kw=5.0)
+        state = SystemState(current_soc_percent=21.0)
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "export"
+
     def test_charge_mode_when_charging_only(self, controller):
         """When charging only, use charge mode intent."""
         slot = SlotPlan(export_kw=0.0, charge_kw=3.0)

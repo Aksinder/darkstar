@@ -388,6 +388,12 @@ class ControllerConfig:
     round_step_w: float = 100.0
     write_threshold_w: float = 100.0
     charge_efficiency: float = 0.92
+    # Runtime battery-export SoC floor (arbitrage gate R1): the planner's
+    # export_floor_soc_percent exists only inside the MILP — a stale plan or SoC
+    # drift between replans could otherwise force-discharge below the floor. The
+    # controller downgrades an export intent to self_consumption at/below this.
+    # Mirrors config export.export_floor_soc_percent.
+    export_floor_soc_percent: float = 20.0
 
 
 @dataclass
@@ -729,6 +735,14 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         ),
         charge_efficiency=float(
             str(ctrl_data.get("charge_efficiency", ControllerConfig.charge_efficiency))
+        ),
+        # From the ROOT export block — the same floor the planner enforces in-model.
+        export_floor_soc_percent=float(
+            str(
+                (data.get("export", {}) if isinstance(data.get("export"), dict) else {}).get(
+                    "export_floor_soc_percent", ControllerConfig.export_floor_soc_percent
+                )
+            )
         ),
     )
 

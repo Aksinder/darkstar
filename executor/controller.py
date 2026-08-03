@@ -198,8 +198,23 @@ class Controller:
         # - Battery export: discharge_kw > 0 (battery actively discharging to grid)
         # - PV surplus: discharge_kw == 0, charge_kw > 0 (excess PV exports while charging)
         if slot.export_kw > 0 and slot.discharge_kw > 0:
-            # Battery discharge to grid - use export mode
-            mode_intent = "export"
+            # Battery discharge to grid - use export mode.
+            # R1 runtime SoC-floor guard (arbitrage gate): the export floor exists
+            # only inside the MILP — between replans the plan is stale and the real
+            # SoC can drift below it (or a bad plan could slip through). Sungrow
+            # Forced discharge would otherwise run to BMS cutoff at full power.
+            # At/below the floor, downgrade to self_consumption (battery serves the
+            # house only, never the grid).
+            if round(state.current_soc_percent) <= self.config.export_floor_soc_percent:
+                logger.warning(
+                    "Export intent blocked: SoC %.1f%% at/below export floor %.0f%% "
+                    "— downgrading to self_consumption",
+                    state.current_soc_percent,
+                    self.config.export_floor_soc_percent,
+                )
+                mode_intent = "self_consumption"
+            else:
+                mode_intent = "export"
         elif (
             slot.charge_kw > 0
             and slot.export_kw == 0
