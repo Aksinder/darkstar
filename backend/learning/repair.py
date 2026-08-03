@@ -22,10 +22,12 @@ rebuilds the artifact slots from that data:
                   the live recorder, which subtracts EV + water)
 
 Hourly-flat 15-min slots are a huge upgrade over fake zeros, and only ARTIFACT
-rows (load_kwh <= 0.001) or missing rows are touched — healthy high-resolution
-rows are never overwritten. Writes go through the store's F35 upsert (energy
-overwrites only when the new value > 0), and repaired rows are tagged in
-``quality_flags``.
+rows (load_kwh <= 0.001 AND pv_kwh <= 0.001 — the zero-backfill signature) or
+missing rows are touched; artifact UPDATES rewrite ONLY pv+load (measured
+import/export/battery on the row are preserved via the store's F35 upsert),
+missing INSERTS get every series that has statistics. Units are normalized
+server-side (units={"power": "kW"}) so W- and kW-reporting sensors both work.
+Repaired rows are tagged in ``quality_flags``.
 """
 
 import asyncio
@@ -93,6 +95,12 @@ async def fetch_statistics_during_period(
                     "statistic_ids": entity_ids,
                     "period": period,
                     "types": types or ["mean", "change"],
+                    # Normalize units server-side: sensors report W OR kW per entity
+                    # (the live recorder normalizes per-read for the same reason —
+                    # e.g. the Fronius reports kW). HA converts from the statistic's
+                    # stored unit metadata, so "mean" is ALWAYS kW and "change"
+                    # always kWh here regardless of the sensor's native unit.
+                    "units": {"power": "kW", "energy": "kWh"},
                 }
             )
         )
@@ -112,9 +120,10 @@ def _hourly_kwh(
 ) -> dict[datetime, float]:
     """Hourly energy (kWh) for one entity from its statistics rows.
 
-    kind "mean_w": power sensor in W — hourly kWh = mean / 1000.
+    kind "mean_kw": power sensor — the WS request asks HA to convert to kW
+    (units={"power": "kW"}), so hourly kWh = mean x 1 h = mean.
     kind "change": cumulative kWh counter — hourly kWh = change.
-    Missing entity / missing field -> empty dict (treated as 0 downstream).
+    Missing entity / missing field -> empty dict (treated as no-data downstream).
     """
     if not entity:
         return {}
@@ -124,10 +133,10 @@ def _hourly_kwh(
         if start_raw is None:
             continue
         hour = _hour_key(int(start_raw))
-        if kind == "mean_w":
+        if kind == "mean_kw":
             v = row.get("mean")
             if v is not None:
-                out[hour] = max(0.0, float(v)) / 1000.0
+                out[hour] = max(0.0, float(v))
         else:
             v = row.get("change")
             if v is not None:
@@ -138,12 +147,24 @@ def _hourly_kwh(
 def compute_slot_record(
     slot_start: datetime,
     hourly: dict[str, dict[datetime, float]],
+    *,
+    full: bool,
 ) -> dict[str, Any] | None:
     """Build one repaired observation record for a 15-min slot from hourly series.
 
     ``hourly`` maps series name -> {hour_start_utc: kWh_for_that_hour}. Each slot
     gets 1/4 of its hour's energy (flat-within-hour). Returns None when the hour
     has NO pv and NO import data at all (statistics gap — nothing to write).
+
+    ``full=False`` (updating an EXISTING artifact row): the record carries ONLY the
+    broken fields (pv_kwh + load_kwh). All other energies are explicit 0.0 and batt
+    fields None, so the store's F35 upsert (energy overwrites only when new > 0,
+    batt/soc coalesce) PRESERVES every measured value already on the row — a
+    zero-backfilled artifact often has REAL import/export counter deltas that a
+    flat hourly estimate must never replace.
+
+    ``full=True`` (INSERTING a missing row): every series with statistics data is
+    written; series without data stay 0.0/None — never fabricated.
     """
     hour = slot_start.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
 
@@ -157,28 +178,51 @@ def compute_slot_record(
     if pv is None and imp is None:
         return None
 
-    exp = q("exp") or 0.0
-    cha = q("cha") or 0.0
-    dis = q("dis") or 0.0
-    water = q("water") or 0.0
-    ev = q("ev") or 0.0
-    pv_v = pv or 0.0
-    imp_v = imp or 0.0
+    exp = q("exp")
+    cha = q("cha")
+    dis = q("dis")
+    water = q("water")
+    ev = q("ev")
 
-    load = max(0.0, pv_v + imp_v - exp + dis - cha - water - ev)
-    return {
+    load = max(
+        0.0,
+        (pv or 0.0)
+        + (imp or 0.0)
+        - (exp or 0.0)
+        + (dis or 0.0)
+        - (cha or 0.0)
+        - (water or 0.0)
+        - (ev or 0.0),
+    )
+    record: dict[str, Any] = {
         "slot_start": slot_start,
         "slot_end": slot_start + timedelta(minutes=15),
-        "pv_kwh": round(pv_v, 4),
+        "pv_kwh": round(pv or 0.0, 4),
         "load_kwh": round(load, 4),
-        "import_kwh": round(imp_v, 4),
-        "export_kwh": round(exp, 4),
-        "water_kwh": round(water, 4),
-        "ev_charging_kwh": round(ev, 4),
-        "batt_charge_kwh": round(cha, 4),
-        "batt_discharge_kwh": round(dis, 4),
+        # Explicit safe defaults: 0.0 fails the F35 ">0" case on update (preserves
+        # existing), None coalesces on update (preserves existing).
+        "import_kwh": 0.0,
+        "export_kwh": 0.0,
+        "water_kwh": 0.0,
+        "ev_charging_kwh": 0.0,
+        "batt_charge_kwh": None,
+        "batt_discharge_kwh": None,
         "quality_flags": json.dumps({"repaired": "statistics_backfill"}),
     }
+    if full:
+        if imp is not None:
+            record["import_kwh"] = round(imp, 4)
+        if exp is not None:
+            record["export_kwh"] = round(exp, 4)
+        if water is not None:
+            record["water_kwh"] = round(water, 4)
+        if ev is not None:
+            record["ev_charging_kwh"] = round(ev, 4)
+        if cha is not None:
+            record["batt_charge_kwh"] = round(cha, 4)
+        if dis is not None:
+            record["batt_discharge_kwh"] = round(dis, 4)
+    return record
 
 
 async def repair_observations(
@@ -201,19 +245,27 @@ async def repair_observations(
         return {"error": "empty window after live-edge clamp", "repaired": 0}
 
     input_sensors: dict[str, Any] = config.get("input_sensors", {}) or {}
+    # Mirror the LIVE recorder's device selection exactly (recorder.py water/EV
+    # energy loops): water uses wh["sensor"], and EV is gated on
+    # system.has_ev_charger — repaired rows must have the same base-load
+    # semantics as live rows or the training target shifts between them.
     water_sensors = [
-        str(wh.get("power_sensor") or wh.get("sensor"))
+        str(wh.get("sensor"))
         for wh in config.get("water_heaters", [])
-        if wh.get("enabled", True) and (wh.get("power_sensor") or wh.get("sensor"))
+        if wh.get("enabled", True) and wh.get("sensor")
     ]
-    ev_sensors = [
-        str(ev.get("sensor"))
-        for ev in config.get("ev_chargers", [])
-        if ev.get("enabled", True) and ev.get("sensor")
-    ]
+    ev_sensors = (
+        [
+            str(ev.get("sensor"))
+            for ev in config.get("ev_chargers", [])
+            if ev.get("enabled", True) and ev.get("sensor")
+        ]
+        if config.get("system", {}).get("has_ev_charger", False)
+        else []
+    )
 
     series_spec: list[tuple[str, str | None, str]] = [
-        ("pv", input_sensors.get("pv_power"), "mean_w"),
+        ("pv", input_sensors.get("pv_power"), "mean_kw"),
         ("imp", input_sensors.get("total_grid_import"), "change"),
         ("exp", input_sensors.get("total_grid_export"), "change"),
         ("cha", input_sensors.get("total_battery_charge"), "change"),
@@ -232,7 +284,7 @@ async def repair_observations(
     for name, sensors in (("water", water_sensors), ("ev", ev_sensors)):
         merged: dict[datetime, float] = {}
         for s in sensors:
-            for hour, kwh in _hourly_kwh(stats, s, "mean_w").items():
+            for hour, kwh in _hourly_kwh(stats, s, "mean_kw").items():
                 merged[hour] = merged.get(hour, 0.0) + kwh
         hourly[name] = merged
 
@@ -242,11 +294,11 @@ async def repair_observations(
     rows = await engine.store.get_observation_rows_between(
         start.astimezone(tz).isoformat(), end.astimezone(tz).isoformat()
     )
-    existing: dict[datetime, float] = {}
+    existing: dict[datetime, tuple[float, float]] = {}
     for r in rows:
         try:
             ts = pd.to_datetime(r["slot_start"]).astimezone(UTC).to_pydatetime()
-            existing[ts] = float(r.get("load_kwh") or 0.0)
+            existing[ts] = (float(r.get("load_kwh") or 0.0), float(r.get("pv_kwh") or 0.0))
         except Exception:
             continue
 
@@ -257,11 +309,15 @@ async def repair_observations(
     scanned = artifacts = missing = no_data = 0
     while slot < end:
         scanned += 1
-        load_existing = existing.get(slot)
-        is_artifact = load_existing is not None and load_existing <= 0.001
-        is_missing = load_existing is None
+        row = existing.get(slot)
+        # Artifact = the zero-backfilled signature: BOTH load and pv ~zero. A live
+        # row with real PV but a clamped/zero load is NOT touched here — the live
+        # balance-rescue owns that case, and flat hourly estimates must never
+        # replace its measured PV.
+        is_artifact = row is not None and row[0] <= 0.001 and row[1] <= 0.001
+        is_missing = row is None
         if is_artifact or is_missing:
-            rec = compute_slot_record(slot, hourly)
+            rec = compute_slot_record(slot, hourly, full=is_missing)
             if rec is None:
                 no_data += 1
             else:

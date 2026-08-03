@@ -143,6 +143,11 @@ async def learning_repair_observations(
         end_utc = end.astimezone(_UTC)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Bad date: {e}") from e
+    if (end_utc - start_utc).days > 90:
+        raise HTTPException(
+            status_code=400,
+            detail="Repair window exceeds 90 days — run in smaller chunks (typo'd year?)",
+        )
 
     try:
         config = load_yaml("config.yaml")
