@@ -1,3 +1,7 @@
+## dev-20260803.1906 — 2026-08-03 19:09
+
+- fix(recorder): balance-rescue load instead of skipping + statistics repair of corrupted history
+
 ## dev-20260726.1316 — 2026-07-26 13:17
 
 - fix(planner): UTC-aware retry timestamps — naive-local stalled replanning for hours
