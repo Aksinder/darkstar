@@ -1,3 +1,7 @@
+## dev-20260803.2003 — 2026-08-03 20:05
+
+- feat(executor): runtime SoC-floor guard on battery-export intent (arbitrage gate R1)
+
 ## dev-20260803.1915 — 2026-08-03 19:17
 
 - Merge remote-tracking branch 'fork/main' into deploy-main
