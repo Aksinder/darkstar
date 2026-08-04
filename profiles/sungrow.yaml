@@ -87,10 +87,13 @@ modes:
         value: "{{max_discharge}}"
       - entity: "max_discharge_power"
         value: "{{discharge_value}}"
-      - entity: "export_power_limit"
-        value: "{{export_power_w}}"
+      # Deliberate grid export wants NO feed-in limit: mode switch OFF (unlimited).
+      # The old actions wrote a high W value to the limit register + switch ON —
+      # the SH10RT rejects out-of-range register writes (pymodbus isError on
+      # 10000 W, 2026-08-03), which silently left the previous low limit active
+      # and would have throttled the export this mode exists to perform.
       - entity: "export_power_limit_switch"
-        value: "on"
+        value: "off"
 
   self_consumption:
     description: "Self consumption — Normal PV to battery and house"

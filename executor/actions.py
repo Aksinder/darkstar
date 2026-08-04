@@ -1509,10 +1509,26 @@ class ActionDispatcher:
             return None
 
     async def _apply_export_curtailment(self, export_price_sek_kwh: float) -> ActionResult | None:
-        """Clamp grid export to 0 W when the effective export price is below the threshold (you
-        would pay to export), and restore the feed-in limit otherwise. C3."""
+        """Price-conditioned export curtailment (C3).
+
+        method="number" (legacy): clamp the feed-in NUMBER to 0 W below the
+        threshold, restore it above (mode switch stays on).
+        method="switch": below the threshold write clamp_limit_w (a known
+        device-legal low value) — _set_max_export_power also enables the mode
+        switch (F49) — and above the threshold turn the mode switch OFF, which
+        is truly unlimited and never risks an out-of-range number write.
+        """
         cc = self.config.export_curtailment
         if export_price_sek_kwh < cc.threshold_sek_per_kwh:
+            if cc.method == "switch":
+                logger.info(
+                    "Export curtailment ACTIVE (switch method): effective export %.3f < %.3f "
+                    "SEK/kWh -> limit %.0f W + mode switch ON",
+                    export_price_sek_kwh,
+                    cc.threshold_sek_per_kwh,
+                    cc.clamp_limit_w,
+                )
+                return await self._set_max_export_power(cc.clamp_limit_w)
             # Capture the resting feed-in limit before overriding it, so restore is exact.
             if cc.restore_limit_w <= 0 and self._restore_export_limit_w is None:
                 current = await self._read_current_export_limit()
@@ -1526,6 +1542,11 @@ class ActionDispatcher:
             )
             return await self._set_max_export_power(0.0)
 
+        if cc.method == "switch":
+            # Restore = unlimited: mode switch OFF. No number write — the device
+            # may reject high values (Sungrow: 10000 -> pymodbus isError).
+            return await self._set_export_limit_switch(False)
+
         # Not curtailing: restore the feed-in limit if we know it (config value or captured).
         restore = (
             cc.restore_limit_w if cc.restore_limit_w > 0 else (self._restore_export_limit_w or 0.0)
@@ -1533,6 +1554,40 @@ class ActionDispatcher:
         if restore > 0:
             return await self._set_max_export_power(restore)
         return None
+
+    async def _set_export_limit_switch(self, on: bool) -> ActionResult | None:
+        """Set the export-limit MODE switch, idempotently (skip when already there)."""
+        start = time.time()
+        entity = self.config.inverter.grid_max_export_power_switch or self._resolve_entity_id(
+            "export_power_limit_switch"
+        )
+        if not _is_entity_configured(entity) or entity is None:
+            logger.debug("Skipping export-limit switch action: no switch entity available")
+            return None
+
+        current = await self.ha.get_state_value(entity)
+        want = "on" if on else "off"
+        if current is not None and str(current).lower() == want:
+            return None  # already in the desired state — no write, no EEPROM churn
+
+        if self.shadow_mode:
+            logger.info("[SHADOW] Would set export-limit switch %s -> %s", entity, want)
+            return None
+
+        try:
+            success = await self.ha.set_switch(entity, on)
+        except HACallError as e:
+            logger.warning("Failed to set export-limit switch %s -> %s: %s", entity, want, e)
+            success = False
+        logger.info("Set export-limit switch %s -> %s (success=%s)", entity, want, success)
+        return ActionResult(
+            action_type="export_limit_switch",
+            success=bool(success),
+            entity_id=entity,
+            previous_value=current,
+            new_value=want,
+            duration_ms=int((time.time() - start) * 1000),
+        )
 
     async def _set_max_export_power(self, watts: float) -> ActionResult | None:
         """Set max grid export power."""

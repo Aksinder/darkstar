@@ -122,6 +122,19 @@ class ExportCurtailmentConfig:
     enabled: bool = False
     threshold_sek_per_kwh: float = 0.0
     restore_limit_w: float = 0.0
+    # "number" (legacy): clamp the export-limit NUMBER to 0 W / restore it to
+    # restore_limit_w — the limit MODE switch stays on throughout.
+    # "switch": curtail = write clamp_limit_w to the number (a known-device-legal
+    # low value) + mode switch ON; restore = mode switch OFF (truly unlimited,
+    # no number write). Built 2026-08-04 for the "no limit except minus prices"
+    # policy on devices whose limit register rejects out-of-range values
+    # (Sungrow SH10RT reg 13073: 10000 rejected with pymodbus isError, 8500
+    # accepted — the exact ceiling is device-firmware-specific, so restoring by
+    # writing a high number is fragile; switch-off is not).
+    method: str = "number"
+    # Curtailment level for method="switch" (W). Keep it a value the device has
+    # demonstrably accepted (Burgbyn10: 400 W sat in the register for 11 days).
+    clamp_limit_w: float = 400.0
 
 
 @dataclass
@@ -808,6 +821,8 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         enabled=bool(ec_data.get("enabled", False)),
         threshold_sek_per_kwh=float(ec_data.get("threshold_sek_per_kwh", 0.0)),
         restore_limit_w=float(ec_data.get("restore_limit_w", 0.0)),
+        method=str(ec_data.get("method", "number")),
+        clamp_limit_w=float(ec_data.get("clamp_limit_w", 400.0)),
     )
 
     return ExecutorConfig(
