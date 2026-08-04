@@ -44,15 +44,34 @@ class EVSurplusConfig:
     battery_assist_min_remaining_solar_kwh: float = 8.0  # need this much PV still forecast today
     battery_assist_floor_soc: float = 30.0  # never discharge the home battery below this for EV
     battery_assist_allowance_w: float = 4000.0  # cap on battery discharge fed to the cars
+    # Re-enable hysteresis for the battery tier: once the tier has dropped out at the
+    # floor, SoC must recover to floor + this before it re-engages. Without it, SoC
+    # dithering right at the floor flips the +/-allowance in and out of the headroom
+    # every tick, and the resulting start/stop commands bypass the write-guard.
+    battery_assist_soc_hysteresis: float = 3.0
     # Controller dynamics.
     gain: float = 0.5  # fraction of the headroom applied per cycle (stability vs speed)
     deadband_w: float = 250.0  # hold when |headroom| is within this (anti-jitter)
+    # Quantized-control stability: the effective fleet deadband is widened to
+    # K x (largest 1-step power quantum among commanded-ON controllable chargers),
+    # so a charger whose smallest move exceeds the band can never limit-cycle
+    # between two adjacent amp levels (the 2026-07 Tesla 14<->16 A wake-storm).
+    # NOTE: at gain 0.5 the loop has an implicit dead zone of ~one quantum from
+    # mid-cell, but round-to-nearest still flips at cell boundaries with
+    # arbitrarily small headroom (~13% of states in simulation) — K <= 1.0 is NOT
+    # inert, but K = 1.5 is what measurably kills the write churn. 0 disables.
+    quantum_deadband_k: float = 1.5
+    # Runtime Schmitt quantizer: suppress a +/-1-step rewrite until the RAW
+    # (unsnapped) amp target has moved at least this fraction of a step away from
+    # the currently written value. Kills midpoint dither and the config-voltage
+    # vs real-voltage mismatch churn (e.g. 230 V configured, 222 V actual).
+    schmitt_fraction: float = 0.7
     min_charge_current_a: float = 5.0  # global safety floor; per-charger min_current_a wins if higher
     default_voltage_v: float = 230.0
-    # Move in deliberately CHUNKY steps so the current isn't nudged constantly: the commanded
-    # amps are snapped to this grid (e.g. 6,8,10,... at 2 A), and the write-guard only rewrites
-    # when the target crosses a step. Bigger = fewer changes, coarser solar tracking.
-    current_step_a: float = 2.0
+    # Amp grid for commanded currents. 1 A gives the finest tracking both cars
+    # support (Tesla 5-16 A, Easee 6-16 A); anti-churn is handled by the quantum
+    # deadband + Schmitt quantizer + per-charger write guards, NOT by a coarse step.
+    current_step_a: float = 1.0
     # On/off hysteresis: a charger that's OFF needs this much MORE than its min before it
     # starts; once ON it keeps running down to its true min. Stops flapping at the threshold.
     start_hysteresis: float = 0.15  # fraction of min_on power (e.g. 15% headroom to start)
@@ -90,6 +109,13 @@ class ChargerState:
     deadline_hours: float | None = None
     # Plug->battery charge efficiency, for sizing the deadline floor from the SoC gap.
     charge_efficiency: float = 0.9
+    # Runtime's last COMMANDED on/off state. None => infer from measured power. Using
+    # the commanded state (not the measured watts) means a car that is slow to start
+    # drawing still counts as ON for the quantum band / hysteresis / start kick.
+    commanded_on: bool | None = None
+    # Min-OFF dwell active: this charger was recently stopped and must not restart
+    # yet (anti-flap). Deadline floors are exempt — grid-backed forcing punches through.
+    start_inhibited: bool = False
 
 
 @dataclass
@@ -102,6 +128,9 @@ class EVSurplusInputs:
     battery_soc_percent: float
     import_price_sek: float
     remaining_solar_kwh: float
+    # Previous cycle's battery-tier state (runtime-tracked) — drives the SoC
+    # re-enable hysteresis in battery_tier_active().
+    battery_tier_active_prev: bool = False
     chargers: list[ChargerState] = field(default_factory=lambda: [])
 
 
@@ -114,6 +143,8 @@ class ChargerCommand:
     set_current_a: float | None  # None => binary charger / leave current unchanged
     target_power_w: float
     reason: str
+    # Unsnapped amp target (pre-step-grid), for the runtime Schmitt quantizer.
+    raw_amps: float | None = None
 
 
 @dataclass
@@ -134,6 +165,11 @@ class WriteGuardConfig:
 
     min_step_a: float = 2.0  # only rewrite when the target differs by >= this many amps
     min_interval_s: float = 90.0  # ...and at least this long since the last write
+    # Direction-aware overrides (None => fall back to min_interval_s). Increases can
+    # be paced hard (a Tesla up-write wakes the car / costs an API call) while
+    # decreases stay fast (backing off protects the home battery).
+    min_interval_up_s: float | None = None
+    min_interval_down_s: float | None = None
 
 
 def should_write_current(
@@ -159,7 +195,10 @@ def should_write_current(
         # on/off flapping is already prevented upstream by the start hysteresis in compute_ev_surplus.
     if abs(new_a - last_a) < cfg.min_step_a:
         return False
-    return (now_ts - last_write_ts) >= cfg.min_interval_s
+    interval = cfg.min_interval_up_s if new_a > last_a else cfg.min_interval_down_s
+    if interval is None:
+        interval = cfg.min_interval_s
+    return (now_ts - last_write_ts) >= interval
 
 
 def _charger_max_w(c: ChargerState) -> float:
@@ -168,6 +207,35 @@ def _charger_max_w(c: ChargerState) -> float:
 
 def _charger_min_on_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
     return max(c.min_current_a, cfg.min_charge_current_a) * c.voltage_v * c.phases
+
+
+def _quantum_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
+    """Power of one amp-step for this charger (its smallest possible move)."""
+    return max(0.0, cfg.current_step_a) * c.phases * c.voltage_v
+
+
+def _is_on(c: ChargerState) -> bool:
+    """Commanded state when known (start-lag safe), else infer from measured power."""
+    return c.commanded_on if c.commanded_on is not None else c.current_power_w > 100.0
+
+
+def battery_tier_active(inputs: EVSurplusInputs, cfg: EVSurplusConfig) -> bool:
+    """Battery-assist tier gate, with SoC re-enable hysteresis.
+
+    Once the tier has dropped out at the floor, SoC must recover to
+    floor + battery_assist_soc_hysteresis before it re-engages — SoC dithering
+    right at the floor must not flip the +/-allowance every tick (those
+    start/stop commands bypass the write-guard).
+    """
+    floor = cfg.battery_assist_floor_soc + (
+        0.0 if inputs.battery_tier_active_prev else cfg.battery_assist_soc_hysteresis
+    )
+    return (
+        cfg.battery_assist_enabled
+        and inputs.import_price_sek <= cfg.battery_assist_max_price_sek
+        and inputs.remaining_solar_kwh >= cfg.battery_assist_min_remaining_solar_kwh
+        and inputs.battery_soc_percent > floor
+    )
 
 
 def _soc_at_or_above_target(c: ChargerState) -> bool:
@@ -270,42 +338,17 @@ def compute_ev_surplus(
     )
     grid_setpoint_w = cfg.cheap_grid_allowance_w if cheap_grid else 0.0
 
-    battery_tier = (
-        cfg.battery_assist_enabled
-        and inputs.import_price_sek <= cfg.battery_assist_max_price_sek
-        and inputs.remaining_solar_kwh >= cfg.battery_assist_min_remaining_solar_kwh
-        and inputs.battery_soc_percent > cfg.battery_assist_floor_soc
-    )
+    battery_tier = battery_tier_active(inputs, cfg)
     battery_allow_w = cfg.battery_assist_allowance_w if battery_tier else 0.0
 
-    current_total_w = sum(c.current_power_w for c in auto)
-    headroom_w = (grid_setpoint_w - inputs.grid_w) + inputs.battery_w + battery_allow_w
-
-    if abs(headroom_w) < cfg.deadband_w:
-        target_total_w = current_total_w  # hold
-    elif current_total_w < 1.0 and headroom_w > 0.0:
-        # Cold-start kick: when the fleet is idle, commit the FULL available headroom
-        # (not the gain-damped step) so a high-minimum charger — e.g. a 3-phase car whose
-        # 6 A floor is ~4.1 kW — can actually cross its start threshold instead of being
-        # stranded below it by the damping. Subsequent cycles ramp/settle via the gain.
-        target_total_w = headroom_w
-    else:
-        target_total_w = current_total_w + cfg.gain * headroom_w
-
-    fleet_max_w = sum(_charger_max_w(c) for c in auto)
-    target_total_w = max(0.0, min(fleet_max_w, target_total_w))
-
-    why = (
-        f"grid={inputs.grid_w:.0f}W batt={inputs.battery_w:.0f}W "
-        f"setpoint={grid_setpoint_w:.0f}W battery_tier={battery_tier} "
-        f"headroom={headroom_w:.0f}W -> target={target_total_w:.0f}W"
-    )
-
-    # --- SoC caps + deadline floors --------------------------------------------
-    # A car at/above its target is done (never overcharge). A car with a target + deadline
-    # gets a grid-backed FLOOR (see _deadline_required_w): the avg power it must pull now to
-    # make the deadline. Floors are honoured regardless of surplus, so a deadline car
-    # "overtakes" the others; free surplus is applied first so grid is only paid for the gap.
+    # --- SoC caps FIRST -----------------------------------------------------------
+    # A car at/above its target is done (never overcharge). Detected BEFORE the fleet
+    # total so a just-capped charger's measured watts are not redistributed to the
+    # others while the meter still shows its (stopping) draw — that redistribution
+    # produced an instant multi-amp jump on the remaining charger followed by a
+    # write-per-interval walk-down (each one a Tesla wake). Excluding it makes the
+    # handoff a gain-damped ramp-up instead: slower to reabsorb (the home battery
+    # buffers meanwhile) but robust to actuation lag.
     capped = [c for c in auto if _soc_at_or_above_target(c)]
     capped_ids = {c.id for c in capped}
     for c in capped:
@@ -318,11 +361,74 @@ def compute_ev_surplus(
     if not chargeable:
         return commands
 
+    current_total_w = sum(c.current_power_w for c in chargeable)
+    headroom_w = (grid_setpoint_w - inputs.grid_w) + inputs.battery_w + battery_allow_w
+
+    # Quantum-aware effective deadband: never demand a move smaller than the largest
+    # single amp-step among the chargers actually running (see quantum_deadband_k).
+    on_quanta = [_quantum_w(c, cfg) for c in chargeable if c.controllable and _is_on(c)]
+    eff_deadband_w = max(cfg.deadband_w, cfg.quantum_deadband_k * max(on_quanta, default=0.0))
+
+    if abs(headroom_w) < eff_deadband_w:
+        target_total_w = current_total_w  # hold
+    elif current_total_w < 1.0 and headroom_w > 0.0:
+        # Cold-start kick: when the fleet is idle, commit the FULL available headroom
+        # (not the gain-damped step) so a high-minimum charger — e.g. a 3-phase car whose
+        # 6 A floor is ~4.1 kW — can actually cross its start threshold instead of being
+        # stranded below it by the damping. Subsequent cycles ramp/settle via the gain.
+        target_total_w = headroom_w
+    else:
+        target_total_w = current_total_w + cfg.gain * headroom_w
+
+    fleet_max_w = sum(_charger_max_w(c) for c in chargeable)
+    target_total_w = max(0.0, min(fleet_max_w, target_total_w))
+
+    why = (
+        f"grid={inputs.grid_w:.0f}W batt={inputs.battery_w:.0f}W "
+        f"setpoint={grid_setpoint_w:.0f}W battery_tier={battery_tier} "
+        f"headroom={headroom_w:.0f}W band={eff_deadband_w:.0f}W -> target={target_total_w:.0f}W"
+    )
+
+    # --- Deadline floors --------------------------------------------------------
+    # A car with a target + deadline gets a grid-backed FLOOR (see
+    # _deadline_required_w): the avg power it must pull now to make the deadline.
+    # Floors are honoured regardless of surplus, so a deadline car "overtakes" the
+    # others; free surplus is applied first so grid is only paid for the gap.
     floor_w = {c.id: _deadline_required_w(c, cfg) for c in chargeable}
 
     # Deadline cars overtake (sort key 0), then by priority. Used for BOTH surplus
     # distribution (free energy goes to the deadline car first) and emission order.
     order = sorted(chargeable, key=lambda x: (0 if floor_w[x.id] > 0.0 else 1, x.priority, x.id))
+
+    # --- Per-charger start kick (multi-charger deadlock fix) ---------------------
+    # With one charger already at max, the gain-damped step can leave a second, OFF
+    # charger permanently stranded below its start threshold even though the FULL
+    # undamped headroom would clear it (verified: Easee@max + Tesla OFF stayed off
+    # for any surplus < ~11.7 kW — ~3-4 kW wasted indefinitely). If the undamped
+    # allocation would start an OFF, non-dwell-inhibited charger that the damped one
+    # would not, commit the undamped total this cycle; later cycles settle via gain.
+    undamped_total_w = max(0.0, min(fleet_max_w, current_total_w + headroom_w))
+    if undamped_total_w > target_total_w:
+
+        def _greedy_shares(total_w: float) -> dict[str, float]:
+            shares: dict[str, float] = {}
+            rem = total_w
+            for cc in order:
+                give = min(rem, _charger_max_w(cc))
+                shares[cc.id] = give
+                rem -= give
+            return shares
+
+        damped_shares = _greedy_shares(target_total_w)
+        undamped_shares = _greedy_shares(undamped_total_w)
+        for c in order:
+            if _is_on(c) or c.start_inhibited:
+                continue
+            start_thr_w = _charger_min_on_w(c, cfg) * (1.0 + cfg.start_hysteresis)
+            if undamped_shares[c.id] >= start_thr_w > damped_shares[c.id]:
+                target_total_w = undamped_total_w
+                why += f" kick={c.id}"
+                break
 
     # Pass 1: hand out the opportunistic surplus greedily in that order.
     surplus_share = {c.id: 0.0 for c in chargeable}
@@ -341,7 +447,16 @@ def compute_ev_surplus(
         target_w = min(max_w, max(surplus_share[c.id], floor_w[c.id]))
         # Hysteresis: an OFF charger needs extra headroom to start; once ON it runs down to
         # its true min. A deadline floor is exempt — it must run even with no surplus.
-        currently_on = c.current_power_w > 100.0
+        currently_on = _is_on(c)
+        # Min-OFF dwell: a recently stopped charger may not restart yet (anti-flap).
+        # Deadline floors punch through — grid-backed forcing must never be delayed.
+        if not currently_on and c.start_inhibited and not forced:
+            commands.append(
+                ChargerCommand(c.id, switch_on=False, set_current_a=0.0 if c.controllable else None,
+                               target_power_w=0.0,
+                               reason=f"off: start dwell; {why}")
+            )
+            continue
         threshold_w = min_on_w if currently_on else min_on_w * (1.0 + cfg.start_hysteresis)
         if target_w < threshold_w and not (forced and target_w >= min_on_w):
             commands.append(
@@ -352,16 +467,18 @@ def compute_ev_surplus(
             continue
         tag = "deadline" if forced and surplus_share[c.id] < floor_w[c.id] else "surplus"
         if c.controllable:
-            amps = target_w / (c.voltage_v * c.phases)
-            # Snap to the chunky step grid, then clamp so we move in larger steps and
-            # don't keep re-tweaking the current.
+            raw_amps = target_w / (c.voltage_v * c.phases)
+            amps = raw_amps
+            # Snap to the step grid, then clamp. Churn suppression is the quantum
+            # band + the runtime Schmitt quantizer (raw_amps below), not a coarse step.
             if step > 0:
                 amps = round(amps / step) * step
             amps = max(c.min_current_a, min(c.max_current_a, amps))
             commands.append(
                 ChargerCommand(c.id, switch_on=True, set_current_a=round(amps, 1),
                                target_power_w=amps * c.voltage_v * c.phases,
-                               reason=f"on {amps:.1f}A ({tag}); {why}")
+                               reason=f"on {amps:.1f}A ({tag}); {why}",
+                               raw_amps=round(raw_amps, 2))
             )
         else:
             # Binary charger: on at its fixed draw (can't throttle).
