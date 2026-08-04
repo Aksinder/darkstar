@@ -114,3 +114,42 @@ class TestExecuteGating:
         d._apply_export_curtailment = AsyncMock()  # type: ignore[method-assign]
         await d.execute(ControllerDecision(mode_intent="export", export_price_sek_kwh=-0.05))
         d._apply_export_curtailment.assert_not_called()
+
+
+class TestSwitchMethod:
+    """method='switch' (2026-08-04): curtail = clamp_limit_w + mode switch ON;
+    restore = mode switch OFF (unlimited, no number write — the SH10RT rejects
+    out-of-range register writes, so restoring via a high number is fragile)."""
+
+    @pytest.mark.asyncio
+    async def test_negative_price_writes_clamp_level_and_enables_switch(self):
+        d, ha = _dispatcher(
+            ExportCurtailmentConfig(enabled=True, method="switch", clamp_limit_w=400)
+        )
+        await d._apply_export_curtailment(-0.05)
+        assert 400.0 in _export_writes(ha)
+        # F49 inside _set_max_export_power turns the mode switch ON.
+        assert any(c.args == (SWITCH_ENTITY, True) for c in ha.set_switch.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_positive_price_turns_switch_off_without_number_write(self):
+        d, ha = _dispatcher(
+            ExportCurtailmentConfig(enabled=True, method="switch", clamp_limit_w=400),
+            current_limit="on",  # get_state_value returns switch state in this path
+        )
+        result = await d._apply_export_curtailment(0.50)
+        assert result is not None and result.success
+        assert result.new_value == "off"
+        assert _export_writes(ha) == []  # no number write on restore
+        assert any(c.args == (SWITCH_ENTITY, False) for c in ha.set_switch.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_restore_is_idempotent_when_switch_already_off(self):
+        d, ha = _dispatcher(
+            ExportCurtailmentConfig(enabled=True, method="switch", clamp_limit_w=400),
+            current_limit="off",
+        )
+        result = await d._apply_export_curtailment(0.50)
+        assert result is None  # already off — no write, no EEPROM churn
+        ha.set_switch.assert_not_awaited()
+        assert _export_writes(ha) == []
