@@ -1,3 +1,7 @@
+## dev-20260804.0516 — 2026-08-04 05:18
+
+- feat(executor): C3 switch-method export curtailment + export-mode limit fix
+
 ## dev-20260803.2003 — 2026-08-03 20:05
 
 - feat(executor): runtime SoC-floor guard on battery-export intent (arbitrage gate R1)
