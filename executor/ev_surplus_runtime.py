@@ -21,6 +21,7 @@ from .ev_surplus import (
     EVSurplusConfig,
     EVSurplusInputs,
     WriteGuardConfig,
+    battery_tier_active,
     compute_ev_surplus,
     should_write_current,
 )
@@ -58,6 +59,17 @@ class EVSurplusChargerCfg:
     # this. e.g. FMB -> 15 (cap at 15%, solar-only since it has no departure deadline). None =>
     # vacation does not change this charger's target (e.g. the Tesla leaving FOR the trip).
     vacation_target_soc: float | None = None
+    # Per-charger write pacing (None => the global guard). Lets an API-expensive
+    # charger (Tesla: every write wakes the car) be paced harder than a cheap one
+    # (Easee dynamic limit: RAM-safe, free).
+    write_guard: WriteGuardConfig | None = None
+    # Restart dwell after a stop (s): once stopped, the charger may not restart for
+    # this long. Deadline floors are exempt. 0 = no dwell (legacy).
+    min_off_s: float = 0.0
+    # Per-charger shadow: log decisions + advance the write-guard state, but never
+    # call HA services. Rollout gate for a re-introduced charger — the GLOBAL
+    # executor shadow flag would shadow battery/water too.
+    shadow: bool = False
 
     @property
     def controllable(self) -> bool:
@@ -108,15 +120,30 @@ def parse_ev_surplus_config(executor_data: dict[str, Any]) -> EVSurplusRuntimeCo
         battery_assist_min_remaining_solar_kwh=float(ba.get("min_remaining_solar_kwh", 8.0)),
         battery_assist_floor_soc=float(ba.get("floor_soc", 40.0)),
         battery_assist_allowance_w=float(ba.get("allowance_w", 6000.0)),
+        battery_assist_soc_hysteresis=float(ba.get("soc_hysteresis", 3.0)),
         gain=float(pol.get("gain", 0.5)),
         deadband_w=float(pol.get("deadband_w", 250.0)),
-        current_step_a=float(pol.get("current_step_a", 2.0)),
+        # NOTE: must match the pure-layer default (1.0) — a diverging parse default
+        # here silently reintroduces the coarse 2 A grid on sites without the key.
+        current_step_a=float(pol.get("current_step_a", 1.0)),
         start_hysteresis=float(pol.get("start_hysteresis", 0.15)),
+        quantum_deadband_k=float(pol.get("quantum_deadband_k", 1.5)),
+        schmitt_fraction=float(pol.get("schmitt_fraction", 0.7)),
     )
-    guard = WriteGuardConfig(
-        min_step_a=float(guard_raw.get("min_step_a", 2.0)),
-        min_interval_s=float(guard_raw.get("min_interval_s", 90.0)),
-    )
+
+    def _parse_guard(raw_g: dict[str, Any], fallback: WriteGuardConfig) -> WriteGuardConfig:
+        def _opt(key: str) -> float | None:
+            v = _f(raw_g.get(key))
+            return v if v is not None else getattr(fallback, key)
+
+        return WriteGuardConfig(
+            min_step_a=float(raw_g.get("min_step_a", fallback.min_step_a)),
+            min_interval_s=float(raw_g.get("min_interval_s", fallback.min_interval_s)),
+            min_interval_up_s=_opt("min_interval_up_s"),
+            min_interval_down_s=_opt("min_interval_down_s"),
+        )
+
+    guard = _parse_guard(guard_raw, WriteGuardConfig())
     chargers: list[EVSurplusChargerCfg] = []
     for c in cast("list[dict[str, Any]]", raw.get("chargers", []) or []):
         if not c.get("id"):
@@ -143,8 +170,26 @@ def parse_ev_surplus_config(executor_data: dict[str, Any]) -> EVSurplusRuntimeCo
                 capacity_kwh=float(c.get("capacity_kwh", 0.0)),
                 charge_efficiency=float(c.get("charge_efficiency", 0.9)),
                 vacation_target_soc=_f(c.get("vacation_target_soc")),
+                write_guard=(
+                    _parse_guard(cast("dict[str, Any]", c["write_guard"]), guard)
+                    if isinstance(c.get("write_guard"), dict)
+                    else None
+                ),
+                min_off_s=float(c.get("min_off_s", 0.0)),
+                shadow=bool(c.get("shadow", False)),
             )
         )
+        # Easee 6 A hard floor (owner-confirmed: the FMB STOPS CHARGING below 6 A).
+        # Structural backstop against a config typo — parse clamps + warns; the
+        # runtime additionally hard-refuses any 1-5 A Easee write (belt & braces).
+        last = chargers[-1]
+        if last.easee_device_id and last.min_current_a < 6.0:
+            logger.warning(
+                "Charger %s: min_current_a %.1f below the Easee 6 A floor — clamping to 6",
+                last.id,
+                last.min_current_a,
+            )
+            last.min_current_a = 6.0
     return EVSurplusRuntimeConfig(
         enabled=bool(raw.get("enabled", False)),
         pv_power_entity=raw.get("pv_power_entity") or None,
@@ -169,6 +214,8 @@ class EVSurplusController:
         self._last_a: dict[str, float] = {}
         self._last_ts: dict[str, float] = {}
         self._last_switch: dict[str, bool] = {}
+        self._last_stop_ts: dict[str, float] = {}  # min-OFF dwell anchors
+        self._battery_tier_prev: bool = False  # battery-assist SoC hysteresis memory
 
     async def _read_f(self, ha: Any, entity: str | None, default: float | None = None) -> float | None:
         if not entity:
@@ -189,12 +236,27 @@ class EVSurplusController:
         v = _f(attrs.get(attr))
         return v if v is not None else default
 
-    async def _read_on(self, ha: Any, entity: str | None, states: tuple[str, ...], default: bool) -> bool:
+    async def _read_on(
+        self,
+        ha: Any,
+        entity: str | None,
+        states: tuple[str, ...],
+        default: bool,
+        unreadable_default: bool | None = None,
+    ) -> bool:
+        """``default`` applies when NO entity is configured (intentional, e.g. a
+        sensorless "assume plugged" setup). ``unreadable_default`` applies when a
+        CONFIGURED entity cannot be read at all (integration deleted + HA restart
+        returns None) — the phantom-car fix passes False there so a vanished
+        charger never looks plugged-in/home. None => same as ``default``."""
         if not entity:
             return default
         v = await ha.get_state_value(entity)
         if v is None:
-            return default
+            resolved = default if unreadable_default is None else unreadable_default
+            if resolved != default:
+                logger.warning("EV surplus: %s configured but unreadable -> %s", entity, resolved)
+            return resolved
         return str(v).lower() in {s.lower() for s in states}
 
     async def _read_override(self, ha: Any, entity: str | None) -> str:
@@ -211,8 +273,11 @@ class EVSurplusController:
         # gather over mixed return types collapses to a union list; narrow each back explicitly.
         res = await asyncio.gather(
             self._read_f(ha, c.power_entity, 0.0),
-            self._read_on(ha, c.plug_entity, ("on", "true", "plugged", "connected"), True),
-            self._read_on(ha, c.home_entity, c.home_states, True),
+            self._read_on(
+                ha, c.plug_entity, ("on", "true", "plugged", "connected"), True,
+                unreadable_default=False,
+            ),
+            self._read_on(ha, c.home_entity, c.home_states, True, unreadable_default=False),
             self._read_override(ha, c.override_entity),
             self._read_f(ha, c.soc_entity, None),
             self._read_f(ha, c.target_soc_entity, None),
@@ -237,6 +302,17 @@ class EVSurplusController:
         if vacation and c.vacation_target_soc is not None:
             target = c.vacation_target_soc
             deadline_hours = None
+        # Commanded state: _last_a is authoritative for controllable chargers (every
+        # actuated stop zeroes it — see _actuate), the switch memory for binary ones.
+        # None (never actuated this process) => the pure layer infers from power.
+        commanded_on: bool | None = None
+        if c.id in self._last_a:
+            commanded_on = self._last_a[c.id] > 0.0
+        elif c.id in self._last_switch:
+            commanded_on = self._last_switch[c.id]
+        start_inhibited = (
+            now_ts - self._last_stop_ts.get(c.id, float("-inf"))
+        ) < c.min_off_s
         return ChargerState(
             id=c.id, plugged=plugged, at_home=at_home, enabled=True,
             current_power_w=power or 0.0, max_current_a=c.max_current_a,
@@ -244,6 +320,7 @@ class EVSurplusController:
             controllable=c.controllable, priority=c.priority, override=override,
             soc_percent=soc, target_soc_percent=target, capacity_kwh=c.capacity_kwh,
             deadline_hours=deadline_hours, charge_efficiency=c.charge_efficiency,
+            commanded_on=commanded_on, start_inhibited=start_inhibited,
         )
 
     async def run(self, ha: Any, now_ts: float, shadow: bool = False) -> dict[str, Any]:
@@ -257,17 +334,28 @@ class EVSurplusController:
         # web server (slow dashboard). asyncio.gather collapses that to ~one round-trip latency.
         src = await asyncio.gather(
             self._read_f(ha, cfg.pv_power_entity, 0.0),
-            self._read_f(ha, cfg.grid_power_entity, 0.0),
-            self._read_f(ha, cfg.battery_power_entity, 0.0),
-            self._read_f(ha, cfg.battery_soc_entity, 100.0),
+            self._read_f(ha, cfg.grid_power_entity, None),
+            self._read_f(ha, cfg.battery_power_entity, None),
+            self._read_f(ha, cfg.battery_soc_entity, 0.0),
             self._read_f(ha, cfg.price_entity, 999.0),
             self._read_f(ha, cfg.remaining_solar_entity, 0.0),
             self._read_on(ha, cfg.vacation_entity, ("on", "true"), False),
         )
+        # The grid + battery meters ARE the control signal — computing with a fake 0
+        # for either would command the cars blind (e.g. full-throttle into an outage).
+        # Hold last commands and skip the tick instead.
+        if src[1] is None or src[2] is None:
+            logger.warning(
+                "EV surplus: core sensors unreadable (grid=%s battery=%s) — skipping tick",
+                src[1],
+                src[2],
+            )
+            return {"enabled": True, "skipped": "core sensors unreadable"}
         pv_w = src[0] or 0.0
-        grid_w = src[1] or 0.0
-        battery_w = src[2] or 0.0
-        soc = src[3] if src[3] is not None else 100.0
+        grid_w = src[1]
+        battery_w = src[2]
+        # Unknown home-battery SoC must DISABLE battery assist (0), never enable it (100).
+        soc = src[3] if src[3] is not None else 0.0
         price = src[4] if src[4] is not None else 999.0
         remaining_solar = src[5] or 0.0
         vacation = bool(src[6])
@@ -279,9 +367,12 @@ class EVSurplusController:
 
         inputs = EVSurplusInputs(
             pv_w=pv_w, grid_w=grid_w, battery_w=battery_w, battery_soc_percent=soc,
-            import_price_sek=price, remaining_solar_kwh=remaining_solar, chargers=states,
+            import_price_sek=price, remaining_solar_kwh=remaining_solar,
+            battery_tier_active_prev=self._battery_tier_prev, chargers=states,
         )
         commands = compute_ev_surplus(inputs, cfg.policy)
+        # Track the tier through the SAME helper the pure layer uses (hysteresis memory).
+        self._battery_tier_prev = battery_tier_active(inputs, cfg.policy)
         cfg_by_id = {c.id: c for c in cfg.chargers}
 
         applied: list[dict[str, Any]] = []
@@ -289,7 +380,12 @@ class EVSurplusController:
             ccfg = cfg_by_id.get(cmd.id)
             if ccfg is None:
                 continue
-            await self._actuate(ha, ccfg, cmd, now_ts, shadow)
+            try:
+                await self._actuate(ha, ccfg, cmd, now_ts, shadow)
+            except Exception:
+                # One charger's dead entity must not starve the others' actuation.
+                logger.exception("EV surplus: actuation failed for %s — continuing", cmd.id)
+                continue
             applied.append({"id": cmd.id, "on": cmd.switch_on, "a": cmd.set_current_a, "why": cmd.reason})
 
         logger.info("EV surplus: grid=%.0fW batt=%.0fW soc=%.0f%% price=%.2f vac=%s -> %s",
@@ -298,25 +394,42 @@ class EVSurplusController:
         return {"enabled": True, "applied": applied}
 
     async def _actuate(self, ha: Any, ccfg: EVSurplusChargerCfg, cmd: Any, now_ts: float, shadow: bool) -> None:
+        # Per-charger shadow (rollout gate): suppress service calls but keep the full
+        # decision path + guard state, so shadow logs show realistic write rates.
+        shadow = shadow or ccfg.shadow
+        # Per-charger write pacing wins over the global guard.
+        guard = ccfg.write_guard or self.cfg.guard
+
         # Switch: only toggle on change.
         if ccfg.switch_entity is not None and self._last_switch.get(ccfg.id) != cmd.switch_on:
             if not shadow:
                 svc = "turn_on" if cmd.switch_on else "turn_off"
                 await ha.call_service("switch", svc, ccfg.switch_entity)
+            if not cmd.switch_on:
+                # A stop must ZERO the commanded-amps memory: commanded_on derives
+                # from _last_a, and without this the start kick / min-OFF dwell /
+                # start hysteresis all read the charger as still ON after its first
+                # switch-path stop — permanently, since nothing else resets it.
+                if self._last_switch.get(ccfg.id) is True:
+                    self._last_stop_ts[ccfg.id] = now_ts
+                self._last_a[ccfg.id] = 0.0
             self._last_switch[ccfg.id] = cmd.switch_on
 
         # Pause a switchless Easee: with no on/off switch, dynamic limit 0 IS the stop. Without
         # this an "off" command (SoC cap / force_off) on a switchless Easee would leave it
         # charging at its last dynamic limit. The write-guard always allows a stop immediately.
         if not cmd.switch_on and ccfg.switch_entity is None and ccfg.easee_device_id:
+            prev_a = self._last_a.get(ccfg.id)
             if should_write_current(
-                self._last_a.get(ccfg.id), self._last_ts.get(ccfg.id), 0.0, now_ts, self.cfg.guard
+                prev_a, self._last_ts.get(ccfg.id), 0.0, now_ts, guard
             ):
                 if not shadow:
                     await ha.call_service(
                         "easee", "set_charger_dynamic_limit", None,
                         {"device_id": ccfg.easee_device_id, "current": 0, "time_to_live": 0},
                     )
+                if prev_a is not None and prev_a > 0.0:
+                    self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
                 self._last_ts[ccfg.id] = now_ts
             return
@@ -325,9 +438,32 @@ class EVSurplusController:
         if not (cmd.switch_on and ccfg.controllable and cmd.set_current_a is not None):
             return
         new_a = float(cmd.set_current_a)
-        if not should_write_current(
-            self._last_a.get(ccfg.id), self._last_ts.get(ccfg.id), new_a, now_ts, self.cfg.guard
+        last_a = self._last_a.get(ccfg.id)
+        # Schmitt quantizer: a +/-1-step move is only real once the RAW (unsnapped)
+        # target has cleared schmitt_fraction of a step away from the written value.
+        # Kills midpoint dither and the config-vs-real-voltage churn that a 1 A grid
+        # would otherwise unmask. Stops and starts are exempt (handled above/guard).
+        raw = getattr(cmd, "raw_amps", None)
+        if (
+            last_a is not None
+            and last_a > 0.0
+            and new_a > 0.0
+            and new_a != last_a
+            and raw is not None
+            and abs(float(raw) - last_a)
+            < self.cfg.policy.schmitt_fraction * max(0.0, self.cfg.policy.current_step_a)
         ):
+            return
+        if not should_write_current(last_a, self._last_ts.get(ccfg.id), new_a, now_ts, guard):
+            return
+        # Easee hard floor (owner-confirmed: the FMB stops charging below 6 A) —
+        # final backstop after the pure-layer clamp and the parse-time config clamp.
+        if ccfg.easee_device_id and 0 < round(new_a) < 6:
+            logger.error(
+                "EV surplus: refusing %.1f A write to Easee %s (below the 6 A floor)",
+                new_a,
+                ccfg.id,
+            )
             return
         if not shadow:
             if ccfg.current_entity:
