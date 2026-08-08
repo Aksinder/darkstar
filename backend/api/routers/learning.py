@@ -92,14 +92,16 @@ async def learning_coverage(days: int = Query(7, ge=1, le=92)) -> dict[str, Any]
         from backend.learning.store import OBS_FIX_APPLIED_KEY
 
         engine = _get_learning_engine()
-        config = engine.config or {}
-        learning_cfg = config.get("learning") or {}
-        db_path = learning_cfg.get("sqlite_path", "data/planner_learning.db")
-        tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+        config: dict[str, Any] = engine.config or {}
+        learning_cfg: dict[str, Any] = config.get("learning") or {}
+        db_path = str(learning_cfg.get("sqlite_path", "data/planner_learning.db"))
+        tz = pytz.timezone(str(config.get("timezone", "Europe/Stockholm")))
 
-        fix_applied_at = await engine.store.get_system_state(OBS_FIX_APPLIED_KEY)
-        cov = await asyncio.to_thread(observation_coverage, db_path, tz, days, fix_applied_at)
-        return cast("dict[str, Any]", cov)
+        fix_applied_at: str | None = await engine.store.get_system_state(OBS_FIX_APPLIED_KEY)
+        cov: dict[str, Any] = await asyncio.to_thread(
+            observation_coverage, db_path, tz, days, fix_applied_at
+        )
+        return cov
     except Exception as e:
         logger.exception("Failed to get observation coverage")
         raise HTTPException(status_code=500, detail=str(e)) from e
