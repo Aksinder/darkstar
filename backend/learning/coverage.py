@@ -31,14 +31,18 @@ from utils.time_utils import dst_safe_date_range
 logger = logging.getLogger("darkstar.learning.coverage")
 
 # A row that store_slot_prices minted: no evidence any writer ever touched it.
-# This cannot misfire on a real recorder row -- the recorder assigns
-# batt_charge_kwh/batt_discharge_kwh unconditionally from
-# calculate_energy_from_cumulative (which always returns a float, falling back to
-# power_kw * 0.25), and it returns WITHOUT writing when SoC is unresolvable.
-# Night / snow / inverter-off slots therefore still carry batt + soc values and are
-# correctly counted as covered, which is exactly the real-zero-vs-missing distinction
-# this whole change turns on.
-_PRICE_MINT = """
+# This cannot misfire on a real recorder row because the recorder assigns
+# batt_charge_kwh/batt_discharge_kwh UNCONDITIONALLY from
+# calculate_energy_from_cumulative, which always returns a float (it falls back to
+# power_kw * 0.25). Night / snow / inverter-off slots therefore still carry battery
+# values and are correctly counted as covered -- exactly the real-zero-vs-missing
+# distinction this whole change turns on.
+# ⚠️ The `batt_* IS NULL` clauses are the load-bearing ones; do NOT drop them as
+# "redundant" because of the soc_end_percent clause. The recorder's SoC skip is
+# CONDITIONAL -- `if soc_percent is None and soc_entity` -- so on a site with no
+# battery_soc sensor configured it happily writes rows with soc_end_percent NULL, and
+# the battery clauses are then the only thing keeping real rows out of this predicate.
+PRICE_MINT_PREDICATE = """
         soc_end_percent      IS NULL
     AND batt_charge_kwh      IS NULL
     AND batt_discharge_kwh   IS NULL
@@ -122,9 +126,9 @@ def observation_coverage(
                 f"""
                 SELECT
                     COUNT(*),
-                    SUM(CASE WHEN {_PRICE_MINT} THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN {PRICE_MINT_PREDICATE} THEN 1 ELSE 0 END),
                     SUM(CASE WHEN import_price_sek_kwh IS NULL
-                              AND NOT ({_PRICE_MINT}) THEN 1 ELSE 0 END)
+                              AND NOT ({PRICE_MINT_PREDICATE}) THEN 1 ELSE 0 END)
                   FROM slot_observations
                  WHERE slot_start >= ? AND slot_start < ?
                 """,
@@ -139,7 +143,7 @@ def observation_coverage(
                 f"""
                 SELECT COUNT(*)
                   FROM slot_observations
-                 WHERE slot_start >= ? AND ({_PRICE_MINT})
+                 WHERE slot_start >= ? AND ({PRICE_MINT_PREDICATE})
                 """,
                 (now_s,),
             )
@@ -165,7 +169,7 @@ def observation_coverage(
                 f"""
                 SELECT MAX(slot_start)
                   FROM slot_observations
-                 WHERE slot_start < ? AND NOT ({_PRICE_MINT})
+                 WHERE slot_start < ? AND NOT ({PRICE_MINT_PREDICATE})
                 """,
                 (end_s,),
             )
