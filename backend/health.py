@@ -301,6 +301,9 @@ class HealthChecker:
         # Check recorder health (REV // Complete Cost Reality Fix)
         issues.extend(self.check_recorder())
 
+        # Check observation coverage + zero-fabrication tripwire (2026-08-08)
+        issues.extend(await self.check_observation_coverage())
+
         # Check forecast health (REV F60)
         issues.extend(self.check_forecast())
 
@@ -965,6 +968,72 @@ class HealthChecker:
         except Exception as e:
             logger.debug("Could not check recorder health: %s", e)
 
+        return issues
+
+    async def check_observation_coverage(self) -> list[HealthIssue]:
+        """Observation coverage + zero-fabrication tripwire (2026-08-08).
+
+        A recorder collapse used to be INVISIBLE: the price mint pre-created a row for
+        every slot, so a month of missing observations read as a bad FORECAST rather
+        than as missing data. check_recorder() could not see it either --
+        recorder_service.status.running stayed True throughout.
+        """
+        issues: list[HealthIssue] = []
+        cov: dict[str, Any]
+
+        try:
+            from backend.learning.coverage import classify_coverage, observation_coverage
+        except Exception as e:
+            logger.warning("Observation coverage module unavailable: %s", e)
+            return [
+                HealthIssue(
+                    category="observations",
+                    severity="critical",
+                    code="obs_coverage_unavailable",
+                    message=f"Observation coverage module could not be loaded: {e}",
+                    guidance=(
+                        "The observation-integrity tripwire is blind. Forecast-accuracy "
+                        "metrics cannot be trusted until this evaluates again."
+                    ),
+                )
+            ]
+
+        try:
+            from backend.learning.store import OBS_FIX_APPLIED_KEY
+
+            learning_cfg = self._config.get("learning") or {}
+            db_path = learning_cfg.get("sqlite_path", "data/planner_learning.db")
+            tz = pytz.timezone(self._config.get("timezone", "Europe/Stockholm"))
+
+            fix_applied_at: str | None = None
+            try:
+                from backend.learning import get_learning_engine
+
+                fix_applied_at = await get_learning_engine().store.get_system_state(
+                    OBS_FIX_APPLIED_KEY
+                )
+            except Exception as e:
+                logger.debug("Could not read %s: %s", OBS_FIX_APPLIED_KEY, e)
+
+            # to_thread is mandatory: check_all is wrapped in asyncio.wait_for, which
+            # cannot cancel a blocking sync call.
+            cov = await asyncio.to_thread(observation_coverage, db_path, tz, 7, fix_applied_at)
+        except Exception as e:
+            logger.warning("Observation coverage check failed: %s", e)
+            # A check that cannot evaluate must NOT return silence.
+            cov = {"evaluable": False, "error": str(e), "rows_present": 0}
+
+        for severity, code, message, guidance in classify_coverage(cov):
+            issues.append(
+                HealthIssue(
+                    category="observations",
+                    severity=severity,
+                    code=code,
+                    message=message,
+                    guidance=guidance,
+                    details=cov,
+                )
+            )
         return issues
 
     def check_forecast(self) -> list[HealthIssue]:

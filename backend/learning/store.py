@@ -1,11 +1,12 @@
 import logging
+import math
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import Integer, case, cast, desc, func, select, text
+from sqlalchemy import Integer, case, cast, desc, func, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -23,6 +24,11 @@ from backend.learning.models import (
 )
 
 logger = logging.getLogger("darkstar.learning.store")
+
+# Stamped by store_slot_prices the first time it runs after the 2026-08-08
+# zero-fabrication fix. The coverage tripwire uses it as its pre/post boundary:
+# rows older than this may be price-mint artefacts, rows newer cannot be.
+OBS_FIX_APPLIED_KEY = "obs_fabrication_fix_at"
 
 
 class LearningStore:
@@ -95,10 +101,35 @@ class LearningStore:
             ]
 
     async def store_slot_prices(self, price_rows: Iterable[dict[str, Any]]) -> None:
-        """Store slot price data (import/export SEK per kWh) using Async SQLAlchemy."""
+        """Persist slot prices onto EXISTING observation rows only. NEVER INSERTS.
+
+        Until 2026-08-08 this method upserted price rows into slot_observations.
+        Because models.py:18-23 declares default=0.0 AND server_default=text("0") on
+        the six energy columns, every future slot was pre-minted as a complete,
+        provenance-free ZERO observation. "Not measured" and "produced 0.0 kWh" became
+        identical on disk, so every is_not(None) guard in the codebase was vacuous --
+        and a month of missing observations masqueraded as a bad PV forecast.
+
+        Merely omitting the energy columns does NOT fix it: SQLAlchemy renders
+        default=0.0 anyway; strip that and SQLite's own DEFAULT 0.0 fires on the legacy
+        _init_schema DDL, while the alembic-baseline DDL (nullable=False) raises
+        instead. UPDATE is the only statement immune on all live DDL variants -- it
+        touches exactly its SET list and invokes no INSERT-time default.
+
+        Future prices are consequently NOT persisted, and nothing reads them from the
+        DB: the planner sources prices via get_all_input_data (bin/run_planner.py),
+        and ml/price_features._get_price_lags is unreachable at inference
+        (ml/price_forecast.py:179 passes no db_session) and looks BACKWARD anyway.
+        """
         rows = list(price_rows or [])
         if not rows:
             return
+
+        offered = 0
+        placed = 0
+        unplaced_past = 0
+        unplaced_future = 0
+        now_iso = datetime.now(self.timezone).isoformat()
 
         async with self.AsyncSession() as session:
             for row in rows:
@@ -125,26 +156,61 @@ class LearningStore:
                 import_price = row.get("import_price_sek_kwh")
                 export_price = row.get("export_price_sek_kwh")
 
-                stmt = sqlite_insert(SlotObservation).values(
-                    slot_start=slot_start,
-                    slot_end=slot_end,
-                    import_price_sek_kwh=import_price,
-                    export_price_sek_kwh=export_price,
+                # Reproduce the previous coalesce semantics: an incoming non-NULL wins,
+                # an incoming NULL never clobbers what is already there. NaN counts as
+                # "no value" -- it is not None, but SQLite stores it as NULL, so
+                # letting it through would clobber a real price with nothing.
+                values: dict[str, Any] = {}
+                if slot_end is not None:
+                    values["slot_end"] = slot_end
+                if import_price is not None and math.isfinite(float(import_price)):
+                    values["import_price_sek_kwh"] = import_price
+                if export_price is not None and math.isfinite(float(export_price)):
+                    values["export_price_sek_kwh"] = export_price
+                if not values:
+                    continue
+
+                offered += 1
+                result = await session.execute(
+                    update(SlotObservation)
+                    .where(SlotObservation.slot_start == slot_start)
+                    .values(**values)
+                    .execution_options(synchronize_session=False)
                 )
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["slot_start"],
-                    set_={
-                        "slot_end": func.coalesce(stmt.excluded.slot_end, SlotObservation.slot_end),
-                        "import_price_sek_kwh": func.coalesce(
-                            stmt.excluded.import_price_sek_kwh, SlotObservation.import_price_sek_kwh
-                        ),
-                        "export_price_sek_kwh": func.coalesce(
-                            stmt.excluded.export_price_sek_kwh, SlotObservation.export_price_sek_kwh
-                        ),
-                    },
-                )
-                await session.execute(stmt)
+                if (result.rowcount or 0) > 0:
+                    placed += 1
+                elif slot_start < now_iso:
+                    # A PAST slot with no row to land on is NOT the expected case: it
+                    # means slot-string drift or a genuinely missing observation. This
+                    # is the silent-degradation class the change exists to end, so it
+                    # must never be logged as routine.
+                    unplaced_past += 1
+                else:
+                    unplaced_future += 1
             await session.commit()
+
+        # Self-arm the coverage tripwire's pre/post boundary. Gated on having actually
+        # offered a row, so a malformed no-op call cannot arm it. Done AFTER the commit
+        # above: set_system_state opens its own session and commits, which would
+        # contend with this one's write lock on SQLite.
+        if offered and await self.get_system_state(OBS_FIX_APPLIED_KEY) is None:
+            await self.set_system_state(
+                OBS_FIX_APPLIED_KEY, datetime.now(self.timezone).isoformat()
+            )
+
+        # Unplaced FUTURE prices are the steady state after the fix -- the planner
+        # offers the whole horizon every tick and only the current slot can land.
+        if unplaced_past:
+            logger.warning(
+                "store_slot_prices: %d PAST slot(s) had no observation row to hold "
+                "their price (placed=%d, future=%d). Prices for those slots are lost "
+                "to savings/arbitrage until backfill_missing_prices repairs them.",
+                unplaced_past,
+                placed,
+                unplaced_future,
+            )
+        else:
+            logger.debug("store_slot_prices: placed=%d unplaced_future=%d", placed, unplaced_future)
 
     async def store_slot_observations(self, observations_df: pd.DataFrame) -> None:
         """Store slot observations in database using Async SQLAlchemy."""

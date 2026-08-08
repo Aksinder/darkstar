@@ -433,6 +433,10 @@ learning:
   min_improvement_threshold: 0.015     # Minimum improvement (0-1 scale) required before applying learned adjustments (prevents noise)
   reflex_enabled: true                 # Enable Reflex: tunes physical/policy parameters (S-Index, PV confidence, battery cost, capacity) based on safety/confidence/ROI/capacity analysis
   min_sample_threshold: 2              # Minimum data points required before applying learned adjustments (prevents premature tuning with insufficient data)
+  ha_backfill_enabled: false           # Startup HA-history gap backfill (BackfillEngine). OFF by default (2026-08-08):
+                                       # etl_cumulative_to_slots zero-fills absent channels and its sensor map has no
+                                       # battery/water/EV entry, so it writes pv_kwh=0.0 rows that pass ml/train.py's
+                                       # `load_kwh > 0.001` filter into the automatic retrain. Audit before enabling.
 
   # Rate Limits for Aurora Reflex Parameter Tuning
   # These limits prevent instability by capping how much each parameter can change per day
