@@ -107,6 +107,46 @@ async def learning_coverage(days: int = Query(7, ge=1, le=92)) -> dict[str, Any]
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.post(
+    "/api/learning/quarantine_fabricated",
+    summary="Quarantine historical price-mint observation rows",
+    description=(
+        "LABEL (never delete) historical slot_observations rows fabricated by the "
+        "pre-2026-08-08 price mint: no SoC, no battery, all six energy columns zero, and "
+        "no quality_flags set by any writer. Writes quality_flags={'price_mint':true}. "
+        "SCOPE: this is an audit label, not an access control — no consumer reads it "
+        "yet. These rows are already excluded from training and eval by the incidental "
+        "'load_kwh > 0.001' filters; the label makes that exclusion explicit and "
+        "auditable so those filters can later be replaced deliberately. PAST rows only "
+        "(90-min margin): labelling a future minted row would brand it permanently once "
+        "the recorder fills it in. Also clears stale labels from rows that have since "
+        "gained real data. dry_run=true (default) writes nothing."
+    ),
+)
+async def learning_quarantine_fabricated(
+    dry_run: bool = Query(True, description="Report only; write nothing"),
+) -> dict[str, Any]:
+    """Label historical price-mint rows so they can never be read as real zeros."""
+    try:
+        import pytz
+
+        from backend.learning.quarantine import quarantine_fabricated
+
+        engine = _get_learning_engine()
+        config: dict[str, Any] = engine.config or {}
+        learning_cfg: dict[str, Any] = config.get("learning") or {}
+        db_path = str(learning_cfg.get("sqlite_path", "data/planner_learning.db"))
+        tz = pytz.timezone(str(config.get("timezone", "Europe/Stockholm")))
+
+        result: dict[str, Any] = await asyncio.to_thread(
+            quarantine_fabricated, db_path, tz, dry_run=dry_run
+        )
+        return result
+    except Exception as e:
+        logger.exception("Failed to quarantine fabricated observations")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get(
     "/api/learning/history",
     summary="Get Learning History",
