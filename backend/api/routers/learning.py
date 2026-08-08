@@ -74,6 +74,38 @@ async def learning_status() -> dict[str, Any]:
 
 
 @router.get(
+    "/api/learning/coverage",
+    summary="Get Observation Coverage",
+    description=(
+        "Return what fraction of the recent slot grid has a REAL observation, plus the "
+        "zero-fabrication tripwire. Read this before trusting /api/forecast/eval: a "
+        "forecast-accuracy regression is indistinguishable from an observation-coverage "
+        "collapse unless you check both."
+    ),
+)
+async def learning_coverage(days: int = Query(7, ge=1, le=92)) -> dict[str, Any]:
+    """Return observation coverage over the trailing window."""
+    try:
+        import pytz
+
+        from backend.learning.coverage import observation_coverage
+        from backend.learning.store import OBS_FIX_APPLIED_KEY
+
+        engine = _get_learning_engine()
+        config = engine.config or {}
+        learning_cfg = config.get("learning") or {}
+        db_path = learning_cfg.get("sqlite_path", "data/planner_learning.db")
+        tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+
+        fix_applied_at = await engine.store.get_system_state(OBS_FIX_APPLIED_KEY)
+        cov = await asyncio.to_thread(observation_coverage, db_path, tz, days, fix_applied_at)
+        return cast("dict[str, Any]", cov)
+    except Exception as e:
+        logger.exception("Failed to get observation coverage")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get(
     "/api/learning/history",
     summary="Get Learning History",
     description="Return learning engine run history.",
@@ -192,9 +224,7 @@ async def learning_train(
         )
 
         # train_all_models is async and handles locking/logging
-        raw_result = await train_all_models(
-            training_type="manual", min_date=parsed_min_date
-        )
+        raw_result = await train_all_models(training_type="manual", min_date=parsed_min_date)
         result: dict[str, Any] = raw_result
 
         if result.get("status") == "busy":
@@ -283,7 +313,11 @@ async def learning_loops() -> dict[str, Any]:
 
             reflex_rows = (await session.execute(select(ReflexState))).scalars().all()
             s_index_last = max(
-                (r.last_updated for r in reflex_rows if r.last_updated and "s_index" in r.param_path),
+                (
+                    r.last_updated
+                    for r in reflex_rows
+                    if r.last_updated and "s_index" in r.param_path
+                ),
                 default=None,
             )
             other_last = max(
@@ -299,7 +333,11 @@ async def learning_loops() -> dict[str, Any]:
         result: dict[str, Any] = {
             "pv_forecast": {"status": train_status, "last_run": last_train, "error": None},
             "load_forecast": {"status": train_status, "last_run": last_train, "error": None},
-            "s_index": {"status": _freshness(s_index_last), "last_run": s_index_last, "error": None},
+            "s_index": {
+                "status": _freshness(s_index_last),
+                "last_run": s_index_last,
+                "error": None,
+            },
             "arbitrage": {"status": _freshness(other_last), "last_run": other_last, "error": None},
         }
         return {"loops": result}

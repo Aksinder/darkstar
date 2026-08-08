@@ -100,6 +100,29 @@ class BackfillEngine:
 
     async def run(self) -> None:
         """Run the backfill process asynchronously."""
+        # 2026-08-08. This engine has been UNREACHABLE for the entire life of the
+        # zero-fabrication bug: get_last_observation_time (store.py) is
+        # MAX(slot_start), and store_slot_prices minted observation rows ~48h into the
+        # FUTURE, so `gap` below was always negative and the "Data is up to date."
+        # branch always returned early. Stopping the fabrication makes MAX(slot_start)
+        # the present again, which would wake this path for the first time in months.
+        #
+        # It is NOT safe to wake it silently: etl_cumulative_to_slots zero-fills absent
+        # channels (engine.py: `deltas[deltas > max_kwh] = 0.0` and `slot_df[col] = 0.0`)
+        # and the auto sensor map below has no battery/water/EV entry. On this site
+        # total_pv_production was deliberately emptied on 2026-07-08, so it would write
+        # pv_kwh=0.0 with load_kwh>0 -- rows that PASS ml/train.py's `load_kwh > 0.001`
+        # filter and would feed the LIVE automatic retrain as genuine zero-PV daytime
+        # samples. Default OFF; enabling it is a deliberate, reviewed act.
+        if not self.learning_config.get("ha_backfill_enabled", False):
+            logger.info(
+                "BackfillEngine: disabled (learning.ha_backfill_enabled=false). This "
+                "reproduces the engine's actual pre-2026-08-08 behaviour. Enable only "
+                "after auditing etl_cumulative_to_slots zero-fill and the sensor map's "
+                "battery/water/EV coverage."
+            )
+            return
+
         logger.info("Starting backfill process...")
 
         # 1. Sync from Home Assistant (Primary Source)

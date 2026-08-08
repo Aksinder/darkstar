@@ -27,7 +27,14 @@ def mock_engine(tmp_path):
         with patch("backend.learning.backfill.BackfillEngine._load_config") as mock_conf:
             mock_conf.return_value = {
                 "timezone": "UTC",
-                "learning": {"sensor_map": {"sensor.test": "test_sensor"}},
+                "learning": {
+                    "sensor_map": {"sensor.test": "test_sensor"},
+                    # BackfillEngine is frozen by default since 2026-08-08 (see
+                    # tests/backend/test_backfill_engine_disabled.py for that
+                    # contract). These tests exercise the backfill MECHANICS, so they
+                    # opt in explicitly.
+                    "ha_backfill_enabled": True,
+                },
             }
 
             # Mock HA config load

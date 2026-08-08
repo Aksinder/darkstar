@@ -100,21 +100,26 @@ def backfill_vattenfall(start_date_str: str, end_date_str: str, area: str = "SN4
                         )
 
                 if rows_to_insert:
-                    conn.executemany(
+                    # UPDATE-only: never mint a zero-energy observation row. The old
+                    # INSERT ... ON CONFLICT relied on the column DEFAULT 0.0 for the
+                    # six energy columns, fabricating rows where "not measured" and
+                    # "produced 0.0 kWh" were indistinguishable. See
+                    # LearningStore.store_slot_prices for the full rationale.
+                    cur = conn.executemany(
                         """
-                        INSERT INTO slot_observations
-                        (slot_start, slot_end, import_price_sek_kwh, export_price_sek_kwh)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(slot_start) DO UPDATE SET
-                        import_price_sek_kwh=excluded.import_price_sek_kwh,
-                        export_price_sek_kwh=excluded.export_price_sek_kwh
+                        UPDATE slot_observations
+                           SET slot_end = COALESCE(slot_end, ?),
+                               import_price_sek_kwh = ?,
+                               export_price_sek_kwh = ?
+                         WHERE slot_start = ?
                     """,
-                        rows_to_insert,
+                        # Reorder: rows_to_insert holds (start, end, imp, exp).
+                        [(e, i, x, s) for (s, e, i, x) in rows_to_insert],
                     )
                     conn.commit()
                     count = len(rows_to_insert)
                     total_slots += count
-                    print(f" OK ({count} slots)")
+                    print(f" OK ({count} slots offered, {cur.rowcount} placed on existing rows)")
                 else:
                     print(" No data returned.")
 

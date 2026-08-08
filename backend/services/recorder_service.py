@@ -145,16 +145,35 @@ class RecorderService:
 
         # 2. Backfill prices on startup
         await backfill_missing_prices()
+        last_price_backfill = datetime.now(UTC)
 
         # 3. Initialize disaggregator
         self._disaggregator = LoadDisaggregator(self._config)
 
         while self._running:
             try:
+                # Repair unpriced observations periodically, not just at startup.
+                # 2026-08-08: store_slot_prices no longer pre-mints a row to hold the
+                # price, so when the recorder's own price fetch fails for a slot
+                # (recorder.py: "Failed to fetch price data") that slot stays unpriced
+                # and silently drops out of savings/arbitrage (savings.py skips rows
+                # with import_price None). Startup-only repair could leave it unpriced
+                # for the whole life of the process.
+                if (datetime.now(UTC) - last_price_backfill) >= timedelta(hours=6):
+                    try:
+                        await backfill_missing_prices()
+                    except Exception as e:
+                        logger.warning(f"Periodic price backfill failed: {e}")
+                    last_price_backfill = datetime.now(UTC)
+
                 # Record observation with retry logic
                 success = await self._record_with_retry()
                 if not success:
-                    logger.warning("Observation gap detected, will backfill on next tick")
+                    logger.warning(
+                        "Observation gap detected (HA backfill is disabled by default "
+                        "since 2026-08-08; the gap will remain and is reported by "
+                        "/api/learning/coverage)"
+                    )
 
                 # Sleep until next 15m boundary
                 await self._sleep_until_next_quarter()

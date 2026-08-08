@@ -67,7 +67,10 @@ async def main(
 
         if "price_data" in input_data:
             await engine.store_slot_prices(input_data["price_data"])
-            print(f"[planner] Stored {len(input_data['price_data'])} price slots to DB")
+            # "Offered", not "stored": since 2026-08-08 store_slot_prices is UPDATE-only
+            # and never creates an observation row, so only slots that already have one
+            # (i.e. the past/current) actually take a price. See its docstring.
+            print(f"[planner] Offered {len(input_data['price_data'])} price slots to DB")
 
         if "forecast_data" in input_data:
             # Forecasts need a version, default to 'aurora' or 'baseline'
