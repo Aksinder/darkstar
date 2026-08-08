@@ -331,10 +331,20 @@ log "Running database migrations..."
 export DB_PATH=/share/darkstar/planner_learning.db
 
 if [ -f /app/alembic.ini ]; then
-    # Run migration with proper error handling and logging
-    if /usr/local/bin/python3.12 -m alembic upgrade head 2>&1 | while read -r line; do log "[ALEMBIC] $line"; done; then
+    # Run migration with proper error handling and logging.
+    # NOTE: this MUST NOT pipe alembic into `while read`. A pipeline's exit status is
+    # that of its LAST command -- the loop -- which always succeeds, so a failed
+    # migration took the success branch and logged "✅ Database migrations complete."
+    # while the `exit 1` below was unreachable. `set -e` does not help (no pipefail),
+    # and this is the HA add-on entrypoint, i.e. the path the box actually takes.
+    _alembic_log=$(mktemp)
+    if /usr/local/bin/python3.12 -m alembic upgrade head >"$_alembic_log" 2>&1; then
+        while IFS= read -r line; do log "[ALEMBIC] $line"; done < "$_alembic_log"
+        rm -f "$_alembic_log"
         log "✅ Database migrations complete."
     else
+        while IFS= read -r line; do log "[ALEMBIC] $line"; done < "$_alembic_log"
+        rm -f "$_alembic_log"
         log "❌ ERROR: Database migration failed!"
         log "Recovery: Check the logs above for detailed error information."
         log "The container will now exit to prevent starting with an inconsistent database state."
