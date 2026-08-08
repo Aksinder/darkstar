@@ -1,3 +1,7 @@
+## dev-20260808.1656 — 2026-08-08 16:59
+
+- style(types): rowcount lives on CursorResult, not Result[Any]
+
 ## dev-20260804.0742 — 2026-08-04 07:44
 
 - feat(ev-surplus): anti-hunt hardening — quantum deadband, Schmitt, per-charger pacing, deadlock fix
