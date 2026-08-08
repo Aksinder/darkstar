@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -9,7 +10,10 @@ import yaml
 from nordpool.elspot import Prices
 
 sys.path.insert(0, str(Path.cwd()))
-from learning import LearningEngine  # type: ignore[reportUnknownVariableType]
+# Was `from learning import LearningEngine` -- there is no top-level `learning`
+# package, so this script raised ImportError before it did anything. Combined with the
+# un-awaited call below, it has never once stored a price.
+from backend.learning import LearningEngine
 
 
 def load_config(path: str = "config.yaml") -> dict[str, Any]:
@@ -18,7 +22,7 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     return cast("dict[str, Any]", raw_data) if isinstance(raw_data, dict) else {}
 
 
-def backfill_prices(days: int, config_path: str = "config.yaml") -> None:
+async def backfill_prices(days: int, config_path: str = "config.yaml") -> None:
     config = load_config(config_path)
     engine: Any = LearningEngine(config_path)  # type: ignore[assignment]
 
@@ -85,9 +89,14 @@ def backfill_prices(days: int, config_path: str = "config.yaml") -> None:
             }
         )
 
+    # store_slot_prices is async. Without the await this built a coroutine, dropped it,
+    # and printed "Done." -- a silent no-op that looked like a successful backfill.
     print(f"Storing {len(records)} price slots...")
-    engine.store_slot_prices(records)  # type: ignore[method-call]
-    print("Done.")
+    await engine.store_slot_prices(records)
+    print(
+        "Done. (Prices attach to EXISTING observation rows only; slots with no "
+        "recorded observation are skipped by design.)"
+    )
 
 
 if __name__ == "__main__":
@@ -95,4 +104,4 @@ if __name__ == "__main__":
     parser.add_argument("--days", type=int, default=7, help="Number of days to backfill")
     args = parser.parse_args()
 
-    backfill_prices(args.days)
+    asyncio.run(backfill_prices(args.days))
