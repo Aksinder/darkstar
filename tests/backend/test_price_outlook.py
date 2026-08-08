@@ -15,6 +15,31 @@ from backend.core.price_outlook import (
 )
 
 
+def _local_midnight():
+    """Midnight today in the SAME timezone the code under test uses.
+
+    get_daily_outlook derives "today" from datetime.now(tz) with tz resolved from
+    config (default Europe/Stockholm). A naive datetime.now() here is CONTAINER-local,
+    so on a UTC CI runner it is a day behind Stockholm between 22:00 and 24:00 UTC --
+    which made these tests fail every night in that two-hour window while passing on a
+    CEST developer machine. Anchor both sides to the same clock.
+    """
+    from datetime import datetime
+
+    import pytz
+
+    tz_name = "Europe/Stockholm"
+    try:
+        from backend.core.secrets import load_yaml
+
+        tz_name = (load_yaml("config.yaml") or {}).get("timezone", tz_name)
+    except Exception:
+        pass
+    return datetime.now(pytz.timezone(tz_name)).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+    )
+
+
 class TestGetDailyOutlook(unittest.TestCase):
     """Test get_daily_outlook() aggregation (Task 6.1)."""
 
@@ -45,9 +70,9 @@ class TestGetDailyOutlook(unittest.TestCase):
         """)
 
         # Insert test data for D+1 through D+7 using future dates relative to today
-        from datetime import datetime, timedelta
+        from datetime import timedelta
 
-        base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        base_date = _local_midnight()
         for day_offset in range(1, 8):
             current_date = base_date + timedelta(days=day_offset)
             date = current_date.strftime("%Y-%m-%d")
@@ -73,7 +98,7 @@ class TestGetDailyOutlook(unittest.TestCase):
         """Test that daily aggregation calculates correct averages."""
         print("\n--- Testing Daily Aggregation ---")
 
-        from datetime import datetime, timedelta
+        from datetime import timedelta
 
         result = get_daily_outlook(self.db_path)
 
@@ -81,18 +106,14 @@ class TestGetDailyOutlook(unittest.TestCase):
 
         # Check D+1
         day1 = result[0]
-        expected_date_1 = (
-            datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        ).strftime("%Y-%m-%d")
+        expected_date_1 = (_local_midnight() + timedelta(days=1)).strftime("%Y-%m-%d")
         self.assertEqual(day1["date"], expected_date_1)
         self.assertEqual(day1["days_ahead"], 1)
         self.assertAlmostEqual(day1["avg_spot_p50"], 0.45, places=2)
 
         # Check D+7
         day7 = result[6]
-        expected_date_7 = (
-            datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=7)
-        ).strftime("%Y-%m-%d")
+        expected_date_7 = (_local_midnight() + timedelta(days=7)).strftime("%Y-%m-%d")
         self.assertEqual(day7["date"], expected_date_7)
         self.assertEqual(day7["days_ahead"], 7)
         self.assertAlmostEqual(day7["avg_spot_p50"], 0.75, places=2)

@@ -5,8 +5,7 @@ from unittest.mock import patch
 
 import pandas as pd
 import pytest
-import sqlalchemy
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine
 
 from backend.learning.models import Base, PriceForecast
 from ml.price_forecast import (
@@ -15,6 +14,22 @@ from ml.price_forecast import (
     get_d1_price_forecast_fallback,
     get_price_forecasts_from_db,
 )
+
+
+def _local_today() -> date:
+    """Return "today" in the SAME timezone the code under test uses.
+
+    ml/price_forecast's D+1 fallback derives today from
+    datetime.now(pytz.timezone(config["timezone"])).date() (default Europe/Stockholm).
+    Bare date.today() here is CONTAINER-local, so on a UTC CI runner it is a day behind
+    Stockholm between 22:00 and 24:00 UTC — these tests failed every night in that
+    window while passing on a CEST developer machine.
+    """
+    from datetime import datetime
+
+    import pytz
+
+    return datetime.now(pytz.timezone("Europe/Stockholm")).date()
 
 
 @pytest.fixture
@@ -117,7 +132,7 @@ async def test_d1_fallback_filters_null_predictions(mock_get_forecasts, price_co
     """Test that D+1 fallback filters out null-prediction rows."""
     print("\n--- Testing D+1 Fallback Null Filtering ---")
 
-    tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
+    tomorrow_str = (_local_today() + timedelta(days=1)).isoformat()
 
     # Mock DB returning only weather-only rows (null predictions)
     mock_get_forecasts.return_value = [
@@ -516,7 +531,7 @@ async def test_d1_fallback_dedup(tmp_db, price_config):
     """Seed DB with duplicate slot_start entries — assert no duplicate slot_start in fallback return."""
     db_path, engine = tmp_db
 
-    tomorrow = date.today() + timedelta(days=1)
+    tomorrow = _local_today() + timedelta(days=1)
     slots = [f"{tomorrow.isoformat()}T{h:02d}:{m:02d}:00+02:00" for h in range(24) for m in (0, 30)]
 
     rows = []
@@ -557,7 +572,7 @@ async def test_d1_fallback_dedup(tmp_db, price_config):
 async def test_d1_fallback_filters_stale_slots(mock_get_forecasts, price_config, db_path):
     """Slots for today or yesterday should be discarded as stale."""
 
-    today = date.today()
+    today = _local_today()
     today_str = today.isoformat()
     yesterday_str = (today - timedelta(days=1)).isoformat()
 
@@ -591,7 +606,7 @@ async def test_d1_fallback_filters_stale_slots(mock_get_forecasts, price_config,
 async def test_d1_fallback_keeps_future_slots(mock_get_forecasts, price_config, db_path):
     """Slots for tomorrow should be returned unchanged."""
 
-    tomorrow = date.today() + timedelta(days=1)
+    tomorrow = _local_today() + timedelta(days=1)
     tomorrow_str = tomorrow.isoformat()
 
     slots = [
