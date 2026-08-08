@@ -177,7 +177,9 @@ class LearningStore:
                     .values(**values)
                     .execution_options(synchronize_session=False)
                 )
-                if (result.rowcount or 0) > 0:
+                # rowcount lives on CursorResult, not the declared Result[Any]; getattr
+                # keeps this honest for Pyright and safe on any driver that omits it.
+                if int(getattr(result, "rowcount", 0) or 0) > 0:
                     placed += 1
                 elif slot_start < now_iso:
                     # A PAST slot with no row to land on is NOT the expected case: it
