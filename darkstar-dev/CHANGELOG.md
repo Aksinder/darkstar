@@ -1,3 +1,7 @@
+## dev-20260809.1939 — 2026-08-09 19:41
+
+- feat(observations): quarantine historical price-mint rows (label, never delete)
+
 ## dev-20260808.1656 — 2026-08-08 16:59
 
 - style(types): rowcount lives on CursorResult, not Result[Any]
