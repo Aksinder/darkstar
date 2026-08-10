@@ -427,7 +427,7 @@ async def get_water_absorption_stats(config: dict[str, Any]) -> dict[str, dict[s
         store: Any = None
         today_by_id: dict[str, float] = {}
         window_by_id: dict[str, float] = {}
-        window_ids: set[str] = set()
+        covered_days_by_id: dict[str, set[Any]] = {}
         try:
             from backend.learning.store import LearningStore
 
@@ -440,25 +440,50 @@ async def get_water_absorption_stats(config: dict[str, Any]) -> dict[str, dict[s
                 if not did:
                     continue
                 kwh = float(r.get("kwh", 0.0) or 0.0)
-                slot_s = str(r.get("slot_start", ""))
-                if slot_s >= bucket_start.isoformat():
+                # Datetime comparison, NOT string: slot_start is a local-offset ISO
+                # string, and during the autumn DST fall-back the repeated hour makes
+                # lexicographic order diverge from time order ("02:xx+02:00" sorts
+                # above "02:yy+01:00") — the repo's recurring tz-trap class.
+                try:
+                    slot_dt = datetime.fromisoformat(str(r.get("slot_start", "")))
+                except (TypeError, ValueError):
+                    continue
+                if slot_dt.tzinfo is None:
+                    continue
+                if slot_dt >= bucket_start:
                     today_by_id[did] = today_by_id.get(did, 0.0) + kwh
                 else:
                     window_by_id[did] = window_by_id.get(did, 0.0) + kwh
-                    window_ids.add(did)
+                    # Coverage: which complete day-buckets the recorder actually
+                    # covered for this device (it writes rows every slot when healthy,
+                    # including 0.0 — so presence means "measured", absence means
+                    # "recorder outage", and outage days must not bias the average low).
+                    row_bucket = slot_dt.astimezone(tz).date()
+                    if slot_dt.astimezone(tz).hour < defer_hours:
+                        row_bucket = row_bucket - timedelta(days=1)
+                    covered_days_by_id.setdefault(did, set()).add(row_bucket)
         finally:
             if store is not None:
                 with contextlib.suppress(Exception):
                     await store.close()
 
+        # The bucket the today-numbers belong to: the planner must NOT subtract them
+        # from a NEWER bucket if the solve crosses the 10:00 boundary mid-flight.
+        bucket_date_iso = bucket_start.astimezone(tz).date().isoformat()
+
         for wh in water_heaters:
             hid = str(wh.get("id", ""))
             if not hid:
                 continue
-            avg = window_by_id.get(hid, 0.0) / 7.0 if hid in window_ids else None
+            covered = covered_days_by_id.get(hid, set())
+            # Average over days the recorder COVERED, not the fixed window length:
+            # an outage day is missing data, while a covered day with only 0.0 rows
+            # is a genuine "thermostat was satisfied" zero and still counts.
+            avg = window_by_id.get(hid, 0.0) / len(covered) if covered else None
             result[hid] = {
                 "absorbed_today_kwh": max(0.0, today_by_id.get(hid, 0.0)),
                 "absorbed_daily_avg_kwh": avg,
+                "absorbed_bucket_date": bucket_date_iso,
             }
         return result
     except Exception as exc:
@@ -530,6 +555,7 @@ async def get_initial_state(
             if stats:
                 entry["absorbed_today_kwh"] = stats.get("absorbed_today_kwh", 0.0)
                 entry["absorbed_daily_avg_kwh"] = stats.get("absorbed_daily_avg_kwh")
+                entry["absorbed_bucket_date"] = stats.get("absorbed_bucket_date")
             water_heater_states.append(entry)
         water_heated_today_kwh = sum(heated_by_id.values())
     except Exception as exc:

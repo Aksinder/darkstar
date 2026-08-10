@@ -87,16 +87,51 @@ async def test_device_without_history_gets_none_average(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_average_divides_by_fixed_window_not_active_days(tmp_path):
-    """A day the tank absorbed nothing is a REAL zero (thermostat satisfied), not
-    missing data — 7.0 kWh on one day of seven averages to 1.0, not 7.0."""
+async def test_average_divides_by_covered_days_zero_rows_count(tmp_path):
+    """A COVERED day where the tank absorbed nothing (recorder wrote 0.0 rows —
+    thermostat satisfied) is a real zero and dilutes the average: 7.0 kWh across
+    7 covered days averages to 1.0."""
     db = str(tmp_path / "stats.db")
     now = datetime.now(TZ)
     bucket = _bucket_start(now)
-    await _seed(db, [(bucket - timedelta(days=3) + timedelta(hours=1), "main_tank", 7.0)])
+    rows: list[tuple[datetime, str, float]] = [
+        (bucket - timedelta(days=3) + timedelta(hours=1), "main_tank", 7.0)
+    ]
+    for day in (1, 2, 4, 5, 6, 7):
+        rows.append((bucket - timedelta(days=day) + timedelta(hours=1), "main_tank", 0.0))
+    await _seed(db, rows)
 
     stats = await get_water_absorption_stats(_config(db))
     assert abs(stats["main_tank"]["absorbed_daily_avg_kwh"] - 1.0) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_recorder_outage_days_do_not_bias_the_average_low(tmp_path):
+    """An UNCOVERED day (no rows at all = recorder outage) is missing data, not a
+    zero: 10.0 kWh over 5 covered days averages to 2.0, not 10/7."""
+    db = str(tmp_path / "stats.db")
+    now = datetime.now(TZ)
+    bucket = _bucket_start(now)
+    rows: list[tuple[datetime, str, float]] = []
+    for day in (1, 2, 3, 4, 5):  # days 6-7: outage, no rows
+        rows.append((bucket - timedelta(days=day) + timedelta(hours=1), "main_tank", 2.0))
+    await _seed(db, rows)
+
+    stats = await get_water_absorption_stats(_config(db))
+    assert abs(stats["main_tank"]["absorbed_daily_avg_kwh"] - 2.0) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_bucket_date_is_reported(tmp_path):
+    """The planner needs to know WHICH bucket the today-numbers belong to, so a
+    solve crossing the 10:00 boundary never charges the new day with them."""
+    db = str(tmp_path / "stats.db")
+    now = datetime.now(TZ)
+    bucket = _bucket_start(now)
+    await _seed(db, [(bucket + timedelta(minutes=5), "main_tank", 0.4)])
+
+    stats = await get_water_absorption_stats(_config(db))
+    assert stats["main_tank"]["absorbed_bucket_date"] == bucket.date().isoformat()
 
 
 @pytest.mark.asyncio

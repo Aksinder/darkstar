@@ -153,6 +153,7 @@ def build_water_heater_inputs(
                 anchor_on_slots=anchor_on_slots if anchor_on_slots else None,
                 absorb_cap_kwh_per_day=absorb_cap,
                 absorbed_today_kwh=absorbed_today,
+                absorbed_bucket_date=state.get("absorbed_bucket_date"),
             )
         )
 

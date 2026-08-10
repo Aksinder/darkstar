@@ -240,7 +240,9 @@ def floored_load_margin(effective_load_margin: float, config: dict[str, Any]) ->
     forecast load), systematically under-reserving and forcing grid buys. ``risk_appetite`` still
     tunes conservatism ABOVE this floor.
     """
-    floor_pct = float(config.get("forecasting", {}).get("load_safety_margin_percent", 100.0) or 100.0)
+    floor_pct = float(
+        config.get("forecasting", {}).get("load_safety_margin_percent", 100.0) or 100.0
+    )
     return max(float(effective_load_margin), floor_pct / 100.0)
 
 
