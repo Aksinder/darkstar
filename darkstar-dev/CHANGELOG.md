@@ -1,3 +1,7 @@
+## dev-20260810.0659 — 2026-08-10 07:01
+
+- fix(solver): close the three accepted review MINORs on the absorption cap
+
 ## dev-20260809.1939 — 2026-08-09 19:41
 
 - feat(observations): quarantine historical price-mint rows (label, never delete)
