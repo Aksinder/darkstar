@@ -419,6 +419,10 @@ class KeplerSolver:
 
         # Per-device slack variables for daily minimum soft constraints
         water_min_kwh_violation: dict[str, dict[int, Any]] = {}
+        # 2026-08-10 absorption-cap overage slack (SOFT cap — see the constraint below
+        # for why hard failed review: hourly-block lattice vs slot-granular floors made
+        # the comfort floor unreachable, and misaligned force_on went infeasible).
+        water_absorb_overage: dict[str, dict[int, Any]] = {}
         if water_enabled:
             for heater in water_heaters:
                 d = heater.id
@@ -426,6 +430,10 @@ class KeplerSolver:
                 water_min_kwh_violation[d] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
                     f"water_min_kwh_violation_{safe_d}", range(100), lowBound=0.0
                 )
+                if heater.absorb_cap_kwh_per_day is not None:
+                    water_absorb_overage[d] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
+                        f"water_absorb_overage_{safe_d}", range(100), lowBound=0.0
+                    )
 
         # Initial SoC Constraint
         initial_soc: float = max(0.0, min(config.capacity_kwh, input_data.initial_soc_kwh))
@@ -589,6 +597,14 @@ class KeplerSolver:
                         prob += water_boost[heater.id][t] == 0
                     else:
                         prob += water_boost[heater.id][t] <= soc_above_threshold[t]
+                        # 2026-08-10: heat and boost drive the SAME physical element —
+                        # they can never both be on. Without this, the energy balance
+                        # charged 2x power_kw in double-on slots (both binaries at 1)
+                        # while result extraction reported power once: ~5 kWh/day of
+                        # hidden phantom load the LP paid for but no one could see.
+                        prob += (  # type: ignore[operator]
+                            water_heat[heater.id][t] + water_boost[heater.id][t] <= 1
+                        )
                         total_cost.append(
                             -BOOST_REWARD_SEK * water_boost[heater.id][t] * heater.power_kw * h
                         )
@@ -951,6 +967,12 @@ class KeplerSolver:
         if water_enabled:
             avg_slot_hours: float = sum(slot_hours) / len(slot_hours) if slot_hours else 0.25
 
+            # Soft-cap overage price: just above the boost reward so reward-farming
+            # beyond the cap nets negative per kWh, yet orders of magnitude below the
+            # reliability floor (15-1000 SEK/kWh) and the WTP credits — comfort and
+            # force_on run over the cap for pennies, phantom booking cannot.
+            absorb_overage_penalty: float = max(0.05, config.excess_pv_reward_sek_per_kwh * 1.2)
+
             # Build day → slot indices map (shared across all devices, global deferral)
             slots_by_day: defaultdict[Any, list[int]] = defaultdict(list)
             defer_hours: float = config.defer_up_to_hours
@@ -983,6 +1005,54 @@ class KeplerSolver:
                             pulp.lpSum(water_heat[d][t] for t in day_slot_indices) * kwh_per_slot
                             >= day_min_kwh - water_min_kwh_violation[d][i]
                         )
+
+                    # 2026-08-10 absorption cap (SOFT): what the PLAN may book into this
+                    # tank per day-bucket (heat + boost together) without paying overage.
+                    # The solver has no tank model, and the boost reward (>= export price
+                    # everywhere) otherwise pays it to "consume" 30+ kWh/day into tanks
+                    # whose measured intake is ~4-5 kWh — phantom load that ate the whole
+                    # modeled PV surplus, so the battery never charged.
+                    #
+                    # WHY SOFT (a hard cap failed adversarial review three ways):
+                    #  - hourly_blocks quantizes heat to 4-slot hour groups, so a hard cap
+                    #    raised to a slot-granular floor FORBIDS the next attainable group
+                    #    and the comfort floor becomes unreachable at almost every replan;
+                    #  - force_on slots misaligned with hour groups went hard INFEASIBLE
+                    #    (no plan at all);
+                    #  - a hard cap deleted boost outright instead of grounding it.
+                    # The overage penalty is set just above the boost reward: farming the
+                    # reward beyond the cap is unprofitable by construction (net < 0 per
+                    # kWh), while the comfort floor (15-1000 SEK/kWh) and force_on run
+                    # straight over it for pennies. The executor still commands the
+                    # element in every planned slot and the hardware thermostat remains
+                    # the physical guard.
+                    #
+                    # The DEMAND RATCHET lives in the adapter: cap includes
+                    # absorbed_today x margin, so a big-draw day (measured absorption
+                    # above trailing) EXPANDS the cap and boost turns profitable again
+                    # within it — the tank's own measured intake is the probe, and the
+                    # thermostat terminates the feedback loop physically.
+                    if heater.absorb_cap_kwh_per_day is not None and d in water_absorb_overage:
+                        if i == 0:
+                            # First bucket: subtract the UNCLAMPED measured absorption
+                            # (heated_today_kwh is clamped to min_kwh for the floor and
+                            # would leave this too generous after a boost-heavy morning).
+                            cap_remaining: float = max(
+                                0.0,
+                                heater.absorb_cap_kwh_per_day - heater.absorbed_today_kwh,
+                            )
+                        else:
+                            cap_remaining = heater.absorb_cap_kwh_per_day
+                        overage: Any = water_absorb_overage[d][i]
+                        prob += (  # type: ignore[operator]
+                            pulp.lpSum(  # type: ignore[reportUnknownMemberType]
+                                water_heat[d][t] + (water_boost[d][t] if d in water_boost else 0)
+                                for t in day_slot_indices
+                            )
+                            * kwh_per_slot
+                            <= cap_remaining + overage
+                        )
+                        total_cost.append(absorb_overage_penalty * overage)
 
                     # Load-priority WTP credit (increment 2): a priority-bearing heater
                     # earns a credit for meeting its daily comfort need (min_kwh_per_day)
@@ -1079,9 +1149,7 @@ class KeplerSolver:
                     d = heater.id
                     if not heater.anchor_on_slots:
                         continue
-                    anchor_in: list[int] = sorted(
-                        t for t in heater.anchor_on_slots if 0 <= t < T
-                    )
+                    anchor_in: list[int] = sorted(t for t in heater.anchor_on_slots if 0 <= t < T)
                     if not anchor_in:
                         continue
                     kwh_per_slot_a: float = heater.power_kw * avg_slot_hours

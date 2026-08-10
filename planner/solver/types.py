@@ -37,6 +37,22 @@ class WaterHeaterInput:
     # pipeline dropped it because a genuinely cheaper position exists). NEVER feeds the
     # daily-minimum floor — it only settles ties among equally-cheap positions.
     anchor_on_slots: list[int] | None = None
+    # 2026-08-10 absorption cap: the most energy the PLAN may book into this tank per
+    # day-bucket (heat + boost together). This is NOT a comfort limit and NOT a lid on
+    # opportunistic top-ups — the executor still commands the element during every
+    # planned surplus slot and the tank's own thermostat remains the physical guard.
+    # It exists because the solver has no tank model: with an uncapped boost reward
+    # (1.0 SEK/kWh > export everywhere) the LP happily "consumed" 30+ kWh/day into a
+    # 195+40 L tank pair whose real absorption is ~4-5 kWh/day, and that phantom load
+    # ate the entire modeled PV surplus — so the battery never charged and nights ran
+    # on imports. None => no cap (fail-open to pre-2026-08 behavior).
+    absorb_cap_kwh_per_day: float | None = None
+    # UNCLAMPED measured kWh absorbed so far in the CURRENT day-bucket, for cap
+    # accounting only. Distinct from heated_today_kwh, which is deliberately clamped
+    # to [0, min_kwh_per_day] for the cold-shower-safe reliability floor: after a
+    # boost-heavy morning the clamped value under-reports absorption and would leave
+    # the first bucket's cap too generous.
+    absorbed_today_kwh: float = 0.0
 
 
 @dataclass

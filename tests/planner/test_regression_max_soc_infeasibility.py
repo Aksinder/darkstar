@@ -1,8 +1,6 @@
 """Regression test: max_soc infeasibility incident (capacity=19.2, initial_soc=18.989)."""
 from datetime import datetime, timedelta
 
-import pytest
-
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import KeplerConfig, KeplerInput, KeplerInputSlot
 

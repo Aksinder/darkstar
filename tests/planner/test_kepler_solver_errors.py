@@ -1,6 +1,6 @@
 """Tests for PlannerError raised by Kepler on solver failure or invalid schedule."""
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -39,7 +39,6 @@ def _base_config() -> KeplerConfig:
 
 def test_solver_infeasible_raises_planner_error():
     """When the solver returns Infeasible, KeplerSolver raises SOLVER_INFEASIBLE."""
-    import pulp
 
     config = _base_config()
     input_data = KeplerInput(slots=_make_slots(2), initial_soc_kwh=5.0)

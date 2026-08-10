@@ -293,9 +293,7 @@ def _water_day_bucket_start(now: datetime, defer_hours: float, tz: Any) -> datet
     bucket_date = now.date()
     if defer_hours > 0 and now.hour < defer_hours:
         bucket_date = bucket_date - timedelta(days=1)
-    naive = datetime(
-        bucket_date.year, bucket_date.month, bucket_date.day, boundary_hour, 0, 0
-    )
+    naive = datetime(bucket_date.year, bucket_date.month, bucket_date.day, boundary_hour, 0, 0)
     # pytz tz => use localize; stdlib/zoneinfo tz => replace(tzinfo=...)
     localize = getattr(tz, "localize", None)
     if callable(localize):
@@ -322,9 +320,7 @@ async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, fl
     """
     result: dict[str, float] = {}
     try:
-        water_heaters = [
-            wh for wh in config.get("water_heaters", []) if wh.get("enabled", True)
-        ]
+        water_heaters = [wh for wh in config.get("water_heaters", []) if wh.get("enabled", True)]
         if not water_heaters:
             return {}
 
@@ -353,7 +349,9 @@ async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, fl
                 measured_by_id[did] = measured_by_id.get(did, 0.0) + float(r.get("kwh", 0.0) or 0.0)
                 seen_ids.add(did)
         except Exception as exc:  # store unavailable => fall back per-tank below
-            logger.warning("heated_today: slot_device_energy read failed (%s); using power history", exc)
+            logger.warning(
+                "heated_today: slot_device_energy read failed (%s); using power history", exc
+            )
         finally:
             if store is not None:
                 with contextlib.suppress(Exception):
@@ -391,6 +389,80 @@ async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, fl
         return result
     except Exception as exc:
         logger.warning("heated_today crediting failed; falling back to 0.0 for all tanks: %s", exc)
+        return {}
+
+
+async def get_water_absorption_stats(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per-tank MEASURED absorption stats for the planner's absorption cap (2026-08-10).
+
+    Returns ``{heater_id: {"absorbed_today_kwh": float, "absorbed_daily_avg_kwh": float | None}}``.
+
+    - ``absorbed_today_kwh``: UNCLAMPED slot_device_energy sum for the current
+      day-bucket. Deliberately separate from get_water_heated_today_by_tank, whose
+      values are clamped to [0, min_kwh] for the cold-shower-safe reliability floor —
+      the cap needs the raw number or a boost-heavy morning leaves it too generous.
+    - ``absorbed_daily_avg_kwh``: trailing mean over the previous 7 COMPLETE
+      day-buckets, divided by the fixed window length (a day the tank absorbed
+      nothing is a real zero — the thermostat was satisfied — not missing data).
+      This is thermostat-limited measured intake, i.e. the honest estimate of
+      draw + standing losses. None when the window holds no rows for the tank
+      (fresh install / new device) => the adapter applies NO cap => fail-open.
+
+    Failure of any kind returns {} — callers must treat missing stats as "no cap".
+    """
+    result: dict[str, dict[str, Any]] = {}
+    try:
+        water_heaters = [wh for wh in config.get("water_heaters", []) if wh.get("enabled", True)]
+        if not water_heaters:
+            return {}
+
+        wh_cfg = config.get("water_heating", {})
+        defer_hours = float(wh_cfg.get("defer_up_to_hours", 0.0) or 0.0)
+        tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+        now = datetime.now(tz)
+        bucket_start = _water_day_bucket_start(now, defer_hours, tz)
+        window_start = bucket_start - timedelta(days=7)
+
+        db_path = config.get("learning", {}).get("sqlite_path", "data/planner_learning.db")
+        store: Any = None
+        today_by_id: dict[str, float] = {}
+        window_by_id: dict[str, float] = {}
+        window_ids: set[str] = set()
+        try:
+            from backend.learning.store import LearningStore
+
+            store = LearningStore(db_path, tz)
+            rows = await store.get_device_energy_rows_between(
+                window_start.isoformat(), now.isoformat()
+            )
+            for r in rows:
+                did = str(r.get("device_id", ""))
+                if not did:
+                    continue
+                kwh = float(r.get("kwh", 0.0) or 0.0)
+                slot_s = str(r.get("slot_start", ""))
+                if slot_s >= bucket_start.isoformat():
+                    today_by_id[did] = today_by_id.get(did, 0.0) + kwh
+                else:
+                    window_by_id[did] = window_by_id.get(did, 0.0) + kwh
+                    window_ids.add(did)
+        finally:
+            if store is not None:
+                with contextlib.suppress(Exception):
+                    await store.close()
+
+        for wh in water_heaters:
+            hid = str(wh.get("id", ""))
+            if not hid:
+                continue
+            avg = window_by_id.get(hid, 0.0) / 7.0 if hid in window_ids else None
+            result[hid] = {
+                "absorbed_today_kwh": max(0.0, today_by_id.get(hid, 0.0)),
+                "absorbed_daily_avg_kwh": avg,
+            }
+        return result
+    except Exception as exc:
+        logger.warning("water absorption stats failed; planner runs uncapped: %s", exc)
         return {}
 
 
@@ -449,8 +521,16 @@ async def get_initial_state(
     water_heated_today_kwh = 0.0
     try:
         heated_by_id = await get_water_heated_today_by_tank(config)
+        # Absorption-cap stats (2026-08-10): unclamped today + trailing 7d average.
+        # {} on any failure => the adapter applies no cap (fail-open).
+        absorption_stats = await get_water_absorption_stats(config)
         for hid, kwh in heated_by_id.items():
-            water_heater_states.append({"id": hid, "heated_today_kwh": kwh})
+            entry: dict[str, Any] = {"id": hid, "heated_today_kwh": kwh}
+            stats = absorption_stats.get(hid)
+            if stats:
+                entry["absorbed_today_kwh"] = stats.get("absorbed_today_kwh", 0.0)
+                entry["absorbed_daily_avg_kwh"] = stats.get("absorbed_daily_avg_kwh")
+            water_heater_states.append(entry)
         water_heated_today_kwh = sum(heated_by_id.values())
     except Exception as exc:
         logger.warning("heated_today: initial-state crediting failed, using 0.0: %s", exc)
@@ -584,9 +664,7 @@ async def get_initial_state(
                 override = OVERRIDE_AUTO
                 ov_obj = per_device_results.get(f"ev_override_{charger_id}")
                 if isinstance(ov_obj, dict):
-                    override = (
-                        str(cast("dict[str, Any]", ov_obj).get("state", "")) or OVERRIDE_AUTO
-                    )
+                    override = str(cast("dict[str, Any]", ov_obj).get("state", "")) or OVERRIDE_AUTO
                 if override == OVERRIDE_FORCE_OFF:
                     at_home = False  # force off also blocks charging now
                     reason = "override:force_off"

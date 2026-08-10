@@ -4,7 +4,6 @@ import logging
 
 import numpy as np
 import pandas as pd
-import pytest
 
 
 def _do_merge(future_df: pd.DataFrame, result_df: pd.DataFrame, logger=None) -> pd.DataFrame:

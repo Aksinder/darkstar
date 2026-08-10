@@ -1,7 +1,5 @@
 from datetime import datetime, timedelta
 
-import pytest
-
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
     KeplerConfig,

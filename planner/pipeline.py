@@ -70,9 +70,7 @@ def partition_vacation_water_heaters(
     return excluded, included
 
 
-def resolve_vacation_enabled(
-    config_enabled: bool, ha_vacation: bool, entity_wired: bool
-) -> bool:
+def resolve_vacation_enabled(config_enabled: bool, ha_vacation: bool, entity_wired: bool) -> bool:
     """Decide whether vacation mode is active from its two sources.
 
     When an HA boolean is WIRED (input_sensors.vacation_mode set), it is authoritative
@@ -576,11 +574,21 @@ class PlannerPipeline:
 
         # Build per-device heated_today lookup from HA states or aggregate fallback
         water_heated_today_by_id: dict[str, float] = {}
+        # Absorption-cap stats (2026-08-10): carried verbatim from initial_state to the
+        # adapter. Missing keys => adapter applies no cap (fail-open).
+        water_absorption_by_id: dict[str, dict[str, Any]] = {}
         if ha_water_states_raw:
             for wh_state in ha_water_states_raw:
                 hid = str(wh_state.get("id", ""))
                 if hid:
                     water_heated_today_by_id[hid] = float(wh_state.get("heated_today_kwh", 0.0))
+                    stats: dict[str, Any] = {}
+                    if "absorbed_today_kwh" in wh_state:
+                        stats["absorbed_today_kwh"] = wh_state["absorbed_today_kwh"]
+                    if "absorbed_daily_avg_kwh" in wh_state:
+                        stats["absorbed_daily_avg_kwh"] = wh_state["absorbed_daily_avg_kwh"]
+                    if stats:
+                        water_absorption_by_id[hid] = stats
         elif ha_water_today_total > 0 and len(enabled_heater_ids) == 1:
             # Single heater: assign total to it
             water_heated_today_by_id[enabled_heater_ids[0]] = ha_water_today_total
@@ -658,14 +666,14 @@ class PlannerPipeline:
         # Build per-device water heater states for the adapter (task 3.3)
         water_heater_states: list[dict[str, Any]] = []
         for heater_id in enabled_heater_ids:
-            water_heater_states.append(
-                {
-                    "id": heater_id,
-                    "heated_today_kwh": water_heated_today_by_id.get(heater_id, 0.0),
-                    "force_on_slots": force_on_slots_by_heater.get(heater_id),
-                    "anchor_on_slots": anchor_on_slots_by_heater.get(heater_id),
-                }
-            )
+            state_entry: dict[str, Any] = {
+                "id": heater_id,
+                "heated_today_kwh": water_heated_today_by_id.get(heater_id, 0.0),
+                "force_on_slots": force_on_slots_by_heater.get(heater_id),
+                "anchor_on_slots": anchor_on_slots_by_heater.get(heater_id),
+            }
+            state_entry.update(water_absorption_by_id.get(heater_id, {}))
+            water_heater_states.append(state_entry)
 
         # Get max DC input for PV clipping
         max_dc_input_kw = system_cfg.get("inverter", {}).get("max_dc_input_kw")
@@ -805,12 +813,8 @@ class PlannerPipeline:
         # half a day after homecoming). The config flag only matters when no entity is
         # configured.
         ha_vacation = bool(initial_state.get("vacation_mode", False))
-        _input_sensors_cfg = cast(
-            "dict[str, Any]", active_config.get("input_sensors") or {}
-        )
-        vacation_entity_wired = bool(
-            str(_input_sensors_cfg.get("vacation_mode") or "").strip()
-        )
+        _input_sensors_cfg = cast("dict[str, Any]", active_config.get("input_sensors") or {})
+        vacation_entity_wired = bool(str(_input_sensors_cfg.get("vacation_mode") or "").strip())
         vacation_enabled = resolve_vacation_enabled(
             vacation_enabled, ha_vacation, vacation_entity_wired
         )
@@ -859,7 +863,9 @@ class PlannerPipeline:
                     last_al = now_slot.to_pydatetime()
 
                 days_since = (
-                    (now_slot.to_pydatetime().replace(tzinfo=None) - last_al.replace(tzinfo=None)).days
+                    (
+                        now_slot.to_pydatetime().replace(tzinfo=None) - last_al.replace(tzinfo=None)
+                    ).days
                     if last_al
                     else 999
                 )

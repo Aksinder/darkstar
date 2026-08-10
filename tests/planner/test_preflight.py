@@ -1,9 +1,9 @@
 """Unit tests for planner/preflight.py — one failing and one passing case per check."""
 from __future__ import annotations
 
-import math
 import logging
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -23,7 +23,7 @@ from planner.preflight import (
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _price_slot(start: datetime, hours: float = 1.0) -> dict:
