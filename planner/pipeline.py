@@ -583,10 +583,13 @@ class PlannerPipeline:
                 if hid:
                     water_heated_today_by_id[hid] = float(wh_state.get("heated_today_kwh", 0.0))
                     stats: dict[str, Any] = {}
-                    if "absorbed_today_kwh" in wh_state:
-                        stats["absorbed_today_kwh"] = wh_state["absorbed_today_kwh"]
-                    if "absorbed_daily_avg_kwh" in wh_state:
-                        stats["absorbed_daily_avg_kwh"] = wh_state["absorbed_daily_avg_kwh"]
+                    for key in (
+                        "absorbed_today_kwh",
+                        "absorbed_daily_avg_kwh",
+                        "absorbed_bucket_date",
+                    ):
+                        if key in wh_state:
+                            stats[key] = wh_state[key]
                     if stats:
                         water_absorption_by_id[hid] = stats
         elif ha_water_today_total > 0 and len(enabled_heater_ids) == 1:

@@ -53,6 +53,12 @@ class WaterHeaterInput:
     # boost-heavy morning the clamped value under-reports absorption and would leave
     # the first bucket's cap too generous.
     absorbed_today_kwh: float = 0.0
+    # ISO date of the day-bucket absorbed_today_kwh was measured in. The solver only
+    # subtracts it from bucket 0 when the dates MATCH: stats are fetched at
+    # initial-state time, and a solve that crosses the 10:00 bucket boundary would
+    # otherwise charge the NEW day with the OLD day's absorption (over-tight cap for
+    # one cycle). None => legacy behavior (always subtract).
+    absorbed_bucket_date: str | None = None
 
 
 @dataclass

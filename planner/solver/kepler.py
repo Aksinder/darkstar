@@ -1033,7 +1033,15 @@ class KeplerSolver:
                     # within it — the tank's own measured intake is the probe, and the
                     # thermostat terminates the feedback loop physically.
                     if heater.absorb_cap_kwh_per_day is not None and d in water_absorb_overage:
-                        if i == 0:
+                        # Subtract measured same-bucket absorption from bucket 0 ONLY
+                        # when the stats were measured in THIS bucket: a solve that
+                        # crosses the 10:00 boundary must not charge the new day with
+                        # the old day's absorption. None => legacy always-subtract.
+                        stats_match_bucket: bool = (
+                            heater.absorbed_bucket_date is None
+                            or heater.absorbed_bucket_date == str(day)
+                        )
+                        if i == 0 and stats_match_bucket:
                             # First bucket: subtract the UNCLAMPED measured absorption
                             # (heated_today_kwh is clamped to min_kwh for the floor and
                             # would leave this too generous after a boost-heavy morning).

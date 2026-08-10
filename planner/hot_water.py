@@ -225,7 +225,9 @@ class HotWaterEstimator:
         if "stored_kwh" in d:
             self.stored_kwh = max(0.0, min(cap, float(d["stored_kwh"])))
         if "learned_draw_kw" in d:
-            self.learned_draw_kw = max(self.min_draw_kw, min(self.max_draw_kw, float(d["learned_draw_kw"])))
+            self.learned_draw_kw = max(
+                self.min_draw_kw, min(self.max_draw_kw, float(d["learned_draw_kw"]))
+            )
         if "heating_run_min" in d:
             self._heating_run_min = float(d["heating_run_min"])
         if "energy_in_since_anchor_kwh" in d:

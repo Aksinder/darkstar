@@ -316,3 +316,33 @@ class TestSoftCapReviewRegressions:
         assert booked <= 6.0 + 0.85 + 1e-6, (
             f"reward farming pierced the soft cap: {booked:.2f} (cap 6.0 + one-slot slack)"
         )
+
+    def test_stale_bucket_stats_are_not_subtracted_from_a_new_day(self):
+        """MINOR repro (bucket-boundary race): stats measured in the OLD bucket must
+        not shrink the NEW bucket's cap when the solve crosses the 10:00 boundary."""
+        n = 48
+        heaters = [
+            _wh(absorb_cap=6.0, absorbed_today=6.0),
+        ]
+        # Slots start 2025-06-01; stats claim they were measured in a different bucket.
+        heaters[0].absorbed_bucket_date = "2025-05-31"
+        result = KeplerSolver().solve(
+            KeplerInput(slots=_make_slots(n), initial_soc_kwh=10.0), _config(n, heaters)
+        )
+        assert result.is_optimal
+        booked = _water_kwh(result, "wh1", 3.4)
+        assert booked > 0.85, f"stale old-bucket absorption locked out the new bucket: {booked:.2f}"
+
+    def test_matching_bucket_stats_are_subtracted(self):
+        """Control for the race fix: matching dates keep the subtraction."""
+        n = 48
+        heaters = [
+            _wh(absorb_cap=6.0, absorbed_today=6.0),
+        ]
+        heaters[0].absorbed_bucket_date = "2025-06-01"  # slots start 2025-06-01 08:00
+        result = KeplerSolver().solve(
+            KeplerInput(slots=_make_slots(n), initial_soc_kwh=10.0), _config(n, heaters)
+        )
+        assert result.is_optimal
+        booked = _water_kwh(result, "wh1", 3.4)
+        assert booked <= 0.85 + 1e-6, f"same-bucket absorption should exhaust the cap: {booked:.2f}"
