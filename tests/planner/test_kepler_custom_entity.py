@@ -1,7 +1,5 @@
 from datetime import datetime, timedelta
 
-import pytest
-
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
     ExcessPVSinkSpec,
@@ -71,8 +69,8 @@ class TestCustomEntitySolverVariable:
 
         for s in result.slots:
             assert not s.custom_entity_active, (
-                f"Custom entity should NOT activate — it costs 0.5 kWh export revenue "
-                f"(2.5 SEK) for only 0.25 SEK reward."
+                "Custom entity should NOT activate — it costs 0.5 kWh export revenue "
+                "(2.5 SEK) for only 0.25 SEK reward."
             )
 
     def test_solver_activates_entity_when_reward_exceeds_export(self):

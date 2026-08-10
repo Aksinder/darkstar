@@ -5,6 +5,8 @@ Tests for the Kepler adapter's support of the new entity-centric config structur
 with multiple water heaters and EV chargers.
 """
 
+from typing import ClassVar
+
 import pandas as pd
 import pytest
 import pytz
@@ -730,3 +732,72 @@ class TestExcessPVSinksAdapter:
     def test_no_sinks_when_nothing_configured(self):
         cfg = config_to_kepler_config(self._base_config({"sink": "disabled"}))
         assert cfg.excess_pv_sinks == []
+
+
+class TestAbsorptionCap:
+    """Absorption cap derivation (2026-08-10) — see WaterHeaterInput.absorb_cap_kwh_per_day."""
+
+    WH: ClassVar[dict] = {
+        "id": "main_tank",
+        "enabled": True,
+        "power_kw": 3.4,
+        "min_kwh_per_day": 6.0,
+        "volume_litres": 195,
+        "t_cold_c": 10,
+        "t_max_c": 75,
+    }
+
+    def test_no_trailing_stats_means_no_cap(self):
+        """Fresh install / stats read failed => fail-open, plan like before."""
+        result = build_water_heater_inputs([self.WH], {}, [{"id": "main_tank"}])
+        assert result[0].absorb_cap_kwh_per_day is None
+
+    def test_min_kwh_floor_wins_over_small_trailing(self):
+        """Trailing 2.5 x 1.5 = 3.75 < min 6.0 => cap = 6.0 (comfort floor)."""
+        state = [{"id": "main_tank", "absorbed_daily_avg_kwh": 2.5}]
+        result = build_water_heater_inputs([self.WH], {}, state)
+        assert result[0].absorb_cap_kwh_per_day == 6.0
+
+    def test_trailing_with_margin_wins_when_above_min(self):
+        state = [{"id": "main_tank", "absorbed_daily_avg_kwh": 6.0}]
+        result = build_water_heater_inputs([self.WH], {}, state)
+        assert result[0].absorb_cap_kwh_per_day == 9.0  # 6.0 * 1.5
+
+    def test_physical_capacity_bounds_the_cap(self):
+        """195 L x 65 K x 1.163 = 14.74 kWh capacity; cap <= capacity + trailing.
+
+        The bound bites when trailing x margin exceeds refill + day's draw, i.e. a
+        corrupted/insane trailing average (40 kWh/day into a 195 L tank) — exactly the
+        garbage-in case the physical bound exists to stop.
+        """
+        state = [{"id": "main_tank", "absorbed_daily_avg_kwh": 40.0}]
+        result = build_water_heater_inputs([self.WH], {}, state)
+        cap = result[0].absorb_cap_kwh_per_day
+        assert cap is not None
+        # raw = max(6, 60) = 60; physical bound = 14.74 + 40 = 54.74 => bound wins
+        assert abs(cap - (195 * 65 * 1.163 / 1000.0 + 40.0)) < 1e-6
+
+    def test_zero_trailing_caps_at_the_floor(self):
+        """A tank that absorbed nothing all week still gets its comfort floor."""
+        state = [{"id": "main_tank", "absorbed_daily_avg_kwh": 0.0}]
+        result = build_water_heater_inputs([self.WH], {}, state)
+        assert result[0].absorb_cap_kwh_per_day == 6.0
+
+    def test_absorbed_today_defaults_to_heated_today(self):
+        """Without raw stats the clamped heated_today is the best available bound."""
+        state = [{"id": "main_tank", "heated_today_kwh": 1.2}]
+        result = build_water_heater_inputs([self.WH], {}, state)
+        assert result[0].absorbed_today_kwh == 1.2
+
+    def test_absorbed_today_uses_raw_when_larger(self):
+        """After a boost-heavy morning the raw value exceeds the clamped credit."""
+        state = [
+            {
+                "id": "main_tank",
+                "heated_today_kwh": 6.0,  # clamped at min
+                "absorbed_today_kwh": 9.3,  # raw store sum
+                "absorbed_daily_avg_kwh": 4.0,
+            }
+        ]
+        result = build_water_heater_inputs([self.WH], {}, state)
+        assert result[0].absorbed_today_kwh == 9.3

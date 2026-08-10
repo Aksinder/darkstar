@@ -27,6 +27,17 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+# Absorption-cap headroom over the trailing daily absorption average. 1.5 leaves room
+# for an above-average day without re-opening the phantom (trailing ~2.5 -> cap 6 via
+# the min_kwh floor anyway on this site); a surprise draw beyond it is picked up by
+# the next replan via heated_today/absorbed_today.
+_ABSORB_CAP_MARGIN = 1.5
+# Demand-ratchet headroom over MEASURED same-day absorption: once the tank has
+# demonstrably taken absorbed_today, the cap allows 30% more, so a big-draw day keeps
+# expanding its own budget for as long as the tank keeps absorbing. The thermostat
+# terminates the loop physically the moment the tank is full.
+_ABSORB_RATCHET_MARGIN = 1.3
+
 
 def _get_config_version(config: dict[str, Any]) -> int:
     """Detect config format version for ARC15 migration compatibility."""
@@ -92,16 +103,56 @@ def build_water_heater_inputs(
         # and price-gated in the pipeline). None/empty => no anchor for this heater.
         anchor_on_slots: list[int] | None = state.get("anchor_on_slots")
 
+        min_kwh = float(wh.get("min_kwh_per_day", 0.0))
+
+        # 2026-08-10 absorption cap (see WaterHeaterInput.absorb_cap_kwh_per_day).
+        # cap = max(min_kwh, trailing_daily_absorption x margin), bounded by what the
+        # tank could physically take in one day (full refill from cold + the day's
+        # draw). Trailing absorption comes from slot_device_energy, i.e. MEASURED,
+        # thermostat-limited intake — the honest estimate of draw + standing losses.
+        # No trailing data => None => no cap (fail-open): a fresh install plans like
+        # before until a week of measurements exists. Under-estimation is the safe
+        # direction: the min_kwh floor still guarantees comfort, and the next replan
+        # (~30 min) re-books via heated_today/absorbed_today when a surprise draw
+        # empties a tank.
+        absorbed_today = max(heated_today, float(state.get("absorbed_today_kwh", 0.0) or 0.0))
+        absorb_cap: float | None = None
+        trailing_raw = state.get("absorbed_daily_avg_kwh")
+        if trailing_raw is not None:
+            trailing = max(0.0, float(trailing_raw))
+            cap = max(min_kwh, trailing * _ABSORB_CAP_MARGIN)
+            volume_l = float(wh.get("volume_litres", 0.0) or 0.0)
+            if volume_l > 0:
+                t_cold = float(wh.get("t_cold_c", 10.0) or 10.0)
+                t_max = float(wh.get("t_max_c", 75.0) or 75.0)
+                # 1.163 Wh per litre-kelvin (water specific heat).
+                capacity_kwh = volume_l * max(0.0, t_max - t_cold) * 1.163 / 1000.0
+                cap = min(cap, capacity_kwh + trailing)
+            # DEMAND RATCHET — the fix for the big-draw-day lockout the hard-cap
+            # design had: a draw never lowers measured absorption, refilling RAISES
+            # it, so "wait for the next replan" pointed the wrong way. Instead the
+            # tank's own measured intake is the demand probe: absorption above the
+            # trailing average is EVIDENCE of an unusual day, and the cap grows with
+            # it (x margin), re-opening profitable boost within the expanded cap.
+            # Self-limiting: absorbed_today only grows while the tank actually takes
+            # energy, and the hardware thermostat stops that the moment it is full.
+            # Applied AFTER the physical bound — measured absorption IS physical
+            # reality, and must never be capped below what already happened.
+            cap = max(cap, absorbed_today * _ABSORB_RATCHET_MARGIN)
+            absorb_cap = cap
+
         result.append(
             WaterHeaterInput(
                 id=heater_id,
                 power_kw=float(wh.get("power_kw", 3.0)),
-                min_kwh_per_day=float(wh.get("min_kwh_per_day", 0.0)),
+                min_kwh_per_day=min_kwh,
                 max_hours_between_heating=float(wh.get("max_hours_between_heating", 8.0)),
                 min_spacing_hours=spacing_hours,
                 force_on_slots=force_on_slots if force_on_slots else None,
                 heated_today_kwh=heated_today,
                 anchor_on_slots=anchor_on_slots if anchor_on_slots else None,
+                absorb_cap_kwh_per_day=absorb_cap,
+                absorbed_today_kwh=absorbed_today,
             )
         )
 
@@ -866,9 +917,7 @@ def config_to_kepler_config(
         # cheaper position beats the anchored one by more than the bonus, so a real price
         # change relocates the block. The executor block-commit is the robust relay
         # backstop if a time-boxed incumbent still ignores the anchor on a hard model.
-        water_anchor_bonus_sek_per_slot=float(
-            wh_cfg.get("anchor_bonus_sek_per_slot", 0.2)
-        ),
+        water_anchor_bonus_sek_per_slot=float(wh_cfg.get("anchor_bonus_sek_per_slot", 0.2)),
         # Rev E4: Export Toggle
         enable_export=bool(planner_config.get("export", {}).get("enable_export", True)),
         # Export SoC Floor: minimum SoC required to allow grid export

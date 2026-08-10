@@ -1,10 +1,10 @@
 """Tests for solver error mapping: SOLVER_INFEASIBLE and INVALID_SCHEDULE."""
+from datetime import datetime, timedelta
+
 import pytest
 
 from planner.errors import PlannerError, PlannerErrorCode
-from planner.solver.kepler import KeplerSolver
-from planner.solver.types import KeplerConfig, KeplerInput, KeplerInputSlot
-from datetime import datetime, timedelta
+from planner.solver.types import KeplerInputSlot
 
 
 def _make_slots(n: int, import_price: float = 0.5, export_price: float = 0.4) -> list[KeplerInputSlot]:
