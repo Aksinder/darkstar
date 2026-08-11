@@ -1,3 +1,7 @@
+## dev-20260811.1731 — 2026-08-11 17:33
+
+- feat(ev): config-constant comfort cap (target_soc) per charger
+
 ## dev-20260811.1532 — 2026-08-11 15:33
 
 - fix(executor): propagate reloaded config to the dispatcher
