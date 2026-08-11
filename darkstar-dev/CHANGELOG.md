@@ -1,3 +1,7 @@
+## dev-20260811.1532 — 2026-08-11 15:33
+
+- fix(executor): propagate reloaded config to the dispatcher
+
 ## dev-20260810.0659 — 2026-08-10 07:01
 
 - fix(solver): close the three accepted review MINORs on the absorption cap
