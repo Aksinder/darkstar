@@ -105,7 +105,10 @@ class ExecutorEngine:
         # freshly-added block is picked up on the next executor (re)start.
         from .ev_surplus_runtime import EVSurplusController, parse_ev_surplus_config
 
-        _ev_surplus_cfg = parse_ev_surplus_config(self._full_config.get("executor", {}) or {})
+        _ev_surplus_cfg = parse_ev_surplus_config(
+            self._full_config.get("executor", {}) or {},
+            timezone=self.config.timezone,
+        )
         self._ev_surplus = EVSurplusController(_ev_surplus_cfg) if _ev_surplus_cfg else None
 
         # FMB SoC estimator (dead-reckons the FMB's unknown SoC; default OFF). Publishes
@@ -1448,11 +1451,18 @@ class ExecutorEngine:
                     export_price_sek_kwh=slot.export_price_sek_kwh,
                 )
 
-                # EV charge failure detection: track ticks with zero actual power
+                # EV charge failure detection: track ticks with zero actual power.
+                # Gated on an actuation path existing: with EV value ladders configured the
+                # planner produces real EV slots for chargers that nothing executes yet
+                # (planner switch_entity empty by design, servo bridge not live) — those are
+                # advisory plans, not failures, and would otherwise fire error notifications
+                # every planned block all night (alert fatigue on the channel that guards
+                # real failures).
                 if (
                     scheduled_ev_charging
                     and not actual_ev_charging
                     and not self._ev_power_fetch_failed
+                    and self._ev_plan_actuation_possible()
                 ):
                     self._ev_zero_power_ticks += 1
                 elif actual_ev_charging:
@@ -2345,6 +2355,31 @@ class ExecutorEngine:
 
         except Exception as e:
             logger.debug("Battery cost update skipped: %s", e)
+
+    def _ev_plan_actuation_possible(self) -> bool:
+        """True when at least one charger can actually execute a planned EV slot.
+
+        Two paths exist: the legacy planner switch path (_control_ev_charger — needs a
+        non-empty switch_entity on a planner ev_chargers entry) and the surplus servo's
+        plan-floor bridge (a servo charger with plan_floor: true). With neither, planned
+        EV energy is advisory-only and the charge-failure notifier must stay quiet.
+        """
+        for ev in cast(
+            "list[dict[str, Any]]", self._full_config.get("ev_chargers", []) or []
+        ):
+            if ev.get("enabled", True) and str(ev.get("switch_entity") or "").strip():
+                return True
+        _ev_surplus_raw = cast(
+            "dict[str, Any]",
+            cast("dict[str, Any]", self._full_config.get("executor", {}) or {}).get(
+                "ev_surplus", {}
+            )
+            or {},
+        )
+        for c in cast("list[dict[str, Any]]", _ev_surplus_raw.get("chargers", []) or []):
+            if c.get("plan_floor"):
+                return True
+        return False
 
     async def _control_ev_charger(self, slot: "SlotPlan | None", now: datetime) -> None:
         """

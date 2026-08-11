@@ -102,6 +102,11 @@ class ChargerState:
     soc_percent: float | None = None
     # Desired SoC by the deadline. soc >= target => stop (never overcharge). None => no target.
     target_soc_percent: float | None = None
+    # The GUARANTEE band's upper SoC — what the grid-backed deadline floor charges toward.
+    # Distinct from target_soc_percent (the comfort cap): the Tesla's cap is the car's own
+    # charge_limit (90) but its weekday-morning guarantee is only ~40. None => the deadline
+    # floor falls back to target_soc_percent (legacy: one number served both roles).
+    floor_soc_percent: float | None = None
     # Usable battery capacity, to convert an SoC gap into energy. 0 => no deadline floor.
     capacity_kwh: float = 0.0
     # Hours until the departure deadline. None / <=0 => no grid-backed deadline floor (the car
@@ -248,28 +253,39 @@ def _soc_at_or_above_target(c: ChargerState) -> bool:
 
 
 def _deadline_required_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
-    """Grid-backed power floor needed to reach ``target_soc`` by the deadline, else 0.
+    """Grid-backed power floor needed to reach the FLOOR SoC by the deadline, else 0.
 
     This is the average plug power required from *now*::
 
-        required = (target - soc)/100 * capacity / efficiency / hours_remaining
+        required = (floor - soc)/100 * capacity / efficiency / hours_remaining
+
+    The floor target is ``floor_soc_percent`` (the guarantee band), falling back to
+    ``target_soc_percent`` when unset. Using the comfort cap here was a real bug: the
+    Tesla's cap is the car's own charge_limit (90), so a weekday deadline grid-forced
+    price-blind charging toward 90 every night instead of stopping at the ~40 guarantee.
 
     Returns 0 (no forcing) when any input is missing OR when ``required`` is still below the
     charger's minimum on-power: a sub-minimum requirement means there is plenty of time, so
     we let opportunistic solar handle it and don't pay for grid yet. As the deadline nears
-    with the car still under target, ``required`` climbs; once it crosses the minimum we begin
-    forcing grid, and it ramps toward the charger max as time runs out. Capped at the charger
-    max. The floor is honoured regardless of surplus, so a deadline car "overtakes" the others.
+    with the car still under the floor, ``required`` climbs; once it crosses the minimum we
+    begin forcing grid, and it ramps toward the charger max as time runs out. Capped at the
+    charger max. The floor is honoured regardless of surplus, so a deadline car "overtakes"
+    the others.
     """
+    floor = c.floor_soc_percent if c.floor_soc_percent is not None else c.target_soc_percent
+    # The floor may never exceed the comfort cap: the cap check stops charging at target,
+    # so a mis-configured floor above it would size grid forcing toward an unreachable SoC.
+    if floor is not None and c.target_soc_percent is not None:
+        floor = min(floor, c.target_soc_percent)
     if (
         c.soc_percent is None
-        or c.target_soc_percent is None
+        or floor is None
         or c.capacity_kwh <= 0.0
         or c.deadline_hours is None
         or c.deadline_hours <= 0.0
     ):
         return 0.0
-    soc_gap = max(0.0, c.target_soc_percent - c.soc_percent) / 100.0
+    soc_gap = max(0.0, floor - c.soc_percent) / 100.0
     if soc_gap <= 0.0:
         return 0.0
     energy_at_plug_kwh = soc_gap * c.capacity_kwh / max(0.05, c.charge_efficiency)
@@ -398,7 +414,20 @@ def compute_ev_surplus(
 
     # Deadline cars overtake (sort key 0), then by priority. Used for BOTH surplus
     # distribution (free energy goes to the deadline car first) and emission order.
-    order = sorted(chargeable, key=lambda x: (0 if floor_w[x.id] > 0.0 else 1, x.priority, x.id))
+    # Within the floor class, DEADLINE URGENCY (fewest hours left) outranks priority: a
+    # commuter car whose 07:30 guarantee is at risk must not be starved by another car's
+    # (future) plan floor or configured priority under fuse/surplus scarcity. Floors
+    # without a deadline sort behind every deadline floor (urgency inf), then priority.
+    def _order_key(x: ChargerState) -> tuple[int, float, int, str]:
+        has_floor = floor_w[x.id] > 0.0
+        urgency = (
+            x.deadline_hours
+            if has_floor and x.deadline_hours is not None
+            else float("inf")
+        )
+        return (0 if has_floor else 1, urgency, x.priority, x.id)
+
+    order = sorted(chargeable, key=_order_key)
 
     # --- Per-charger start kick (multi-charger deadlock fix) ---------------------
     # With one charger already at max, the gain-damped step can leave a second, OFF

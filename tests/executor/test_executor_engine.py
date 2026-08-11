@@ -1530,6 +1530,86 @@ executor:
         assert dispatcher._last_water_switch_ts == {"switch.vvb": 123.0}
 
 
+class TestEVPlanActuationGate:
+    """The EV charge-failure notifier must stay quiet while planned EV energy is
+    advisory-only (no planner switch_entity, no servo plan_floor) — otherwise value
+    ladders on shadow chargers spam error notifications every planned block."""
+
+    def _engine(self, tmp_path, extra_yaml: str):
+        config_path = tmp_path / "config.yaml"
+        secrets_path = tmp_path / "secrets.yaml"
+        config_path.write_text(
+            """
+system:
+  timezone: "Europe/Stockholm"
+executor:
+  enabled: true
+  interval_seconds: 60
+"""
+            + extra_yaml
+        )
+        secrets_path.write_text("home_assistant:\n  url: http://test\n  token: test_token\n")
+        engine = ExecutorEngine(str(config_path), str(secrets_path))
+        engine.reload_config()
+        return engine
+
+    def test_no_actuation_path_gates_notifier(self, tmp_path):
+        engine = self._engine(
+            tmp_path,
+            """
+ev_chargers:
+  - id: easee_fmb
+    enabled: true
+    switch_entity: ""
+  - id: tesla
+    enabled: true
+    switch_entity: ""
+""",
+        )
+        assert engine._ev_plan_actuation_possible() is False
+
+    def test_planner_switch_entity_enables(self, tmp_path):
+        engine = self._engine(
+            tmp_path,
+            """
+ev_chargers:
+  - id: easee_fmb
+    enabled: true
+    switch_entity: "switch.easee"
+""",
+        )
+        assert engine._ev_plan_actuation_possible() is True
+
+    def test_disabled_charger_with_switch_does_not_enable(self, tmp_path):
+        engine = self._engine(
+            tmp_path,
+            """
+ev_chargers:
+  - id: tesla
+    enabled: false
+    switch_entity: "switch.tesla"
+""",
+        )
+        assert engine._ev_plan_actuation_possible() is False
+
+    def test_servo_plan_floor_enables(self, tmp_path):
+        engine = self._engine(
+            tmp_path,
+            """
+ev_chargers:
+  - id: easee_fmb
+    enabled: true
+    switch_entity: ""
+""",
+        )
+        # plan_floor lives under executor.ev_surplus.chargers — patch the loaded dict
+        # directly (the field ships in S3; the gate must already honour it).
+        engine._full_config.setdefault("executor", {})["ev_surplus"] = {
+            "chargers": [{"id": "easee_fmb", "plan_floor": True}]
+        }
+        assert engine._ev_plan_actuation_possible() is True
+
+
 class TestNordpoolPriceFetch:
     """Tests for Nordpool price fetch fix (executor-performance-fixes)."""
 
