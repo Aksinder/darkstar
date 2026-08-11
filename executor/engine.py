@@ -294,6 +294,13 @@ class ExecutorEngine:
             self.status.enabled = self.config.enabled
             self.status.shadow_mode = self.config.shadow_mode
             if self.dispatcher:
+                # Rebind the dispatcher's config too: load_executor_config() returns a NEW
+                # object, so a dispatcher constructed with the old one silently kept reading
+                # stale settings (export_curtailment, inverter entities, water temps...) until
+                # an add-on restart — while this reload path logged success. Rebind rather than
+                # reconstruct so runtime state (dwell latches, manual-ON windows, the captured
+                # C3 restore limit) survives a config save.
+                self.dispatcher.config = self.config
                 self.dispatcher.shadow_mode = self.config.shadow_mode
 
             system_cfg = self._full_config.get("system", {})
