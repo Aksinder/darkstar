@@ -1475,6 +1475,60 @@ executor:
             mock_load.assert_called_once()
             assert engine._config_mtime != initial_mtime
 
+    def test_reload_rebinds_dispatcher_config(self, tmp_path):
+        """A config save must reach the dispatcher, not just the engine.
+
+        Regression: the dispatcher was constructed once with the engine's config object;
+        reload_config() rebound engine.config to a NEW object but only propagated
+        shadow_mode, so settings the dispatcher reads (export_curtailment, inverter
+        entities, water temps) silently kept their boot-time values until a restart —
+        while the save path logged "Executor configuration reloaded".
+        """
+        import time
+
+        config_path = tmp_path / "config.yaml"
+        secrets_path = tmp_path / "secrets.yaml"
+        config_content = """
+system:
+  timezone: "Europe/Stockholm"
+executor:
+  enabled: true
+  shadow_mode: false
+  interval_seconds: 60
+  export_curtailment:
+    enabled: true
+    method: "switch"
+    threshold_sek_per_kwh: 0.0
+"""
+        config_path.write_text(config_content)
+        secrets_path.write_text("home_assistant:\n  url: http://test\n  token: test_token\n")
+
+        engine = ExecutorEngine(str(config_path), str(secrets_path))
+        engine.reload_config()
+
+        # Stand in for the dispatcher built at HA-client init, carrying runtime state.
+        dispatcher = MagicMock()
+        dispatcher.config = engine.config
+        dispatcher._last_water_switch_ts = {"switch.vvb": 123.0}
+        engine.dispatcher = dispatcher
+        boot_config = engine.config
+        assert boot_config.export_curtailment.threshold_sek_per_kwh == 0.0
+
+        time.sleep(0.1)
+        config_path.write_text(
+            config_content.replace("threshold_sek_per_kwh: 0.0", "threshold_sek_per_kwh: -0.25")
+        )
+        engine.reload_config()
+
+        # Engine picked up the new value...
+        assert engine.config is not boot_config
+        assert engine.config.export_curtailment.threshold_sek_per_kwh == -0.25
+        # ...and so did the dispatcher (this is what regressed).
+        assert dispatcher.config is engine.config
+        assert dispatcher.config.export_curtailment.threshold_sek_per_kwh == -0.25
+        # Rebound, not reconstructed: runtime state survives the save.
+        assert dispatcher._last_water_switch_ts == {"switch.vvb": 123.0}
+
 
 class TestNordpoolPriceFetch:
     """Tests for Nordpool price fetch fix (executor-performance-fixes)."""
