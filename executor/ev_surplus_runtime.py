@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .ev_surplus import (
     ChargerState,
@@ -53,6 +55,16 @@ class EVSurplusChargerCfg:
     soc_entity: str | None = None  # current SoC (input_number.fmb_soc / sensor.*_battery_level)
     target_soc_entity: str | None = None  # user-settable target % (input_number); None => no cap
     departure_entity: str | None = None  # input_datetime (date+time) -> 'timestamp' attr (epoch)
+    # The guarantee band's upper SoC (what the deadline floor charges toward). Plain config
+    # value per owner decision — the current SoC comes from soc_entity, the comfort cap from
+    # target_soc_entity; this is the third, distinct number. None => floor uses the cap (legacy).
+    floor_soc: float | None = None
+    # Recurring deadline (e.g. the commuter car's weekday 07:30): days as lowercase
+    # three-letter names, local wall-clock time "HH:MM" in `timezone`. Effective deadline =
+    # earliest(future departure_entity timestamp, next recurring occurrence) — the
+    # input_datetime stays as a one-off override (an extra trip), the recurrence never rots.
+    recurring_deadline_days: tuple[str, ...] = ()
+    recurring_deadline_time: str | None = None
     capacity_kwh: float = 0.0  # usable battery capacity (sizes the deadline floor); 0 => no floor
     charge_efficiency: float = 0.9  # plug->battery efficiency for the deadline floor
     # When vacation is active (see EVSurplusRuntimeConfig.vacation_entity) the target switches to
@@ -88,6 +100,15 @@ class EVSurplusRuntimeConfig:
     price_entity: str | None = None
     remaining_solar_entity: str | None = None  # optional; absent => battery-assist tier inert
     vacation_entity: str | None = None  # input_boolean.vacation_mode; flips per-charger vacation targets
+    # Manual fleet priority (owner-adjustable): an input_select whose selected option maps,
+    # via priority_orders, to an explicit charger ordering for the SURPLUS class only —
+    # floors (deadline/plan) always outrank, so the selector distributes comfort, not need.
+    # Missing/unknown option (or unreadable entity) => configured per-charger priorities.
+    priority_entity: str | None = None  # e.g. input_select.darkstar_ev_priority
+    priority_orders: dict[str, list[str]] = field(default_factory=dict)
+    # Local timezone for recurring deadlines (wall-clock "07:30" must survive DST — the
+    # naive-datetime trap class; never compare naive local against epoch).
+    timezone: str = "Europe/Stockholm"
     policy: EVSurplusConfig = field(default_factory=EVSurplusConfig)
     guard: WriteGuardConfig = field(default_factory=WriteGuardConfig)
     chargers: list[EVSurplusChargerCfg] = field(default_factory=lambda: [])
@@ -102,8 +123,72 @@ def _f(v: Any) -> float | None:
         return None
 
 
-def parse_ev_surplus_config(executor_data: dict[str, Any]) -> EVSurplusRuntimeConfig | None:
-    """Build the runtime config from ``executor.ev_surplus``; None if absent."""
+_DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _hhmm(v: Any) -> str | None:
+    """Coerce a config time to "HH:MM"; YAML 1.1 parses unquoted 7:30 as int 450."""
+    if isinstance(v, int):
+        return f"{v // 60:02d}:{v % 60:02d}" if 0 <= v <= 1439 else None
+    return str(v or "") or None
+
+
+def next_recurring_deadline_ts(
+    days: tuple[str, ...], time_str: str | None, now_ts: float, tz_name: str
+) -> float | None:
+    """Epoch of the next occurrence of a recurring local wall-clock deadline, else None.
+
+    ``days`` are lowercase three-letter names; ``time_str`` is local "HH:MM". All wall-clock
+    math runs in the configured IANA timezone and only the final result is converted to epoch
+    — the container runs LOCAL time and naive/epoch mixups are this repo's recurring bug
+    class (see the tz-trap incidents), so no naive datetime ever leaves this function.
+    Invalid day names are ignored; no valid day or time => None (feature off).
+    """
+    if not days or not time_str:
+        return None
+    # YAML 1.1 sexagesimal defense (mirrors the planner's calculate_ev_deadline): an
+    # unquoted `recurring_deadline_time: 7:30` parses as int 450 (minutes since midnight).
+    if isinstance(time_str, int):
+        if 0 <= time_str <= 1439:
+            time_str = f"{time_str // 60:02d}:{time_str % 60:02d}"
+        else:
+            logger.warning("EV surplus: invalid recurring_deadline_time integer %r", time_str)
+            return None
+    try:
+        hour, minute = (int(p) for p in time_str.split(":"))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        logger.warning("EV surplus: invalid recurring_deadline_time %r", time_str)
+        return None
+    wanted = {d for d in days if d in _DAY_NAMES}
+    if not wanted:
+        logger.warning("EV surplus: no valid recurring_deadline_days in %r", days)
+        return None
+    try:
+        tz = ZoneInfo(tz_name)
+    except (KeyError, ZoneInfoNotFoundError):
+        logger.warning("EV surplus: unknown timezone %r, using Europe/Stockholm", tz_name)
+        tz = ZoneInfo("Europe/Stockholm")
+    now_local = datetime.fromtimestamp(now_ts, tz)
+    for day_offset in range(8):  # today + 7 covers every weekday pattern
+        cand = (now_local + timedelta(days=day_offset)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if _DAY_NAMES[cand.weekday()] in wanted and cand.timestamp() > now_ts:
+            return cand.timestamp()
+    return None  # unreachable with a valid day set; defensive
+
+
+def parse_ev_surplus_config(
+    executor_data: dict[str, Any], timezone: str | None = None
+) -> EVSurplusRuntimeConfig | None:
+    """Build the runtime config from ``executor.ev_surplus``; None if absent.
+
+    ``timezone`` is the RESOLVED site timezone (root-level config key) — the caller must
+    pass it; ``executor.timezone`` does not exist in the schema, so reading it here would
+    silently pin recurring deadlines to the Stockholm fallback on every non-SE site.
+    """
     raw_any = executor_data.get("ev_surplus")
     if not isinstance(raw_any, dict):
         return None
@@ -167,6 +252,12 @@ def parse_ev_surplus_config(executor_data: dict[str, Any]) -> EVSurplusRuntimeCo
                 soc_entity=c.get("soc_entity") or None,
                 target_soc_entity=c.get("target_soc_entity") or None,
                 departure_entity=c.get("departure_entity") or None,
+                floor_soc=_f(c.get("floor_soc")),
+                recurring_deadline_days=tuple(
+                    str(d).lower()[:3]
+                    for d in cast("list[Any]", c.get("recurring_deadline_days", []) or [])
+                ),
+                recurring_deadline_time=_hhmm(c.get("recurring_deadline_time")),
                 capacity_kwh=float(c.get("capacity_kwh", 0.0)),
                 charge_efficiency=float(c.get("charge_efficiency", 0.9)),
                 vacation_target_soc=_f(c.get("vacation_target_soc")),
@@ -199,6 +290,15 @@ def parse_ev_surplus_config(executor_data: dict[str, Any]) -> EVSurplusRuntimeCo
         price_entity=raw.get("price_entity") or None,
         remaining_solar_entity=raw.get("remaining_solar_entity") or None,
         vacation_entity=raw.get("vacation_entity") or None,
+        priority_entity=raw.get("priority_entity") or None,
+        priority_orders={
+            str(k).lower(): [str(cid) for cid in cast("list[Any]", v)]
+            for k, v in cast(
+                "dict[str, Any]", raw.get("priority_orders", {}) or {}
+            ).items()
+            if isinstance(v, list)
+        },
+        timezone=str(timezone or executor_data.get("timezone") or "Europe/Stockholm"),
         policy=policy,
         guard=guard,
         chargers=chargers,
@@ -266,6 +366,20 @@ class EVSurplusController:
         val = str(v).lower() if v else "auto"
         return val if val in ("auto", "force_on", "force_off") else "auto"
 
+    async def _read_priority_order(self, ha: Any) -> list[str] | None:
+        """Resolve the manual priority selector to a charger ordering, else None.
+
+        None (no entity, unreadable, or an option without a priority_orders mapping —
+        including "auto") => configured per-charger priorities. Unknown options degrade
+        safely the same way, so a renamed/removed helper can never strand the fleet.
+        """
+        if not self.cfg.priority_entity or not self.cfg.priority_orders:
+            return None
+        v = await ha.get_state_value(self.cfg.priority_entity)
+        if not v:
+            return None
+        return self.cfg.priority_orders.get(str(v).lower())
+
     async def _read_charger(
         self, ha: Any, c: EVSurplusChargerCfg, now_ts: float, vacation: bool
     ) -> ChargerState:
@@ -290,18 +404,29 @@ class EVSurplusController:
         soc = cast("float | None", res[4])
         target = cast("float | None", res[5])
         dep_ts = cast("float | None", res[6])
+        # Effective deadline = earliest of the one-off departure entity (if in the future)
+        # and the recurring weekday deadline. The entity is a per-trip override that can rot
+        # (a past date is simply inert); the recurrence never does.
+        candidates: list[float] = []
+        if dep_ts is not None and dep_ts > now_ts:
+            candidates.append(dep_ts)
+        rec_ts = next_recurring_deadline_ts(
+            c.recurring_deadline_days, c.recurring_deadline_time, now_ts, self.cfg.timezone
+        )
+        if rec_ts is not None:
+            candidates.append(rec_ts)
         deadline_hours: float | None = None
-        if dep_ts is not None:
-            dh = (dep_ts - now_ts) / 3600.0
-            if dh > 0.0:
-                deadline_hours = dh
-        # Vacation overrides the target (e.g. FMB -> 15%); a charger without a vacation target is
-        # unaffected. ``soc`` / ``target`` of None disable the cap and deadline floor entirely.
-        # A vacation-targeted charger is solar-only: clear any departure deadline so it is never
-        # grid-forced toward the (low) vacation target.
-        if vacation and c.vacation_target_soc is not None:
-            target = c.vacation_target_soc
+        if candidates:
+            deadline_hours = (min(candidates) - now_ts) / 3600.0
+        # Vacation = solar-only for EVERY charger: clear any deadline unconditionally so no
+        # car is grid-forced while the household is away (a weekday recurrence would otherwise
+        # keep force-charging the commuter car all vacation). The target override additionally
+        # applies only where a vacation_target_soc is configured (e.g. FMB -> 15%);
+        # ``soc`` / ``target`` of None disable the cap and deadline floor entirely.
+        if vacation:
             deadline_hours = None
+            if c.vacation_target_soc is not None:
+                target = c.vacation_target_soc
         # Commanded state: _last_a is authoritative for controllable chargers (every
         # actuated stop zeroes it — see _actuate), the switch memory for binary ones.
         # None (never actuated this process) => the pure layer infers from power.
@@ -318,7 +443,8 @@ class EVSurplusController:
             current_power_w=power or 0.0, max_current_a=c.max_current_a,
             min_current_a=c.min_current_a, phases=c.phases, voltage_v=c.voltage_v,
             controllable=c.controllable, priority=c.priority, override=override,
-            soc_percent=soc, target_soc_percent=target, capacity_kwh=c.capacity_kwh,
+            soc_percent=soc, target_soc_percent=target, floor_soc_percent=c.floor_soc,
+            capacity_kwh=c.capacity_kwh,
             deadline_hours=deadline_hours, charge_efficiency=c.charge_efficiency,
             commanded_on=commanded_on, start_inhibited=start_inhibited,
         )
@@ -340,6 +466,7 @@ class EVSurplusController:
             self._read_f(ha, cfg.price_entity, 999.0),
             self._read_f(ha, cfg.remaining_solar_entity, 0.0),
             self._read_on(ha, cfg.vacation_entity, ("on", "true"), False),
+            self._read_priority_order(ha),
         )
         # The grid + battery meters ARE the control signal — computing with a fake 0
         # for either would command the cars blind (e.g. full-throttle into an outage).
@@ -359,11 +486,23 @@ class EVSurplusController:
         price = src[4] if src[4] is not None else 999.0
         remaining_solar = src[5] or 0.0
         vacation = bool(src[6])
+        priority_order = cast("list[str] | None", src[7])
         states: list[ChargerState] = list(
             await asyncio.gather(
                 *(self._read_charger(ha, c, now_ts, vacation) for c in cfg.chargers)
             )
         )
+        # Manual fleet priority: remap ChargerState.priority from the selected ordering.
+        # Floors are untouched by design — in the pure sort, floor class + deadline urgency
+        # rank BEFORE priority, so the selector only redistributes the surplus class.
+        # Unlisted chargers keep their configured priority pushed behind every listed one.
+        if priority_order:
+            rank = {cid: i for i, cid in enumerate(priority_order)}
+            n = len(priority_order)
+            for s in states:
+                # max(0, ...) keeps the "unlisted goes behind every listed" invariant even
+                # for a (legal) negative configured priority.
+                s.priority = rank.get(s.id, n + max(0, s.priority))
 
         inputs = EVSurplusInputs(
             pv_w=pv_w, grid_w=grid_w, battery_w=battery_w, battery_soc_percent=soc,

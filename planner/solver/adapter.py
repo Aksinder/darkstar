@@ -240,8 +240,11 @@ def build_ev_charger_inputs(
             plugged_in = False
         deadline = state.get("deadline")  # datetime | None
 
-        # Build incentive buckets from penalty_levels config
-        penalty_levels: list[dict[str, Any]] = ev.get("penalty_levels", [])
+        # Build incentive buckets from penalty_levels config. `or []` (not a .get default):
+        # the key may be PRESENT with None — user YAML `penalty_levels:` parses to None, and
+        # the vacation strip passes an explicit empty — and .get's default only applies when
+        # the key is absent entirely.
+        penalty_levels: list[dict[str, Any]] = ev.get("penalty_levels") or []
         buckets: list[IncentiveBucket] = [
             IncentiveBucket(
                 threshold_soc=float(p.get("max_soc", 100.0)),

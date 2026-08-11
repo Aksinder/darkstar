@@ -131,7 +131,12 @@ def _calculate_excess_pv_flags(
     return flags
 
 
-def calculate_ev_deadline(departure_time: str, now: datetime, timezone: str) -> datetime | None:
+def calculate_ev_deadline(
+    departure_time: str,
+    now: datetime,
+    timezone: str,
+    allowed_days: list[str] | None = None,
+) -> datetime | None:
     """
     Calculate the next occurrence of departure time from current time.
 
@@ -141,6 +146,12 @@ def calculate_ev_deadline(departure_time: str, now: datetime, timezone: str) -> 
         departure_time: Time string in "HH:MM" format (24-hour)
         now: Current datetime (timezone-aware)
         timezone: IANA timezone name (e.g., "Europe/Stockholm")
+        allowed_days: Optional weekday filter (lowercase three-letter names, e.g.
+            ["mon","tue","wed","thu","fri"]) — the deadline rolls forward to the next
+            allowed day. Shares the weekday vocabulary with the servo's
+            recurring_deadline_days so plan floors and servo floors agree on which
+            mornings exist (a Friday-evening plan must not fill for Saturday 07:30).
+            None/empty (or no valid names) => daily, the legacy behaviour.
 
     Returns:
         Timezone-aware datetime of the next deadline, or None if departure_time is invalid/empty
@@ -149,6 +160,7 @@ def calculate_ev_deadline(departure_time: str, now: datetime, timezone: str) -> 
         - now=15:00, departure="07:00" -> tomorrow 07:00 (next day)
         - now=06:00, departure="07:00" -> today 07:00 (1 hour from now)
         - now=09:00, departure="07:00" -> tomorrow 07:00 (next day, for following day)
+        - now=Fri 09:00, departure="07:30", allowed mon-fri -> Monday 07:30
     """
     if not departure_time:
         return None
@@ -182,20 +194,38 @@ def calculate_ev_deadline(departure_time: str, now: datetime, timezone: str) -> 
     if now.tzinfo is None:
         now = tz.localize(now)
 
-    # Create deadline for today
-    today_deadline = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    # Optional weekday filter (shared vocabulary with the servo's recurring_deadline_days).
+    # A wholly-invalid non-empty list disables the deadline (None) — SAME degradation as the
+    # servo's next_recurring_deadline_ts, so a config typo can never make the two layers
+    # disagree (planner filling weekend mornings the servo would never floor).
+    _day_names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    wanted = {
+        str(d).lower()[:3] for d in (allowed_days or []) if str(d).lower()[:3] in _day_names
+    }
+    if allowed_days and not wanted:
+        logger.warning(f"No valid departure_days in {allowed_days!r} - deadline disabled")
+        return None
 
-    # If today's deadline has passed, use tomorrow
-    if today_deadline <= now:
-        from datetime import timedelta
+    # Walk forward in NAIVE local wall-clock space and localize each candidate. Arithmetic
+    # on a pytz-aware datetime keeps the offset that was valid at `now` — a candidate on the
+    # far side of a DST transition then lands an hour off true local (verified: a Friday
+    # 20:00 CET plan put the Monday-07:30 deadline at 08:30 local). tz.localize on the
+    # candidate's own date assigns the offset valid THAT day, preserving the wall clock.
+    from datetime import timedelta
 
-        deadline = today_deadline + timedelta(days=1)
-        logger.debug(f"EV deadline: {departure_time} has passed today, using tomorrow: {deadline}")
-    else:
-        deadline = today_deadline
-        logger.debug(f"EV deadline: {departure_time} is today: {deadline}")
-
-    return deadline
+    base_naive = now.astimezone(tz).replace(tzinfo=None)
+    for day_offset in range(8):  # today + 7 covers every weekday pattern
+        cand_naive = (base_naive + timedelta(days=day_offset)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        cand = tz.localize(cand_naive)  # tz is always pytz here (incl. the UTC fallback)
+        if cand <= now:
+            continue
+        if wanted and _day_names[cand.weekday()] not in wanted:
+            continue
+        logger.debug(f"EV deadline: {departure_time} -> {cand}")
+        return cand
+    return None  # unreachable with a valid day set; defensive
 
 
 class PlannerPipeline:
@@ -746,6 +776,20 @@ class PlannerPipeline:
             kepler_config.max_charge_power_kw = 0.0
             kepler_config.max_discharge_power_kw = 0.0
 
+        # Vacation source of truth (hoisted above the EV build — both EVs and water need it):
+        # when the HA boolean is WIRED it is authoritative in BOTH directions — turning it
+        # off at home ends vacation even if the config flag was left true (a stale config
+        # flag once suppressed all comfort heating for half a day after homecoming). The
+        # config flag only matters when no entity is configured.
+        vacation_cfg = water_cfg.get("vacation_mode", {})
+        vacation_enabled = vacation_cfg.get("enabled", False)
+        ha_vacation = bool(initial_state.get("vacation_mode", False))
+        _input_sensors_cfg = cast("dict[str, Any]", active_config.get("input_sensors") or {})
+        vacation_entity_wired = bool(str(_input_sensors_cfg.get("vacation_mode") or "").strip())
+        vacation_enabled = resolve_vacation_enabled(
+            vacation_enabled, ha_vacation, vacation_entity_wired
+        )
+
         # Per-device EV state: build EVChargerInput list for Kepler
         has_ev_charger = system_cfg.get("has_ev_charger", False)
         if has_ev_charger:
@@ -769,11 +813,12 @@ class PlannerPipeline:
                 )
                 departure_time = ev_cfg_item.get("departure_time", "")
                 deadline = None
-                if departure_time and ha_state.get("plugged_in", False):
+                if departure_time and ha_state.get("plugged_in", False) and not vacation_enabled:
                     deadline = calculate_ev_deadline(
                         departure_time,
                         now_slot.to_pydatetime(),
                         timezone_name,
+                        allowed_days=ev_cfg_item.get("departure_days"),
                     )
                     if deadline:
                         logger.info(
@@ -795,32 +840,37 @@ class PlannerPipeline:
                     ev_state_for_solver(ha_state, charger_id, deadline)
                 )
 
-            # Rebuild kepler_config with per-device EV charger inputs
+            # Rebuild kepler_config with per-device EV charger inputs.
+            # Vacation gate: an away household must not have EV energy PLANNED — the servo
+            # clears its deadlines/targets on vacation, so planned charging would diverge
+            # from execution for the whole trip (nightly phantom-failure territory). Strip
+            # the per-SoC incentives (=> zero planned EV energy); plugged/at_home state is
+            # untouched, so any_ev_charging still reflects reality if a car charges anyway.
             from planner.solver.adapter import build_ev_charger_inputs
 
+            # Strip with an EMPTY LIST, never None: dict.get's default only applies when
+            # the key is absent, so an explicit None would flow into the adapter's bucket
+            # comprehension and TypeError every planner run for the whole vacation.
+            solver_ev_cfg = (
+                [{**e, "penalty_levels": []} for e in ev_chargers_cfg]
+                if vacation_enabled
+                else ev_chargers_cfg
+            )
+            if vacation_enabled and ev_chargers_cfg:
+                logger.info(
+                    "Vacation mode: EV charging incentives stripped for %d charger(s)",
+                    len(ev_chargers_cfg),
+                )
             kepler_config.ev_chargers = build_ev_charger_inputs(
-                ev_chargers_cfg,
+                solver_ev_cfg,
                 ev_charger_states_with_deadline,
                 load_priority_cfg=active_config.get("load_priority"),
             )
 
             # Rev K19: Vacation Mode Anti-Legionella
-        vacation_cfg = water_cfg.get("vacation_mode", {})
-        vacation_enabled = vacation_cfg.get("enabled", False)
+            # (vacation_enabled resolved above, before the EV build — one source of truth)
         schedule_anti_legionella = False
         sqlite_path: str = ""
-
-        # Vacation source of truth: when the HA boolean is WIRED it is authoritative in
-        # BOTH directions — turning it off at home ends vacation even if the config flag
-        # was left true (a stale config flag once suppressed all comfort heating for
-        # half a day after homecoming). The config flag only matters when no entity is
-        # configured.
-        ha_vacation = bool(initial_state.get("vacation_mode", False))
-        _input_sensors_cfg = cast("dict[str, Any]", active_config.get("input_sensors") or {})
-        vacation_entity_wired = bool(str(_input_sensors_cfg.get("vacation_mode") or "").strip())
-        vacation_enabled = resolve_vacation_enabled(
-            vacation_enabled, ha_vacation, vacation_entity_wired
-        )
 
         if vacation_enabled:
             # Partition by exclude_from_vacation (Fas 0): flagged tanks (e.g. a rented-out
