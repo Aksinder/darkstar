@@ -54,6 +54,10 @@ class EVSurplusChargerCfg:
     # --- Departure / target-SoC awareness (all optional) ---
     soc_entity: str | None = None  # current SoC (input_number.fmb_soc / sensor.*_battery_level)
     target_soc_entity: str | None = None  # user-settable target % (input_number); None => no cap
+    # Config-constant comfort cap, used when no target_soc_entity is wired (owner decision:
+    # the FMB's 150 km cap is a plain config value, not another helper). An entity, when
+    # configured AND readable, wins; this is the fallback. None + no entity => no cap.
+    target_soc: float | None = None
     departure_entity: str | None = None  # input_datetime (date+time) -> 'timestamp' attr (epoch)
     # The guarantee band's upper SoC (what the deadline floor charges toward). Plain config
     # value per owner decision — the current SoC comes from soc_entity, the comfort cap from
@@ -251,6 +255,7 @@ def parse_ev_surplus_config(
                 voltage_v=float(c.get("voltage_v", 230.0)),
                 soc_entity=c.get("soc_entity") or None,
                 target_soc_entity=c.get("target_soc_entity") or None,
+                target_soc=_f(c.get("target_soc")),
                 departure_entity=c.get("departure_entity") or None,
                 floor_soc=_f(c.get("floor_soc")),
                 recurring_deadline_days=tuple(
@@ -403,6 +408,8 @@ class EVSurplusController:
         override = str(res[3])
         soc = cast("float | None", res[4])
         target = cast("float | None", res[5])
+        if target is None:
+            target = c.target_soc  # config-constant cap when no entity is wired/readable
         dep_ts = cast("float | None", res[6])
         # Effective deadline = earliest of the one-off departure entity (if in the future)
         # and the recurring weekday deadline. The entity is a per-trip override that can rot

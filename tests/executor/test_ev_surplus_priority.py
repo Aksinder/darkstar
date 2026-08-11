@@ -329,3 +329,35 @@ class TestRuntimeIntegration:
         summary = await ctl.run(ha, now_ts=_ts(2026, 8, 12, 12, 0), shadow=True)
         cmds = {c["id"]: c for c in summary.get("applied", [])}
         assert cmds["easee_fmb"]["on"] is True  # configured prio 0 wins again
+
+
+class TestConfigConstantCap:
+    """target_soc: the FMB's 150 km comfort cap as a plain config value (owner decision —
+    no extra helper). An entity, when wired and readable, wins; config is the fallback."""
+
+    @pytest.mark.asyncio
+    async def test_config_cap_used_without_entity(self):
+        raw = _cfg_dict()
+        for c in raw["ev_surplus"]["chargers"]:
+            if c["id"] == "easee_fmb":
+                c["target_soc"] = 86
+        cfg = parse_ev_surplus_config(raw)
+        ctl = EVSurplusController(cfg)
+        fmb_cfg = next(c for c in cfg.chargers if c.id == "easee_fmb")
+        st = await ctl._read_charger(FakeHA(_states()), fmb_cfg, _ts(2026, 8, 12, 5, 0), False)
+        assert st.target_soc_percent == 86.0
+
+    @pytest.mark.asyncio
+    async def test_entity_wins_over_config(self):
+        raw = _cfg_dict()
+        for c in raw["ev_surplus"]["chargers"]:
+            if c["id"] == "easee_fmb":
+                c["target_soc"] = 86
+                c["target_soc_entity"] = "input_number.cap"
+        cfg = parse_ev_surplus_config(raw)
+        ctl = EVSurplusController(cfg)
+        fmb_cfg = next(c for c in cfg.chargers if c.id == "easee_fmb")
+        st = await ctl._read_charger(
+            FakeHA(_states(**{"input_number.cap": "70"})), fmb_cfg, _ts(2026, 8, 12, 5, 0), False
+        )
+        assert st.target_soc_percent == 70.0
