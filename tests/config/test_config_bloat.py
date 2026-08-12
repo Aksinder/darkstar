@@ -89,3 +89,31 @@ def test_user_values_win_and_template_comments_survive_once():
     out = _dump(yaml, template)
     assert "Europe/Helsinki" in out
     assert out.count("EXACTLY ONCE") == 1
+
+
+def test_atomic_write_through_symlink_updates_the_target(tmp_path):
+    """Regression: the add-on's config.yaml is a SYMLINK (/app/config.yaml ->
+    /config/darkstar/config.yaml). os.replace on the link path replaces the LINK
+    with the temp file — content lands in an ephemeral local file, the real
+    (bind-mounted) config is never written, and every save is lost at restart
+    while reporting success. _write_config must resolve the link first."""
+    from ruamel.yaml import YAML
+
+    from backend.config_migration import _write_config
+
+    real = tmp_path / "mounted" / "config.yaml"
+    real.parent.mkdir()
+    real.write_text("system:\n  timezone: 'Europe/Stockholm'\nmarker: old\n")
+    link = tmp_path / "app" / "config.yaml"
+    link.parent.mkdir()
+    link.symlink_to(real)
+
+    yaml = YAML()
+    new_cfg = yaml.load("system:\n  timezone: 'Europe/Stockholm'\nmarker: new\n")
+
+    assert _write_config(link, new_cfg, yaml, strict_validation=False) is True
+
+    # The REAL file got the new content...
+    assert "marker: new" in real.read_text()
+    # ...and reading via the link agrees (link still points at the real file).
+    assert "marker: new" in link.read_text()
