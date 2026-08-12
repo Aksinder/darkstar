@@ -977,6 +977,17 @@ def _write_config(
         logger.error(f"❌ Aborting write to {path} - validation failed.")
         return False
 
+    # Resolve symlinks FIRST. The add-on runs with cwd /app where run.sh symlinks
+    # config.yaml -> /config/darkstar/config.yaml; os.replace on the symlink path
+    # REPLACES THE LINK ITSELF with the temp file, so the new content lands in an
+    # ephemeral container-local file while the bind-mounted real config is never
+    # touched — the write "succeeds", verification passes (it reads the new local
+    # file), and every save since is silently lost at the next restart. The legacy
+    # open("w") wrote THROUGH the link, which is why this only broke with the
+    # atomic writer. Resolving makes the temp sibling + rename happen inside the
+    # bind-mount directory, atomically, against the real file.
+    path = Path(path).resolve()
+
     temp_path = path.with_name(path.name + ".tmp")
     legacy_backup_path = path.with_name(path.name + ".bak")
     log_prefix = "[CONTAINER]" if Path("/.dockerenv").exists() else "[HOST]"
