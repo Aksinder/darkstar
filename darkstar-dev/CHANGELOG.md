@@ -1,3 +1,7 @@
+## dev-20260812.1339 — 2026-08-12 13:41
+
+- feat(ev): comfort demotion — "FMB till 150 km, sedan Teslan, sedan FMB mer"
+
 ## dev-20260812.0638 — 2026-08-12 06:40
 
 - fix(config): stop comment-token duplication in template merge (config bloat)
