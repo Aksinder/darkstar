@@ -1706,24 +1706,7 @@ class ExecutorEngine:
                         except Exception as defer_exc:
                             logger.warning("Deferrable appliance controller error: %s", defer_exc)
 
-                    # Fuse guard (25 A/phase): the battery is the guard's only non-EV
-                    # shed lever — planner grid-charging (9.5 kW ≈ 13.8 A on every
-                    # phase) stacked on the 1-phase VVB block can exceed the fuse with
-                    # zero cars to clamp. Cap the commanded max-charge to the measured
-                    # per-phase headroom (W control-unit only; the servo owns the
-                    # phase readings). None => guard off; stale sensors => cap 0.
-                    if (
-                        self._ev_surplus is not None
-                        and self.config.inverter.control_unit == "W"
-                    ):
-                        _fuse_cap = self._ev_surplus.fuse_battery_cap_w(time.time())
-                        if _fuse_cap is not None and decision.max_charge > _fuse_cap:
-                            logger.info(
-                                "Fuse guard: capping battery max_charge %.0f -> %.0f W",
-                                decision.max_charge,
-                                _fuse_cap,
-                            )
-                            decision.max_charge = _fuse_cap
+                    self._apply_fuse_battery_cap(decision)
 
                     # Fix Issue 0: Await expected coroutine properly
                     profile_results = await self.dispatcher.execute(decision)
@@ -2374,6 +2357,43 @@ class ExecutorEngine:
 
         except Exception as e:
             logger.debug("Battery cost update skipped: %s", e)
+
+    def _apply_fuse_battery_cap(self, decision: Any) -> None:
+        """Fuse guard (25 A/phase): cap the battery's commanded charge power.
+
+        The battery is the guard's only non-EV shed lever — planner grid-charging
+        (9.5 kW ≈ 13.8 A on every phase) stacked on the 1-phase VVB block can exceed
+        the fuse with zero cars to clamp. BOTH fields must be capped: the sungrow
+        'charge' mode renders {{charge_value}} into forced_charge_discharge_power AND
+        max_charge_power, while {{max_charge}} only reaches self_consumption/idle —
+        capping max_charge alone was a no-op in exactly the motivating scenario
+        (review-caught, critical). W control-unit only; the servo owns the phase
+        readings. None => guard off; blind/stale sensors => cap 0. Rounded to 100 W
+        so the 10 s meter jitter doesn't defeat the dispatcher's write dedup.
+        """
+        if self._ev_surplus is None:
+            return
+        unit = (
+            self.profile.behavior.control_unit
+            if self.profile
+            else self.config.inverter.control_unit
+        )
+        if unit != "W":
+            return
+        cap = self._ev_surplus.fuse_battery_cap_w(time.time())
+        if cap is None:
+            return
+        cap = round(cap / 100.0) * 100.0
+        for field_name in ("charge_value", "max_charge"):
+            val = getattr(decision, field_name, None)
+            if isinstance(val, int | float) and val > cap:
+                logger.info(
+                    "Fuse guard: capping battery %s %.0f -> %.0f W",
+                    field_name,
+                    val,
+                    cap,
+                )
+                setattr(decision, field_name, cap)
 
     def _ev_plan_actuation_possible(self) -> bool:
         """True when at least one charger can actually execute a planned EV slot.

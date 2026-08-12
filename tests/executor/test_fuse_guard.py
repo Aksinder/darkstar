@@ -25,8 +25,11 @@ BUDGET = EVSurplusConfig(enabled=True, fuse_budget_a=23.0)
 
 
 def _inputs(chargers, phases, surplus_w=20000.0):
+    """Surplus delivered via battery absorption (grid ~0) so the |A| readings stay
+    physically coherent with the signed grid — the export credit is exercised only
+    by tests that set grid_w negative explicitly WITH matching readings."""
     return EVSurplusInputs(
-        pv_w=surplus_w, grid_w=-surplus_w, battery_w=0.0, battery_soc_percent=95.0,
+        pv_w=surplus_w, grid_w=0.0, battery_w=surplus_w, battery_soc_percent=95.0,
         import_price_sek=1.0, remaining_solar_kwh=0.0,
         phase_currents_a=phases, chargers=chargers,
     )
@@ -127,10 +130,29 @@ class TestBatteryShed:
     def test_blind_sensors_mean_zero(self):
         assert fuse_battery_charge_cap_w({}, 5000.0, 23.0) == 0.0
 
-    def test_export_magnitude_counts(self):
-        """|A| is direction-blind: heavy export also loads the fuse."""
-        cap = fuse_battery_charge_cap_w({"a": 24.0, "b": 5.0, "c": 5.0}, 0.0, 23.0)
-        assert cap == 0.0
+    def test_import_overload_still_sheds(self):
+        """Signed grid says IMPORT: an overloaded phase pulls the setpoint down."""
+        cap = fuse_battery_charge_cap_w(
+            {"a": 25.0, "b": 15.0, "c": 10.0}, 3000.0, 23.0, grid_w=5000.0
+        )
+        assert cap == pytest.approx(3000.0 - 2.0 * 3 * 230.0)
+
+    def test_export_overload_never_ratchets(self):
+        """Review-caught positive feedback: pulling charge DOWN during export raises
+        export 1:1. With the export credit the cap stays at/above present charge."""
+        cap = fuse_battery_charge_cap_w(
+            {"a": 24.0, "b": 24.0, "c": 24.0}, 2000.0, 23.0, grid_w=-16560.0
+        )
+        assert cap >= 2000.0
+
+    def test_ev_alloc_is_subtracted(self):
+        """The EV clamp and the battery cap must not double-spend one snapshot."""
+        base = fuse_battery_charge_cap_w({"a": 10.0, "b": 10.0, "c": 10.0}, 0.0, 23.0)
+        with_ev = fuse_battery_charge_cap_w(
+            {"a": 10.0, "b": 10.0, "c": 10.0}, 0.0, 23.0,
+            ev_alloc_a={"a": 8.0, "b": 8.0, "c": 8.0},
+        )
+        assert with_ev == pytest.approx(base - 8.0 * 3 * 230.0)
 
 
 class TestReliefWrites:
@@ -208,6 +230,48 @@ class FuseFakeHA:
         return True
 
 
+class TestForceOnClamp:
+    def test_force_on_is_fuse_capped(self):
+        """A manual comfort override does not outrank the main fuse."""
+        fmb = _fmb(soc_percent=50.0, deadline_hours=None, override="force_on")
+        cmds = compute_ev_surplus(
+            _inputs([fmb], {"a": 24.5, "b": 24.5, "c": 24.5}, surplus_w=0.0), BUDGET
+        )
+        assert not cmds[0].switch_on and cmds[0].fuse_limited
+
+    def test_force_on_partially_capped_runs_reduced(self):
+        fmb = _fmb(soc_percent=50.0, deadline_hours=None, override="force_on")
+        cmds = compute_ev_surplus(
+            _inputs([fmb], {"a": 13.0, "b": 3.0, "c": 3.0}, surplus_w=0.0), BUDGET
+        )
+        cmd = cmds[0]
+        assert cmd.switch_on and cmd.fuse_limited
+        assert cmd.set_current_a == 10.0  # 23 - 13 headroom (unknown phase => min)
+
+    def test_force_on_grant_consumes_budget_for_auto_cars(self):
+        forced = _fmb(soc_percent=50.0, deadline_hours=None, override="force_on")
+        auto = _tesla(soc_percent=60.0, deadline_hours=None)
+        cmds = {c.id: c for c in compute_ev_surplus(
+            _inputs([forced, auto], {"a": 2.0, "b": 2.0, "c": 2.0}), BUDGET
+        )}
+        assert cmds["easee_fmb"].set_current_a == 16.0
+        # 23 - 2 - 16 = 5 A left: below the Tesla's cold-start threshold => OFF.
+        assert not cmds["tesla"].switch_on
+
+
+class TestExportCredit:
+    def test_ev_start_allowed_during_heavy_export(self):
+        """Direction-blind |A| deadlocked EV starts during export (review-caught):
+        an OFF car never changes the reading. The symmetric-export credit opens
+        the budget — consuming more genuinely reduces those currents."""
+        fmb = _fmb(soc_percent=50.0, deadline_hours=None)
+        inputs = _inputs([fmb], {"a": 24.0, "b": 24.0, "c": 24.0})
+        inputs.grid_w = -16560.0  # 24 A symmetric export
+        cmds = compute_ev_surplus(inputs, BUDGET)
+        assert cmds[0].switch_on
+        assert cmds[0].set_current_a == 16.0
+
+
 class TestRuntimeFuse:
     def test_parse_arms_the_pure_clamp(self):
         cfg = parse_ev_surplus_config(_fuse_cfg_dict())
@@ -265,3 +329,84 @@ class TestRuntimeFuse:
             {"ev_surplus": {"enabled": True, "chargers": [{"id": "x"}]}}
         )
         assert EVSurplusController(cfg2).fuse_battery_cap_w(1000.0) is None  # guard off
+
+
+class TestReviewFixes:
+    """Regression guards for the verified S4 review findings."""
+
+    @pytest.mark.asyncio
+    async def test_failsafe_respects_global_shadow(self):
+        """Observe-only executor must not actuate live devices even to fail safe."""
+        cfg = parse_ev_surplus_config(_fuse_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ctl._last_a["easee_fmb"] = 14.0
+        ha = FuseFakeHA(
+            {"sensor.pv": "0", "sensor.grid": "0", "sensor.batt": "0",
+             "sensor.soc": "50", "sensor.price": "1.0",
+             "sensor.easee_power": "3200", "binary_sensor.easee_plug": "on",
+             "sensor.tesla_power": "0", "binary_sensor.tesla_plug": "on",
+             "sensor.ph_a": "10", "sensor.ph_b": "10", "sensor.ph_c": "10"},
+            ages={"sensor.ph_b": 999},
+        )
+        summary = await ctl.run(ha, now_ts=ha.now.timestamp(), shadow=True)
+        assert summary.get("fuse_failsafe")
+        assert ha.calls == []  # zero service calls in global shadow
+
+    @pytest.mark.asyncio
+    async def test_phase_read_exception_is_blindness_not_crash(self):
+        """404 (renamed entity — this site's history) must reach the fail-safe."""
+        cfg = parse_ev_surplus_config(_fuse_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ctl._last_a["easee_fmb"] = 14.0
+
+        class RaisingHA(FuseFakeHA):
+            async def get_state(self, entity):
+                if entity == "sensor.ph_b":
+                    raise RuntimeError("404 Not Found")
+                return await super().get_state(entity)
+
+        ha = RaisingHA(
+            {"sensor.pv": "0", "sensor.grid": "0", "sensor.batt": "0",
+             "sensor.soc": "50", "sensor.price": "1.0",
+             "sensor.easee_power": "3200", "binary_sensor.easee_plug": "on",
+             "sensor.tesla_power": "0", "binary_sensor.tesla_plug": "on",
+             "sensor.ph_a": "10", "sensor.ph_b": "10", "sensor.ph_c": "10"},
+        )
+        summary = await ctl.run(ha, now_ts=ha.now.timestamp())
+        assert summary.get("fuse_failsafe") == "phase sensors stale"
+
+    def test_parse_rejects_orphan_fuse_guard(self):
+        """fuse_guard without servo/chargers/phase_entities would permanently zero
+        the battery cap (never-read => 0) — reject loudly at parse."""
+        raw = _fuse_cfg_dict()
+        raw["ev_surplus"]["fuse_guard"]["phase_entities"] = {}
+        cfg = parse_ev_surplus_config(raw)
+        assert cfg is not None
+        assert not cfg.fuse_guard_enabled
+        assert cfg.policy.fuse_budget_a is None
+
+    def test_parse_drops_typo_phase_map_to_conservative(self):
+        raw = _fuse_cfg_dict()
+        raw["ev_surplus"]["chargers"][1]["phase_map"] = ["l1", "l2", "l3"]
+        cfg = parse_ev_surplus_config(raw)
+        tesla = next(c for c in cfg.chargers if c.id == "tesla")
+        assert tesla.phase_map == ()  # conservative, not silently missing lookups
+
+    def test_engine_cap_hits_charge_value_too(self):
+        """The critical finding: sungrow charge mode writes {{charge_value}} into
+        BOTH battery registers — capping max_charge alone was a no-op."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from executor.engine import ExecutorEngine
+
+        eng = MagicMock(spec=ExecutorEngine)
+        eng.profile = None
+        eng.config = SimpleNamespace(
+            inverter=SimpleNamespace(control_unit="W")
+        )
+        eng._ev_surplus = SimpleNamespace(fuse_battery_cap_w=lambda _ts: 2350.0)
+        decision = SimpleNamespace(charge_value=9500.0, max_charge=9500.0)
+        ExecutorEngine._apply_fuse_battery_cap(eng, decision)
+        assert decision.charge_value == 2400.0  # capped + rounded to 100 W
+        assert decision.max_charge == 2400.0
