@@ -58,6 +58,11 @@ class EVSurplusChargerCfg:
     # the FMB's 150 km cap is a plain config value, not another helper). An entity, when
     # configured AND readable, wins; this is the fallback. None + no entity => no cap.
     target_soc: float | None = None
+    # Comfort-demotion threshold: at/above this SoC the charger yields surplus to every
+    # non-demoted charger but keeps charging on what remains, up to the cap (owner:
+    # "FMB till 150 km, sedan Teslan, sedan FMB mer"). An ACTIVE manual priority
+    # selection disables demotion — an explicit order is taken literally.
+    comfort_soc: float | None = None
     departure_entity: str | None = None  # input_datetime (date+time) -> 'timestamp' attr (epoch)
     # The guarantee band's upper SoC (what the deadline floor charges toward). Plain config
     # value per owner decision — the current SoC comes from soc_entity, the comfort cap from
@@ -256,6 +261,7 @@ def parse_ev_surplus_config(
                 soc_entity=c.get("soc_entity") or None,
                 target_soc_entity=c.get("target_soc_entity") or None,
                 target_soc=_f(c.get("target_soc")),
+                comfort_soc=_f(c.get("comfort_soc")),
                 departure_entity=c.get("departure_entity") or None,
                 floor_soc=_f(c.get("floor_soc")),
                 recurring_deadline_days=tuple(
@@ -451,6 +457,7 @@ class EVSurplusController:
             min_current_a=c.min_current_a, phases=c.phases, voltage_v=c.voltage_v,
             controllable=c.controllable, priority=c.priority, override=override,
             soc_percent=soc, target_soc_percent=target, floor_soc_percent=c.floor_soc,
+            comfort_soc_percent=c.comfort_soc,
             capacity_kwh=c.capacity_kwh,
             deadline_hours=deadline_hours, charge_efficiency=c.charge_efficiency,
             commanded_on=commanded_on, start_inhibited=start_inhibited,
@@ -503,6 +510,8 @@ class EVSurplusController:
         # Floors are untouched by design — in the pure sort, floor class + deadline urgency
         # rank BEFORE priority, so the selector only redistributes the surplus class.
         # Unlisted chargers keep their configured priority pushed behind every listed one.
+        # An explicit order also DISABLES comfort-demotion: the owner's literal choice
+        # beats the soft "yield above comfort" rule (auto keeps the smart ordering).
         if priority_order:
             rank = {cid: i for i, cid in enumerate(priority_order)}
             n = len(priority_order)
@@ -510,6 +519,7 @@ class EVSurplusController:
                 # max(0, ...) keeps the "unlisted goes behind every listed" invariant even
                 # for a (legal) negative configured priority.
                 s.priority = rank.get(s.id, n + max(0, s.priority))
+                s.comfort_soc_percent = None
 
         inputs = EVSurplusInputs(
             pv_w=pv_w, grid_w=grid_w, battery_w=battery_w, battery_soc_percent=soc,

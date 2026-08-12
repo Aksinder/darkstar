@@ -361,3 +361,103 @@ class TestConfigConstantCap:
             FakeHA(_states(**{"input_number.cap": "70"})), fmb_cfg, _ts(2026, 8, 12, 5, 0), False
         )
         assert st.target_soc_percent == 70.0
+
+
+class TestComfortDemotion:
+    """Owner order: FMB -> 150 km, then the Tesla, then FMB again toward 100.
+
+    At/above comfort_soc the charger yields the surplus class to every non-demoted
+    charger but keeps charging on what remains, up to its (now higher) cap. Floors
+    are unaffected, and an ACTIVE manual priority selection disables demotion.
+    """
+
+    def _inputs(self, fmb_soc, surplus_w=4000.0):
+        fmb = _fmb(
+            soc_percent=fmb_soc, target_soc_percent=100.0, floor_soc_percent=None,
+            comfort_soc_percent=86.0, deadline_hours=None, priority=0,
+        )
+        tesla = _tesla(
+            soc_percent=60.0, floor_soc_percent=40.0, deadline_hours=None, priority=1,
+        )
+        return EVSurplusInputs(
+            pv_w=surplus_w + 2000.0, grid_w=-surplus_w, battery_w=0.0,
+            battery_soc_percent=95.0, import_price_sek=1.0,
+            remaining_solar_kwh=0.0, chargers=[fmb, tesla],
+        )
+
+    def test_below_comfort_fmb_first(self):
+        cmds = {c.id: c for c in compute_ev_surplus(self._inputs(70.0), EVSurplusConfig(enabled=True))}
+        assert cmds["easee_fmb"].switch_on
+        assert not cmds["tesla"].switch_on  # 4 kW surplus: FMB (prio 0) takes it
+
+    def test_at_comfort_tesla_first(self):
+        """FMB at 86: demoted — the Tesla takes the surplus, FMB gets the rest (none)."""
+        cmds = {c.id: c for c in compute_ev_surplus(self._inputs(86.0), EVSurplusConfig(enabled=True))}
+        assert cmds["tesla"].switch_on
+        assert not cmds["easee_fmb"].switch_on  # leftover below FMB min-on
+
+    def test_demoted_fmb_still_charges_on_big_surplus(self):
+        """"sedan FMB mer": surplus beyond the Tesla's 11 kW max flows to the demoted FMB."""
+        cmds = {c.id: c for c in compute_ev_surplus(
+            self._inputs(90.0, surplus_w=13000.0), EVSurplusConfig(enabled=True)
+        )}
+        assert cmds["tesla"].switch_on
+        assert cmds["easee_fmb"].switch_on
+
+    def test_demoted_fmb_gets_surplus_when_tesla_is_full(self):
+        """The other "FMB mer" path: Tesla at its 90-cap => all surplus to the FMB."""
+        fmb = _fmb(
+            soc_percent=90.0, target_soc_percent=100.0, floor_soc_percent=None,
+            comfort_soc_percent=86.0, deadline_hours=None, priority=0,
+        )
+        tesla = _tesla(soc_percent=90.0, deadline_hours=None, priority=1)  # at cap
+        inputs = EVSurplusInputs(
+            pv_w=6000.0, grid_w=-4000.0, battery_w=0.0, battery_soc_percent=95.0,
+            import_price_sek=1.0, remaining_solar_kwh=0.0, chargers=[fmb, tesla],
+        )
+        cmds = {c.id: c for c in compute_ev_surplus(inputs, EVSurplusConfig(enabled=True))}
+        assert not cmds["tesla"].switch_on  # capped
+        assert cmds["easee_fmb"].switch_on
+
+    def test_floor_beats_demotion(self):
+        """A deadline floor is need, not comfort — demotion never touches it."""
+        fmb = _fmb(
+            soc_percent=30.0, floor_soc_percent=40.0, comfort_soc_percent=86.0,
+            deadline_hours=1.0, priority=0,
+        )
+        tesla = _tesla(soc_percent=60.0, deadline_hours=None, priority=1)
+        inputs = EVSurplusInputs(
+            pv_w=0.0, grid_w=0.0, battery_w=0.0, battery_soc_percent=50.0,
+            import_price_sek=1.0, remaining_solar_kwh=0.0, chargers=[fmb, tesla],
+        )
+        cmds = compute_ev_surplus(inputs, EVSurplusConfig(enabled=True))
+        assert cmds[0].id == "easee_fmb" and cmds[0].switch_on
+
+    @pytest.mark.asyncio
+    async def test_explicit_selector_order_disables_demotion(self):
+        """fmb_first is literal: FMB leads the surplus class even above comfort."""
+        raw = _cfg_dict()
+        for c in raw["ev_surplus"]["chargers"]:
+            if c["id"] == "easee_fmb":
+                c["target_soc"] = 100
+                c["comfort_soc"] = 86
+        cfg = parse_ev_surplus_config(raw)
+        ctl = EVSurplusController(cfg)
+        states = _states(**{
+            "input_select.prio": "fmb_first",
+            "sensor.pv": "5000", "sensor.grid": "-4000", "sensor.soc": "95",
+            "input_number.fmb_soc": "90",  # above comfort 86
+            "sensor.tesla_soc": "60",
+        })
+        summary = await ctl.run(FakeHA(states), now_ts=_ts(2026, 8, 12, 12, 0), shadow=True)
+        cmds = {c["id"]: c for c in summary.get("applied", [])}
+        assert cmds["easee_fmb"]["on"] is True
+        assert cmds["tesla"]["on"] is False
+
+    def test_parse_comfort_soc(self):
+        raw = _cfg_dict()
+        raw["ev_surplus"]["chargers"][0]["comfort_soc"] = 86
+        cfg = parse_ev_surplus_config(raw)
+        assert cfg is not None
+        assert cfg.chargers[0].comfort_soc == 86.0
+        assert cfg.chargers[1].comfort_soc is None

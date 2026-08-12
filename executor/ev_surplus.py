@@ -107,6 +107,11 @@ class ChargerState:
     # charge_limit (90) but its weekday-morning guarantee is only ~40. None => the deadline
     # floor falls back to target_soc_percent (legacy: one number served both roles).
     floor_soc_percent: float | None = None
+    # Comfort-demotion threshold: at/above this SoC the charger yields the SURPLUS class
+    # to every non-demoted charger (owner: "FMB till 150 km, sedan Teslan, sedan FMB mer").
+    # It keeps charging — from whatever surplus remains — up to target_soc_percent.
+    # Floors are unaffected (need outranks comfort). None => never demoted.
+    comfort_soc_percent: float | None = None
     # Usable battery capacity, to convert an SoC gap into energy. 0 => no deadline floor.
     capacity_kwh: float = 0.0
     # Hours until the departure deadline. None / <=0 => no grid-backed deadline floor (the car
@@ -418,14 +423,22 @@ def compute_ev_surplus(
     # commuter car whose 07:30 guarantee is at risk must not be starved by another car's
     # (future) plan floor or configured priority under fuse/surplus scarcity. Floors
     # without a deadline sort behind every deadline floor (urgency inf), then priority.
-    def _order_key(x: ChargerState) -> tuple[int, float, int, str]:
+    # Within the SURPLUS class, comfort-demotion ranks before priority: a car at/above
+    # its comfort_soc yields to every non-demoted car, then keeps charging on what's left.
+    def _order_key(x: ChargerState) -> tuple[int, float, int, int, str]:
         has_floor = floor_w[x.id] > 0.0
         urgency = (
             x.deadline_hours
             if has_floor and x.deadline_hours is not None
             else float("inf")
         )
-        return (0 if has_floor else 1, urgency, x.priority, x.id)
+        demoted = int(
+            not has_floor
+            and x.comfort_soc_percent is not None
+            and x.soc_percent is not None
+            and x.soc_percent >= x.comfort_soc_percent
+        )
+        return (0 if has_floor else 1, urgency, demoted, x.priority, x.id)
 
     order = sorted(chargeable, key=_order_key)
 
