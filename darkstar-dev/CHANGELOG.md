@@ -1,3 +1,7 @@
+## dev-20260812.1553 — 2026-08-12 15:55
+
+- fix(config): resolve symlinks before atomic write — saves were silently lost
+
 ## dev-20260812.1339 — 2026-08-12 13:41
 
 - feat(ev): comfort demotion — "FMB till 150 km, sedan Teslan, sedan FMB mer"
