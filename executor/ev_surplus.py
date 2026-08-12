@@ -238,11 +238,26 @@ def should_write_current(
     return (now_ts - last_write_ts) >= interval
 
 
+def _export_credit_a(grid_w: float, voltage_v: float = 230.0) -> float:
+    """Per-phase ampere credit for net EXPORT (grid_w < 0).
+
+    The |A| phase readings are direction-blind, but BOTH site inverters push
+    symmetric 3-phase, so net export contributes |grid_w|/(3V) amps per phase that
+    ADDED CONSUMPTION removes 1:1. Without this credit an export-loaded phase
+    deadlocks EV starts (an OFF car never changes the reading, so there is no
+    iteration path) and the battery cap ratchets itself to zero (reducing charge
+    RAISES export). The credit never exceeds the reading (clamped at use sites).
+    """
+    return max(0.0, -grid_w) / (3.0 * voltage_v)
+
+
 def fuse_battery_charge_cap_w(
     phase_currents_a: dict[str, float],
     battery_charge_w: float,
     budget_a: float,
     voltage_v: float = 230.0,
+    grid_w: float = 0.0,
+    ev_alloc_a: dict[str, float] | None = None,
 ) -> float:
     """Max battery charge SETPOINT (W) that keeps every phase within the fuse budget.
 
@@ -251,16 +266,51 @@ def fuse_battery_charge_cap_w(
     30+ A on the VVB phase with zero cars to clamp. The battery charges 3-phase
     SYMMETRIC, and its present grid draw is already IN the meter readings, so the cap
     is iterative: allow growth up to the measured min-phase headroom; when a phase
-    goes over budget the headroom turns negative and the setpoint is pulled below the
-    present charge level. Direction-blindness is handled by the same iteration —
-    during EXPORT, raising the charge LOWERS the meter, so the headroom re-opens on
-    the next reading. Empty readings => 0 (fail safe: no grid charging on blind
-    sensors; PV then flows to export instead, which is loss-free).
+    goes over budget on the IMPORT side the setpoint is pulled below the present
+    charge level. Export-side overloads are credited via _export_credit_a — pulling
+    the charge DOWN during export would raise export 1:1 (a positive-feedback
+    ratchet, review-caught). ``ev_alloc_a`` is the ampere increase the EV clamp
+    granted THIS tick from the same meter snapshot — without subtracting it the two
+    levers double-spend the same headroom. Empty readings => 0 (fail safe: no grid
+    charging on blind sensors; PV then flows to export instead, which is loss-free).
     """
     if not phase_currents_a:
         return 0.0
-    headroom_a = min(budget_a - abs(i) for i in phase_currents_a.values())
+    credit = _export_credit_a(grid_w, voltage_v)
+    alloc = ev_alloc_a or {}
+    headroom_a = min(
+        budget_a - max(0.0, abs(i) - credit) - alloc.get(p, 0.0)
+        for p, i in phase_currents_a.items()
+    )
     return max(0.0, max(0.0, battery_charge_w) + headroom_a * 3.0 * voltage_v)
+
+
+def _fuse_delta_allowed_a(
+    c: ChargerState,
+    inputs: EVSurplusInputs,
+    cfg: EVSurplusConfig,
+    alloc: dict[str, float],
+) -> tuple[float | None, tuple[str, ...]]:
+    """Allowed per-phase ampere INCREASE for this charger, or (None, ()) = guard off.
+
+    Blind (no/partial readings) => 0.0: hold-or-reduce only. Export-aware via
+    _export_credit_a. Shared by the force_on path and pass 2 — a manual comfort
+    override does not outrank the main fuse when a deadline guarantee does not.
+    """
+    if cfg.fuse_budget_a is None:
+        return None, ()
+    phases = c.phase_map or tuple(sorted(inputs.phase_currents_a.keys()))
+    if not inputs.phase_currents_a or any(
+        p not in inputs.phase_currents_a for p in phases
+    ):
+        return 0.0, phases
+    credit = _export_credit_a(inputs.grid_w, c.voltage_v)
+    return min(
+        cfg.fuse_budget_a
+        - max(0.0, inputs.phase_currents_a[p] - credit)
+        - alloc.get(p, 0.0)
+        for p in phases
+    ), phases
 
 
 def _charger_max_w(c: ChargerState) -> float:
@@ -395,11 +445,46 @@ def compute_ev_surplus(
             ChargerCommand(c.id, switch_on=False, set_current_a=0.0 if c.controllable else None,
                            target_power_w=0.0, reason="override: force_off")
         )
+    # Fuse-guard allocation ledger for the WHOLE cycle: force_on grants are charged
+    # here first, so the auto chargers in pass 2 see the remaining budget.
+    fuse_alloc_a: dict[str, float] = {}
     for c in forced_on:
+        # force_on wants max — but the main fuse outranks a manual comfort override
+        # exactly as it outranks a deadline guarantee (review-caught: an unclamped
+        # force_on at 16 A on the VVB phase was a ~35 A stack).
+        amps = c.max_current_a
+        fuse_capped = False
+        delta_a, fuse_phases = _fuse_delta_allowed_a(c, inputs, cfg, fuse_alloc_a)
+        if delta_a is not None:
+            per_phase_now_a = c.current_power_w / (c.voltage_v * c.phases)
+            cap_a = max(0.0, per_phase_now_a + delta_a)
+            if cap_a < amps:
+                amps = cap_a
+                fuse_capped = True
+            step_f = max(0.0, cfg.current_step_a)
+            if fuse_capped and step_f > 0:
+                amps = (amps // step_f) * step_f
+            if amps < c.min_current_a or (not c.controllable and fuse_capped):
+                commands.append(
+                    ChargerCommand(c.id, switch_on=False,
+                                   set_current_a=0.0 if c.controllable else None,
+                                   target_power_w=0.0,
+                                   reason="off: fuse (force_on denied)",
+                                   fuse_limited=True)
+                )
+                continue
+            for p in fuse_phases:
+                fuse_alloc_a[p] = fuse_alloc_a.get(p, 0.0) + max(
+                    0.0, amps - per_phase_now_a
+                )
         commands.append(
             ChargerCommand(c.id, switch_on=True,
-                           set_current_a=c.max_current_a if c.controllable else None,
-                           target_power_w=_charger_max_w(c), reason="override: force_on (max)")
+                           set_current_a=amps if c.controllable else None,
+                           target_power_w=amps * c.voltage_v * c.phases
+                           if c.controllable else _charger_max_w(c),
+                           reason="override: force_on"
+                           + (" (fuse-capped)" if fuse_capped else " (max)"),
+                           fuse_limited=fuse_capped)
         )
     if not auto:
         return commands
@@ -534,11 +619,10 @@ def compute_ev_surplus(
 
     # Pass 2: each car charges to max(free surplus share, grid-backed deadline floor).
     step = max(0.0, cfg.current_step_a)
-    # Fuse-guard allocation ledger: ampere increases GRANTED this cycle, per phase.
-    # The meter already carries every charger's PRESENT draw, so only deltas are
-    # tracked; a 3-phase (or unknown-phase, conservative) charger's grant consumes
-    # budget on every phase in its map.
-    fuse_alloc_a: dict[str, float] = {}
+    # (fuse_alloc_a was seeded by the force_on grants above — one shared ledger:
+    # ampere increases GRANTED this cycle, per phase. The meter already carries every
+    # charger's PRESENT draw, so only deltas are tracked; a 3-phase (or unknown-phase,
+    # conservative) charger's grant consumes budget on every phase in its map.)
     for c in order:
         max_w = _charger_max_w(c)
         min_on_w = _charger_min_on_w(c, cfg)
@@ -549,27 +633,10 @@ def compute_ev_surplus(
         # target below min-on falls through to OFF — even for a deadline floor:
         # fuse safety trumps the punch-through). ---
         fuse_capped = False
-        fuse_phases: tuple[str, ...] = ()
         per_phase_now_a = c.current_power_w / (c.voltage_v * c.phases)
-        if cfg.fuse_budget_a is not None and inputs.phase_currents_a:
-            fuse_phases = c.phase_map or tuple(sorted(inputs.phase_currents_a.keys()))
-            if any(p not in inputs.phase_currents_a for p in fuse_phases):
-                # A mapped phase without a reading: allow no INCREASE (hold/reduce).
-                delta_allowed_a = 0.0
-            else:
-                delta_allowed_a = min(
-                    cfg.fuse_budget_a
-                    - inputs.phase_currents_a[p]
-                    - fuse_alloc_a.get(p, 0.0)
-                    for p in fuse_phases
-                )
+        delta_allowed_a, fuse_phases = _fuse_delta_allowed_a(c, inputs, cfg, fuse_alloc_a)
+        if delta_allowed_a is not None:
             cap_w = max(0.0, per_phase_now_a + delta_allowed_a) * c.voltage_v * c.phases
-            if cap_w < target_w:
-                target_w = cap_w
-                fuse_capped = True
-        elif cfg.fuse_budget_a is not None:
-            # Guard enabled but no phase readings this cycle: no increases.
-            cap_w = c.current_power_w
             if cap_w < target_w:
                 target_w = cap_w
                 fuse_capped = True

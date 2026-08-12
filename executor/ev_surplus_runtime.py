@@ -207,6 +207,30 @@ def next_recurring_deadline_ts(
     return None  # unreachable with a valid day set; defensive
 
 
+def _valid_phase_map(
+    raw_map: list, fg: dict, charger_id: str
+) -> tuple[str, ...]:
+    """Lowercase the map and drop names not in fuse_guard.phase_entities.
+
+    A typo ('l1' vs 'a') would otherwise make every reading lookup miss and
+    silently turn the mapped charger into a no-increase hold — dropping to ()
+    instead degrades to the CONSERVATIVE all-phases budget, loudly.
+    """
+    names = tuple(str(p).lower() for p in raw_map)
+    known = {str(k).lower() for k in (fg.get("phase_entities") or {})}
+    if not names or not known:
+        return names
+    kept = tuple(n for n in names if n in known)
+    if kept != names:
+        logger.warning(
+            "Charger %s: phase_map %r has names outside phase_entities %r — "
+            "using conservative all-phases budgeting",
+            charger_id, names, sorted(known),
+        )
+        return ()
+    return kept
+
+
 def parse_ev_surplus_config(
     executor_data: dict[str, Any], timezone: str | None = None
 ) -> EVSurplusRuntimeConfig | None:
@@ -257,8 +281,22 @@ def parse_ev_surplus_config(
 
     guard = _parse_guard(guard_raw, WriteGuardConfig())
     fg = cast("dict[str, Any]", raw.get("fuse_guard", {}) or {})
+    fuse_enabled = bool(fg.get("enabled", False))
+    if fuse_enabled and (
+        not bool(raw.get("enabled", False))
+        or not raw.get("chargers")
+        or not fg.get("phase_entities")
+    ):
+        # A guard that can never run its read path would permanently zero the
+        # engine's battery cap (never-read => fail-safe 0) or fail-safe every
+        # tick on an empty entity map — reject the combination loudly instead.
+        logger.warning(
+            "fuse_guard disabled: requires ev_surplus.enabled, chargers and "
+            "phase_entities"
+        )
+        fuse_enabled = False
     # The pure clamp activates via policy.fuse_budget_a (limit minus margin).
-    if bool(fg.get("enabled", False)):
+    if fuse_enabled:
         policy.fuse_budget_a = float(fg.get("limit_a", 25.0)) - float(fg.get("margin_a", 2.0))
     chargers: list[EVSurplusChargerCfg] = []
     for c in cast("list[dict[str, Any]]", raw.get("chargers", []) or []):
@@ -299,8 +337,10 @@ def parse_ev_surplus_config(
                     if isinstance(c.get("write_guard"), dict)
                     else None
                 ),
-                phase_map=tuple(
-                    str(p).lower() for p in cast("list[Any]", c.get("phase_map", []) or [])
+                phase_map=_valid_phase_map(
+                    cast("list[Any]", c.get("phase_map", []) or []),
+                    fg if fuse_enabled else {},
+                    str(c.get("id", "?")),
                 ),
                 min_off_s=float(c.get("min_off_s", 0.0)),
                 shadow=bool(c.get("shadow", False)),
@@ -335,7 +375,7 @@ def parse_ev_surplus_config(
             if isinstance(v, list)
         },
         timezone=str(timezone or executor_data.get("timezone") or "Europe/Stockholm"),
-        fuse_guard_enabled=bool(fg.get("enabled", False)),
+        fuse_guard_enabled=fuse_enabled,
         fuse_limit_a=float(fg.get("limit_a", 25.0)),
         fuse_margin_a=float(fg.get("margin_a", 2.0)),
         fuse_phase_entities={
@@ -365,6 +405,11 @@ class EVSurplusController:
         self.last_phase_currents_a: dict[str, float] = {}
         self.last_phase_ok_ts: float | None = None
         self.last_battery_w: float = 0.0
+        self.last_grid_w: float = 0.0
+        # Ampere increases the EV clamp granted THIS tick, per phase — the engine's
+        # battery cap subtracts these so the two levers never double-spend the same
+        # meter snapshot (review-caught).
+        self.last_ev_alloc_a: dict[str, float] = {}
         self._core_skip_since: float | None = None
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
@@ -384,7 +429,11 @@ class EVSurplusController:
         ):
             return 0.0
         return fuse_battery_charge_cap_w(
-            self.last_phase_currents_a, self.last_battery_w, budget
+            self.last_phase_currents_a,
+            self.last_battery_w,
+            budget,
+            grid_w=self.last_grid_w,
+            ev_alloc_a=self.last_ev_alloc_a,
         )
 
     async def _read_phase_currents(
@@ -398,7 +447,14 @@ class EVSurplusController:
         """
         out: dict[str, float] = {}
         for phase, entity in self.cfg.fuse_phase_entities.items():
-            st = cast("dict[str, Any] | None", await ha.get_state(entity))
+            try:
+                st = cast("dict[str, Any] | None", await ha.get_state(entity))
+            except Exception:
+                # A non-retryable read error (404 renamed entity — this site's
+                # documented history — 401 rotated token, decode failure) is
+                # BLINDNESS, not a reason to crash past the fail-safe.
+                logger.exception("EV surplus: phase read failed for %s", entity)
+                return None
             if not st:
                 return None
             val = _f(st.get("state"))
@@ -415,8 +471,16 @@ class EVSurplusController:
             out[phase] = abs(val)
         return out or None
 
-    async def _failsafe_stop_all(self, ha: Any, now_ts: float, why: str) -> None:
-        """Guard-blind => cars OFF. Stops need no sensors and bypass all pacing."""
+    async def _failsafe_stop_all(
+        self, ha: Any, now_ts: float, why: str, shadow: bool
+    ) -> None:
+        """Guard-blind => cars OFF. Stops need no sensors and bypass all pacing.
+
+        ``shadow`` is the GLOBAL observe-only flag threaded from run() — an
+        observe-only executor must not actuate live devices even to fail safe
+        (review-caught: the hardcoded False here sent a real Easee stop in
+        shadow mode). Per-charger shadow composes inside _actuate as before.
+        """
         logger.warning("EV surplus FUSE FAIL-SAFE: %s — stopping all chargers", why)
         for ccfg in self.cfg.chargers:
             cmd = ChargerCommand(
@@ -426,7 +490,7 @@ class EVSurplusController:
                 fuse_limited=True,
             )
             try:
-                await self._actuate(ha, ccfg, cmd, now_ts, False)
+                await self._actuate(ha, ccfg, cmd, now_ts, shadow)
             except Exception:
                 logger.exception(
                     "EV surplus: fail-safe stop failed for %s — continuing", ccfg.id
@@ -603,7 +667,7 @@ class EVSurplusController:
                 if self._core_skip_since is None:
                     self._core_skip_since = now_ts
                 elif (now_ts - self._core_skip_since) > self.cfg.fuse_stale_after_s:
-                    await self._failsafe_stop_all(ha, now_ts, "core sensors dark")
+                    await self._failsafe_stop_all(ha, now_ts, "core sensors dark", shadow)
                     return {"enabled": True, "fuse_failsafe": "core sensors dark"}
             return {"enabled": True, "skipped": "core sensors unreadable"}
         self._core_skip_since = None
@@ -626,7 +690,7 @@ class EVSurplusController:
                     self.last_phase_ok_ts is None
                     or (now_ts - self.last_phase_ok_ts) > self.cfg.fuse_stale_after_s
                 ):
-                    await self._failsafe_stop_all(ha, now_ts, "phase sensors stale")
+                    await self._failsafe_stop_all(ha, now_ts, "phase sensors stale", shadow)
                     return {"enabled": True, "fuse_failsafe": "phase sensors stale"}
                 # Briefly stale: proceed with NO increases (pure clamp holds/reduces).
                 phase_currents = {}
@@ -635,6 +699,7 @@ class EVSurplusController:
                 self.last_phase_currents_a = read
                 self.last_phase_ok_ts = now_ts
         self.last_battery_w = battery_w
+        self.last_grid_w = grid_w
         states: list[ChargerState] = list(
             await asyncio.gather(
                 *(self._read_charger(ha, c, now_ts, vacation) for c in cfg.chargers)
@@ -662,6 +727,26 @@ class EVSurplusController:
             phase_currents_a=phase_currents, chargers=states,
         )
         commands = compute_ev_surplus(inputs, cfg.policy)
+        if cfg.fuse_guard_enabled:
+            _alloc: dict[str, float] = {}
+            _by_id = {s2.id: s2 for s2 in states}
+            for _cmd in commands:
+                _st = _by_id.get(_cmd.id)
+                if _st is None or not _cmd.switch_on:
+                    continue
+                _amps = (
+                    float(_cmd.set_current_a)
+                    if _cmd.set_current_a is not None
+                    else _cmd.target_power_w / (_st.voltage_v * _st.phases)
+                )
+                _granted = max(
+                    0.0, _amps - _st.current_power_w / (_st.voltage_v * _st.phases)
+                )
+                if _granted <= 0.0:
+                    continue
+                for _p in _st.phase_map or tuple(phase_currents.keys()):
+                    _alloc[_p] = _alloc.get(_p, 0.0) + _granted
+            self.last_ev_alloc_a = _alloc
         # Track the tier through the SAME helper the pure layer uses (hysteresis memory).
         self._battery_tier_prev = battery_tier_active(inputs, cfg.policy)
         cfg_by_id = {c.id: c for c in cfg.chargers}
@@ -718,6 +803,29 @@ class EVSurplusController:
                     await ha.call_service(
                         "easee", "set_charger_dynamic_limit", None,
                         {"device_id": ccfg.easee_device_id, "current": 0, "time_to_live": 0},
+                    )
+                if prev_a is not None and prev_a > 0.0:
+                    self._last_stop_ts[ccfg.id] = now_ts
+                self._last_a[ccfg.id] = 0.0
+                self._last_ts[ccfg.id] = now_ts
+            return
+
+        # Pause a switchless current-entity charger (e.g. a Tesla wired without its
+        # switch): write 0 A — otherwise an "off" command silently no-ops and the
+        # car keeps charging at its last current (fail-safe included).
+        if (
+            not cmd.switch_on
+            and ccfg.switch_entity is None
+            and ccfg.easee_device_id is None
+            and ccfg.current_entity
+        ):
+            prev_a = self._last_a.get(ccfg.id)
+            if should_write_current(
+                prev_a, self._last_ts.get(ccfg.id), 0.0, now_ts, guard
+            ):
+                if not shadow:
+                    await ha.call_service(
+                        "number", "set_value", ccfg.current_entity, {"value": 0}
                     )
                 if prev_a is not None and prev_a > 0.0:
                     self._last_stop_ts[ccfg.id] = now_ts
