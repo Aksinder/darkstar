@@ -571,6 +571,38 @@ def validate_config_for_write(config: dict[str, Any], strict: bool = True) -> bo
     return True
 
 
+def _strip_comment_tokens(obj: Any) -> None:
+    """Recursively remove ruamel comment attachments from a loaded YAML tree.
+
+    The migration design is "template provides structure + comments, user config
+    provides values" — but the user file is loaded in round-trip mode, so its nodes
+    carry comment tokens too. When recursive_merge binds a user list/map into the
+    template tree (``target[key] = value``), the template's own comment token for
+    that key stays at the parent while the user value brings its embedded copy: on
+    the next load the doubled block parses as content-attached comments, and every
+    subsequent write adds the template's copy AGAIN — +1 copy of every affected
+    comment block per write, forever (observed live: ~7 kB/write, a 428 kB
+    config.yaml, and an interrupted write of that file nuking the config in June).
+    Stripping the USER tree before merging kills the whole class: comments can then
+    only ever come from the template, exactly once.
+    """
+    ca = getattr(obj, "ca", None)
+    if ca is not None:
+        try:
+            ca.comment = None
+            ca.items.clear()
+            if hasattr(ca, "end"):
+                ca.end = []
+        except Exception:  # pragma: no cover - defensive against ruamel internals
+            pass
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _strip_comment_tokens(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _strip_comment_tokens(v)
+
+
 def template_aware_merge(default_cfg: dict[str, Any], user_cfg: dict[str, Any]) -> None:
     """
     Uses default_cfg as the BASE (template).
@@ -580,6 +612,8 @@ def template_aware_merge(default_cfg: dict[str, Any], user_cfg: dict[str, Any]) 
 
     Fixed array handling - merge arrays by unique ID instead of overwriting.
     """
+    # Comments only ever come from the template — see _strip_comment_tokens.
+    _strip_comment_tokens(user_cfg)
 
     ARRAY_UNIQUE_KEYS = {
         "solar_arrays": "name",
