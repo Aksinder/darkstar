@@ -1,3 +1,7 @@
+## dev-20260812.0638 — 2026-08-12 06:40
+
+- fix(config): stop comment-token duplication in template merge (config bloat)
+
 ## dev-20260811.1731 — 2026-08-11 17:33
 
 - feat(ev): config-constant comfort cap (target_soc) per charger
