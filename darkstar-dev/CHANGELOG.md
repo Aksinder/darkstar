@@ -1,3 +1,7 @@
+## dev-20260812.1649 — 2026-08-12 16:51
+
+- fix(executor): S4 review fixes — battery shed reaches charge mode, export-aware clamp, hardened fail-safes
+
 ## dev-20260812.1553 — 2026-08-12 15:55
 
 - fix(config): resolve symlinks before atomic write — saves were silently lost
