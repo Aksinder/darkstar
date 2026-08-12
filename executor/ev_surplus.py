@@ -52,6 +52,11 @@ class EVSurplusConfig:
     # Controller dynamics.
     gain: float = 0.5  # fraction of the headroom applied per cycle (stability vs speed)
     deadband_w: float = 250.0  # hold when |headroom| is within this (anti-jitter)
+    # Main-fuse guard: usable ampere budget PER PHASE (fuse rating minus margin, e.g.
+    # 25 - 2 = 23). None => guard disabled (legacy). The clamp runs in the greedy order,
+    # so urgent deadline floors keep their budget and topup cars are shed first; it
+    # TRUMPS floors — a grid-backed guarantee must never blow the main fuse.
+    fuse_budget_a: float | None = None
     # Quantized-control stability: the effective fleet deadband is widened to
     # K x (largest 1-step power quantum among commanded-ON controllable chargers),
     # so a charger whose smallest move exceeds the band can never limit-cycle
@@ -112,6 +117,12 @@ class ChargerState:
     # It keeps charging — from whatever surplus remains — up to target_soc_percent.
     # Floors are unaffected (need outranks comfort). None => never demoted.
     comfort_soc_percent: float | None = None
+    # Which grid phases this charger's draw lands on, e.g. ("a",) for a 1-phase car or
+    # ("a", "b", "c") for a 3-phase one. EMPTY = unknown => the fuse guard budgets the
+    # charger's amps on EVERY phase (conservative — over-restrictive only under real
+    # congestion, never unsafe). NOTE: this maps the CAR'S DRAW, not the charger box's
+    # wiring — the 3-phase-wired Easee carries the FMB on one leg.
+    phase_map: tuple[str, ...] = ()
     # Usable battery capacity, to convert an SoC gap into energy. 0 => no deadline floor.
     capacity_kwh: float = 0.0
     # Hours until the departure deadline. None / <=0 => no grid-backed deadline floor (the car
@@ -141,6 +152,12 @@ class EVSurplusInputs:
     # Previous cycle's battery-tier state (runtime-tracked) — drives the SoC
     # re-enable hysteresis in battery_tier_active().
     battery_tier_active_prev: bool = False
+    # Grid phase current magnitudes in AMPERE, keyed by phase name (e.g. {"a": 12.3, ...}).
+    # This is the MAIN-FUSE current (direction-blind |A| — export blows fuses too).
+    # Empty dict = no fresh readings; the pure fuse clamp then allows NO increases
+    # (hold-or-reduce). The runtime's stale fail-safe handles full sensor loss with
+    # explicit stops BEFORE compute is ever reached.
+    phase_currents_a: dict[str, float] = field(default_factory=dict)
     chargers: list[ChargerState] = field(default_factory=lambda: [])
 
 
@@ -153,6 +170,10 @@ class ChargerCommand:
     set_current_a: float | None  # None => binary charger / leave current unchanged
     target_power_w: float
     reason: str
+    # True when the 25 A/phase fuse guard reduced this command below its wanted level.
+    # The write guard treats such REDUCTIONS like stops (bypass min_step/min_interval):
+    # a fuse-relief write must never wait out a pacing interval.
+    fuse_limited: bool = False
     # Unsnapped amp target (pre-step-grid), for the runtime Schmitt quantizer.
     raw_amps: float | None = None
 
@@ -188,15 +209,21 @@ def should_write_current(
     new_a: float,
     now_ts: float,
     cfg: WriteGuardConfig,
+    fuse_relief: bool = False,
 ) -> bool:
     """True if the new charge-current target should be written this cycle.
 
     First write always proceeds. A stop (new_a <= 0) is always allowed (safety — never
-    delay backing off the home battery). Otherwise require both a step >= ``min_step_a``
-    and >= ``min_interval_s`` since the last write.
+    delay backing off the home battery). A fuse-guard REDUCTION (``fuse_relief`` with
+    new < last) gets the same safety class: an overloaded phase must not wait out
+    min_step_a or a pacing interval (an Easee sub-2A trim would otherwise be dropped
+    and a Tesla shed deferred 90 s while the fuse cooks). Otherwise require both a
+    step >= ``min_step_a`` and >= ``min_interval_s`` since the last write.
     """
     if last_a is None or last_write_ts is None:
         return True
+    if fuse_relief and new_a < last_a:
+        return True  # fuse-overload relief — act immediately, any step size
     if new_a <= 0.0 < last_a:
         return True  # stopping / dropping to zero — act immediately
     if last_a <= 0.0 < new_a:
@@ -209,6 +236,31 @@ def should_write_current(
     if interval is None:
         interval = cfg.min_interval_s
     return (now_ts - last_write_ts) >= interval
+
+
+def fuse_battery_charge_cap_w(
+    phase_currents_a: dict[str, float],
+    battery_charge_w: float,
+    budget_a: float,
+    voltage_v: float = 230.0,
+) -> float:
+    """Max battery charge SETPOINT (W) that keeps every phase within the fuse budget.
+
+    The battery is the fuse guard's only non-EV shed lever: planner grid-charging
+    (9.5 kW ≈ 13.8 A on all phases) co-scheduled with the 1-phase VVB block can sit at
+    30+ A on the VVB phase with zero cars to clamp. The battery charges 3-phase
+    SYMMETRIC, and its present grid draw is already IN the meter readings, so the cap
+    is iterative: allow growth up to the measured min-phase headroom; when a phase
+    goes over budget the headroom turns negative and the setpoint is pulled below the
+    present charge level. Direction-blindness is handled by the same iteration —
+    during EXPORT, raising the charge LOWERS the meter, so the headroom re-opens on
+    the next reading. Empty readings => 0 (fail safe: no grid charging on blind
+    sensors; PV then flows to export instead, which is loss-free).
+    """
+    if not phase_currents_a:
+        return 0.0
+    headroom_a = min(budget_a - abs(i) for i in phase_currents_a.values())
+    return max(0.0, max(0.0, battery_charge_w) + headroom_a * 3.0 * voltage_v)
 
 
 def _charger_max_w(c: ChargerState) -> float:
@@ -482,11 +534,48 @@ def compute_ev_surplus(
 
     # Pass 2: each car charges to max(free surplus share, grid-backed deadline floor).
     step = max(0.0, cfg.current_step_a)
+    # Fuse-guard allocation ledger: ampere increases GRANTED this cycle, per phase.
+    # The meter already carries every charger's PRESENT draw, so only deltas are
+    # tracked; a 3-phase (or unknown-phase, conservative) charger's grant consumes
+    # budget on every phase in its map.
+    fuse_alloc_a: dict[str, float] = {}
     for c in order:
         max_w = _charger_max_w(c)
         min_on_w = _charger_min_on_w(c, cfg)
         forced = floor_w[c.id] > 0.0
         target_w = min(max_w, max(surplus_share[c.id], floor_w[c.id]))
+
+        # --- 25 A/phase fuse clamp (runs BEFORE the on/off thresholds so a capped
+        # target below min-on falls through to OFF — even for a deadline floor:
+        # fuse safety trumps the punch-through). ---
+        fuse_capped = False
+        fuse_phases: tuple[str, ...] = ()
+        per_phase_now_a = c.current_power_w / (c.voltage_v * c.phases)
+        if cfg.fuse_budget_a is not None and inputs.phase_currents_a:
+            fuse_phases = c.phase_map or tuple(sorted(inputs.phase_currents_a.keys()))
+            if any(p not in inputs.phase_currents_a for p in fuse_phases):
+                # A mapped phase without a reading: allow no INCREASE (hold/reduce).
+                delta_allowed_a = 0.0
+            else:
+                delta_allowed_a = min(
+                    cfg.fuse_budget_a
+                    - inputs.phase_currents_a[p]
+                    - fuse_alloc_a.get(p, 0.0)
+                    for p in fuse_phases
+                )
+            cap_w = max(0.0, per_phase_now_a + delta_allowed_a) * c.voltage_v * c.phases
+            if cap_w < target_w:
+                target_w = cap_w
+                fuse_capped = True
+        elif cfg.fuse_budget_a is not None:
+            # Guard enabled but no phase readings this cycle: no increases.
+            cap_w = c.current_power_w
+            if cap_w < target_w:
+                target_w = cap_w
+                fuse_capped = True
+        # A binary charger cannot throttle: unless its FULL draw fits, it must be off.
+        if fuse_capped and not c.controllable and target_w < max_w:
+            target_w = 0.0
         # Hysteresis: an OFF charger needs extra headroom to start; once ON it runs down to
         # its true min. A deadline floor is exempt — it must run even with no surplus.
         currently_on = _is_on(c)
@@ -501,29 +590,47 @@ def compute_ev_surplus(
             continue
         threshold_w = min_on_w if currently_on else min_on_w * (1.0 + cfg.start_hysteresis)
         if target_w < threshold_w and not (forced and target_w >= min_on_w):
+            # NOTE: a fuse cap below min-on lands here even for a deadline floor —
+            # the punch-through requires target_w >= min_on_w, which the cap denies.
+            off_tag = "fuse" if fuse_capped else f"target {target_w:.0f}<thr {threshold_w:.0f}"
             commands.append(
                 ChargerCommand(c.id, switch_on=False, set_current_a=0.0 if c.controllable else None,
                                target_power_w=0.0,
-                               reason=f"off: target {target_w:.0f}<thr {threshold_w:.0f}; {why}")
+                               reason=f"off: {off_tag}; {why}",
+                               fuse_limited=fuse_capped)
             )
             continue
         tag = "deadline" if forced and surplus_share[c.id] < floor_w[c.id] else "surplus"
+        if fuse_capped:
+            tag += "+fuse"
         if c.controllable:
             raw_amps = target_w / (c.voltage_v * c.phases)
             amps = raw_amps
             # Snap to the step grid, then clamp. Churn suppression is the quantum
             # band + the runtime Schmitt quantizer (raw_amps below), not a coarse step.
+            # A fuse-capped target snaps DOWN — rounding up would exceed the budget.
             if step > 0:
-                amps = round(amps / step) * step
+                amps = (amps // step) * step if fuse_capped else round(amps / step) * step
             amps = max(c.min_current_a, min(c.max_current_a, amps))
+            if cfg.fuse_budget_a is not None and fuse_phases:
+                granted_delta_a = max(0.0, amps - per_phase_now_a)
+                for p in fuse_phases:
+                    fuse_alloc_a[p] = fuse_alloc_a.get(p, 0.0) + granted_delta_a
             commands.append(
                 ChargerCommand(c.id, switch_on=True, set_current_a=round(amps, 1),
                                target_power_w=amps * c.voltage_v * c.phases,
                                reason=f"on {amps:.1f}A ({tag}); {why}",
+                               fuse_limited=fuse_capped,
                                raw_amps=round(raw_amps, 2))
             )
         else:
             # Binary charger: on at its fixed draw (can't throttle).
+            if cfg.fuse_budget_a is not None and fuse_phases:
+                granted_delta_a = max(
+                    0.0, max_w / (c.voltage_v * c.phases) - per_phase_now_a
+                )
+                for p in fuse_phases:
+                    fuse_alloc_a[p] = fuse_alloc_a.get(p, 0.0) + granted_delta_a
             commands.append(
                 ChargerCommand(c.id, switch_on=True, set_current_a=None,
                                target_power_w=max_w, reason=f"on (binary, {tag}); {why}")
