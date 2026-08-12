@@ -2373,9 +2373,14 @@ class ExecutorEngine:
         """
         if self._ev_surplus is None:
             return
+        # The ENGINE's attribute is inverter_profile (dispatcher's is .profile — a
+        # latent copy of that name at engine.py:2377 survives only because the dead
+        # legacy EV switch path never runs). getattr: profile loading can fail and
+        # leave the attribute unset entirely.
+        profile = getattr(self, "inverter_profile", None)
         unit = (
-            self.profile.behavior.control_unit
-            if self.profile
+            profile.behavior.control_unit
+            if profile is not None
             else self.config.inverter.control_unit
         )
         if unit != "W":
