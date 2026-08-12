@@ -1706,6 +1706,25 @@ class ExecutorEngine:
                         except Exception as defer_exc:
                             logger.warning("Deferrable appliance controller error: %s", defer_exc)
 
+                    # Fuse guard (25 A/phase): the battery is the guard's only non-EV
+                    # shed lever — planner grid-charging (9.5 kW ≈ 13.8 A on every
+                    # phase) stacked on the 1-phase VVB block can exceed the fuse with
+                    # zero cars to clamp. Cap the commanded max-charge to the measured
+                    # per-phase headroom (W control-unit only; the servo owns the
+                    # phase readings). None => guard off; stale sensors => cap 0.
+                    if (
+                        self._ev_surplus is not None
+                        and self.config.inverter.control_unit == "W"
+                    ):
+                        _fuse_cap = self._ev_surplus.fuse_battery_cap_w(time.time())
+                        if _fuse_cap is not None and decision.max_charge > _fuse_cap:
+                            logger.info(
+                                "Fuse guard: capping battery max_charge %.0f -> %.0f W",
+                                decision.max_charge,
+                                _fuse_cap,
+                            )
+                            decision.max_charge = _fuse_cap
+
                     # Fix Issue 0: Await expected coroutine properly
                     profile_results = await self.dispatcher.execute(decision)
                     action_results.extend(profile_results)
