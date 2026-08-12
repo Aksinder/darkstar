@@ -401,7 +401,7 @@ class TestReviewFixes:
         from executor.engine import ExecutorEngine
 
         eng = MagicMock(spec=ExecutorEngine)
-        eng.profile = None
+        eng.inverter_profile = None  # the ENGINE attribute name (not .profile!)
         eng.config = SimpleNamespace(
             inverter=SimpleNamespace(control_unit="W")
         )
@@ -410,3 +410,22 @@ class TestReviewFixes:
         ExecutorEngine._apply_fuse_battery_cap(eng, decision)
         assert decision.charge_value == 2400.0  # capped + rounded to 100 W
         assert decision.max_charge == 2400.0
+
+    def test_cap_survives_missing_profile_attribute(self):
+        """Live regression: the engine attribute is inverter_profile; referencing
+        .profile raised AttributeError BEFORE dispatcher.execute — killing ALL
+        actuation (water/mode/battery) every tick. The cap must run off a plain
+        object without either attribute set."""
+        from types import SimpleNamespace
+
+        from executor.engine import ExecutorEngine
+
+        class Bare:
+            pass
+
+        eng = Bare()  # no profile, no inverter_profile
+        eng.config = SimpleNamespace(inverter=SimpleNamespace(control_unit="W"))
+        eng._ev_surplus = SimpleNamespace(fuse_battery_cap_w=lambda _ts: 1000.0)
+        decision = SimpleNamespace(charge_value=9500.0, max_charge=9500.0)
+        ExecutorEngine._apply_fuse_battery_cap(eng, decision)
+        assert decision.charge_value == 1000.0
