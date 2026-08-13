@@ -1,3 +1,7 @@
+## dev-20260813.0647 — 2026-08-13 06:49
+
+- fix(executor): S3 review fixes — urgency source-awareness, bounded hold, vacation gate
+
 ## dev-20260812.1847 — 2026-08-12 18:49
 
 - fix(executor): hotfix — engine attribute is inverter_profile, not .profile
