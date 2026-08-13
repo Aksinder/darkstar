@@ -160,6 +160,13 @@ class EVSurplusInputs:
     # Previous cycle's battery-tier state (runtime-tracked) — drives the SoC
     # re-enable hysteresis in battery_tier_active().
     battery_tier_active_prev: bool = False
+    # The PLANNER's battery-charge power for the current slot (W). The battery-
+    # yield gate is CONDITIONED on this: kepler only plans battery charging when
+    # the stored energy has forward value (a spike evening to serve, a profitable
+    # sale), so "cars yield to the battery" applies exactly then — otherwise the
+    # cars take surplus first as always (owner 2026-08-13: "inte prioritera
+    # batteriet över FMB, bara om vi ser vinst i att sälja").
+    plan_battery_charge_w: float = 0.0
     # Grid phase current magnitudes in AMPERE, keyed by phase name (e.g. {"a": 12.3, ...}).
     # This is the MAIN-FUSE current (direction-blind |A| — export blows fuses too).
     # Empty dict = no fresh readings; the pure fuse clamp then allows NO increases
@@ -540,6 +547,7 @@ def compute_ev_surplus(
     if (
         batt_term_w > 0.0
         and inputs.battery_soc_percent < cfg.battery_yield_soc
+        and inputs.plan_battery_charge_w > 0.0
     ):
         batt_term_w = 0.0
     headroom_w = (grid_setpoint_w - inputs.grid_w) + batt_term_w + battery_allow_w

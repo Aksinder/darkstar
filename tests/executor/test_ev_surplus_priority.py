@@ -519,21 +519,29 @@ class TestBatteryYieldGate:
     battery_yield_soc — cars may not steal its inflow for comfort bands when a
     stored kWh is worth an avoided 3-4 kr evening import."""
 
-    def _inputs(self, soc, batt_w=4000.0):
+    def _inputs(self, soc, batt_w=4000.0, plan_chg_w=0.0):
         fmb = _fmb(soc_percent=50.0, deadline_hours=None)
         return EVSurplusInputs(
             pv_w=5000.0, grid_w=0.0, battery_w=batt_w, battery_soc_percent=soc,
-            import_price_sek=1.0, remaining_solar_kwh=0.0, chargers=[fmb],
+            import_price_sek=1.0, remaining_solar_kwh=0.0,
+            plan_battery_charge_w=plan_chg_w, chargers=[fmb],
         )
 
-    def test_battery_inflow_not_headroom_below_yield_soc(self):
+    def test_gate_inactive_without_planned_battery_charge(self):
+        """Owner: FMB first as always — the battery is protected ONLY when kepler
+        itself planned battery charging (= the stored energy has forward value)."""
         cfg = EVSurplusConfig(enabled=True, battery_yield_soc=95.0)
-        cmds = compute_ev_surplus(self._inputs(soc=50.0), cfg)
-        assert not cmds[0].switch_on  # battery keeps its 4 kW inflow
+        cmds = compute_ev_surplus(self._inputs(soc=12.0), cfg)
+        assert cmds[0].switch_on  # no planned charge => legacy: car takes the inflow
+
+    def test_battery_inflow_not_headroom_when_plan_wants_charge(self):
+        cfg = EVSurplusConfig(enabled=True, battery_yield_soc=95.0)
+        cmds = compute_ev_surplus(self._inputs(soc=50.0, plan_chg_w=2000.0), cfg)
+        assert not cmds[0].switch_on  # kepler reserved this inflow for the battery
 
     def test_battery_inflow_is_headroom_at_yield_soc(self):
         cfg = EVSurplusConfig(enabled=True, battery_yield_soc=95.0)
-        cmds = compute_ev_surplus(self._inputs(soc=96.0), cfg)
+        cmds = compute_ev_surplus(self._inputs(soc=96.0, plan_chg_w=2000.0), cfg)
         assert cmds[0].switch_on  # near-full battery yields to the car
 
     def test_discharge_always_counts_against_cars(self):
