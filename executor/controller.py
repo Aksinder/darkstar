@@ -132,7 +132,21 @@ class Controller:
         if override.override_type.value == "force_charge":
             mode_intent = "charge"
         elif override.override_type.value == "force_export":
-            mode_intent = "export"
+            # R1 SoC floor applies to MANUAL exports too (live-caught: a 15-min
+            # force_export quick action ran 29 -> 17.8 %, straight through the 20 %
+            # floor — only the timer stopped it; the plan path had the guard, this
+            # path did not). A forced discharge would otherwise run to the quick
+            # action's soc_target (default 10) at full power.
+            if round(state.current_soc_percent) <= self.config.export_floor_soc_percent:
+                logger.warning(
+                    "Force-export blocked: SoC %.1f%% at/below export floor %.0f%% "
+                    "— downgrading override to self_consumption",
+                    state.current_soc_percent,
+                    self.config.export_floor_soc_percent,
+                )
+                mode_intent = "self_consumption"
+            else:
+                mode_intent = "export"
 
         # For overrides, we typically don't actively charge/discharge
         # unless specifically requested
@@ -150,8 +164,9 @@ class Controller:
                 charge_value = self.config.max_charge_a
             write_charge = True
 
-        # Handle quick action exporting
-        if override.override_type.value == "force_export":
+        # Handle quick action exporting (only when the floor guard above kept the
+        # export intent — a floor-downgraded override must not force discharge).
+        if override.override_type.value == "force_export" and mode_intent == "export":
             # Force export - allow max discharge
             if self.inverter_config.control_unit == "W":
                 discharge_value = self.config.max_discharge_w

@@ -119,6 +119,34 @@ class TestControllerFollowPlan:
 
         assert decision.mode_intent == "export"
 
+    def test_force_export_override_respects_the_soc_floor(self, controller):
+        """R1 applies to MANUAL exports too — live-caught: a 15-min force_export
+        quick action ran 29 -> 17.8 %, straight through the 20 % floor (only the
+        timer stopped it). The override path must downgrade exactly like the plan
+        path and must NOT force discharge when downgraded."""
+        slot = SlotPlan()
+        state = SystemState(current_soc_percent=19.0)
+        override = OverrideResult(
+            override_needed=True, override_type=OverrideType.FORCE_EXPORT, actions={}
+        )
+
+        decision = controller._apply_override(slot, state, override)
+
+        assert decision.mode_intent == "self_consumption"
+        assert decision.discharge_value == 0.0
+
+    def test_force_export_override_allowed_above_floor(self, controller):
+        slot = SlotPlan()
+        state = SystemState(current_soc_percent=45.0)
+        override = OverrideResult(
+            override_needed=True, override_type=OverrideType.FORCE_EXPORT, actions={}
+        )
+
+        decision = controller._apply_override(slot, state, override)
+
+        assert decision.mode_intent == "export"
+        assert decision.discharge_value > 0.0
+
     def test_charge_mode_when_charging_only(self, controller):
         """When charging only, use charge mode intent."""
         slot = SlotPlan(export_kw=0.0, charge_kw=3.0)
