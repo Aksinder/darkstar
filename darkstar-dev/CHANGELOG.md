@@ -1,3 +1,7 @@
+## dev-20260813.1915 — 2026-08-13 19:17
+
+- fix(executor): battery-yield gate conditioned on PLANNED battery charging
+
 ## dev-20260813.1843 — 2026-08-13 18:45
 
 - feat(executor): battery-yield gate — the home battery fills first on spike days
