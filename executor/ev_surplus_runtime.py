@@ -402,11 +402,21 @@ def parse_ev_surplus_config(
         if _cc.plan_floor:
             _pe = planner_by_id.get(_cc.id) or {}
             if str(_pe.get("switch_entity") or "").strip():
+                # Two live actuation paths would fight in the same tick — hard-
+                # disable the bridge for this charger rather than just warning.
                 logger.warning(
-                    "Charger %s: plan_floor is set AND the planner entry has a "
-                    "switch_entity — the legacy _control_ev_charger path runs BEFORE "
-                    "the servo in the same tick and the two will fight. Clear the "
-                    "planner switch_entity (F4).",
+                    "Charger %s: plan_floor DISABLED — the planner entry has a "
+                    "switch_entity and the legacy _control_ev_charger path runs "
+                    "BEFORE the servo in the same tick (F4). Clear the planner "
+                    "switch_entity to enable the bridge.",
+                    _cc.id,
+                )
+                _cc.plan_floor = False
+            elif _cc.plan_gate_soc is None:
+                logger.warning(
+                    "Charger %s: plan_floor is set but no planner guarantee band "
+                    "was found — every plan slot will be gated off (silent no-op "
+                    "otherwise). Add penalty_levels to the planner entry.",
                     _cc.id,
                 )
     return EVSurplusRuntimeConfig(
@@ -469,6 +479,10 @@ class EVSurplusController:
         # held for >= PLAN_HOLD_S even if the next replan drops the slot — bounded
         # cost (<= 30 min at the held level), and the soc-gate still ends it early.
         self._plan_hold: dict[str, tuple[float, float]] = {}
+        # Why each plan_floor charger did/didn't act this tick ('active' /
+        # 'gated' / 'vacation' / 'idle') — read by the engine's EV-charge-failure
+        # notifier so an intentionally soc-gated plan is never counted as failure.
+        self.last_plan_note: dict[str, str] = {}
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
         """Battery charge-setpoint cap for the engine, or None when the guard is off.
@@ -775,10 +789,18 @@ class EVSurplusController:
             )
         )
         # S3 plan floors: gate + continuity hold, then attach to the states.
+        # Vacation gates the WHOLE attach (mirroring the unconditional deadline
+        # clear): plan slots computed pre-vacation must not grid-force an away
+        # household even for the ~15 min until the vacation-stripped replan.
         cfg_by_id_pre = {c.id: c for c in cfg.chargers}
+        self.last_plan_note = {}
         for st in states:
             ccfg = cfg_by_id_pre.get(st.id)
             if ccfg is None or not ccfg.plan_floor:
+                continue
+            if vacation:
+                self._plan_hold.pop(st.id, None)
+                self.last_plan_note[st.id] = "vacation"
                 continue
             raw_w = max(0.0, float((plan_kw or {}).get(st.id, 0.0)) * 1000.0)
             min_on_w = max(ccfg.min_current_a, cfg.policy.min_charge_current_a) \
@@ -790,13 +812,26 @@ class EVSurplusController:
             )
             plan_w = 0.0 if (gated or raw_w < min_on_w) else raw_w
             if plan_w > 0.0:
-                self._plan_hold[st.id] = (plan_w, now_ts + 1800.0)
+                # Hold horizon = ONE replan period (~16 min): bridges kepler's
+                # 15-min checkerboard flips, but bounds the tail after a GENUINE
+                # block end to <= one slot (a rolling 30-min hold fired at every
+                # nightly block end, buying energy kepler priced as not-worth-it
+                # — review-caught, with the battery-discharge lockout on top).
+                self._plan_hold[st.id] = (plan_w, now_ts + 960.0)
+                self.last_plan_note[st.id] = "active"
             else:
                 held = self._plan_hold.get(st.id)
                 if held is not None and now_ts < held[1] and not gated:
                     plan_w = held[0]  # replan flip — hold the started floor
-                elif held is not None and now_ts >= held[1]:
-                    del self._plan_hold[st.id]
+                    logger.info(
+                        "EV surplus: plan-floor hold for %s (%.0f W, %.0f s left)",
+                        st.id, plan_w, held[1] - now_ts,
+                    )
+                    self.last_plan_note[st.id] = "active"
+                else:
+                    if held is not None and now_ts >= held[1]:
+                        del self._plan_hold[st.id]
+                    self.last_plan_note[st.id] = "gated" if gated else "idle"
             st.plan_floor_w = plan_w
 
         # Manual fleet priority: remap ChargerState.priority from the selected ordering.

@@ -1466,6 +1466,7 @@ class ExecutorEngine:
                     and not actual_ev_charging
                     and not self._ev_power_fetch_failed
                     and self._ev_plan_actuation_possible()
+                    and not self._ev_plan_intentionally_suppressed()
                 ):
                     self._ev_zero_power_ticks += 1
                 elif actual_ev_charging:
@@ -2412,6 +2413,22 @@ class ExecutorEngine:
                     cap,
                 )
                 setattr(decision, field_name, cap)
+
+    def _ev_plan_intentionally_suppressed(self) -> bool:
+        """True when the servo DELIBERATELY isn't executing the planned EV slots.
+
+        A plan slot the servo soc-gated (car already above its guarantee band) or
+        vacation-gated is working-as-designed, not a charge failure — without this
+        check the failure notifier counts those ticks and fires false errors every
+        gated block (review-caught). Conservative: only suppress when the servo has
+        plan notes and NONE of them says 'active'.
+        """
+        if self._ev_surplus is None:
+            return False
+        notes = getattr(self._ev_surplus, "last_plan_note", None) or {}
+        if not notes:
+            return False
+        return all(v != "active" for v in notes.values())
 
     def _ev_plan_actuation_possible(self) -> bool:
         """True when at least one charger can actually execute a planned EV slot.
