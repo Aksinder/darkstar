@@ -461,3 +461,54 @@ class TestComfortDemotion:
         assert cfg is not None
         assert cfg.chargers[0].comfort_soc == 86.0
         assert cfg.chargers[1].comfort_soc is None
+
+
+class TestActuationBackoff:
+    """A sleeping Tesla (switch 500) must not be hammered every tick — the failed
+    call never updates _last_switch, so without backoff the servo re-sends up to
+    60 calls/h against an API with a documented rate-limit ban history."""
+
+    @staticmethod
+    def _ha_with_failing_tesla(states):
+        class FailingHA(FakeHA):
+            async def call_service(self, domain, service, entity_id=None, data=None):
+                if entity_id == "switch.tesla" or (data or {}).get("value") is not None:
+                    self.calls.append((domain, service, entity_id, data))
+                    if domain == "switch":
+                        raise RuntimeError("500 Internal Server Error")
+                    return True
+                return await super().call_service(domain, service, entity_id, data)
+        return FailingHA(states)
+
+    @pytest.mark.asyncio
+    async def test_failed_actuation_backs_off(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        states = _states(**{
+            "sensor.pv": "12000", "sensor.grid": "-9000", "sensor.soc": "95",
+            "sensor.tesla_soc": "30", "input_number.fmb_soc": "97",
+        })
+        ha = self._ha_with_failing_tesla(states)
+        await ctl.run(ha, now_ts=1000.0)
+        n_after_first = len([c for c in ha.calls if c[2] == "switch.tesla"])
+        assert n_after_first >= 1
+        assert "tesla" in ctl._act_fail
+        # Next tick 60 s later: inside the 120 s backoff => NO new tesla call.
+        await ctl.run(ha, now_ts=1060.0)
+        assert len([c for c in ha.calls if c[2] == "switch.tesla"]) == n_after_first
+        # After the backoff window a retry is allowed again.
+        await ctl.run(ha, now_ts=1000.0 + 130.0)
+        assert len([c for c in ha.calls if c[2] == "switch.tesla"]) > n_after_first
+
+    @pytest.mark.asyncio
+    async def test_success_clears_backoff(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ctl._act_fail["easee_fmb"] = (0.0, 2)  # old failure, window passed
+        states = _states(**{
+            "sensor.pv": "12000", "sensor.grid": "-9000", "sensor.soc": "95",
+            "input_number.fmb_soc": "50", "sensor.tesla_soc": "97",
+        })
+        ha = FakeHA(states)
+        await ctl.run(ha, now_ts=10000.0)
+        assert "easee_fmb" not in ctl._act_fail
