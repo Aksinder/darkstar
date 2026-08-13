@@ -1,3 +1,7 @@
+## dev-20260813.1810 — 2026-08-13 18:12
+
+- fix(executor): R1 SoC floor applies to force_export quick actions too
+
 ## dev-20260813.1720 — 2026-08-13 17:22
 
 - fix(executor): actuation-failure backoff — a sleeping Tesla must not be hammered
