@@ -299,6 +299,7 @@ def parse_ev_surplus_config(
         start_hysteresis=float(pol.get("start_hysteresis", 0.15)),
         quantum_deadband_k=float(pol.get("quantum_deadband_k", 1.5)),
         schmitt_fraction=float(pol.get("schmitt_fraction", 0.7)),
+        battery_yield_soc=float(pol.get("battery_yield_soc", 0.0)),
     )
 
     def _parse_guard(raw_g: dict[str, Any], fallback: WriteGuardConfig) -> WriteGuardConfig:

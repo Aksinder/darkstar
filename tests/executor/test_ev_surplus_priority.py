@@ -512,3 +512,44 @@ class TestActuationBackoff:
         ha = FakeHA(states)
         await ctl.run(ha, now_ts=10000.0)
         assert "easee_fmb" not in ctl._act_fail
+
+
+class TestBatteryYieldGate:
+    """Owner (spike-evening insight): the battery fills FIRST on its way to
+    battery_yield_soc — cars may not steal its inflow for comfort bands when a
+    stored kWh is worth an avoided 3-4 kr evening import."""
+
+    def _inputs(self, soc, batt_w=4000.0):
+        fmb = _fmb(soc_percent=50.0, deadline_hours=None)
+        return EVSurplusInputs(
+            pv_w=5000.0, grid_w=0.0, battery_w=batt_w, battery_soc_percent=soc,
+            import_price_sek=1.0, remaining_solar_kwh=0.0, chargers=[fmb],
+        )
+
+    def test_battery_inflow_not_headroom_below_yield_soc(self):
+        cfg = EVSurplusConfig(enabled=True, battery_yield_soc=95.0)
+        cmds = compute_ev_surplus(self._inputs(soc=50.0), cfg)
+        assert not cmds[0].switch_on  # battery keeps its 4 kW inflow
+
+    def test_battery_inflow_is_headroom_at_yield_soc(self):
+        cfg = EVSurplusConfig(enabled=True, battery_yield_soc=95.0)
+        cmds = compute_ev_surplus(self._inputs(soc=96.0), cfg)
+        assert cmds[0].switch_on  # near-full battery yields to the car
+
+    def test_discharge_always_counts_against_cars(self):
+        """Protective direction is unconditional: discharging battery => back off."""
+        cfg = EVSurplusConfig(enabled=True, battery_yield_soc=95.0)
+        fmb = _fmb(soc_percent=50.0, deadline_hours=None,
+                   current_power_w=3680.0, commanded_on=True)
+        inputs = EVSurplusInputs(
+            pv_w=500.0, grid_w=0.0, battery_w=-2500.0, battery_soc_percent=50.0,
+            import_price_sek=1.0, remaining_solar_kwh=0.0, chargers=[fmb],
+        )
+        cmds = compute_ev_surplus(inputs, cfg)
+        cmd = cmds[0]
+        assert (not cmd.switch_on) or cmd.set_current_a < 16.0  # backing off
+
+    def test_legacy_default_unchanged(self):
+        cfg = EVSurplusConfig(enabled=True)  # battery_yield_soc 0.0
+        cmds = compute_ev_surplus(self._inputs(soc=12.0), cfg)
+        assert cmds[0].switch_on  # legacy: inflow is headroom at any SoC
