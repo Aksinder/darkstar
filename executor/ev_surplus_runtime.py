@@ -483,6 +483,13 @@ class EVSurplusController:
         # 'gated' / 'vacation' / 'idle') — read by the engine's EV-charge-failure
         # notifier so an intentionally soc-gated plan is never counted as failure.
         self.last_plan_note: dict[str, str] = {}
+        # Actuation-failure backoff: (last_fail_ts, consecutive_failures) per charger.
+        # A failed HA call (Tesla asleep => switch 500) must NOT retry every tick —
+        # the failure doesn't update _last_switch, so without backoff the servo
+        # re-sends up to 60 calls/h against an API with a documented rate-limit ban
+        # history. Exponential: 120 s doubling to a 900 s ceiling; any SUCCESSFUL
+        # actuation clears it.
+        self._act_fail: dict[str, tuple[float, int]] = {}
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
         """Battery charge-setpoint cap for the engine, or None when the guard is off.
@@ -885,12 +892,24 @@ class EVSurplusController:
             ccfg = cfg_by_id.get(cmd.id)
             if ccfg is None:
                 continue
+            fail = self._act_fail.get(cmd.id)
+            if fail is not None:
+                backoff_s = min(900.0, 120.0 * (2.0 ** (fail[1] - 1)))
+                if (now_ts - fail[0]) < backoff_s:
+                    continue  # in failure backoff — spare the (Tesla) API
             try:
                 await self._actuate(ha, ccfg, cmd, now_ts, shadow)
             except Exception:
-                # One charger's dead entity must not starve the others' actuation.
-                logger.exception("EV surplus: actuation failed for %s — continuing", cmd.id)
+                # One charger's dead entity must not starve the others' actuation,
+                # and a sleeping Tesla must not be hammered every tick.
+                n = (fail[1] + 1) if fail is not None else 1
+                self._act_fail[cmd.id] = (now_ts, n)
+                logger.exception(
+                    "EV surplus: actuation failed for %s (fail #%d, backoff %.0fs) — continuing",
+                    cmd.id, n, min(900.0, 120.0 * (2.0 ** (n - 1))),
+                )
                 continue
+            self._act_fail.pop(cmd.id, None)
             applied.append({"id": cmd.id, "on": cmd.switch_on, "a": cmd.set_current_a, "why": cmd.reason})
 
         logger.info("EV surplus: grid=%.0fW batt=%.0fW soc=%.0f%% price=%.2f vac=%s -> %s",
