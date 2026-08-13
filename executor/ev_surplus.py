@@ -123,6 +123,11 @@ class ChargerState:
     # congestion, never unsafe). NOTE: this maps the CAR'S DRAW, not the charger box's
     # wiring — the 3-phase-wired Easee carries the FMB on one leg.
     phase_map: tuple[str, ...] = ()
+    # This tick's PLANNER floor (W): kepler's price-placed charging for the current slot,
+    # already soc-gated and continuity-held by the runtime. Merged with the deadline floor
+    # via max() (never sum). 0 = no plan floor. In the ordering, plan floors rank BEHIND
+    # deadline floors (need before price-optimality) but ahead of the surplus class.
+    plan_floor_w: float = 0.0
     # Usable battery capacity, to convert an SoC gap into energy. 0 => no deadline floor.
     capacity_kwh: float = 0.0
     # Hours until the departure deadline. None / <=0 => no grid-backed deadline floor (the car
@@ -552,7 +557,11 @@ def compute_ev_surplus(
     # _deadline_required_w): the avg power it must pull now to make the deadline.
     # Floors are honoured regardless of surplus, so a deadline car "overtakes" the
     # others; free surplus is applied first so grid is only paid for the gap.
-    floor_w = {c.id: _deadline_required_w(c, cfg) for c in chargeable}
+    # Two floor sources per charger: the grid-backed deadline guarantee and the
+    # planner's price-placed slot (plan_floor_w, pre-gated by the runtime). Merged
+    # with max() — NEVER sum (the same energy need must not be double-counted).
+    deadline_w = {c.id: _deadline_required_w(c, cfg) for c in chargeable}
+    floor_w = {c.id: max(deadline_w[c.id], c.plan_floor_w) for c in chargeable}
 
     # Deadline cars overtake (sort key 0), then by priority. Used for BOTH surplus
     # distribution (free energy goes to the deadline car first) and emission order.
@@ -667,7 +676,10 @@ def compute_ev_surplus(
                                fuse_limited=fuse_capped)
             )
             continue
-        tag = "deadline" if forced and surplus_share[c.id] < floor_w[c.id] else "surplus"
+        if forced and surplus_share[c.id] < floor_w[c.id]:
+            tag = "deadline" if deadline_w[c.id] >= c.plan_floor_w else "plan"
+        else:
+            tag = "surplus"
         if fuse_capped:
             tag += "+fuse"
         if c.controllable:
