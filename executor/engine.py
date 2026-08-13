@@ -1691,6 +1691,11 @@ class ExecutorEngine:
                                     if original_slot is not None
                                     else None
                                 ),
+                                plan_battery_charge_kw=(
+                                    original_slot.charge_kw
+                                    if original_slot is not None
+                                    else 0.0
+                                ),
                             )
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)

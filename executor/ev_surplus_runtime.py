@@ -717,6 +717,7 @@ class EVSurplusController:
         now_ts: float,
         shadow: bool = False,
         plan_kw: dict[str, float] | None = None,
+        plan_battery_charge_kw: float = 0.0,
     ) -> dict[str, Any]:
         """One control cycle. Returns a summary (for logging / UI).
 
@@ -861,6 +862,7 @@ class EVSurplusController:
             pv_w=pv_w, grid_w=grid_w, battery_w=battery_w, battery_soc_percent=soc,
             import_price_sek=price, remaining_solar_kwh=remaining_solar,
             battery_tier_active_prev=self._battery_tier_prev,
+            plan_battery_charge_w=max(0.0, plan_battery_charge_kw) * 1000.0,
             phase_currents_a=phase_currents, chargers=states,
         )
         commands = compute_ev_surplus(inputs, cfg.policy)
