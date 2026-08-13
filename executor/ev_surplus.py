@@ -57,6 +57,9 @@ class EVSurplusConfig:
     # so urgent deadline floors keep their budget and topup cars are shed first; it
     # TRUMPS floors — a grid-backed guarantee must never blow the main fuse.
     fuse_budget_a: float | None = None
+    # Battery-yield gate: the home battery's charging inflow becomes car headroom
+    # only at/above this SoC (see the headroom computation). 0.0 = legacy.
+    battery_yield_soc: float = 0.0
     # Quantized-control stability: the effective fleet deadband is widened to
     # K x (largest 1-step power quantum among commanded-ON controllable chargers),
     # so a charger whose smallest move exceeds the band can never limit-cycle
@@ -525,7 +528,21 @@ def compute_ev_surplus(
         return commands
 
     current_total_w = sum(c.current_power_w for c in chargeable)
-    headroom_w = (grid_setpoint_w - inputs.grid_w) + inputs.battery_w + battery_allow_w
+    # Battery-yield gate (owner 2026-08-13, spike-evening insight: "håll batteriet
+    # till 100 % först"): the home battery's CHARGING power counts as car headroom
+    # only once its SoC has reached battery_yield_soc — on days ending in a 4-kr
+    # evening peak a stored kWh (avoided import 3-4+) beats the cars' comfort bands
+    # (0.35-2.0), so the battery fills FIRST and the cars take the taper-era rest.
+    # DISCHARGING battery always counts (negative => cars back off — protective and
+    # unconditional). 0.0 = legacy (cars may always take the battery's inflow).
+    # Grid-backed floors (deadline/plan) are unaffected — they don't ride headroom.
+    batt_term_w = inputs.battery_w
+    if (
+        batt_term_w > 0.0
+        and inputs.battery_soc_percent < cfg.battery_yield_soc
+    ):
+        batt_term_w = 0.0
+    headroom_w = (grid_setpoint_w - inputs.grid_w) + batt_term_w + battery_allow_w
 
     # Quantum-aware effective deadband: never demand a move smaller than the largest
     # single amp-step among the chargers actually running (see quantum_deadband_k).
