@@ -573,9 +573,14 @@ def compute_ev_surplus(
     # its comfort_soc yields to every non-demoted car, then keeps charging on what's left.
     def _order_key(x: ChargerState) -> tuple[int, float, int, int, str]:
         has_floor = floor_w[x.id] > 0.0
+        # Urgency comes from the DEADLINE SOURCE only: a plan-only floor (deadline_w
+        # == 0 — e.g. the FMB above its floor_soc with a cheap night slot) must not
+        # borrow the recurring 07:30 deadline_hours, tie the genuinely-behind car and
+        # win on priority — under fuse scarcity that starved the Tesla's guarantee
+        # while the FMB charged comfort energy (review-caught, critical).
         urgency = (
             x.deadline_hours
-            if has_floor and x.deadline_hours is not None
+            if deadline_w[x.id] > 0.0 and x.deadline_hours is not None
             else float("inf")
         )
         demoted = int(
