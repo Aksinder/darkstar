@@ -108,6 +108,9 @@ class ExecutorEngine:
         _ev_surplus_cfg = parse_ev_surplus_config(
             self._full_config.get("executor", {}) or {},
             timezone=self.config.timezone,
+            planner_ev_chargers=cast(
+                "list[dict[str, Any]]", self._full_config.get("ev_chargers", []) or []
+            ),
         )
         self._ev_surplus = EVSurplusController(_ev_surplus_cfg) if _ev_surplus_cfg else None
 
@@ -1673,10 +1676,20 @@ class ExecutorEngine:
 
                     # Real-time EV surplus controller (variable charge current, default OFF).
                     # Isolated so a transient HA read can never break the main actuation.
+                    # S3 bridge: pass ORIGINAL_slot's per-charger plan — the isolation
+                    # rebuild strips ev_charger_plans exactly when a car is actually
+                    # charging, which is precisely when the bridge must keep working.
                     if self._ev_surplus is not None and self.ha_client is not None:
                         try:
                             await self._ev_surplus.run(
-                                self.ha_client, time.time(), shadow=self.config.shadow_mode
+                                self.ha_client,
+                                time.time(),
+                                shadow=self.config.shadow_mode,
+                                plan_kw=(
+                                    original_slot.ev_charger_plans
+                                    if original_slot is not None
+                                    else None
+                                ),
                             )
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)

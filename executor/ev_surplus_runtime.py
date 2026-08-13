@@ -93,6 +93,17 @@ class EVSurplusChargerCfg:
     # Restart dwell after a stop (s): once stopped, the charger may not restart for
     # this long. Deadline floors are exempt. 0 = no dwell (legacy).
     min_off_s: float = 0.0
+    # S3 bridge: honour kepler's per-slot charging plan as a grid-backed FLOOR for
+    # this charger (price-optimal night placement instead of the evenly-smeared
+    # deadline backstop). Default OFF for staged rollout.
+    plan_floor: bool = False
+    # Plan floors are honoured only BELOW this SoC — single-sourced at parse time
+    # from the PLANNER's first penalty band (its guarantee band), NOT floor_soc:
+    # the FMB's guarantee band tops at 86 while its emergency floor_soc is 40, and
+    # gating on 40 would kill night charging for the whole 40-86 band (S3 note).
+    # Above the gate, planned slots are surplus HINTS, never grid-backed (F11:
+    # a cloud gap in a topup slot must not buy 0.35-valued energy at import price).
+    plan_gate_soc: float | None = None
     # Per-charger shadow: log decisions + advance the write-guard state, but never
     # call HA services. Rollout gate for a re-introduced charger — the GLOBAL
     # executor shadow flag would shadow battery/water too.
@@ -231,14 +242,37 @@ def _valid_phase_map(
     return kept
 
 
+def _plan_gate_soc(planner_entry: dict | None, charger_id: str) -> float | None:
+    """The plan-floor soc-gate = the PLANNER's first penalty band's max_soc.
+
+    Single source (F6): the gate IS the guarantee band, so an owner edit to the
+    band moves the gate with it. None (no planner entry / no bands) => a
+    plan_floor charger gets NO grid-backed plan floors (gate everything).
+    """
+    if not planner_entry:
+        return None
+    bands = planner_entry.get("penalty_levels") or []
+    if not bands:
+        return None
+    v = _f(bands[0].get("max_soc"))
+    if v is None:
+        logger.warning("Charger %s: unparsable first penalty band — plan floors gated off", charger_id)
+    return v
+
+
 def parse_ev_surplus_config(
-    executor_data: dict[str, Any], timezone: str | None = None
+    executor_data: dict[str, Any],
+    timezone: str | None = None,
+    planner_ev_chargers: list[dict[str, Any]] | None = None,
 ) -> EVSurplusRuntimeConfig | None:
     """Build the runtime config from ``executor.ev_surplus``; None if absent.
 
     ``timezone`` is the RESOLVED site timezone (root-level config key) — the caller must
     pass it; ``executor.timezone`` does not exist in the schema, so reading it here would
     silently pin recurring deadlines to the Stockholm fallback on every non-SE site.
+    ``planner_ev_chargers`` is the ROOT ev_chargers list — the plan-floor soc-gate is
+    single-sourced from each charger's FIRST penalty band so servo gate and planner
+    guarantee band can never drift apart (F6).
     """
     raw_any = executor_data.get("ev_surplus")
     if not isinstance(raw_any, dict):
@@ -298,6 +332,9 @@ def parse_ev_surplus_config(
     # The pure clamp activates via policy.fuse_budget_a (limit minus margin).
     if fuse_enabled:
         policy.fuse_budget_a = float(fg.get("limit_a", 25.0)) - float(fg.get("margin_a", 2.0))
+    planner_by_id: dict[str, dict[str, Any]] = {
+        str(e.get("id", "")): e for e in (planner_ev_chargers or [])
+    }
     chargers: list[EVSurplusChargerCfg] = []
     for c in cast("list[dict[str, Any]]", raw.get("chargers", []) or []):
         if not c.get("id"):
@@ -343,6 +380,10 @@ def parse_ev_surplus_config(
                     str(c.get("id", "?")),
                 ),
                 min_off_s=float(c.get("min_off_s", 0.0)),
+                plan_floor=bool(c.get("plan_floor", False)),
+                plan_gate_soc=_plan_gate_soc(
+                    planner_by_id.get(str(c.get("id", ""))), str(c.get("id", "?"))
+                ),
                 shadow=bool(c.get("shadow", False)),
             )
         )
@@ -357,6 +398,17 @@ def parse_ev_surplus_config(
                 last.min_current_a,
             )
             last.min_current_a = 6.0
+    for _cc in chargers:
+        if _cc.plan_floor:
+            _pe = planner_by_id.get(_cc.id) or {}
+            if str(_pe.get("switch_entity") or "").strip():
+                logger.warning(
+                    "Charger %s: plan_floor is set AND the planner entry has a "
+                    "switch_entity — the legacy _control_ev_charger path runs BEFORE "
+                    "the servo in the same tick and the two will fight. Clear the "
+                    "planner switch_entity (F4).",
+                    _cc.id,
+                )
     return EVSurplusRuntimeConfig(
         enabled=bool(raw.get("enabled", False)),
         pv_power_entity=raw.get("pv_power_entity") or None,
@@ -411,6 +463,12 @@ class EVSurplusController:
         # meter snapshot (review-caught).
         self.last_ev_alloc_a: dict[str, float] = {}
         self._core_skip_since: float | None = None
+        # S3 continuity hold: (held_w, until_ts) per charger. Kepler's 15-min replans
+        # can flip equivalent-cost slot checkerboards; without a hold each flip would
+        # stop/start the car (Tesla wakes, Easee relay churn). A started plan floor is
+        # held for >= PLAN_HOLD_S even if the next replan drops the slot — bounded
+        # cost (<= 30 min at the held level), and the soc-gate still ends it early.
+        self._plan_hold: dict[str, tuple[float, float]] = {}
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
         """Battery charge-setpoint cap for the engine, or None when the guard is off.
@@ -631,8 +689,19 @@ class EVSurplusController:
             commanded_on=commanded_on, start_inhibited=start_inhibited,
         )
 
-    async def run(self, ha: Any, now_ts: float, shadow: bool = False) -> dict[str, Any]:
-        """One control cycle. Returns a summary (for logging / UI)."""
+    async def run(
+        self,
+        ha: Any,
+        now_ts: float,
+        shadow: bool = False,
+        plan_kw: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """One control cycle. Returns a summary (for logging / UI).
+
+        ``plan_kw`` is the executor's current-slot per-charger plan
+        (SlotPlan.ev_charger_plans, kW) — the S3 bridge. Only chargers with
+        plan_floor: true consume it, after the soc-gate and continuity hold.
+        """
         cfg = self.cfg
         if not cfg.enabled or not cfg.chargers:
             return {"enabled": False}
@@ -705,6 +774,31 @@ class EVSurplusController:
                 *(self._read_charger(ha, c, now_ts, vacation) for c in cfg.chargers)
             )
         )
+        # S3 plan floors: gate + continuity hold, then attach to the states.
+        cfg_by_id_pre = {c.id: c for c in cfg.chargers}
+        for st in states:
+            ccfg = cfg_by_id_pre.get(st.id)
+            if ccfg is None or not ccfg.plan_floor:
+                continue
+            raw_w = max(0.0, float((plan_kw or {}).get(st.id, 0.0)) * 1000.0)
+            min_on_w = max(ccfg.min_current_a, cfg.policy.min_charge_current_a) \
+                * ccfg.voltage_v * ccfg.phases
+            gated = (
+                ccfg.plan_gate_soc is None
+                or st.soc_percent is None
+                or st.soc_percent >= ccfg.plan_gate_soc
+            )
+            plan_w = 0.0 if (gated or raw_w < min_on_w) else raw_w
+            if plan_w > 0.0:
+                self._plan_hold[st.id] = (plan_w, now_ts + 1800.0)
+            else:
+                held = self._plan_hold.get(st.id)
+                if held is not None and now_ts < held[1] and not gated:
+                    plan_w = held[0]  # replan flip — hold the started floor
+                elif held is not None and now_ts >= held[1]:
+                    del self._plan_hold[st.id]
+            st.plan_floor_w = plan_w
+
         # Manual fleet priority: remap ChargerState.priority from the selected ordering.
         # Floors are untouched by design — in the pure sort, floor class + deadline urgency
         # rank BEFORE priority, so the selector only redistributes the surplus class.
