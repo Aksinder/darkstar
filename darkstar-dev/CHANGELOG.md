@@ -1,3 +1,7 @@
+## dev-20260813.1720 — 2026-08-13 17:22
+
+- fix(executor): actuation-failure backoff — a sleeping Tesla must not be hammered
+
 ## dev-20260813.0647 — 2026-08-13 06:49
 
 - fix(executor): S3 review fixes — urgency source-awareness, bounded hold, vacation gate
