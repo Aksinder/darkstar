@@ -1,3 +1,7 @@
+## dev-20260813.1843 — 2026-08-13 18:45
+
+- feat(executor): battery-yield gate — the home battery fills first on spike days
+
 ## dev-20260813.1810 — 2026-08-13 18:12
 
 - fix(executor): R1 SoC floor applies to force_export quick actions too
