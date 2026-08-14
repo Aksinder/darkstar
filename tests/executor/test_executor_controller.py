@@ -847,3 +847,68 @@ class TestControllerPerDeviceWaterTemps:
         )
 
         assert decision.water_temp == 60
+
+
+class TestPerDeviceWaterTemps:
+    """Thermostatic loads don't share a temperature range: the spa runs 20-40 C via
+    an input_number bridge (>30 = heat to value, <=30 = fan_only), so the tanks'
+    global temp_off=40 would read as 'heat to 40' and temp_normal=60 exceeds its
+    max. Per-device overrides fix that; unset devices keep the globals."""
+
+    @staticmethod
+    def _controller():
+        from executor.config import (
+            ControllerConfig,
+            InverterConfig,
+            WaterHeaterDeviceConfig,
+            WaterHeaterGlobalConfig,
+        )
+        from executor.controller import Controller
+
+        return Controller(
+            config=ControllerConfig(),
+            inverter_config=InverterConfig(),
+            water_heater_config=WaterHeaterGlobalConfig(
+                temp_off=40, temp_normal=60, temp_boost=70, temp_max=85
+            ),
+            water_heater_devices=[
+                WaterHeaterDeviceConfig(id="main_tank", target_entity="switch.vvb"),
+                WaterHeaterDeviceConfig(
+                    id="spa",
+                    target_entity="input_number.spa_darkstar_target_temp",
+                    temp_off=20, temp_normal=38, temp_boost=40, temp_max=40,
+                ),
+            ],
+        )
+
+    def test_off_uses_per_device_override(self):
+        c = self._controller()
+        temps = c._determine_water_temps(SlotPlan())
+        assert temps["spa"] == 20      # fan_only via the bridge
+        assert temps["main_tank"] == 40  # global
+
+    def test_planned_heat_uses_per_device_normal(self):
+        c = self._controller()
+        slot = SlotPlan(water_heater_plans={"spa": 1.8, "main_tank": 3.4})
+        temps = c._determine_water_temps(slot)
+        assert temps["spa"] == 38
+        assert temps["main_tank"] == 60
+
+    def test_boost_uses_per_device_max(self):
+        c = self._controller()
+        slot = SlotPlan(
+            water_heater_plans={"spa": 1.8, "main_tank": 3.4},
+            water_heating_boost={"spa": True, "main_tank": True},
+        )
+        temps = c._determine_water_temps(slot)
+        assert temps["spa"] == 40   # never the tanks' 85
+        assert temps["main_tank"] == 85
+
+    def test_zero_is_a_real_override_not_absent(self):
+        from executor.config import WaterHeaterDeviceConfig
+
+        c = self._controller()
+        c.water_heater_devices = [
+            WaterHeaterDeviceConfig(id="x", target_entity="switch.x", temp_off=0)
+        ]
+        assert c._determine_water_temps(SlotPlan())["x"] == 0

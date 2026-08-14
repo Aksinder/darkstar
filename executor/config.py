@@ -15,6 +15,20 @@ from ruamel.yaml import YAML
 logger = logging.getLogger(__name__)
 
 
+def _int_or_none(value: Any) -> int | None:
+    """Convert an optional numeric config value to int, or None when absent/blank.
+
+    Used for per-device overrides where "not set" must fall back to a global —
+    distinct from 0, which is a legitimate temperature.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _str_or_none(value: Any) -> str | None:
     """Convert config value to str or None. Empty strings become None.
 
@@ -332,6 +346,17 @@ class WaterHeaterDeviceConfig:
     # managed. Fail-safe: an unreadable entity is treated as NOT paused (normal
     # control). See dispatcher.is_control_paused.
     control_pause_entities: list[str] = field(default_factory=lambda: [])
+    # Per-device temperature overrides (None => the global executor.water_heater
+    # values). Needed for thermostatic loads whose range differs from the tanks':
+    # the spa runs 20-40 C, so the global temp_off=40 would read as "heat to 40"
+    # on its bridge and temp_normal=60 exceeds its max. The values are written to
+    # the device's target_entity exactly like the globals — for a numeric target
+    # (input_number bridge) they ARE the setpoint; for a switch target only the
+    # off/on distinction matters.
+    temp_off: int | None = None
+    temp_normal: int | None = None
+    temp_boost: int | None = None
+    temp_max: int | None = None
 
 
 DEFAULT_PENALTY_LEVELS = {
@@ -612,6 +637,10 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 target_entity=target_ent,
                 power_kw=float(heater.get("power_kw", WaterHeaterDeviceConfig.power_kw)),
                 control_pause_entities=_str_list(heater.get("control_pause_entities")),
+                temp_off=_int_or_none(heater.get("temp_off")),
+                temp_normal=_int_or_none(heater.get("temp_normal")),
+                temp_boost=_int_or_none(heater.get("temp_boost")),
+                temp_max=_int_or_none(heater.get("temp_max")),
             )
         )
 
