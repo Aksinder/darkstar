@@ -1,3 +1,7 @@
+## dev-20260814.0500 — 2026-08-14 05:02
+
+- feat(executor): per-device water-heater temperature overrides
+
 ## dev-20260813.1915 — 2026-08-13 19:17
 
 - fix(executor): battery-yield gate conditioned on PLANNED battery charging
