@@ -1,3 +1,7 @@
+## dev-20260814.0658 — 2026-08-14 07:00
+
+- feat(planner): absorb_cap_kwh_per_day config override for water heaters
+
 ## dev-20260814.0500 — 2026-08-14 05:02
 
 - feat(executor): per-device water-heater temperature overrides
