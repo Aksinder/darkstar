@@ -408,6 +408,19 @@ class Controller:
             return self.water_heater_config.temp_normal
         return self.water_heater_config.temp_off
 
+    def _device_temp(self, device: WaterHeaterDeviceConfig, kind: str) -> int:
+        """One temperature for one device: per-device override, else the global.
+
+        Thermostatic loads don't share a temperature range — the spa runs 20-40 C,
+        so the tanks' global temp_off=40 would read as "heat to 40" on the spa's
+        bridge and temp_normal=60 exceeds its max. A device may override any of
+        temp_off / temp_normal / temp_boost / temp_max; unset falls back.
+        """
+        override = getattr(device, f"temp_{kind}", None)
+        if override is not None:
+            return int(override)
+        return int(getattr(self.water_heater_config, f"temp_{kind}"))
+
     def _determine_water_temps(self, slot: SlotPlan) -> dict[str, int]:
         """Determine per-device water heater temperatures from slot plan (task 6.4)."""
         if not self.water_heater_devices:
@@ -419,11 +432,11 @@ class Controller:
             if is_boost and planned_kw > 0:
                 # Excess PV boost uses temp_max (85°C, the PV dump target).
                 # temp_boost (70°C) is reserved for the manual dashboard boost button.
-                temps[device.id] = self.water_heater_config.temp_max
+                temps[device.id] = self._device_temp(device, "max")
             elif planned_kw > 0:
-                temps[device.id] = self.water_heater_config.temp_normal
+                temps[device.id] = self._device_temp(device, "normal")
             else:
-                temps[device.id] = self.water_heater_config.temp_off
+                temps[device.id] = self._device_temp(device, "off")
         return temps
 
     def _generate_reason(self, slot: SlotPlan, mode_intent: str) -> str:

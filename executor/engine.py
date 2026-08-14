@@ -789,11 +789,15 @@ class ExecutorEngine:
                 devices = self.config.water_heater_devices or []
                 if devices:
                     # Per-device: a control-paused device (rent-out hands-off) is skipped
-                    # so the boost button cannot turn a renter's tank ON.
+                    # so the boost button cannot turn a renter's tank ON. Per-device
+                    # temp overrides win (a 20-40 C spa cannot take the tanks' 70).
                     for dev in devices:
+                        dev_boost = (
+                            dev.temp_boost if dev.temp_boost is not None else boost_temp
+                        )
                         task: asyncio.Task[Any] = loop.create_task(
                             self._apply_water_temp_gated(
-                                boost_temp, dev, log_key=f"boost:{dev.id}"
+                                dev_boost, dev, log_key=f"boost:{dev.id}"
                             )
                         )
                         self._background_tasks.add(task)
@@ -840,10 +844,14 @@ class ExecutorEngine:
                     if devices:
                         # Per-device: a control-paused device (rent-out hands-off) is
                         # skipped so a boost-cancel cannot turn a renter's tank OFF.
+                        # Per-device temp overrides win (the spa's OFF is 20, not 40).
                         for dev in devices:
+                            dev_off = (
+                                dev.temp_off if dev.temp_off is not None else off_temp
+                            )
                             task: asyncio.Task[Any] = loop.create_task(
                                 self._apply_water_temp_gated(
-                                    off_temp, dev, log_key=f"clearboost:{dev.id}"
+                                    dev_off, dev, log_key=f"clearboost:{dev.id}"
                                 )
                             )
                             self._background_tasks.add(task)
