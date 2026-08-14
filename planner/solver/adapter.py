@@ -117,7 +117,31 @@ def build_water_heater_inputs(
         # empties a tank.
         absorbed_today = max(heated_today, float(state.get("absorbed_today_kwh", 0.0) or 0.0))
         absorb_cap: float | None = None
+        # Owner-declared physical ceiling (kWh/day). The learned cap needs a week of
+        # measurements and fails OPEN until then — fine for a tank that has always been
+        # metered, dangerous for a newly added load: an uncapped 1.8 kW spa with a low
+        # WTP gets booked into every cheap slot, and that phantom demand eats the
+        # modeled surplus exactly like the 2026-08 fantomvatten incident. Declaring the
+        # physics (spa: ~2 C/h => ~0.9 kWh per degree) bounds the plan from day one.
+        # Used as the value while no trailing data exists, and as a hard upper bound on
+        # the learned cap afterwards (the demand ratchet may still exceed it — measured
+        # absorption IS reality and must never be capped below what already happened).
+        cfg_cap_raw = wh.get("absorb_cap_kwh_per_day")
+        cfg_cap: float | None = None
+        if cfg_cap_raw is not None:
+            try:
+                cfg_cap = float(cfg_cap_raw)
+                if cfg_cap <= 0.0:
+                    cfg_cap = None
+            except (TypeError, ValueError):
+                logger.warning(
+                    "water_heater %s: absorb_cap_kwh_per_day=%r not a number - ignoring",
+                    heater_id,
+                    cfg_cap_raw,
+                )
         trailing_raw = state.get("absorbed_daily_avg_kwh")
+        if trailing_raw is None and cfg_cap is not None:
+            absorb_cap = max(cfg_cap, absorbed_today * _ABSORB_RATCHET_MARGIN)
         if trailing_raw is not None:
             trailing = max(0.0, float(trailing_raw))
             cap = max(min_kwh, trailing * _ABSORB_CAP_MARGIN)
@@ -138,6 +162,8 @@ def build_water_heater_inputs(
             # energy, and the hardware thermostat stops that the moment it is full.
             # Applied AFTER the physical bound — measured absorption IS physical
             # reality, and must never be capped below what already happened.
+            if cfg_cap is not None:
+                cap = min(cap, cfg_cap)
             cap = max(cap, absorbed_today * _ABSORB_RATCHET_MARGIN)
             absorb_cap = cap
 

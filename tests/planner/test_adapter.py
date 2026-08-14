@@ -801,3 +801,53 @@ class TestAbsorptionCap:
         ]
         result = build_water_heater_inputs([self.WH], {}, state)
         assert result[0].absorbed_today_kwh == 9.3
+
+
+class TestAbsorbCapConfigOverride:
+    """A newly added heater has no trailing absorption data, and the learned cap
+    fails OPEN — an uncapped 1.8 kW spa with a low WTP gets booked into every cheap
+    slot and that phantom demand eats the modeled surplus (the 2026-08 fantomvatten
+    failure mode). absorb_cap_kwh_per_day lets the owner declare the physics."""
+
+    @staticmethod
+    def _cfg(**over):
+        base = {
+            "id": "spa", "enabled": True, "power_kw": 1.8, "min_kwh_per_day": 0,
+            "target_entity": "input_number.spa_darkstar_target_temp",
+            "absorb_cap_kwh_per_day": 8.0,
+        }
+        base.update(over)
+        return base
+
+    @staticmethod
+    def _build(cfg, state):
+        from planner.solver.adapter import build_water_heater_inputs
+
+        return build_water_heater_inputs([cfg], {}, [{"id": "spa", **state}])[0]
+
+    def test_config_cap_applies_without_trailing_data(self):
+        out = self._build(self._cfg(), {})
+        assert out.absorb_cap_kwh_per_day == 8.0
+
+    def test_no_config_cap_stays_fail_open(self):
+        cfg = {k: v for k, v in self._cfg().items() if k != "absorb_cap_kwh_per_day"}
+        out = self._build(cfg, {})
+        assert out.absorb_cap_kwh_per_day is None
+
+    def test_config_cap_bounds_a_higher_learned_cap(self):
+        out = self._build(self._cfg(), {"absorbed_daily_avg_kwh": 20.0})
+        assert out.absorb_cap_kwh_per_day == 8.0  # not 20 * 1.5
+
+    def test_lower_learned_cap_wins(self):
+        out = self._build(self._cfg(), {"absorbed_daily_avg_kwh": 2.0})
+        assert out.absorb_cap_kwh_per_day == pytest.approx(3.0)  # 2 * 1.5
+
+    def test_demand_ratchet_still_exceeds_the_config_cap(self):
+        """Measured absorption IS reality — a real big day must never be capped
+        below what already happened."""
+        out = self._build(self._cfg(), {"absorbed_today_kwh": 10.0})
+        assert out.absorb_cap_kwh_per_day == pytest.approx(13.0)  # 10 * 1.3
+
+    def test_garbage_cap_is_ignored(self):
+        cfg = self._cfg(absorb_cap_kwh_per_day="kanske")
+        assert self._build(cfg, {}).absorb_cap_kwh_per_day is None
