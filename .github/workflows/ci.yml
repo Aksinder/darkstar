@@ -53,17 +53,16 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
-      - name: Run pytest (planner / solver / executor / ev / backend / config / services)
-        # tests/api, tests/performance and tests/test_inputs_ha_client need a live HA config / DB
-        # harness (FileNotFoundError config.yaml, uninitialised LearningStore, httpx config) — they
-        # are integration tests, excluded from this logic gate until a CI harness is added (debt).
+      - name: Run pytest (planner / solver / executor / ev / backend / config / services / api)
+        # tests/api and tests/test_inputs_ha_client no longer need a live HA config / DB
+        # harness: they feed get_initial_state a real temp config, stub the secrets loader,
+        # and override the LearningStore dependency instead of relying on the lifespan.
+        # tests/performance stays out — its assertions are wall-clock, which a shared
+        # runner cannot hold to. tests/ml has its own job below.
         run: >
           PYTHONPATH=. pytest tests/ -q
           --ignore=tests/ml
-          --ignore=tests/api
           --ignore=tests/performance
-          --ignore=tests/test_inputs_ha_client.py
-          --deselect "tests/ev/test_ev_charging_replan.py::TestExecutorEVSwitchGating::test_executor_ev_switch_not_opened_without_schedule"
 
   test-ml:
     name: Tests (ML — informational)
