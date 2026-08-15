@@ -342,9 +342,15 @@ class TestExecutorEVSwitchGating:
             mock_disaggregator.get_total_ev_power.return_value = 3.5  # Actual charging detected
             engine._load_disaggregator = mock_disaggregator
 
-            # Mock other dependencies
+            # Mock other dependencies. The dispatcher must be an AsyncMock: the tick
+            # awaits its methods, and a plain MagicMock turns every action into
+            # "object MagicMock can't be used in 'await' expression" — which the tick
+            # then tries to report through the equally unawaitable notify_error.
             engine.ha_client = MagicMock()
-            engine.dispatcher = MagicMock()
+            engine.dispatcher = AsyncMock()
+            # No migrated DB in a checkout, and this test is about the switch gating,
+            # not persistence: the execution_log insert would raise "no such table".
+            engine.history = MagicMock()
 
             # Mock _gather_system_state
             state = SystemState(current_soc_percent=50.0)

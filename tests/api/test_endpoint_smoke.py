@@ -31,11 +31,22 @@ def client():
 
     app = create_app()
     fastapi_app = app.other_asgi_app if hasattr(app, "other_asgi_app") else app
-    with (
-        patch("backend.main.LearningStore", return_value=mock_store),
-        TestClient(fastapi_app) as c,
-    ):
-        yield c
+
+    # Override the dependency rather than patching backend.main.LearningStore: the
+    # lifespan reads config.yaml BEFORE constructing the store, so in a checkout it
+    # raises, parks None in app.state, and every store-backed route 500s no matter
+    # what the constructor was patched to return.
+    from backend.api.deps import get_learning_store
+
+    fastapi_app.dependency_overrides[get_learning_store] = lambda: mock_store
+    try:
+        with (
+            patch("backend.main.LearningStore", return_value=mock_store),
+            TestClient(fastapi_app) as c,
+        ):
+            yield c
+    finally:
+        fastapi_app.dependency_overrides.clear()
 
 
 def test_smoke_ha_entity(client):

@@ -131,10 +131,14 @@ def test_learning_run_success(client):
     """Test full learning run success."""
     with (
         patch("ml.training_orchestrator.train_all_models", new_callable=AsyncMock) as mock_train,
-        patch("backend.learning.reflex.AuroraReflex.run", new_callable=AsyncMock) as mock_reflex,
+        # Patch the CLASS, not just .run: AuroraReflex.__init__ opens config.yaml and
+        # builds a LearningEngine, so constructing it in a checkout raises before the
+        # patched run() is ever reached and the route 500s.
+        patch("backend.learning.reflex.AuroraReflex") as mock_reflex_cls,
     ):
         mock_train.return_value = {"status": "success"}
-        mock_reflex.return_value = {"updated": True}
+        mock_reflex = AsyncMock(return_value={"updated": True})
+        mock_reflex_cls.return_value = MagicMock(run=mock_reflex)
 
         response = client.post("/api/learning/run")
         assert response.status_code == 200

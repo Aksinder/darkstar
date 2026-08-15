@@ -7,6 +7,26 @@ to prevent resource leaks when fetching HA data.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
+
+# get_ha_entity_state() returns early when secrets.yaml has no url/token, so the
+# httpx tests must supply credentials or they assert against a call that was never
+# made. There is no secrets.yaml in a checkout — that is the point of the fixture.
+FAKE_HA = {"url": "http://ha.test", "token": "fake-token"}
+
+
+def _write_config(tmp_path, config: dict) -> str:
+    """Materialise a real config file and hand back its path.
+
+    get_initial_state() takes config_path, so tests feed it a file instead of
+    patching yaml.safe_load or builtins.open globally. Those patches were both
+    fragile and over-broad: Path.open() reaches io.open directly, so the
+    builtins.open patch never fired, and patching yaml.safe_load hits every
+    other yaml read in the call path too.
+    """
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    return str(path)
 
 
 class TestGatherSensorReads:
@@ -85,7 +105,7 @@ class TestGatherSensorReads:
 
 
 @pytest.mark.asyncio
-async def test_ev_soc_fallback_logging_no_crash():
+async def test_ev_soc_fallback_logging_no_crash(tmp_path):
     """Verify that EV SoC fallback logging with '0%%' does not crash due to formatting.
 
     This is a regression test for the ValueError: incomplete format bug where
@@ -117,13 +137,12 @@ async def test_ev_soc_fallback_logging_no_crash():
     # Track if the warning was called with proper format
     warning_calls = []
 
-    def mock_yaml_load(f):
-        return test_config
+    config_path = _write_config(tmp_path, test_config)
 
     with (
-        patch("yaml.safe_load", side_effect=mock_yaml_load),
         patch("backend.core.ha_client.get_ha_sensor_float") as mock_get_sensor,
         patch("backend.core.ha_client.logger") as mock_logger,
+        patch("backend.core.secrets.load_home_assistant_config", return_value={}),
     ):
         # Battery SoC returns valid data
         mock_get_sensor.side_effect = lambda entity_id: {
@@ -135,7 +154,7 @@ async def test_ev_soc_fallback_logging_no_crash():
         mock_logger.warning = lambda msg, *args: warning_calls.append((msg, args))
 
         # This should NOT raise ValueError: incomplete format
-        result = await get_initial_state()
+        result = await get_initial_state(config_path)
 
         # Verify the warning was logged with 0%%
         ev_soc_warnings = [call for call in warning_calls if "defaulting to" in call[0]]
@@ -169,7 +188,10 @@ async def test_get_ha_entity_state_uses_async_context_manager():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("httpx.AsyncClient") as mock_async_client:
+    with (
+        patch("backend.core.secrets.load_home_assistant_config", return_value=FAKE_HA),
+        patch("httpx.AsyncClient") as mock_async_client,
+    ):
         mock_async_client.return_value = mock_client
 
         # Call the function
@@ -200,7 +222,10 @@ async def test_get_ha_entity_state_closes_client_on_exception():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("httpx.AsyncClient") as mock_async_client:
+    with (
+        patch("backend.core.secrets.load_home_assistant_config", return_value=FAKE_HA),
+        patch("httpx.AsyncClient") as mock_async_client,
+    ):
         mock_async_client.return_value = mock_client
 
         # Call the function - should not raise, should return None
@@ -288,12 +313,14 @@ class TestGatherSensorReadsBatchExecution:
         results = await gather_sensor_reads(reads, context="timing_test")
         elapsed = time.monotonic() - start
 
-        # Should complete in ~DELAY, not 5*DELAY
-        assert elapsed < DELAY * 2.5, f"Expected parallel execution, took {elapsed:.3f}s"
+        # Should complete in ~DELAY, not 5*DELAY. The bound sits between the two so it
+        # still discriminates (sequential would be 5*DELAY = 250ms) while leaving a
+        # shared CI runner room to be slow — this assertion now gates the build.
+        assert elapsed < DELAY * 3, f"Expected parallel execution, took {elapsed:.3f}s"
         assert results == {"s0": 0, "s1": 1, "s2": 2, "s3": 3, "s4": 4}
 
     @pytest.mark.asyncio
-    async def test_get_initial_state_partial_failure_continues(self):
+    async def test_get_initial_state_partial_failure_continues(self, tmp_path):
         """get_initial_state() continues with defaults when optional sensors fail."""
         from unittest.mock import AsyncMock, patch
 
@@ -328,11 +355,9 @@ class TestGatherSensorReadsBatchExecution:
             "sensor.ev_soc": None,
         }
 
+        config_path = _write_config(tmp_path, test_config)
+
         with (
-            patch("yaml.safe_load", return_value=test_config),
-            patch(
-                "builtins.open", new_callable=lambda: lambda *a, **k: __import__("io").StringIO("")
-            ),
             patch("backend.core.ha_client.get_ha_sensor_float") as mock_sensor,
             patch("backend.core.ha_client.get_ha_bool", new_callable=AsyncMock, return_value=False),
             patch("backend.core.secrets.load_home_assistant_config", return_value={}),
@@ -340,7 +365,7 @@ class TestGatherSensorReadsBatchExecution:
             # AsyncMock with sync side_effect: returns the dict value for each entity
             mock_sensor.side_effect = lambda e: sensor_values.get(e)
 
-            result = await get_initial_state()
+            result = await get_initial_state(config_path)
 
             assert result["battery_soc_percent"] == 75.0
             assert result["water_heated_today_kwh"] == 0.0  # failed sensor → default
