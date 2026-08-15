@@ -48,6 +48,12 @@ class EVSurplusChargerCfg:
     home_entity: str | None = None  # device_tracker; absent => assume home
     home_states: tuple[str, ...] = ("home",)
     override_entity: str | None = None  # input_select auto/force_on/force_off
+    # Optional button that wakes a sleeping car (e.g. button.white_betty_wake).
+    # A sleeping Tesla answers switch.turn_on with HTTP 500, so a plugged-in car
+    # sitting on surplus can never start. On an actuation failure the runtime
+    # presses this once (cooldown-limited) so the backoff retry lands on a woken
+    # car. Pressing costs one API call and no vehicle wake-lock beyond the usual.
+    wake_entity: str | None = None
     priority: int = 0
     min_current_a: float = 6.0
     max_current_a: float = 16.0
@@ -351,6 +357,7 @@ def parse_ev_surplus_config(
                 home_entity=c.get("home_entity") or None,
                 home_states=tuple(c.get("home_states", ["home"])),
                 override_entity=c.get("override_entity") or None,
+                wake_entity=c.get("wake_entity") or None,
                 priority=int(c.get("priority", 0)),
                 min_current_a=float(c.get("min_current_a", 6.0)),
                 max_current_a=float(c.get("max_current_a", 16.0)),
@@ -491,6 +498,7 @@ class EVSurplusController:
         # history. Exponential: 120 s doubling to a 900 s ceiling; any SUCCESSFUL
         # actuation clears it.
         self._act_fail: dict[str, tuple[float, int]] = {}
+        self._last_wake_ts: dict[str, float] = {}
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
         """Battery charge-setpoint cap for the engine, or None when the guard is off.
@@ -907,6 +915,26 @@ class EVSurplusController:
                 # and a sleeping Tesla must not be hammered every tick.
                 n = (fail[1] + 1) if fail is not None else 1
                 self._act_fail[cmd.id] = (now_ts, n)
+                # A sleeping car is the dominant failure cause (switch.turn_on ->
+                # HTTP 500). Press its wake button once per WAKE_COOLDOWN_S so the
+                # backoff retry finds it awake; only for commands that wanted it ON
+                # (a failed stop needs no wake — the car isn't drawing anyway).
+                if ccfg.wake_entity and cmd.switch_on and not (shadow or ccfg.shadow):
+                    last_wake = self._last_wake_ts.get(cmd.id, float("-inf"))
+                    if (now_ts - last_wake) >= 300.0:
+                        self._last_wake_ts[cmd.id] = now_ts
+                        try:
+                            await ha.call_service(
+                                "button", "press", ccfg.wake_entity
+                            )
+                            logger.info(
+                                "EV surplus: pressed wake button %s for %s",
+                                ccfg.wake_entity, cmd.id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "EV surplus: wake press failed for %s", cmd.id
+                            )
                 logger.exception(
                     "EV surplus: actuation failed for %s (fail #%d, backoff %.0fs) — continuing",
                     cmd.id, n, min(900.0, 120.0 * (2.0 ** (n - 1))),

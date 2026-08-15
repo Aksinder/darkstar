@@ -357,6 +357,19 @@ class WaterHeaterDeviceConfig:
     temp_normal: int | None = None
     temp_boost: int | None = None
     temp_max: int | None = None
+    # Self-thermostatted heater (the spa): when the plan wants OFF, skip the write
+    # while the appliance is idle or heating on export, so its own thermostat keeps
+    # the standing warmth. See executor/water_hold.py for the full rule. Dumb tanks
+    # leave this False — for them an off-write IS the control.
+    idle_hold: bool = False
+    # Above this import price the off-write always happens, idle or not. None =
+    # no ceiling. Set it at/near the heater's WTP so the hold never outbids the plan.
+    idle_hold_max_price_sek_per_kwh: float | None = None
+    # At or below this measured load the heater counts as not heating.
+    idle_power_w: float = 100.0
+    # Measured power source for the idle test; falls back to the heater's own
+    # power_sensor/sensor when unset.
+    power_entity: str | None = None
 
 
 DEFAULT_PENALTY_LEVELS = {
@@ -641,6 +654,16 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 temp_normal=_int_or_none(heater.get("temp_normal")),
                 temp_boost=_int_or_none(heater.get("temp_boost")),
                 temp_max=_int_or_none(heater.get("temp_max")),
+                idle_hold=bool(heater.get("idle_hold", False)),
+                idle_hold_max_price_sek_per_kwh=_float_or_none(
+                    heater.get("idle_hold_max_price_sek_per_kwh")
+                ),
+                idle_power_w=float(
+                    heater.get("idle_power_w", WaterHeaterDeviceConfig.idle_power_w)
+                ),
+                power_entity=_str_or_none(
+                    heater.get("power_sensor") or heater.get("sensor")
+                ),
             )
         )
 
