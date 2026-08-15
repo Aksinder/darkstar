@@ -45,6 +45,7 @@ from .override import (
     SystemState,
     evaluate_overrides,
 )
+from .water_hold import should_hold_off_write
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +228,9 @@ class ExecutorEngine:
         self._has_battery = system_cfg.get("has_battery", True)
         self._has_water_heater = system_cfg.get("has_water_heater", True)
         self._has_ev_charger = system_cfg.get("has_ev_charger", False)
+
+        # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
+        self._water_hold_state: dict[str, tuple[bool, str]] = {}
 
         # Per-device EV charging state tracking
         self._ev_charger_states: dict[str, EVChargerState] = {}
@@ -1618,6 +1622,18 @@ class ExecutorEngine:
                                 temp = decision.water_temps.get(
                                     device.id, self.config.water_heater.temp_off
                                 )
+                                # Self-thermostatted heaters (spa): leave an idle or
+                                # surplus-fed appliance alone instead of throwing away
+                                # its standing warmth with an off-write.
+                                off_temp = (
+                                    device.temp_off
+                                    if device.temp_off is not None
+                                    else self.config.water_heater.temp_off
+                                )
+                                if await self._water_idle_hold(
+                                    device, temp, off_temp, state
+                                ):
+                                    continue
                                 commit_minutes = self._planned_water_block_minutes(
                                     device.id, now
                                 )
@@ -2120,6 +2136,84 @@ class ExecutorEngine:
             sinks=sinks,
             export_price_sek_kwh=float(slot_data.get("export_price_sek_kwh", 0.0) or 0.0),
         )
+
+    async def _current_import_price(self) -> float | None:
+        """Import price for the current hour, or None when prices are unreadable."""
+        try:
+            import pytz
+
+            from backend.core.prices import get_nordpool_data
+
+            prices = await get_nordpool_data("config.yaml")
+            if not prices:
+                return None
+            tz = pytz.timezone(self.config.timezone)
+            now = datetime.now(tz)
+            for p in prices:
+                st = p.get("start_time")
+                if st and st <= now < st + timedelta(hours=1):
+                    return float(p.get("import_price_sek_kwh"))
+        except Exception as e:
+            logger.debug("Idle-hold: import price unavailable: %s", e)
+        return None
+
+    async def _water_idle_hold(
+        self,
+        device: Any,
+        temp: Any,
+        off_temp: Any,
+        state: SystemState,
+    ) -> bool:
+        """
+        True => skip this heater's planned OFF write (see executor/water_hold.py).
+
+        Only ever suppresses a write TO the off temperature; a heat command always
+        goes through. Any unreadable input falls through to the normal off-write.
+        """
+        if not getattr(device, "idle_hold", False):
+            return False
+        if off_temp is None or temp is None or float(temp) != float(off_temp):
+            return False
+
+        power_w: float | None = None
+        if device.power_entity and self.ha_client:
+            raw = await self.ha_client.get_state_value(device.power_entity)
+            if raw not in (None, "", "unknown", "unavailable"):
+                with contextlib.suppress(ValueError, TypeError):
+                    power_w = float(raw)
+
+        grid_w: float | None = None
+        grid_entity = self._full_config.get("input_sensors", {}).get("grid_power")
+        if grid_entity and self.ha_client:
+            raw = await self.ha_client.get_state_value(grid_entity)
+            if raw not in (None, "", "unknown", "unavailable"):
+                with contextlib.suppress(ValueError, TypeError):
+                    grid_w = float(raw)
+                if grid_w is not None and self._full_config.get("input_sensors", {}).get(
+                    "grid_power_inverted"
+                ):
+                    grid_w = -grid_w
+
+        price = await self._current_import_price()
+        if price is not None:
+            state.current_import_price = price
+
+        hold, reason = should_hold_off_write(
+            power_w=power_w,
+            grid_w=grid_w,
+            price_sek_kwh=price,
+            idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
+            max_price_sek_kwh=getattr(device, "idle_hold_max_price_sek_per_kwh", None),
+        )
+        # Log only on transition — this runs every tick.
+        prev = self._water_hold_state.get(device.id)
+        if prev != (hold, reason):
+            self._water_hold_state[device.id] = (hold, reason)
+            logger.info(
+                "Water idle-hold %s: %s off-write for %s (%s)",
+                device.id, "HOLDING" if hold else "allowing", device.id, reason,
+            )
+        return hold
 
     async def _gather_system_state(self) -> SystemState:
         """Gather current system state from Home Assistant."""
