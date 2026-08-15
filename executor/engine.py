@@ -2165,7 +2165,10 @@ class ExecutorEngine:
             for p in prices:
                 st = p.get("start_time")
                 if st and st <= now < st + timedelta(hours=1):
-                    price = float(p.get("import_price_sek_kwh"))
+                    raw = p.get("import_price_sek_kwh")
+                    if raw is None:
+                        return None
+                    price = float(raw)
                     self._import_price_cache = (hour_key, price)
                     return price
         except Exception as e:
