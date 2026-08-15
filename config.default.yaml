@@ -123,6 +123,19 @@ water_heaters:
     exclude_from_vacation: false     # When vacation is active, this tank still gets NORMAL comfort
                                      # heating instead of being shut off (e.g. a rented-out Villavagn
                                      # tank while the owners are away). Default false = follows vacation.
+    idle_hold: false                 # For heaters with their OWN thermostat (a spa), where writing
+                                     # "off" discards standing warmth rather than just ending a block.
+                                     # When true, a planned OFF is SKIPPED while the appliance is idle
+                                     # or running on surplus and the price is under the ceiling below;
+                                     # it is written normally otherwise. Never turns the heater ON.
+                                     # Leave false for dumb resistive tanks — there the off-write IS
+                                     # the control.
+    idle_hold_max_price_sek_per_kwh: # Ceiling for the hold. Above it the OFF write always happens.
+                                     # Compared against the EXPORT price when there is surplus and the
+                                     # IMPORT price otherwise. Set it at the heater's WTP so the hold
+                                     # never keeps energy the planner would not have bought. Empty =
+                                     # no ceiling (price never forces the write).
+    idle_power_w: 100                # At or below this measured draw the heater counts as not heating.
 
   # Example: Second water heater (disabled by default)
   # - id: upstairs_tank
@@ -808,6 +821,11 @@ executor:
       #   plug_entity: binary_sensor.white_betty_charge_cable
       #   home_entity: device_tracker.white_betty_location
       #   override_entity: input_select.darkstar_ev_tesla_mode
+      #   wake_entity: button.white_betty_wake   # A sleeping car answers switch.turn_on with
+      #                                          # HTTP 500, so a plugged-in car sitting on
+      #                                          # surplus never starts. On an actuation
+      #                                          # failure the servo presses this once per
+      #                                          # 300 s so the backoff retry finds it awake.
       #   soc_entity: sensor.white_betty_battery_level
       #   target_soc_entity: input_number.darkstar_tesla_target_soc
       #   departure_entity: input_datetime.darkstar_tesla_departure
