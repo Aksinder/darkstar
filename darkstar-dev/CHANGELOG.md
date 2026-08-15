@@ -1,3 +1,7 @@
+## dev-20260815.1313 — 2026-08-15 13:15
+
+- Compare the real appliance against our own intent, not just our helper
+
 ## dev-20260815.1136 — 2026-08-15 11:37
 
 - Push a self-thermostatted heater to its boost target on measured surplus
