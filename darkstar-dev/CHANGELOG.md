@@ -1,3 +1,7 @@
+## dev-20260815.0846 — 2026-08-15 08:48
+
+- Wake a sleeping car on actuation failure; idle-hold for the spa's own thermostat
+
 ## dev-20260814.0658 — 2026-08-14 07:00
 
 - feat(planner): absorb_cap_kwh_per_day config override for water heaters
