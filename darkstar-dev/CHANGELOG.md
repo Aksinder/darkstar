@@ -1,3 +1,7 @@
+## dev-20260815.0900 — 2026-08-15 09:02
+
+- Idle-hold: a non-numeric water target is not our case, act normally
+
 ## dev-20260815.0846 — 2026-08-15 08:48
 
 - Wake a sleeping car on actuation failure; idle-hold for the spa's own thermostat
