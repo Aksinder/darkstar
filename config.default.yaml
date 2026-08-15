@@ -784,6 +784,21 @@ executor:
         min_remaining_solar_kwh: 8.0    # ...and this much PV still forecast today
         floor_soc: 40.0                 # never pull the home battery below this for cars
         allowance_w: 6000               # cap on battery -> car
+      # Battery-yield gate: whether the home battery's CHARGING inflow counts as car
+      # headroom. It is a DEADLINE, not a threshold — while enough PV is still forecast
+      # to fill the battery later today, the cars get the surplus first, because a car
+      # can drive away with it unspent and the battery cannot. The battery claims its
+      # inflow at the latest safe moment to still reach battery_yield_soc.
+      battery_yield_soc: 0.0            # 0 = legacy (cars may always take the inflow)
+      battery_capacity_kwh: 0.0         # usable kWh; 0 disables the deadline -> plain SoC gate
+      battery_charge_efficiency: 0.95   # PV -> stored, sizes the remaining need
+      battery_fill_margin_kwh: 3.0      # slack the forecast must show BEYOND that need.
+                                        # remaining_solar is GROSS production, so this is
+                                        # what covers the house load drawing on the same PV
+                                        # plus forecast error. Raise it if the battery ends
+                                        # sunny days short; lower it if the cars never get
+                                        # a sunny hour.
+      battery_fill_margin_hysteresis_kwh: 2.0  # extra slack needed to RELEASE once engaged
     write_guard:
       min_step_a: 2.0                   # only rewrite current when target moves >= this many A
       min_interval_s: 90                # ...and at least this long since the last write (a STOP bypasses it)

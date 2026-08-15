@@ -24,6 +24,8 @@ from .ev_surplus import (
     EVSurplusConfig,
     EVSurplusInputs,
     WriteGuardConfig,
+    battery_fill_slack_kwh,
+    battery_reserve_active,
     battery_tier_active,
     compute_ev_surplus,
     fuse_battery_charge_cap_w,
@@ -306,6 +308,12 @@ def parse_ev_surplus_config(
         quantum_deadband_k=float(pol.get("quantum_deadband_k", 1.5)),
         schmitt_fraction=float(pol.get("schmitt_fraction", 0.7)),
         battery_yield_soc=float(pol.get("battery_yield_soc", 0.0)),
+        battery_capacity_kwh=float(pol.get("battery_capacity_kwh", 0.0)),
+        battery_charge_efficiency=float(pol.get("battery_charge_efficiency", 0.95)),
+        battery_fill_margin_kwh=float(pol.get("battery_fill_margin_kwh", 3.0)),
+        battery_fill_margin_hysteresis_kwh=float(
+            pol.get("battery_fill_margin_hysteresis_kwh", 2.0)
+        ),
     )
 
     def _parse_guard(raw_g: dict[str, Any], fallback: WriteGuardConfig) -> WriteGuardConfig:
@@ -471,6 +479,7 @@ class EVSurplusController:
         self._last_switch: dict[str, bool] = {}
         self._last_stop_ts: dict[str, float] = {}  # min-OFF dwell anchors
         self._battery_tier_prev: bool = False  # battery-assist SoC hysteresis memory
+        self._battery_reserve_prev: bool = False  # battery fill-deadline hysteresis memory
         # Fuse-guard state, also consumed by the engine's battery-charge cap.
         self.last_phase_currents_a: dict[str, float] = {}
         self.last_phase_ok_ts: float | None = None
@@ -870,6 +879,7 @@ class EVSurplusController:
             pv_w=pv_w, grid_w=grid_w, battery_w=battery_w, battery_soc_percent=soc,
             import_price_sek=price, remaining_solar_kwh=remaining_solar,
             battery_tier_active_prev=self._battery_tier_prev,
+            battery_reserve_active_prev=self._battery_reserve_prev,
             plan_battery_charge_w=max(0.0, plan_battery_charge_kw) * 1000.0,
             phase_currents_a=phase_currents, chargers=states,
         )
@@ -896,6 +906,17 @@ class EVSurplusController:
             self.last_ev_alloc_a = _alloc
         # Track the tier through the SAME helper the pure layer uses (hysteresis memory).
         self._battery_tier_prev = battery_tier_active(inputs, cfg.policy)
+        reserve = battery_reserve_active(inputs, cfg.policy)
+        if reserve != self._battery_reserve_prev:
+            slack = battery_fill_slack_kwh(inputs, cfg.policy)
+            logger.info(
+                "EV surplus: battery fill-reserve %s (slack %s kWh, soc %.0f%%, "
+                "remaining solar %.1f kWh)",
+                "ENGAGED — battery claims its inflow" if reserve else "released — cars first",
+                "n/a" if slack is None else f"{slack:.1f}",
+                inputs.battery_soc_percent, inputs.remaining_solar_kwh,
+            )
+        self._battery_reserve_prev = reserve
         cfg_by_id = {c.id: c for c in cfg.chargers}
 
         applied: list[dict[str, Any]] = []

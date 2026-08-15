@@ -60,6 +60,21 @@ class EVSurplusConfig:
     # Battery-yield gate: the home battery's charging inflow becomes car headroom
     # only at/above this SoC (see the headroom computation). 0.0 = legacy.
     battery_yield_soc: float = 0.0
+    # ...but the battery only CLAIMS that inflow once it must: the car is mobile and
+    # the battery is not (owner 2026-08-15), so while enough PV is still forecast to
+    # fill the battery later today, the cars get the surplus first. These size that
+    # "latest safe start" test — see battery_reserve_active(). capacity 0 disables it
+    # and restores the plain SoC gate.
+    battery_capacity_kwh: float = 0.0
+    battery_charge_efficiency: float = 0.95
+    # Slack the forecast must show BEYOND the battery's remaining need. It absorbs the
+    # house load (which eats the same PV) and forecast error, because remaining_solar
+    # is gross production, not what actually reaches the battery. Too small and the
+    # battery ends the day short; too large and the cars never get a sunny hour.
+    battery_fill_margin_kwh: float = 3.0
+    # Extra slack required to RELEASE the reserve once engaged, so a forecast hovering
+    # at the margin cannot flip the cars on and off every tick.
+    battery_fill_margin_hysteresis_kwh: float = 2.0
     # Quantized-control stability: the effective fleet deadband is widened to
     # K x (largest 1-step power quantum among commanded-ON controllable chargers),
     # so a charger whose smallest move exceeds the band can never limit-cycle
@@ -160,6 +175,8 @@ class EVSurplusInputs:
     # Previous cycle's battery-tier state (runtime-tracked) — drives the SoC
     # re-enable hysteresis in battery_tier_active().
     battery_tier_active_prev: bool = False
+    # Hysteresis memory for battery_reserve_active() — same role as above.
+    battery_reserve_active_prev: bool = False
     # The PLANNER's battery-charge power for the current slot (W). The battery-
     # yield gate is CONDITIONED on this: kepler only plans battery charging when
     # the stored energy has forward value (a spike evening to serve, a profitable
@@ -365,6 +382,52 @@ def battery_tier_active(inputs: EVSurplusInputs, cfg: EVSurplusConfig) -> bool:
     )
 
 
+def battery_fill_slack_kwh(inputs: EVSurplusInputs, cfg: EVSurplusConfig) -> float | None:
+    """
+    Forecast PV left today MINUS what the home battery still needs to reach
+    battery_yield_soc. Positive = we can afford to let the cars go first.
+
+    None when the question cannot be answered (no configured capacity), which the
+    caller must treat as "battery first" — guessing wrong here costs a whole
+    evening's stored energy.
+
+    Caveat worth knowing: remaining_solar_kwh is GROSS production. The house load
+    draws on the same PV, so the raw difference overstates what reaches the battery;
+    battery_fill_margin_kwh is what covers that gap and forecast error.
+    """
+    if cfg.battery_capacity_kwh <= 0.0:
+        return None
+    deficit_pct = cfg.battery_yield_soc - inputs.battery_soc_percent
+    if deficit_pct <= 0.0:
+        return float("inf")
+    need_kwh = (
+        cfg.battery_capacity_kwh * deficit_pct / 100.0 / max(cfg.battery_charge_efficiency, 0.1)
+    )
+    return inputs.remaining_solar_kwh - need_kwh
+
+
+def battery_reserve_active(inputs: EVSurplusInputs, cfg: EVSurplusConfig) -> bool:
+    """
+    True when the home battery must claim its own charging inflow — i.e. now is the
+    latest safe moment to start filling it, so the cars stop counting that inflow as
+    headroom.
+
+    False while the forecast still shows slack: charge the car first. The asymmetry is
+    the owner's: "Teslan kan försvinna, det kan inte batteriet" — a car that drives off
+    with the surplus unspent has lost it for good, whereas the battery can still be
+    filled from later sun.
+    """
+    if inputs.battery_soc_percent >= cfg.battery_yield_soc:
+        return False
+    slack_kwh = battery_fill_slack_kwh(inputs, cfg)
+    if slack_kwh is None:
+        return True
+    margin_kwh = cfg.battery_fill_margin_kwh + (
+        cfg.battery_fill_margin_hysteresis_kwh if inputs.battery_reserve_active_prev else 0.0
+    )
+    return slack_kwh < margin_kwh
+
+
 def _soc_at_or_above_target(c: ChargerState) -> bool:
     """True when the car has a known SoC at/above its target — stop (never overcharge)."""
     return (
@@ -537,17 +600,20 @@ def compute_ev_surplus(
     current_total_w = sum(c.current_power_w for c in chargeable)
     # Battery-yield gate (owner 2026-08-13, spike-evening insight: "håll batteriet
     # till 100 % först"): the home battery's CHARGING power counts as car headroom
-    # only once its SoC has reached battery_yield_soc — on days ending in a 4-kr
-    # evening peak a stored kWh (avoided import 3-4+) beats the cars' comfort bands
-    # (0.35-2.0), so the battery fills FIRST and the cars take the taper-era rest.
+    # only while the battery does not need it — on days ending in a 4-kr evening peak
+    # a stored kWh (avoided import 3-4+) beats the cars' comfort bands (0.35-2.0).
+    # Refined 2026-08-15: "need it" is a DEADLINE, not an SoC threshold. While enough
+    # PV is still forecast to fill the battery later, the cars go first, because a car
+    # can drive away with the surplus unspent and the battery cannot. See
+    # battery_reserve_active().
     # DISCHARGING battery always counts (negative => cars back off — protective and
     # unconditional). 0.0 = legacy (cars may always take the battery's inflow).
     # Grid-backed floors (deadline/plan) are unaffected — they don't ride headroom.
     batt_term_w = inputs.battery_w
     if (
         batt_term_w > 0.0
-        and inputs.battery_soc_percent < cfg.battery_yield_soc
         and inputs.plan_battery_charge_w > 0.0
+        and battery_reserve_active(inputs, cfg)
     ):
         batt_term_w = 0.0
     headroom_w = (grid_setpoint_w - inputs.grid_w) + batt_term_w + battery_allow_w
