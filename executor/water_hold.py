@@ -43,6 +43,31 @@ DEFAULT_IDLE_POWER_W = 100.0
 DEFAULT_SURPLUS_MARGIN_W = 200.0
 
 
+def battery_charge_w(
+    *, servo_signed_w: float | None, house_signed_w: float | None
+) -> float | None:
+    """
+    Normalise battery power to POSITIVE = charging.
+
+    Two conventions live side by side in this codebase and they disagree in SIGN:
+    the servo's ``executor.ev_surplus.battery_power_entity`` is documented "+ charge"
+    (sensor.battery_charging_power_signed = +4797 while charging), whereas
+    ``input_sensors.battery_power`` is the inverter's own convention, NEGATIVE while
+    charging (sensor.battery_power = -4797 at the same instant) — see recorder.py,
+    which derives batt_charge_kw as ``abs(battery_kw) if battery_kw < 0``.
+
+    Reading the house sensor with the servo's convention silently inverts the surplus
+    test, so a battery soaking 8 kW of PV reads as -8000 and never counts as surplus —
+    killing the hold on precisely the sunny hours it exists for. Prefer the servo's
+    entity; fall back to the house sensor with its sign flipped.
+    """
+    if servo_signed_w is not None:
+        return servo_signed_w
+    if house_signed_w is None:
+        return None
+    return -house_signed_w
+
+
 def _has_surplus(
     grid_w: float | None,
     battery_w: float | None,

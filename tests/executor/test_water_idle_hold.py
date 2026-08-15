@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from executor.water_hold import should_hold_off_write
+from executor.water_hold import battery_charge_w, should_hold_off_write
 
 SPA_W = 1800.0
 
@@ -121,3 +121,33 @@ class TestFailsClosed:
 
     def test_unreadable_grid_and_battery_is_no_surplus(self):
         assert _hold(power_w=SPA_W, grid_w=None, battery_w=None)[0] is False
+
+
+class TestBatterySignConvention:
+    """Two conventions coexist and disagree in sign — reading the wrong one inverts
+    the whole surplus test. Live values at one instant: the servo's
+    sensor.battery_charging_power_signed read +4797 while charging, and
+    input_sensors' sensor.battery_power read -4797."""
+
+    def test_servo_entity_is_already_charge_positive(self):
+        assert battery_charge_w(servo_signed_w=4797.0, house_signed_w=-4797.0) == 4797.0
+
+    def test_house_sensor_is_flipped(self):
+        assert battery_charge_w(servo_signed_w=None, house_signed_w=-4797.0) == 4797.0
+
+    def test_house_discharge_stays_negative(self):
+        assert battery_charge_w(servo_signed_w=None, house_signed_w=3000.0) == -3000.0
+
+    def test_both_unreadable(self):
+        assert battery_charge_w(servo_signed_w=None, house_signed_w=None) is None
+
+    def test_the_morning_case_end_to_end(self):
+        """PV 9.8 kW, meter +303 W (importing!), battery charging: still surplus."""
+        charge_w = battery_charge_w(servo_signed_w=None, house_signed_w=-4797.0)
+        hold, reason = _hold(power_w=SPA_W, grid_w=303.0, battery_w=charge_w)
+        assert hold is True
+        assert "surplus" in reason
+
+    def test_the_same_reading_misread_would_have_failed(self):
+        """Guards the regression: the raw house value inverts the test."""
+        assert _hold(power_w=SPA_W, grid_w=303.0, battery_w=-4797.0)[0] is False

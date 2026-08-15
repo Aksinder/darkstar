@@ -45,7 +45,7 @@ from .override import (
     SystemState,
     evaluate_overrides,
 )
-from .water_hold import should_hold_off_write
+from .water_hold import battery_charge_w, should_hold_off_write
 
 logger = logging.getLogger(__name__)
 
@@ -2224,9 +2224,17 @@ class ExecutorEngine:
             sensors.get("grid_power"), bool(sensors.get("grid_power_inverted"))
         )
         # Surplus is not the same as export: on a sunny morning the meter reads ~0
-        # while the battery soaks 8 kW of PV. See executor/water_hold.py.
-        battery_w = await self._signed_power(
-            sensors.get("battery_power"), bool(sensors.get("battery_power_inverted"))
+        # while the battery soaks 8 kW of PV. Mind the two clashing sign conventions
+        # — see battery_charge_w() in executor/water_hold.py.
+        ev_cfg = self._full_config.get("executor", {}).get("ev_surplus", {}) or {}
+        battery_w = battery_charge_w(
+            servo_signed_w=await self._signed_power(
+                ev_cfg.get("battery_power_entity"), False
+            ),
+            house_signed_w=await self._signed_power(
+                sensors.get("battery_power"),
+                bool(sensors.get("battery_power_inverted")),
+            ),
         )
 
         price = await self._current_import_price()
