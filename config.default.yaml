@@ -136,6 +136,14 @@ water_heaters:
                                      # never keeps energy the planner would not have bought. Empty =
                                      # no ceiling (price never forces the write).
     idle_power_w: 100                # At or below this measured draw the heater counts as not heating.
+    state_entity:                    # The REAL appliance behind a bridge (e.g.
+                                     # climate.layzspa_temperature_control). Writes are
+                                     # change-gated against target_entity — Darkstar's own
+                                     # helper — so a device someone else moved is invisible.
+                                     # Set this and the executor compares the appliance's mode
+                                     # AND measured draw against its own intent each tick,
+                                     # re-asserting on a mismatch (the switch path already
+                                     # self-heals this way). Empty = no reality check.
     surplus_boost: false             # Push to temp_boost while there is MEASURED surplus and the
                                      # price is under the ceiling above. Unlike idle_hold this
                                      # COMMANDS heat and overrides the plan, because real-time

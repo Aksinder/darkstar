@@ -198,3 +198,67 @@ def should_boost_on_surplus(
         return False, f"daily cap reached ({heated_today_kwh:.1f} kWh)"
 
     return True, "surplus + cheap"
+
+
+# Appliance states that mean "the element may run". A climate bridge reports "heat";
+# a relay-style appliance reports "on".
+DEFAULT_HEATING_STATES = ("heat", "on", "heating", "true")
+
+
+def detect_appliance_drift(
+    *,
+    intended_temp: float | None,
+    off_temp: float | None,
+    appliance_state: str | None,
+    appliance_setpoint_c: float | None = None,
+    power_w: float | None = None,
+    idle_power_w: float = DEFAULT_IDLE_POWER_W,
+    heating_states: tuple[str, ...] = DEFAULT_HEATING_STATES,
+    setpoint_tolerance_c: float = 0.5,
+) -> tuple[bool, str]:
+    """
+    Has the appliance drifted away from what we intend, so that we must re-assert?
+
+    Darkstar drives a thermostatted heater through a helper: it writes
+    ``input_number.<x>_target_temp`` and an HA bridge relays that to the climate
+    entity. The write is change-gated against THE HELPER, so once the helper reads 20
+    nothing more is sent — and if anything else moves the appliance (the tub's own app
+    or panel, a device reboot), Darkstar never notices. Observed live 2026-08-15: the
+    helper sat at 20 from 13:12 while the spa ran heat/38 from 13:18 with the element
+    drawing 1.8 kW, and no tick corrected it. The switch path has always self-healed
+    because it compares the RELAY; this gives the bridge path the same property.
+
+    Two signals, because either alone can lie: the reported mode can lag the device,
+    and power alone cannot distinguish "heating" from a circulation pump. Either one
+    showing heat while we intend off is enough to re-assert — a false re-assert costs
+    one idempotent service call, a missed one costs a 1.8 kW element at the evening peak.
+
+    Returns (drifted, reason).
+    """
+    if intended_temp is None or off_temp is None:
+        return False, "nothing intended"
+
+    state = (appliance_state or "").strip().lower()
+    known = bool(state) and state not in ("unknown", "unavailable")
+    drawing = power_w is not None and power_w > idle_power_w
+    heating = (known and state in heating_states) or drawing
+
+    intended_off = float(intended_temp) <= float(off_temp)
+
+    if intended_off:
+        if heating:
+            why = state if known and state in heating_states else f"{power_w:.0f}W"
+            return True, f"appliance heating ({why}) while we intend off"
+        return False, "off as intended"
+
+    # We intend HEAT. A device sitting idle means our target never landed.
+    if known and state not in heating_states:
+        return True, f"appliance {state} while we intend {intended_temp:.0f}C"
+    if (
+        appliance_setpoint_c is not None
+        and abs(float(appliance_setpoint_c) - float(intended_temp)) > setpoint_tolerance_c
+    ):
+        return True, (
+            f"setpoint {appliance_setpoint_c:.0f}C != intended {intended_temp:.0f}C"
+        )
+    return False, "heating as intended"
