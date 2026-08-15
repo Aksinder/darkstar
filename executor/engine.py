@@ -1631,7 +1631,8 @@ class ExecutorEngine:
                                     else self.config.water_heater.temp_off
                                 )
                                 if await self._water_idle_hold(
-                                    device, temp, off_temp, state
+                                    device, temp, off_temp, state,
+                                    slot.export_price_sek_kwh,
                                 ):
                                     continue
                                 commit_minutes = self._planned_water_block_minutes(
@@ -2157,12 +2158,26 @@ class ExecutorEngine:
             logger.debug("Idle-hold: import price unavailable: %s", e)
         return None
 
+    async def _signed_power(self, entity: str | None, inverted: bool) -> float | None:
+        """Read a signed power sensor in W, or None when it is unreadable."""
+        if not entity or not self.ha_client:
+            return None
+        raw = await self.ha_client.get_state_value(entity)
+        if raw in (None, "", "unknown", "unavailable"):
+            return None
+        try:
+            value = float(raw)
+        except (ValueError, TypeError):
+            return None
+        return -value if inverted else value
+
     async def _water_idle_hold(
         self,
         device: Any,
         temp: Any,
         off_temp: Any,
         state: SystemState,
+        export_price: float | None,
     ) -> bool:
         """
         True => skip this heater's planned OFF write (see executor/water_hold.py).
@@ -2182,17 +2197,15 @@ class ExecutorEngine:
                 with contextlib.suppress(ValueError, TypeError):
                     power_w = float(raw)
 
-        grid_w: float | None = None
-        grid_entity = self._full_config.get("input_sensors", {}).get("grid_power")
-        if grid_entity and self.ha_client:
-            raw = await self.ha_client.get_state_value(grid_entity)
-            if raw not in (None, "", "unknown", "unavailable"):
-                with contextlib.suppress(ValueError, TypeError):
-                    grid_w = float(raw)
-                if grid_w is not None and self._full_config.get("input_sensors", {}).get(
-                    "grid_power_inverted"
-                ):
-                    grid_w = -grid_w
+        sensors = self._full_config.get("input_sensors", {})
+        grid_w = await self._signed_power(
+            sensors.get("grid_power"), bool(sensors.get("grid_power_inverted"))
+        )
+        # Surplus is not the same as export: on a sunny morning the meter reads ~0
+        # while the battery soaks 8 kW of PV. See executor/water_hold.py.
+        battery_w = await self._signed_power(
+            sensors.get("battery_power"), bool(sensors.get("battery_power_inverted"))
+        )
 
         price = await self._current_import_price()
         if price is not None:
@@ -2201,7 +2214,10 @@ class ExecutorEngine:
         hold, reason = should_hold_off_write(
             power_w=power_w,
             grid_w=grid_w,
-            price_sek_kwh=price,
+            battery_w=battery_w,
+            import_price_sek_kwh=price,
+            export_price_sek_kwh=export_price,
+            heater_power_w=float(getattr(device, "power_kw", 0.0) or 0.0) * 1000.0,
             idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
             max_price_sek_kwh=getattr(device, "idle_hold_max_price_sek_per_kwh", None),
         )
