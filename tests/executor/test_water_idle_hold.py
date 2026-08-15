@@ -61,14 +61,36 @@ class TestSurplusIsNotExport:
         assert "surplus" in reason
 
     def test_battery_charge_smaller_than_the_heater_is_not_surplus(self):
-        """Only spare capacity the spa could actually eat counts."""
-        assert _hold(power_w=SPA_W, grid_w=13.0, battery_w=900.0)[0] is False
+        """Only spare capacity the spa could actually eat counts (heater idle)."""
+        reason = _hold(power_w=0.0, grid_w=13.0, battery_w=900.0)[1]
+        assert "surplus" not in reason  # held for idleness, not for spare energy
 
     def test_battery_discharging_is_never_surplus(self):
+        """Settled before the own-draw credit: the marginal kWh comes from storage."""
         assert _hold(power_w=SPA_W, grid_w=13.0, battery_w=-3000.0)[0] is False
 
     def test_meter_noise_near_zero_is_not_export(self):
-        assert _hold(power_w=SPA_W, grid_w=-50.0)[0] is False
+        """With the heater IDLE, -50 W really is noise and not spare energy."""
+        reason = _hold(power_w=0.0, grid_w=-50.0)[1]
+        assert "surplus" not in reason
+
+
+class TestOwnDrawIsNotScarcity:
+    """The meter reads ~0 BECAUSE the element is on. Counting a heater's own draw
+    against itself makes the surplus vanish the instant it starts — the same blindness
+    that made the EV servo switch off the load it had just created."""
+
+    def test_a_heater_eating_the_export_still_sees_surplus(self):
+        hold, reason = _hold(power_w=SPA_W, grid_w=-50.0)
+        assert hold is True
+        assert "surplus" in reason
+
+    def test_the_credit_is_only_its_own_draw(self):
+        """2.4 kW of import is more than the spa can account for."""
+        assert _hold(power_w=SPA_W, grid_w=2400.0)[0] is False
+
+    def test_the_credit_does_not_survive_a_discharging_battery(self):
+        assert _hold(power_w=SPA_W, grid_w=-50.0, battery_w=-3000.0)[0] is False
 
 
 class TestEffectivePrice:

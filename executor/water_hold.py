@@ -73,9 +73,25 @@ def _has_surplus(
     battery_w: float | None,
     heater_w: float,
     surplus_margin_w: float,
+    own_draw_w: float = 0.0,
 ) -> bool:
-    """Exporting, or storing at least this heater's draw into the battery."""
-    if grid_w is not None and grid_w <= -surplus_margin_w:
+    """Exporting, or storing at least this heater's draw into the battery.
+
+    ``own_draw_w`` is subtracted from the meter first, because a heater running ON the
+    surplus has already consumed it: the meter reads ~0 precisely BECAUSE the element
+    is on. Counting that against itself makes the surplus vanish the moment the load
+    starts, which flaps the heater between two targets. The honest question is "would
+    there be surplus if this heater were off", and that is grid minus its own draw.
+    (Same failure the EV servo had: never let your own actuation read as scarcity.)
+    """
+    # A discharging battery settles it: the house is already drawing down storage, so
+    # the marginal kWh this heater eats comes from the battery (or, under a forced
+    # export, from energy we chose to sell) — never from spare production. Checked
+    # BEFORE the own-draw credit, which would otherwise turn "battery covering the
+    # spa" into "the spa is running on surplus".
+    if battery_w is not None and battery_w <= -surplus_margin_w:
+        return False
+    if grid_w is not None and (grid_w - own_draw_w) <= -surplus_margin_w:
         return True
     return battery_w is not None and battery_w >= max(heater_w, surplus_margin_w)
 
@@ -109,7 +125,8 @@ def should_hold_off_write(
     Returns:
         (hold, reason). hold=True means "do not write; leave the appliance alone".
     """
-    surplus = _has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w)
+    own = power_w or 0.0
+    surplus = _has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w, own)
 
     if max_price_sek_kwh is not None:
         # Spare PV costs the export revenue foregone; bought energy costs import.
@@ -130,3 +147,54 @@ def should_hold_off_write(
         return True, f"idle ({power_w:.0f}W)"
 
     return False, f"drawing {power_w:.0f}W without surplus"
+
+
+def should_boost_on_surplus(
+    *,
+    power_w: float | None,
+    grid_w: float | None,
+    battery_w: float | None,
+    import_price_sek_kwh: float | None,
+    export_price_sek_kwh: float | None,
+    heater_power_w: float,
+    max_price_sek_kwh: float | None,
+    heated_today_kwh: float | None = None,
+    absorb_cap_kwh_per_day: float | None = None,
+    surplus_margin_w: float = DEFAULT_SURPLUS_MARGIN_W,
+) -> tuple[bool, str]:
+    """
+    Should this heater be pushed to its BOOST target right now?
+
+    Owner rule (2026-08-15): "spa borde tryckas upp till 40 om det finns överskott och
+    elpriset inte är dyrt." The planner cannot express this here — its boost path needs
+    excess_pv_sink == "water_heater_boost", which is deliberately off, being the
+    mechanism behind the 36 kWh/day phantom-water incident. So the decision is made
+    from MEASURED surplus each tick instead of a forecast, which is both truer to the
+    request and self-limiting: the boost lasts exactly as long as the surplus does.
+
+    Unlike the idle-hold this DOES command heat, so it carries the daily energy bound
+    the planner would otherwise have enforced (absorb_cap_kwh_per_day).
+
+    Returns (boost, reason).
+    """
+    own = power_w or 0.0
+    if not _has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w, own):
+        return False, "no surplus"
+
+    if max_price_sek_kwh is not None:
+        price = export_price_sek_kwh
+        if price is None:
+            price = import_price_sek_kwh
+        if price is None:
+            return False, "price unknown"
+        if price > max_price_sek_kwh:
+            return False, f"price {price:.2f} > {max_price_sek_kwh:.2f}"
+
+    if (
+        absorb_cap_kwh_per_day is not None
+        and heated_today_kwh is not None
+        and heated_today_kwh >= absorb_cap_kwh_per_day
+    ):
+        return False, f"daily cap reached ({heated_today_kwh:.1f} kWh)"
+
+    return True, "surplus + cheap"
