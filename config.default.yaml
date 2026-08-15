@@ -136,6 +136,13 @@ water_heaters:
                                      # never keeps energy the planner would not have bought. Empty =
                                      # no ceiling (price never forces the write).
     idle_power_w: 100                # At or below this measured draw the heater counts as not heating.
+    surplus_boost: false             # Push to temp_boost while there is MEASURED surplus and the
+                                     # price is under the ceiling above. Unlike idle_hold this
+                                     # COMMANDS heat and overrides the plan, because real-time
+                                     # surplus is something a 15-minute forecast cannot see.
+                                     # Respects vacation, and honours absorb_cap_kwh_per_day as the
+                                     # daily bound the planner would otherwise have enforced.
+    absorb_cap_kwh_per_day:          # Daily energy ceiling for this heater. Empty = no bound.
 
   # Example: Second water heater (disabled by default)
   # - id: upstairs_tank

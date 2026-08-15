@@ -370,6 +370,12 @@ class WaterHeaterDeviceConfig:
     # Measured power source for the idle test; falls back to the heater's own
     # power_sensor/sensor when unset.
     power_entity: str | None = None
+    # Push to temp_boost while there is MEASURED surplus and the price is under the
+    # idle-hold ceiling. Unlike idle_hold this commands heat, so it honours the daily
+    # energy bound below (the planner's absorb cap, which it bypasses by acting in
+    # real time rather than from the forecast).
+    surplus_boost: bool = False
+    absorb_cap_kwh_per_day: float | None = None
 
 
 DEFAULT_PENALTY_LEVELS = {
@@ -663,6 +669,10 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 ),
                 power_entity=_str_or_none(
                     heater.get("power_sensor") or heater.get("sensor")
+                ),
+                surplus_boost=bool(heater.get("surplus_boost", False)),
+                absorb_cap_kwh_per_day=_float_or_none(
+                    heater.get("absorb_cap_kwh_per_day")
                 ),
             )
         )

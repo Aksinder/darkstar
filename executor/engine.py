@@ -45,7 +45,11 @@ from .override import (
     SystemState,
     evaluate_overrides,
 )
-from .water_hold import battery_charge_w, should_hold_off_write
+from .water_hold import (
+    battery_charge_w,
+    should_boost_on_surplus,
+    should_hold_off_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +238,7 @@ class ExecutorEngine:
 
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
         self._water_hold_state: dict[str, tuple[bool, str]] = {}
+        self._water_boost_state: dict[str, tuple[bool, str]] = {}
 
         # Per-device EV charging state tracking
         self._ev_charger_states: dict[str, EVChargerState] = {}
@@ -1612,6 +1617,19 @@ class ExecutorEngine:
                                     self._full_config.get("water_heaters", []),
                                 )
                             }
+                            # Grid / battery / price / vacation, read once for all tanks.
+                            needs_ctx = any(
+                                getattr(d, "idle_hold", False)
+                                or getattr(d, "surplus_boost", False)
+                                for d in self.config.water_heater_devices
+                            )
+                            water_ctx = (
+                                await self._water_energy_ctx(
+                                    state, slot.export_price_sek_kwh
+                                )
+                                if needs_ctx
+                                else None
+                            )
                             for device in self.config.water_heater_devices:
                                 # Rent-out hands-off: skip a control-paused device
                                 # entirely (do NOT command on OR off).
@@ -1625,19 +1643,31 @@ class ExecutorEngine:
                                 temp = decision.water_temps.get(
                                     device.id, self.config.water_heater.temp_off
                                 )
-                                # Self-thermostatted heaters (spa): leave an idle or
-                                # surplus-fed appliance alone instead of throwing away
-                                # its standing warmth with an off-write.
                                 off_temp = (
                                     device.temp_off
                                     if device.temp_off is not None
                                     else self.config.water_heater.temp_off
                                 )
-                                if await self._water_idle_hold(
-                                    device, temp, off_temp, state,
-                                    slot.export_price_sek_kwh,
-                                ):
-                                    continue
+                                if water_ctx is not None:
+                                    heater_w = await self._heater_power_w(device)
+                                    # Free-and-cheap: push to the boost target. This
+                                    # OVERRIDES the plan, which cannot see real-time
+                                    # surplus (the planner's own boost path needs
+                                    # excess_pv_sink, deliberately off since the
+                                    # phantom-water incident).
+                                    boosted = self._water_surplus_boost(
+                                        device, heater_w, water_ctx,
+                                        heated_today_map.get(device.id),
+                                    )
+                                    if boosted is not None:
+                                        temp = boosted
+                                    # Self-thermostatted heaters (spa): leave an idle or
+                                    # surplus-fed appliance alone instead of throwing
+                                    # away its standing warmth with an off-write.
+                                    elif self._water_idle_hold(
+                                        device, temp, off_temp, heater_w, water_ctx
+                                    ):
+                                        continue
                                 commit_minutes = self._planned_water_block_minutes(
                                     device.id, now
                                 )
@@ -2188,13 +2218,109 @@ class ExecutorEngine:
             return None
         return -value if inverted else value
 
-    async def _water_idle_hold(
+    async def _water_energy_ctx(
+        self, state: SystemState, export_price: float | None
+    ) -> dict[str, Any]:
+        """Grid, battery and price for the water decisions — read ONCE per tick.
+
+        Per-heater reads would multiply the same three entity fetches by the number of
+        tanks every tick for no new information.
+        """
+        sensors = self._full_config.get("input_sensors", {})
+        # Surplus is not the same as export: on a sunny morning the meter reads ~0
+        # while the battery soaks 8 kW of PV. Mind the two clashing sign conventions
+        # — see battery_charge_w() in executor/water_hold.py.
+        battery_w = battery_charge_w(
+            servo_signed_w=await self._signed_power(
+                (self._full_config.get("executor", {}).get("ev_surplus", {}) or {}).get(
+                    "battery_power_entity"
+                ),
+                False,
+            ),
+            house_signed_w=await self._signed_power(
+                sensors.get("battery_power"),
+                bool(sensors.get("battery_power_inverted")),
+            ),
+        )
+        price = await self._current_import_price()
+        if price is not None:
+            state.current_import_price = price
+
+        vacation = False
+        vac_entity = sensors.get("vacation_mode")
+        if vac_entity and self.ha_client:
+            raw = await self.ha_client.get_state_value(vac_entity)
+            vacation = str(raw).lower() in ("on", "true", "home")
+
+        return {
+            "grid_w": await self._signed_power(
+                sensors.get("grid_power"), bool(sensors.get("grid_power_inverted"))
+            ),
+            "battery_w": battery_w,
+            "import_price": price,
+            "export_price": export_price,
+            "vacation": vacation,
+        }
+
+    async def _heater_power_w(self, device: Any) -> float | None:
+        """This heater's measured draw, or None when unreadable."""
+        if not device.power_entity or not self.ha_client:
+            return None
+        raw = await self.ha_client.get_state_value(device.power_entity)
+        if raw in (None, "", "unknown", "unavailable"):
+            return None
+        with contextlib.suppress(ValueError, TypeError):
+            return float(raw)
+        return None
+
+    def _water_surplus_boost(
+        self,
+        device: Any,
+        power_w: float | None,
+        ctx: dict[str, Any],
+        heated_today_kwh: float | None,
+    ) -> int | None:
+        """The boost target while surplus is cheap and the daily bound allows, else None.
+
+        Vacation wins: an empty house does not want a 40-degree spa, however free the
+        energy looks. The planner already zeroes the plan on vacation; since this path
+        overrides the plan it has to honour that itself.
+        """
+        if not getattr(device, "surplus_boost", False) or ctx["vacation"]:
+            return None
+        boost, reason = should_boost_on_surplus(
+            power_w=power_w,
+            grid_w=ctx["grid_w"],
+            battery_w=ctx["battery_w"],
+            import_price_sek_kwh=ctx["import_price"],
+            export_price_sek_kwh=ctx["export_price"],
+            heater_power_w=float(getattr(device, "power_kw", 0.0) or 0.0) * 1000.0,
+            max_price_sek_kwh=getattr(device, "idle_hold_max_price_sek_per_kwh", None),
+            heated_today_kwh=heated_today_kwh,
+            absorb_cap_kwh_per_day=getattr(device, "absorb_cap_kwh_per_day", None),
+        )
+        prev = self._water_boost_state.get(device.id)
+        if prev != (boost, reason):
+            self._water_boost_state[device.id] = (boost, reason)
+            logger.info(
+                "Water surplus-boost %s: %s (%s)",
+                device.id, "ON" if boost else "off", reason,
+            )
+        if not boost:
+            return None
+        return (
+            device.temp_boost
+            if device.temp_boost is not None
+            else self.config.water_heater.temp_boost
+        )
+
+    def _water_idle_hold(
         self,
         device: Any,
         temp: Any,
         off_temp: Any,
-        state: SystemState,
-        export_price: float | None,
+        power_w: float | None,
+        ctx: dict[str, Any],
     ) -> bool:
         """
         True => skip this heater's planned OFF write (see executor/water_hold.py).
@@ -2212,41 +2338,12 @@ class ExecutorEngine:
         except (TypeError, ValueError):
             return False
 
-        power_w: float | None = None
-        if device.power_entity and self.ha_client:
-            raw = await self.ha_client.get_state_value(device.power_entity)
-            if raw not in (None, "", "unknown", "unavailable"):
-                with contextlib.suppress(ValueError, TypeError):
-                    power_w = float(raw)
-
-        sensors = self._full_config.get("input_sensors", {})
-        grid_w = await self._signed_power(
-            sensors.get("grid_power"), bool(sensors.get("grid_power_inverted"))
-        )
-        # Surplus is not the same as export: on a sunny morning the meter reads ~0
-        # while the battery soaks 8 kW of PV. Mind the two clashing sign conventions
-        # — see battery_charge_w() in executor/water_hold.py.
-        ev_cfg = self._full_config.get("executor", {}).get("ev_surplus", {}) or {}
-        battery_w = battery_charge_w(
-            servo_signed_w=await self._signed_power(
-                ev_cfg.get("battery_power_entity"), False
-            ),
-            house_signed_w=await self._signed_power(
-                sensors.get("battery_power"),
-                bool(sensors.get("battery_power_inverted")),
-            ),
-        )
-
-        price = await self._current_import_price()
-        if price is not None:
-            state.current_import_price = price
-
         hold, reason = should_hold_off_write(
             power_w=power_w,
-            grid_w=grid_w,
-            battery_w=battery_w,
-            import_price_sek_kwh=price,
-            export_price_sek_kwh=export_price,
+            grid_w=ctx["grid_w"],
+            battery_w=ctx["battery_w"],
+            import_price_sek_kwh=ctx["import_price"],
+            export_price_sek_kwh=ctx["export_price"],
             heater_power_w=float(getattr(device, "power_kw", 0.0) or 0.0) * 1000.0,
             idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
             max_price_sek_kwh=getattr(device, "idle_hold_max_price_sek_per_kwh", None),
@@ -2256,8 +2353,8 @@ class ExecutorEngine:
         if prev != (hold, reason):
             self._water_hold_state[device.id] = (hold, reason)
             logger.info(
-                "Water idle-hold %s: %s off-write for %s (%s)",
-                device.id, "HOLDING" if hold else "allowing", device.id, reason,
+                "Water idle-hold %s: %s off-write (%s)",
+                device.id, "HOLDING" if hold else "allowing", reason,
             )
         return hold
 
