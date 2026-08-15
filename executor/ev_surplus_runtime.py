@@ -56,6 +56,13 @@ class EVSurplusChargerCfg:
     # presses this once (cooldown-limited) so the backoff retry lands on a woken
     # car. Pressing costs one API call and no vehicle wake-lock beyond the usual.
     wake_entity: str | None = None
+    # Believe what we COMMANDED while the power sensor has not yet caught up with it.
+    # A Tesla reports charger power on a multi-minute poll, so right after a start the
+    # servo reads 0 W from a car that is already pulling 5 kW — and since the control
+    # law is "target = measured draw + headroom", a car that has just eaten the export
+    # looks exactly like a cloud. The servo then switches off the load it just created.
+    # Only ever substitutes while the reading demonstrably predates our own write.
+    trust_commanded_draw: bool = True
     priority: int = 0
     min_current_a: float = 6.0
     max_current_a: float = 16.0
@@ -366,6 +373,7 @@ def parse_ev_surplus_config(
                 home_states=tuple(c.get("home_states", ["home"])),
                 override_entity=c.get("override_entity") or None,
                 wake_entity=c.get("wake_entity") or None,
+                trust_commanded_draw=bool(c.get("trust_commanded_draw", True)),
                 priority=int(c.get("priority", 0)),
                 min_current_a=float(c.get("min_current_a", 6.0)),
                 max_current_a=float(c.get("max_current_a", 16.0)),
@@ -508,6 +516,9 @@ class EVSurplusController:
         # actuation clears it.
         self._act_fail: dict[str, tuple[float, int]] = {}
         self._last_wake_ts: dict[str, float] = {}
+        # When we last WROTE anything for a charger — a power reading older than
+        # this cannot reflect the command (see trust_commanded_draw).
+        self._last_cmd_ts: dict[str, float] = {}
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
         """Battery charge-setpoint cap for the engine, or None when the guard is off.
@@ -599,6 +610,25 @@ class EVSurplusController:
         v = _f(await ha.get_state_value(entity))
         return v if v is not None else default
 
+    async def _read_power_with_ts(
+        self, ha: Any, entity: str | None
+    ) -> tuple[float | None, float | None]:
+        """Read a power sensor plus the epoch of its last update (None if unknown)."""
+        if not entity:
+            return None, None
+        state = cast("dict[str, Any] | None", await ha.get_state(entity))
+        if not state:
+            return None, None
+        value = _f(state.get("state"))
+        raw_ts = state.get("last_updated") or state.get("last_changed")
+        ts: float | None = None
+        if isinstance(raw_ts, str):
+            try:
+                ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = None
+        return value, ts
+
     async def _read_attr_f(
         self, ha: Any, entity: str | None, attr: str, default: float | None = None
     ) -> float | None:
@@ -662,7 +692,7 @@ class EVSurplusController:
         """Read one charger's live state (its entity reads run concurrently)."""
         # gather over mixed return types collapses to a union list; narrow each back explicitly.
         res = await asyncio.gather(
-            self._read_f(ha, c.power_entity, 0.0),
+            self._read_power_with_ts(ha, c.power_entity),
             self._read_on(
                 ha, c.plug_entity, ("on", "true", "plugged", "connected"), True,
                 unreadable_default=False,
@@ -673,7 +703,9 @@ class EVSurplusController:
             self._read_f(ha, c.target_soc_entity, None),
             self._read_attr_f(ha, c.departure_entity, "timestamp", None),
         )
-        power = cast("float | None", res[0])
+        power, power_ts = cast("tuple[float | None, float | None]", res[0])
+        if power is None:
+            power = 0.0
         plugged = bool(res[1])
         at_home = bool(res[2])
         override = str(res[3])
@@ -713,6 +745,20 @@ class EVSurplusController:
             commanded_on = self._last_a[c.id] > 0.0
         elif c.id in self._last_switch:
             commanded_on = self._last_switch[c.id]
+        # Close the loop on our own actuation. The control law is
+        # "target = measured draw + headroom", so a car that has just eaten the export
+        # while its power sensor still reads 0 is indistinguishable from a cloud — and
+        # the servo switches off the very load it created (observed live 2026-08-15:
+        # commanded 8 A at 12:07:04, grid went -5.4 kW -> -0.15 kW, charger power stayed
+        # 0.0, switched off at 12:08:05, then locked out by min_off_s for 15 min).
+        # Substitute the commanded draw ONLY while the reading provably predates our
+        # write; the moment the sensor catches up, measurement wins again — including
+        # when it reports 0 because the car declined.
+        if c.trust_commanded_draw and c.id in self._last_a:
+            cmd_ts = self._last_cmd_ts.get(c.id)
+            if cmd_ts is not None and power_ts is not None and power_ts < cmd_ts:
+                power = self._last_a[c.id] * c.phases * c.voltage_v
+
         start_inhibited = (
             now_ts - self._last_stop_ts.get(c.id, float("-inf"))
         ) < c.min_off_s
@@ -990,6 +1036,8 @@ class EVSurplusController:
                     self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
             self._last_switch[ccfg.id] = cmd.switch_on
+            # Any write invalidates a power reading older than it (trust_commanded_draw).
+            self._last_cmd_ts[ccfg.id] = now_ts
 
         # Pause a switchless Easee: with no on/off switch, dynamic limit 0 IS the stop. Without
         # this an "off" command (SoC cap / force_off) on a switchless Easee would leave it
@@ -1008,6 +1056,7 @@ class EVSurplusController:
                     self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
                 self._last_ts[ccfg.id] = now_ts
+                self._last_cmd_ts[ccfg.id] = now_ts
             return
 
         # Pause a switchless current-entity charger (e.g. a Tesla wired without its
@@ -1031,6 +1080,7 @@ class EVSurplusController:
                     self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
                 self._last_ts[ccfg.id] = now_ts
+                self._last_cmd_ts[ccfg.id] = now_ts
             return
 
         # Current: only when on, controllable, and the write-guard allows it.
@@ -1082,4 +1132,5 @@ class EVSurplusController:
                     {"device_id": ccfg.easee_device_id, "current": round(new_a), "time_to_live": 0},
                 )
         self._last_a[ccfg.id] = new_a
+        self._last_cmd_ts[ccfg.id] = now_ts
         self._last_ts[ccfg.id] = now_ts
