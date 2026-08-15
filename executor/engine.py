@@ -2201,7 +2201,12 @@ class ExecutorEngine:
         """
         if not getattr(device, "idle_hold", False):
             return False
-        if off_temp is None or temp is None or float(temp) != float(off_temp):
+        # Only a write TO the off temperature is ever suppressed; a heat command
+        # always goes through. Anything non-numeric is not our case — act normally.
+        try:
+            if off_temp is None or temp is None or float(temp) != float(off_temp):
+                return False
+        except (TypeError, ValueError):
             return False
 
         power_w: float | None = None
