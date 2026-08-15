@@ -1,3 +1,7 @@
+## dev-20260815.1021 — 2026-08-15 10:23
+
+- The servo was blind to its own actuation and switched off the load it created
+
 ## dev-20260815.1002 — 2026-08-15 10:03
 
 - Battery-yield gate becomes a fill DEADLINE, not an SoC threshold
