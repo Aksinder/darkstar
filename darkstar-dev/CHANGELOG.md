@@ -1,3 +1,7 @@
+## dev-20260815.1002 — 2026-08-15 10:03
+
+- Battery-yield gate becomes a fill DEADLINE, not an SoC threshold
+
 ## dev-20260815.0949 — 2026-08-15 09:50
 
 - Idle-hold read the battery with the wrong sign convention
