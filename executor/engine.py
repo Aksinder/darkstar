@@ -47,6 +47,7 @@ from .override import (
 )
 from .water_hold import (
     battery_charge_w,
+    detect_appliance_drift,
     should_boost_on_surplus,
     should_hold_off_write,
 )
@@ -1668,6 +1669,26 @@ class ExecutorEngine:
                                         device, temp, off_temp, heater_w, water_ctx
                                     ):
                                         continue
+                                    # Reality check: the write below is gated against
+                                    # OUR helper, so a device someone else moved would
+                                    # never be corrected. Compare the appliance itself
+                                    # and re-assert through a nudge when they disagree.
+                                    drifted, why = await self._water_appliance_drift(
+                                        device, temp, off_temp, heater_w
+                                    )
+                                    if drifted:
+                                        logger.warning(
+                                            "Water %s drift: %s — re-asserting %s C",
+                                            device.id, why, temp,
+                                        )
+                                        action_results.append(
+                                            await self.dispatcher.set_water_temp(
+                                                self._drift_nudge_value(
+                                                    device, int(temp), int(off_temp)
+                                                ),
+                                                device.target_entity,
+                                            )
+                                        )
                                 commit_minutes = self._planned_water_block_minutes(
                                     device.id, now
                                 )
@@ -2272,6 +2293,43 @@ class ExecutorEngine:
         with contextlib.suppress(ValueError, TypeError):
             return float(raw)
         return None
+
+    async def _water_appliance_drift(
+        self, device: Any, intended: Any, off_temp: Any, power_w: float | None
+    ) -> tuple[bool, str]:
+        """Has the real appliance drifted from what we intend? (needs state_entity)"""
+        if not getattr(device, "state_entity", None) or not self.ha_client:
+            return False, ""
+        raw = await self.ha_client.get_state(device.state_entity)
+        state = None
+        setpoint = None
+        if isinstance(raw, dict):
+            state = raw.get("state")
+            attrs = raw.get("attributes") or {}
+            sp = attrs.get("temperature")
+            if isinstance(sp, int | float):
+                setpoint = float(sp)
+        return detect_appliance_drift(
+            intended_temp=None if intended is None else float(intended),
+            off_temp=None if off_temp is None else float(off_temp),
+            appliance_state=state,
+            appliance_setpoint_c=setpoint,
+            power_w=power_w,
+            idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
+        )
+
+    def _drift_nudge_value(self, device: Any, intended: int, off_temp: int) -> int:
+        """A neighbouring target that lands in the SAME branch of the HA bridge.
+
+        Re-writing the value the helper already holds may not fire a state trigger, so
+        the correction writes a neighbour first and the real target second. The
+        neighbour must not flip the bridge's heat/off decision, so it moves AWAY from
+        the threshold: colder when we intend off, warmer when we intend heat.
+        """
+        if intended <= off_temp:
+            return intended - 1
+        ceiling = device.temp_max if device.temp_max is not None else intended + 1
+        return min(intended + 1, int(ceiling))
 
     def _water_surplus_boost(
         self,

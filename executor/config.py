@@ -374,6 +374,12 @@ class WaterHeaterDeviceConfig:
     # idle-hold ceiling. Unlike idle_hold this commands heat, so it honours the daily
     # energy bound below (the planner's absorb cap, which it bypasses by acting in
     # real time rather than from the forecast).
+    # The REAL appliance behind a bridge (e.g. climate.layzspa_temperature_control).
+    # Writes are change-gated against target_entity — Darkstar's own helper — so an
+    # externally moved appliance is invisible. Given this, the executor compares the
+    # appliance's mode and measured draw against its own intent each tick and
+    # re-asserts on a mismatch, the way the switch path already self-heals.
+    state_entity: str | None = None
     surplus_boost: bool = False
     absorb_cap_kwh_per_day: float | None = None
 
@@ -670,6 +676,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 power_entity=_str_or_none(
                     heater.get("power_sensor") or heater.get("sensor")
                 ),
+                state_entity=_str_or_none(heater.get("state_entity")),
                 surplus_boost=bool(heater.get("surplus_boost", False)),
                 absorb_cap_kwh_per_day=_float_or_none(
                     heater.get("absorb_cap_kwh_per_day")
