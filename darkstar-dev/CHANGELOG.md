@@ -1,3 +1,7 @@
+## dev-20260815.0949 — 2026-08-15 09:50
+
+- Idle-hold read the battery with the wrong sign convention
+
 ## dev-20260815.0900 — 2026-08-15 09:02
 
 - Idle-hold: a non-numeric water target is not our case, act normally
