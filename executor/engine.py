@@ -229,6 +229,9 @@ class ExecutorEngine:
         self._has_water_heater = system_cfg.get("has_water_heater", True)
         self._has_ev_charger = system_cfg.get("has_ev_charger", False)
 
+        # Idle-hold: (hour iso, import price) memo — recomputed once per hour.
+        self._import_price_cache: tuple[str, float] | None = None
+
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
         self._water_hold_state: dict[str, tuple[bool, str]] = {}
 
@@ -2139,21 +2142,32 @@ class ExecutorEngine:
         )
 
     async def _current_import_price(self) -> float | None:
-        """Import price for the current hour, or None when prices are unreadable."""
+        """Import price for the current hour, or None when prices are unreadable.
+
+        Memoized per hour: this runs on every tick for every idle-hold heater, and
+        the price series it reads only changes hourly.
+        """
         try:
             import pytz
 
             from backend.core.prices import get_nordpool_data
 
+            tz = pytz.timezone(self.config.timezone)
+            now = datetime.now(tz)
+            hour_key = now.replace(minute=0, second=0, microsecond=0).isoformat()
+            cached = self._import_price_cache
+            if cached is not None and cached[0] == hour_key:
+                return cached[1]
+
             prices = await get_nordpool_data("config.yaml")
             if not prices:
                 return None
-            tz = pytz.timezone(self.config.timezone)
-            now = datetime.now(tz)
             for p in prices:
                 st = p.get("start_time")
                 if st and st <= now < st + timedelta(hours=1):
-                    return float(p.get("import_price_sek_kwh"))
+                    price = float(p.get("import_price_sek_kwh"))
+                    self._import_price_cache = (hour_key, price)
+                    return price
         except Exception as e:
             logger.debug("Idle-hold: import price unavailable: %s", e)
         return None
