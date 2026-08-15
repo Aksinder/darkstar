@@ -1,3 +1,7 @@
+## dev-20260815.1136 — 2026-08-15 11:37
+
+- Push a self-thermostatted heater to its boost target on measured surplus
+
 ## dev-20260815.1021 — 2026-08-15 10:23
 
 - The servo was blind to its own actuation and switched off the load it created
