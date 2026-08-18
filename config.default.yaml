@@ -102,6 +102,18 @@ water_heating:
 # These sections replace the old `deferrable_loads` array with proper entity
 # definitions. Each device type has its own array supporting multiple instances.
 
+# Shared-feed power ceilings (optional)
+# The solver optimises against ONE net node and knows nothing about sub-panels, so it
+# will co-schedule loads whose combined draw exceeds a feed they share — leaving the
+# phase guard to clean up after the plan instead of acting as the backstop it is.
+# A group caps the SUM of its members' power in every slot. members are device ids from
+# water_heaters[] and/or ev_chargers[]; unknown ids are ignored so a disabled device
+# cannot silently drop the bound for the rest.
+# load_groups:
+#   - id: villavagn
+#     max_power_kw: 2.3          # e.g. a 10 A feed at 230 V
+#     members: [spa, villavagn_tank]
+
 # Water Heaters (Array for multiple water heaters)
 # ARC15: Replaces deferrable_loads entry for water heating
 water_heaters:

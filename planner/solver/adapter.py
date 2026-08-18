@@ -21,6 +21,7 @@ from .types import (
     KeplerInput,
     KeplerInputSlot,
     KeplerResult,
+    LoadGroup,
     LoadPriority,
     WaterHeaterInput,
 )
@@ -37,6 +38,39 @@ _ABSORB_CAP_MARGIN = 1.5
 # expanding its own budget for as long as the tank keeps absorbing. The thermostat
 # terminates the loop physically the moment the tank is full.
 _ABSORB_RATCHET_MARGIN = 1.3
+
+
+def _parse_load_groups(config: dict[str, Any]) -> list[LoadGroup]:
+    """Parse the optional top-level ``load_groups:`` list.
+
+    A group with no positive cap or no members is dropped rather than added as a
+    no-op: an empty ceiling in the model reads like a real one when debugging a plan.
+    """
+    raw: Any = config.get("load_groups") or []
+    if not isinstance(raw, list):
+        logger.warning("load_groups is not a list — ignoring")
+        return []
+    groups: list[LoadGroup] = []
+    for entry in cast("list[dict[str, Any]]", raw):
+        if not isinstance(entry, dict):
+            continue
+        gid = str(entry.get("id") or "").strip()
+        try:
+            cap = float(entry.get("max_power_kw") or 0.0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        members = [str(m) for m in (entry.get("members") or []) if str(m).strip()]
+        if not gid or cap <= 0.0 or not members:
+            logger.warning(
+                "load_group %r skipped (needs id, max_power_kw > 0 and members)",
+                gid or entry,
+            )
+            continue
+        groups.append(LoadGroup(id=gid, max_power_kw=cap, members=members))
+        logger.info(
+            "Load group %s: %.2f kW shared by %s", gid, cap, ", ".join(members)
+        )
+    return groups
 
 
 def _get_config_version(config: dict[str, Any]) -> int:
@@ -889,6 +923,7 @@ def config_to_kepler_config(
             if system.get("grid", {}).get("max_power_kw")
             else None
         ),
+        load_groups=_parse_load_groups(planner_config),
         max_inverter_ac_kw=(
             float(system.get("inverter", {}).get("max_ac_power_kw"))
             if system.get("inverter", {}).get("max_ac_power_kw")

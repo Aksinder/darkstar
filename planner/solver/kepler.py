@@ -729,6 +729,27 @@ class KeplerSolver:
             if config.max_import_power_kw is not None:
                 prob += grid_import[t] <= config.max_import_power_kw * h
 
+            # Shared-feed ceilings. The solver sees ONE net node, so without this it
+            # co-schedules loads that share a sub-panel whose capacity their sum
+            # exceeds — measured at Burgbyn: spa 7.8 A + villavagn tank 6.7 A on the
+            # same villavagn L2, 14.2 A against a 10 A guard. A POWER bound (kW), not
+            # energy, so no *h: the feed limits instantaneous draw, not the slot total.
+            for _grp in config.load_groups:
+                _terms: list[Any] = []
+                for _m in _grp.members:
+                    if _m in water_heat:
+                        _wh = next((x for x in water_heaters if x.id == _m), None)
+                        if _wh is not None:
+                            _terms.append(water_heat[_m][t] * _wh.power_kw)
+                            if _m in water_boost:
+                                _terms.append(water_boost[_m][t] * _wh.power_kw)
+                    elif _m in ev_charge:
+                        _ev = next((x for x in plugged_chargers if x.id == _m), None)
+                        if _ev is not None:
+                            _terms.append(ev_charge[_m][t] * _ev.max_power_kw)
+                if _terms:
+                    prob += pulp.lpSum(_terms) <= _grp.max_power_kw  # type: ignore[operator]
+
             # Inverter AC output limit: battery discharge shares the hybrid inverter's AC bus
             # with that inverter's OWN PV. On a multi-inverter site, PV on a separate
             # AC-coupled inverter (e.g. Fronius) does NOT consume the hybrid inverter's

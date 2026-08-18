@@ -18,6 +18,26 @@ class IncentiveBucket:
 
 
 @dataclass
+class LoadGroup:
+    """A shared supply that several controllable loads sit behind.
+
+    The solver optimises against ONE net node and knows nothing about sub-panels, so
+    it will happily co-schedule two loads that share a feed the sum of their power
+    exceeds. Measured at Burgbyn: the spa (7.8 A) and the villavagn tank (6.7 A) both
+    sit on the villavagn's L2 and together hit 14.2 A against a 10 A guard.
+
+    members are device ids drawn from BOTH water_heaters and ev_chargers, so a group
+    can cover a mixed feed. An unknown id is ignored (a heater may be disabled or
+    absent this run) — silently, because a group is a safety bound, and one missing
+    member must not drop the constraint for the rest.
+    """
+
+    id: str
+    max_power_kw: float
+    members: list[str] = field(default_factory=lambda: [])
+
+
+@dataclass
 class WaterHeaterInput:
     """Per-device water heater input for the Kepler MILP solver."""
 
@@ -188,6 +208,8 @@ class KeplerConfig:
     peak_hour_elapsed_import_kwh: float = 0.0
     # Per-device water heater inputs (replaces scalar water fields)
     water_heaters: list[WaterHeaterInput] = field(default_factory=lambda: [])
+    # Shared-feed power ceilings (sub-panel / breaker groups). See LoadGroup.
+    load_groups: list[LoadGroup] = field(default_factory=lambda: [])
 
     # Global water heating settings (apply to all heaters)
     water_heating_max_gap_hours: float = 0.0  # Threshold for gap penalty (0 = disabled)
