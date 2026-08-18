@@ -1,3 +1,7 @@
+## dev-20260818.1744 — 2026-08-18 17:46
+
+- Per-load window for the dynamic WTP percentile
+
 ## dev-20260818.1451 — 2026-08-18 14:54
 
 - Make the percentile window configurable, and backfill it from passed hours
