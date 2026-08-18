@@ -161,6 +161,12 @@ class LoadPriority:
     # (cheap, expensive, or flat) so it never starves on a uniformly-expensive day, while
     # still refusing that day's most expensive hours. None => use the static base value.
     dynamic_percentile: float | None = None
+    # How many hours that percentile spans. None = 24. Clipped to the plan horizon,
+    # which is all the planner has: unlike the executor it cannot look BACKWARDS, so a
+    # longer ask simply uses the whole horizon (~31 h once tomorrow is published).
+    # A comfort load that should sit out an expensive stretch wants more than a day —
+    # at 24 h it merely picks the cheapest hours of an expensive day.
+    dynamic_window_hours: float | None = None
 
 
 @dataclass

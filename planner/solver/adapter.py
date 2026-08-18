@@ -707,8 +707,33 @@ def build_load_priorities(
             # Lower rank => slightly higher WTP => preferred in intra-tier ties.
             rank_epsilon_sek_per_kwh=-rank * rank_step,
             dynamic_percentile=dynamic_percentile,
+            dynamic_window_hours=_wtp_window_hours(spec, tier, load_id),
         )
     return True, priorities
+
+
+def _wtp_window_hours(
+    spec: dict[str, Any], tier: dict[str, Any], load_id: str
+) -> float | None:
+    """Per-load override for the dynamic-WTP window length, in hours."""
+    raw: Any = spec.get("wtp_window_hours", tier.get("wtp_window_hours"))
+    if raw is None:
+        return None
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "load_priority: load %s wtp_window_hours=%r not a number - ignoring",
+            load_id, raw,
+        )
+        return None
+    if hours <= 0:
+        logger.warning(
+            "load_priority: load %s wtp_window_hours=%r must be > 0 - ignoring",
+            load_id, raw,
+        )
+        return None
+    return hours
 
 
 def dynamic_wtp_from_prices(

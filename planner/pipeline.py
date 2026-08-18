@@ -1039,7 +1039,16 @@ class PlannerPipeline:
             for _lid, _lp in kepler_config.load_priorities.items():
                 if _lp.dynamic_percentile is None:
                     continue
-                _cap = dynamic_wtp_from_prices(dyn_prices, _lp.dynamic_percentile, window_24h)
+                # Per-load window: a comfort load that should sit out a whole expensive
+                # stretch needs more than a day, or it just picks the cheapest hours OF
+                # that expensive day. Clipped to the horizon — the planner has no history.
+                _win = window_24h
+                if _lp.dynamic_window_hours is not None and slot_min > 0:
+                    _win = min(
+                        len(dyn_prices),
+                        max(1, round(_lp.dynamic_window_hours * 60 / slot_min)),
+                    )
+                _cap = dynamic_wtp_from_prices(dyn_prices, _lp.dynamic_percentile, _win)
                 if _cap is not None:
                     _lp.base_wtp_sek_per_kwh = _cap
                     logger.info(
@@ -1047,7 +1056,7 @@ class PlannerPipeline:
                         _lid,
                         _cap,
                         _lp.dynamic_percentile,
-                        window_24h,
+                        _win,
                     )
 
         run_preflight(input_data, active_config)
