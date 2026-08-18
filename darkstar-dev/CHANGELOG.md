@@ -1,3 +1,7 @@
+## dev-20260818.1828 — 2026-08-18 18:30
+
+- may_skip_day, and a manual override for water heaters
+
 ## dev-20260818.1744 — 2026-08-18 17:46
 
 - Per-load window for the dynamic WTP percentile
