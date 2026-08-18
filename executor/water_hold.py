@@ -43,6 +43,31 @@ DEFAULT_IDLE_POWER_W = 100.0
 DEFAULT_SURPLUS_MARGIN_W = 200.0
 
 
+def price_percentile(prices: list[float], percentile: float) -> float | None:
+    """The ``percentile``-th value of a price window, linear-interpolated (numpy type 7).
+
+    Deliberately a ROLLING window rather than a calendar day (owner 2026-08-18: "spatak
+    borde vara dynamiskt mot period och inte per dygn"). A fixed ceiling tuned in a cheap
+    week silently stops working when the market moves: 0.9 SEK/kWh permitted most of
+    summer, then sat below EVERY hour once spot reached 1.43 and the spa simply went cold.
+    A percentile keeps the same INTENT — "only the cheap part of what is coming" —
+    whatever the absolute level happens to be.
+
+    Mirrors dynamic_wtp_from_prices() in the planner adapter; kept separate because the
+    executor deliberately imports nothing from the planner.
+    """
+    window = sorted(p for p in prices if p is not None)
+    if not window:
+        return None
+    if len(window) == 1:
+        return window[0]
+    rank = (max(0.0, min(100.0, percentile)) / 100.0) * (len(window) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(window) - 1)
+    frac = rank - lo
+    return window[lo] * (1.0 - frac) + window[hi] * frac
+
+
 def battery_charge_w(
     *, servo_signed_w: float | None, house_signed_w: float | None
 ) -> float | None:

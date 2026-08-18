@@ -142,6 +142,14 @@ water_heaters:
                                      # it is written normally otherwise. Never turns the heater ON.
                                      # Leave false for dumb resistive tanks — there the off-write IS
                                      # the control.
+    idle_hold_max_price_percentile:  # ...or express that ceiling as a PERCENTILE of the coming
+                                     # 24 h of prices (rolling, NOT per calendar day). Wins over
+                                     # the absolute value below. Use this: a fixed ceiling tuned
+                                     # in a cheap season silently stops working when the market
+                                     # moves — 0.9 permitted heating all summer, then sat under
+                                     # EVERY hour at spot 1.43 and the heater went cold. A
+                                     # percentile keeps the intent ("only the cheap part of what
+                                     # is coming") at any price level. e.g. 30 = cheapest 30 %.
     idle_hold_max_price_sek_per_kwh: # Ceiling for the hold. Above it the OFF write always happens.
                                      # Compared against the EXPORT price when there is surplus and the
                                      # IMPORT price otherwise. Set it at the heater's WTP so the hold
@@ -156,6 +164,17 @@ water_heaters:
                                      # AND measured draw against its own intent each tick,
                                      # re-asserting on a mismatch (the switch path already
                                      # self-heals this way). Empty = no reality check.
+    fuse_shed: false                 # Let the S4 fuse guard force this heater OFF when a phase
+                                     # it sits on exceeds the HOUSE budget (25 A less margin).
+                                     # Without it the guard sheds cars and battery charging only,
+                                     # which is backwards: a tank waits an hour happily, a car may
+                                     # be leaving in the morning. NOT fail-safe-to-shed — blind
+                                     # phase sensors leave the heater alone, because the EV layer
+                                     # already stops every car on blindness and cutting hot water
+                                     # on a sensor hiccup is the worse trade.
+    phase_map: []                    # House phases this heater draws on, e.g. [b]. EMPTY =
+                                     # unknown => counts against EVERY phase (conservative, same
+                                     # convention as the EV phase_map). Measure before setting.
     surplus_boost: false             # Push to temp_boost while there is MEASURED surplus and the
                                      # price is under the ceiling above. Unlike idle_hold this
                                      # COMMANDS heat and overrides the plan, because real-time

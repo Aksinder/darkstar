@@ -38,6 +38,7 @@ from backend.loads.service import LoadDisaggregator
 from .actions import ActionDispatcher, ActionResult, HAClient
 from .config import load_executor_config, load_yaml
 from .controller import ControllerDecision, make_decision
+from .fuse_shed import should_shed_for_fuse
 from .history import ExecutionHistory, ExecutionRecord
 from .override import (
     OverrideResult,
@@ -48,6 +49,7 @@ from .override import (
 from .water_hold import (
     battery_charge_w,
     detect_appliance_drift,
+    price_percentile,
     should_boost_on_surplus,
     should_hold_off_write,
 )
@@ -236,6 +238,7 @@ class ExecutorEngine:
 
         # Idle-hold: (hour iso, import price) memo — recomputed once per hour.
         self._import_price_cache: tuple[str, float] | None = None
+        self._price_window_cache: tuple[str, list[float]] | None = None
 
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
         self._water_hold_state: dict[str, tuple[bool, str]] = {}
@@ -1651,6 +1654,31 @@ class ExecutorEngine:
                                 )
                                 if water_ctx is not None:
                                     heater_w = await self._heater_power_w(device)
+                                    # Fuse relief outranks everything below: the plan,
+                                    # the boost and the idle-hold all assume the main
+                                    # can carry the load.
+                                    if getattr(device, "fuse_shed", False):
+                                        shed, why = should_shed_for_fuse(
+                                            phase_currents_a=water_ctx["phase_currents"],
+                                            budget_a=water_ctx["fuse_budget_a"],
+                                            heater_phases=getattr(
+                                                device, "phase_map", ()
+                                            ),
+                                            grid_w=water_ctx["grid_w"] or 0.0,
+                                        )
+                                        if shed:
+                                            logger.warning(
+                                                "Water FUSE SHED %s: %s — forcing off",
+                                                device.id, why,
+                                            )
+                                            action_results.append(
+                                                await self.dispatcher.set_water_temp(
+                                                    int(off_temp),
+                                                    device.target_entity,
+                                                    bypass_dwell=True,
+                                                )
+                                            )
+                                            continue
                                     # Free-and-cheap: push to the boost target. This
                                     # OVERRIDES the plan, which cannot see real-time
                                     # surplus (the planner's own boost path needs
@@ -2226,6 +2254,50 @@ class ExecutorEngine:
             logger.debug("Idle-hold: import price unavailable: %s", e)
         return None
 
+    async def _price_window(self, hours: float = 24.0) -> list[float]:
+        """Import prices for the next `hours`, from now. Rolling, not calendar-day.
+
+        Memoised per hour alongside the spot price — the series only moves hourly and
+        this runs every tick for every heater with a percentile ceiling.
+        """
+        try:
+            import pytz
+
+            from backend.core.prices import get_nordpool_data
+
+            tz = pytz.timezone(self.config.timezone)
+            now = datetime.now(tz)
+            key = now.replace(minute=0, second=0, microsecond=0).isoformat()
+            cached = self._price_window_cache
+            if cached is not None and cached[0] == key:
+                return cached[1]
+
+            prices = await get_nordpool_data("config.yaml")
+            horizon = now + timedelta(hours=hours)
+            window = [
+                float(p["import_price_sek_kwh"])
+                for p in (prices or [])
+                if p.get("start_time")
+                and p.get("import_price_sek_kwh") is not None
+                and now <= p["start_time"] < horizon
+            ]
+            self._price_window_cache = (key, window)
+            return window
+        except Exception as e:
+            logger.debug("Price window unavailable: %s", e)
+        return []
+
+    def _heater_price_ceiling(self, device: Any, ctx: dict[str, Any]) -> float | None:
+        """This heater's effective price ceiling: percentile of the window, else absolute."""
+        pct = getattr(device, "idle_hold_max_price_percentile", None)
+        if pct is not None:
+            cap = price_percentile(ctx.get("price_window") or [], float(pct))
+            if cap is not None:
+                return cap
+            # An unreadable price series must not silently REMOVE the ceiling — fall
+            # back to the absolute value, which fails closed on an unknown price.
+        return getattr(device, "idle_hold_max_price_sek_per_kwh", None)
+
     async def _signed_power(self, entity: str | None, inverted: bool) -> float | None:
         """Read a signed power sensor in W, or None when it is unreadable."""
         if not entity or not self.ha_client:
@@ -2273,7 +2345,27 @@ class ExecutorEngine:
             raw = await self.ha_client.get_state_value(vac_entity)
             vacation = str(raw).lower() in ("on", "true", "home")
 
+        needs_fuse = any(
+            getattr(d, "fuse_shed", False) for d in self.config.water_heater_devices
+        )
+        phase_currents: dict[str, float] | None = None
+        fuse_budget: float | None = None
+        srv = getattr(self, "_ev_surplus", None)
+        if needs_fuse and srv is not None and self.ha_client:
+            fuse_budget = srv.fuse_budget_a
+            if fuse_budget is not None:
+                phase_currents = await srv.read_phase_currents(
+                    self.ha_client, time.time()
+                )
+
+        needs_window = any(
+            getattr(d, "idle_hold_max_price_percentile", None) is not None
+            for d in self.config.water_heater_devices
+        )
         return {
+            "price_window": await self._price_window() if needs_window else [],
+            "phase_currents": phase_currents,
+            "fuse_budget_a": fuse_budget,
             "grid_w": await self._signed_power(
                 sensors.get("grid_power"), bool(sensors.get("grid_power_inverted"))
             ),
@@ -2353,7 +2445,7 @@ class ExecutorEngine:
             import_price_sek_kwh=ctx["import_price"],
             export_price_sek_kwh=ctx["export_price"],
             heater_power_w=float(getattr(device, "power_kw", 0.0) or 0.0) * 1000.0,
-            max_price_sek_kwh=getattr(device, "idle_hold_max_price_sek_per_kwh", None),
+            max_price_sek_kwh=self._heater_price_ceiling(device, ctx),
             heated_today_kwh=heated_today_kwh,
             absorb_cap_kwh_per_day=getattr(device, "absorb_cap_kwh_per_day", None),
         )
@@ -2404,7 +2496,7 @@ class ExecutorEngine:
             export_price_sek_kwh=ctx["export_price"],
             heater_power_w=float(getattr(device, "power_kw", 0.0) or 0.0) * 1000.0,
             idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
-            max_price_sek_kwh=getattr(device, "idle_hold_max_price_sek_per_kwh", None),
+            max_price_sek_kwh=self._heater_price_ceiling(device, ctx),
         )
         # Log only on transition — this runs every tick.
         prev = self._water_hold_state.get(device.id)

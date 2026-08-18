@@ -544,6 +544,21 @@ class EVSurplusController:
             ev_alloc_a=self.last_ev_alloc_a,
         )
 
+    @property
+    def fuse_budget_a(self) -> float | None:
+        """Limit minus margin, or None when the guard is off. Shared with the water
+        layer, which uses the same budget as its own shed trigger."""
+        if not self.cfg.fuse_guard_enabled:
+            return None
+        return self.cfg.fuse_limit_a - self.cfg.fuse_margin_a
+
+    async def read_phase_currents(
+        self, ha: Any, now_ts: float
+    ) -> dict[str, float] | None:
+        """Public alias so the water layer can share ONE freshness policy with the
+        EV clamp — two readers would eventually disagree about what 'stale' means."""
+        return await self._read_phase_currents(ha, now_ts)
+
     async def _read_phase_currents(
         self, ha: Any, now_ts: float
     ) -> dict[str, float] | None:
