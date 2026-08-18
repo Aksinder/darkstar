@@ -1,3 +1,7 @@
+## dev-20260818.0458 — 2026-08-18 05:00
+
+- load_groups: cap the loads that share a sub-panel
+
 ## dev-20260815.1313 — 2026-08-15 13:15
 
 - Compare the real appliance against our own intent, not just our helper
