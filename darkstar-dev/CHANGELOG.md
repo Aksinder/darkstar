@@ -1,3 +1,7 @@
+## dev-20260818.1451 — 2026-08-18 14:54
+
+- Make the percentile window configurable, and backfill it from passed hours
+
 ## dev-20260818.0458 — 2026-08-18 05:00
 
 - load_groups: cap the loads that share a sub-panel
