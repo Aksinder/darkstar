@@ -369,6 +369,12 @@ class WaterHeaterDeviceConfig:
     # it tracks the market rather than a level tuned in one season. Wins over the
     # absolute value above when set. See price_percentile() in executor/water_hold.py.
     idle_hold_max_price_percentile: float | None = None
+    # How long a window that percentile spans. Future-first, backfilled from today's
+    # passed hours when the forward series is shorter (Nordpool publishes only today
+    # and tomorrow, so ~48 h is the hard ceiling). A comfort load that can wait out a
+    # whole expensive stretch wants MORE than 24 h — otherwise it just picks the
+    # cheapest hours of an expensive day.
+    idle_hold_price_window_hours: float = 24.0
     # At or below this measured load the heater counts as not heating.
     idle_power_w: float = 100.0
     # Measured power source for the idle test; falls back to the heater's own
@@ -684,6 +690,10 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 ),
                 idle_hold_max_price_percentile=_float_or_none(
                     heater.get("idle_hold_max_price_percentile")
+                ),
+                idle_hold_price_window_hours=float(
+                    heater.get("idle_hold_price_window_hours")
+                    or WaterHeaterDeviceConfig.idle_hold_price_window_hours
                 ),
                 idle_power_w=float(
                     heater.get("idle_power_w", WaterHeaterDeviceConfig.idle_power_w)

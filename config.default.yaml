@@ -150,6 +150,13 @@ water_heaters:
                                      # EVERY hour at spot 1.43 and the heater went cold. A
                                      # percentile keeps the intent ("only the cheap part of what
                                      # is coming") at any price level. e.g. 30 = cheapest 30 %.
+    idle_hold_price_window_hours: 24 # How long a window that percentile spans. Future-first,
+                                     # backfilled from today's already-passed hours when the
+                                     # forward series is shorter — Nordpool publishes only today
+                                     # and tomorrow, so ~48 h is the hard ceiling. A comfort load
+                                     # that should wait out a whole expensive stretch wants MORE
+                                     # than 24 h; at 24 it merely picks the cheapest hours of an
+                                     # expensive day.
     idle_hold_max_price_sek_per_kwh: # Ceiling for the hold. Above it the OFF write always happens.
                                      # Compared against the EXPORT price when there is surplus and the
                                      # IMPORT price otherwise. Set it at the heater's WTP so the hold
