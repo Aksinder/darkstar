@@ -2255,7 +2255,15 @@ class ExecutorEngine:
         return None
 
     async def _price_window(self, hours: float = 24.0) -> list[float]:
-        """Import prices for the next `hours`, from now. Rolling, not calendar-day.
+        """A rolling window of `hours` worth of import prices, future-first.
+
+        NOT a calendar day (owner: "dynamiskt mot period och inte per dygn"), and not
+        future-only either: Nordpool publishes today and tomorrow and nothing older, so
+        the forward series runs out after ~12-36 h depending on the hour. Asking for a
+        longer window than that can only be satisfied backwards, so whatever the future
+        cannot supply is backfilled from today's already-passed hours. The hard ceiling
+        is the feed itself — roughly 48 h, today 00:00 to tomorrow 23:45; beyond that
+        would need the recorder.
 
         Memoised per hour alongside the spot price — the series only moves hourly and
         this runs every tick for every heater with a percentile ceiling.
@@ -2272,15 +2280,31 @@ class ExecutorEngine:
             if cached is not None and cached[0] == key:
                 return cached[1]
 
-            prices = await get_nordpool_data("config.yaml")
-            horizon = now + timedelta(hours=hours)
-            window = [
-                float(p["import_price_sek_kwh"])
-                for p in (prices or [])
-                if p.get("start_time")
-                and p.get("import_price_sek_kwh") is not None
-                and now <= p["start_time"] < horizon
+            prices = [
+                p
+                for p in (await get_nordpool_data("config.yaml") or [])
+                if p.get("start_time") and p.get("import_price_sek_kwh") is not None
             ]
+            prices.sort(key=lambda p: p["start_time"])
+            horizon = now + timedelta(hours=hours)
+            forward = [
+                float(p["import_price_sek_kwh"])
+                for p in prices
+                if now <= p["start_time"] < horizon
+            ]
+            want = max(1, round(hours))
+            window = forward
+            if len(forward) < want:
+                past = [
+                    float(p["import_price_sek_kwh"])
+                    for p in prices
+                    if p["start_time"] < now
+                ]
+                window = past[-(want - len(forward)) :] + forward
+            logger.debug(
+                "Price window: %d samples for a %.0f h ask (%d forward, %d backfilled)",
+                len(window), hours, len(forward), len(window) - len(forward),
+            )
             self._price_window_cache = (key, window)
             return window
         except Exception as e:
@@ -2363,7 +2387,21 @@ class ExecutorEngine:
             for d in self.config.water_heater_devices
         )
         return {
-            "price_window": await self._price_window() if needs_window else [],
+            "price_window": (
+                await self._price_window(
+                    max(
+                        (
+                            float(getattr(d, "idle_hold_price_window_hours", 24.0))
+                            for d in self.config.water_heater_devices
+                            if getattr(d, "idle_hold_max_price_percentile", None)
+                            is not None
+                        ),
+                        default=24.0,
+                    )
+                )
+                if needs_window
+                else []
+            ),
             "phase_currents": phase_currents,
             "fuse_budget_a": fuse_budget,
             "grid_w": await self._signed_power(

@@ -222,3 +222,31 @@ class TestDynamicCeiling:
         static = 0.9
         assert all(p > static for p in self.EXPENSIVE_WEEK)
         assert price_percentile(self.EXPENSIVE_WEEK, 30.0) > static
+
+
+class TestWindowLength:
+    """Owner, 2026-08-18: "för spa skulle vi behöva längre fönster än 24h".
+
+    A 24 h window still lets a comfort load heat during a uniformly expensive day — it
+    just picks that day's cheapest hours. Waiting out the whole expensive stretch needs
+    a longer span. The hard ceiling is the price feed: Nordpool publishes today and
+    tomorrow and nothing older, so the forward series runs out after ~12-36 h and the
+    remainder can only come from hours already passed.
+    """
+
+    def test_a_longer_window_dilutes_one_expensive_day(self):
+        """The same P30 permits nothing on the dear day once cheap history is included."""
+        dear_day = [3.0, 3.2, 3.4, 3.6, 3.8, 4.0]
+        cheap_history = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+        short = price_percentile(dear_day, 30.0)
+        long = price_percentile(cheap_history + dear_day, 30.0)
+        assert short > 3.0, "a day-long window sets the bar at that day's own level"
+        assert long < 1.0, "a longer window remembers the stretch was expensive"
+
+    def test_a_longer_window_also_lifts_the_bar_after_a_dear_stretch(self):
+        """Symmetric: the same mechanism must not starve a load after cheap days end."""
+        cheap_day = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+        dear_history = [3.0, 3.2, 3.4, 3.6, 3.8, 4.0]
+        assert price_percentile(dear_history + cheap_day, 30.0) > price_percentile(
+            cheap_day, 30.0
+        )
