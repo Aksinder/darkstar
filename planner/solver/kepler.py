@@ -1341,11 +1341,18 @@ class KeplerSolver:
                     # floor forces it to meet the daily minimum *in that cheap band* and it can
                     # never silently defer-forever / skip a day. (Belt-and-suspenders: the cap
                     # steers to the cheapest hours, the floor guarantees it actually heats.)
+                    # may_skip_day breaks that coupling: a load can now track the market with a
+                    # percentile AND still sit out a whole expensive period. Without it, giving
+                    # the spa a percentile silently removed its right to skip and the floor
+                    # forced 4 kWh into the 3.6 SEK evening peak (observed 2026-08-18).
                     for d in water_min_kwh_violation
                     if not (
                         config.load_priority_enabled
                         and d in config.load_priorities
-                        and config.load_priorities[d].dynamic_percentile is None
+                        and (
+                            config.load_priorities[d].dynamic_percentile is None
+                            or config.load_priorities[d].may_skip_day
+                        )
                     )
                     for i in range(len(sorted_days))
                 )

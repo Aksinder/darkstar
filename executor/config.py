@@ -395,6 +395,16 @@ class WaterHeaterDeviceConfig:
     # house budget. A tank waits an hour happily; a car may be leaving in the morning,
     # so without this the guard sheds the expensive option to save the cheap one.
     fuse_shed: bool = False
+    # Manual override, mirroring the EV chargers' input_select: auto / force_on /
+    # force_off. Acts on the EXECUTOR, so it takes effect on the next tick rather than
+    # waiting for a replan — which is what a human wants from "heat it now".
+    # It is the companion to may_skip_day: a load allowed to sit out an expensive
+    # PERIOD may stay cold for days, so there has to be a way to say "anyway".
+    override_entity: str | None = None
+    # Auto-expiry in minutes, 0 = never. A forgotten force_on cannot run away (the
+    # appliance's own thermostat caps the temperature) but it CAN quietly buy at peak
+    # for days, so an expiry is worth setting on anything expensive.
+    override_timeout_minutes: float = 0.0
     # Which house phases this heater draws on (lowercase, matching the guard's
     # phase_entities keys). EMPTY = unknown => counts against EVERY phase, the same
     # conservative convention the EV phase_map uses.
@@ -704,6 +714,10 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 state_entity=_str_or_none(heater.get("state_entity")),
                 surplus_boost=bool(heater.get("surplus_boost", False)),
                 fuse_shed=bool(heater.get("fuse_shed", False)),
+                override_entity=_str_or_none(heater.get("override_entity")),
+                override_timeout_minutes=float(
+                    heater.get("override_timeout_minutes") or 0.0
+                ),
                 phase_map=tuple(
                     str(x).strip().lower()
                     for x in (heater.get("phase_map") or [])

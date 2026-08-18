@@ -243,6 +243,9 @@ class ExecutorEngine:
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
         self._water_hold_state: dict[str, tuple[bool, str]] = {}
         self._water_boost_state: dict[str, tuple[bool, str]] = {}
+        # heater id -> (epoch when this override was first seen, which one)
+        self._override_since: dict[str, tuple[float, str]] = {}
+        self._override_state: dict[str, str] = {}
 
         # Per-device EV charging state tracking
         self._ev_charger_states: dict[str, EVChargerState] = {}
@@ -1679,6 +1682,38 @@ class ExecutorEngine:
                                                 )
                                             )
                                             continue
+
+                                    # Manual override. Below the fuse shed on purpose —
+                                    # a human asking for hot water must not be allowed
+                                    # to overload the main — but above everything that
+                                    # reasons about price, which is the whole point.
+                                    ovr = await self._heater_override(device)
+                                    if ovr == "force_off":
+                                        temp = int(off_temp)
+                                    elif ovr == "force_on":
+                                        temp = (
+                                            device.temp_normal
+                                            if device.temp_normal is not None
+                                            else self.config.water_heater.temp_normal
+                                        )
+                                    if ovr != "auto":
+                                        prev = self._override_state.get(device.id)
+                                        if prev != ovr:
+                                            self._override_state[device.id] = ovr
+                                            logger.info(
+                                                "Water override %s: %s -> %s C",
+                                                device.id, ovr, temp,
+                                            )
+                                        action_results.append(
+                                            await self.dispatcher.set_water_temp(
+                                                int(temp),
+                                                device.target_entity,
+                                                bypass_dwell=True,
+                                            )
+                                        )
+                                        continue
+                                    self._override_state.pop(device.id, None)
+
                                     # Free-and-cheap: push to the boost target. This
                                     # OVERRIDES the plan, which cannot see real-time
                                     # surplus (the planner's own boost path needs
@@ -2412,6 +2447,42 @@ class ExecutorEngine:
             "export_price": export_price,
             "vacation": vacation,
         }
+
+    async def _heater_override(self, device: Any) -> str:
+        """This heater's manual override: auto / force_on / force_off.
+
+        Expires after override_timeout_minutes (0 = never) so a forgotten force_on
+        cannot quietly buy at peak for days. The clock starts when the selection is
+        first SEEN, not when the helper changed — the executor may have been down.
+        Anything unreadable or unrecognised degrades to auto, never to a stuck force.
+        """
+        entity = getattr(device, "override_entity", None)
+        if not entity or not self.ha_client:
+            return "auto"
+        raw = await self.ha_client.get_state_value(entity)
+        val = str(raw).strip().lower() if raw is not None else "auto"
+        if val not in ("auto", "force_on", "force_off"):
+            val = "auto"
+
+        timeout_min = float(getattr(device, "override_timeout_minutes", 0.0) or 0.0)
+        if val == "auto":
+            self._override_since.pop(device.id, None)
+            return "auto"
+        if timeout_min <= 0:
+            return val
+
+        now = time.time()
+        since, seen = self._override_since.get(device.id, (now, val))
+        if seen != val:
+            since = now
+        self._override_since[device.id] = (since, val)
+        if (now - since) >= timeout_min * 60.0:
+            logger.info(
+                "Water override %s: %s expired after %.0f min — back to auto",
+                device.id, val, timeout_min,
+            )
+            return "auto"
+        return val
 
     async def _heater_power_w(self, device: Any) -> float | None:
         """This heater's measured draw, or None when unreadable."""

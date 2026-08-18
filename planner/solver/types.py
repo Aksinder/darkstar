@@ -167,6 +167,16 @@ class LoadPriority:
     # A comfort load that should sit out an expensive stretch wants more than a day —
     # at 24 h it merely picks the cheapest hours of an expensive day.
     dynamic_window_hours: float | None = None
+    # May this load sit out a whole expensive PERIOD, not just place its need in the
+    # cheap hours of each day? Exempts it from the reliability floor.
+    #
+    # Until now that permission was an accident of "dynamic_percentile is None": a
+    # static-WTP load skipped, a percentile load did not. Setting a percentile on the
+    # spa therefore silently REMOVED its right to skip, and the 15 SEK/kWh floor then
+    # forced 4 kWh into the only hours left in the calendar day — the 3.6 SEK evening
+    # peak, bought from the grid (observed 2026-08-18). The two properties are
+    # independent and are now expressed independently.
+    may_skip_day: bool = False
 
 
 @dataclass

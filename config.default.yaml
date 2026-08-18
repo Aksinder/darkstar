@@ -182,6 +182,19 @@ water_heaters:
     phase_map: []                    # House phases this heater draws on, e.g. [b]. EMPTY =
                                      # unknown => counts against EVERY phase (conservative, same
                                      # convention as the EV phase_map). Measure before setting.
+    override_entity:                 # input_select with options auto / force_on / force_off.
+                                     # Acts on the EXECUTOR, so it lands on the next tick rather
+                                     # than waiting for a replan — what a human means by "heat it
+                                     # now". Ranks BELOW the fuse shed (a request for hot water
+                                     # must not overload the main) and ABOVE everything that
+                                     # reasons about price. Anything unreadable degrades to auto,
+                                     # never to a stuck force. Companion to load_priority's
+                                     # may_skip_day: a load allowed to sit out a whole expensive
+                                     # period may stay cold for days, so there must be a way to
+                                     # say "anyway".
+    override_timeout_minutes: 0      # Auto-expiry, 0 = never. A forgotten force_on cannot run
+                                     # away (the appliance's thermostat caps it) but it CAN
+                                     # quietly buy at peak for days.
     surplus_boost: false             # Push to temp_boost while there is MEASURED surplus and the
                                      # price is under the ceiling above. Unlike idle_hold this
                                      # COMMANDS heat and overrides the plan, because real-time
@@ -385,6 +398,22 @@ load_priority:
     #   #                             #   starves on a uniformly-expensive day, yet always
     #   #                             #   refuses the day's most expensive hours. Lower =
     #   #                             #   stricter peak-avoidance; higher = more headroom.
+    #   # wtp_window_hours: 48        # How long that percentile spans (default 24, clipped to
+    #   #                             #   the plan horizon). More than a day for a load that
+    #   #                             #   should sit out a whole expensive stretch rather than
+    #   #                             #   pick the cheapest hours OF an expensive day.
+    #   # may_skip_day: true          # Exempt from the reliability floor, i.e. this load may go
+    #   #                             #   a whole day (or several) without meeting its
+    #   #                             #   min_kwh_per_day when energy is dear.
+    #   #                             #   ⚠️ Until 2026-08-18 this permission was an accident of
+    #   #                             #   "wtp_percentile is unset". Setting a percentile on the
+    #   #                             #   spa therefore silently REMOVED its right to skip, and
+    #   #                             #   the 15 SEK/kWh floor forced its daily need into the
+    #   #                             #   only hours left in the calendar day — the 3.6 SEK
+    #   #                             #   evening peak, bought from the grid. Set this whenever
+    #   #                             #   you give a comfort load a percentile.
+    #   #                             #   Pair it with water_heaters[].override_entity so a
+    #   #                             #   human can still say "heat it anyway".
     #   #                             #   Recommended for the VVB (e.g. 45-55).
 
 # Phase-aware imbalance cost in the planner (default OFF). The single-net-node solver

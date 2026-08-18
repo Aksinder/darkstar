@@ -708,6 +708,9 @@ def build_load_priorities(
             rank_epsilon_sek_per_kwh=-rank * rank_step,
             dynamic_percentile=dynamic_percentile,
             dynamic_window_hours=_wtp_window_hours(spec, tier, load_id),
+            may_skip_day=bool(
+                spec.get("may_skip_day", tier.get("may_skip_day", False))
+            ),
         )
     return True, priorities
 
