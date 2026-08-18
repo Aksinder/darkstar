@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from executor.water_hold import battery_charge_w, should_hold_off_write
+from typing import ClassVar
+
+from executor.water_hold import (
+    battery_charge_w,
+    price_percentile,
+    should_hold_off_write,
+)
 
 SPA_W = 1800.0
 
@@ -173,3 +179,46 @@ class TestBatterySignConvention:
     def test_the_same_reading_misread_would_have_failed(self):
         """Guards the regression: the raw house value inverts the test."""
         assert _hold(power_w=SPA_W, grid_w=303.0, battery_w=-4797.0)[0] is False
+
+
+class TestDynamicCeiling:
+    """A fixed ceiling tuned in a cheap week stops working when the market moves.
+
+    Owner, 2026-08-18: "spatak borde vara dynamiskt mot period och inte per dygn."
+    Live proof of the failure: 0.9 SEK/kWh permitted heating through the summer, then
+    sat below EVERY hour once spot reached 1.43 (export 1.36-2.44, import 2.42-3.78) —
+    so the spa quietly went cold and all three of its features stood down. A percentile
+    keeps the same intent, "only the cheap part of what is coming", at any price level.
+    """
+
+    CHEAP_WEEK: ClassVar[list[float]] = [0.20, 0.30, 0.45, 0.60, 0.90, 1.20]
+    EXPENSIVE_WEEK: ClassVar[list[float]] = [2.42, 2.60, 2.90, 3.10, 3.40, 3.78]
+
+    def test_the_ceiling_tracks_a_cheap_window(self):
+        cap = price_percentile(self.CHEAP_WEEK, 30.0)
+        assert 0.30 <= cap <= 0.60
+
+    def test_the_same_percentile_rises_with_the_market(self):
+        cap = price_percentile(self.EXPENSIVE_WEEK, 30.0)
+        assert 2.6 <= cap <= 2.95, "must follow the market, not the old absolute level"
+
+    def test_a_percentile_never_permits_the_dearest_hours(self):
+        for window in (self.CHEAP_WEEK, self.EXPENSIVE_WEEK):
+            assert price_percentile(window, 30.0) < max(window)
+
+    def test_p100_is_the_top_and_p0_the_floor(self):
+        assert price_percentile(self.CHEAP_WEEK, 100.0) == max(self.CHEAP_WEEK)
+        assert price_percentile(self.CHEAP_WEEK, 0.0) == min(self.CHEAP_WEEK)
+
+    def test_an_empty_window_yields_no_ceiling(self):
+        """Callers must fall back to the absolute value, not drop the ceiling."""
+        assert price_percentile([], 30.0) is None
+
+    def test_a_single_price_is_its_own_percentile(self):
+        assert price_percentile([1.43], 30.0) == 1.43
+
+    def test_the_expensive_week_would_have_blocked_a_static_ceiling(self):
+        """The regression this exists to prevent, stated as a test."""
+        static = 0.9
+        assert all(p > static for p in self.EXPENSIVE_WEEK)
+        assert price_percentile(self.EXPENSIVE_WEEK, 30.0) > static

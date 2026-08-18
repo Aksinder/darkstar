@@ -365,6 +365,10 @@ class WaterHeaterDeviceConfig:
     # Above this import price the off-write always happens, idle or not. None =
     # no ceiling. Set it at/near the heater's WTP so the hold never outbids the plan.
     idle_hold_max_price_sek_per_kwh: float | None = None
+    # ...or express that ceiling as a PERCENTILE of the coming price window instead, so
+    # it tracks the market rather than a level tuned in one season. Wins over the
+    # absolute value above when set. See price_percentile() in executor/water_hold.py.
+    idle_hold_max_price_percentile: float | None = None
     # At or below this measured load the heater counts as not heating.
     idle_power_w: float = 100.0
     # Measured power source for the idle test; falls back to the heater's own
@@ -381,6 +385,14 @@ class WaterHeaterDeviceConfig:
     # re-asserts on a mismatch, the way the switch path already self-heals.
     state_entity: str | None = None
     surplus_boost: bool = False
+    # Let the S4 fuse guard force this heater OFF when a phase it sits on exceeds the
+    # house budget. A tank waits an hour happily; a car may be leaving in the morning,
+    # so without this the guard sheds the expensive option to save the cheap one.
+    fuse_shed: bool = False
+    # Which house phases this heater draws on (lowercase, matching the guard's
+    # phase_entities keys). EMPTY = unknown => counts against EVERY phase, the same
+    # conservative convention the EV phase_map uses.
+    phase_map: tuple[str, ...] = ()
     absorb_cap_kwh_per_day: float | None = None
 
 
@@ -670,6 +682,9 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 idle_hold_max_price_sek_per_kwh=_float_or_none(
                     heater.get("idle_hold_max_price_sek_per_kwh")
                 ),
+                idle_hold_max_price_percentile=_float_or_none(
+                    heater.get("idle_hold_max_price_percentile")
+                ),
                 idle_power_w=float(
                     heater.get("idle_power_w", WaterHeaterDeviceConfig.idle_power_w)
                 ),
@@ -678,6 +693,12 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 ),
                 state_entity=_str_or_none(heater.get("state_entity")),
                 surplus_boost=bool(heater.get("surplus_boost", False)),
+                fuse_shed=bool(heater.get("fuse_shed", False)),
+                phase_map=tuple(
+                    str(x).strip().lower()
+                    for x in (heater.get("phase_map") or [])
+                    if str(x).strip()
+                ),
                 absorb_cap_kwh_per_day=_float_or_none(
                     heater.get("absorb_cap_kwh_per_day")
                 ),
