@@ -240,7 +240,7 @@ class ExecutorEngine:
 
         # Idle-hold: (hour iso, import price) memo — recomputed once per hour.
         self._import_price_cache: tuple[str, float] | None = None
-        self._price_window_cache: tuple[str, list[float]] | None = None
+        self._price_window_cache: tuple[tuple[str, str, float], list[float]] | None = None
 
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
         self._water_hold_state: dict[str, tuple[bool, str]] = {}
@@ -2333,8 +2333,16 @@ class ExecutorEngine:
             logger.debug("Idle-hold: import price unavailable: %s", e)
         return None
 
-    async def _price_window(self, hours: float = 24.0) -> list[float]:
-        """A rolling window of `hours` worth of import prices, future-first.
+    async def _price_window(
+        self, hours: float = 24.0, field: str = "import_price_sek_kwh"
+    ) -> list[float]:
+        """A rolling window of `hours` worth of prices, future-first.
+
+        ``field`` selects the series. A percentile ceiling is only meaningful against
+        the series the compared price comes FROM: under surplus the effective price is
+        the EXPORT price, and export runs roughly a krona below import here, so an
+        export price measured against an import percentile clears almost any ceiling
+        and the gate quietly stops gating.
 
         NOT a calendar day (owner: "dynamiskt mot period och inte per dygn"), and not
         future-only either: Nordpool publishes today and tomorrow and nothing older, so
@@ -2354,7 +2362,13 @@ class ExecutorEngine:
 
             tz = pytz.timezone(self.config.timezone)
             now = datetime.now(tz)
-            key = now.replace(minute=0, second=0, microsecond=0).isoformat()
+            # Keyed on the ASK as well as the hour: two callers wanting different
+            # spans or different series in the same hour must not share one answer.
+            key = (
+                now.replace(minute=0, second=0, microsecond=0).isoformat(),
+                field,
+                round(hours, 1),
+            )
             cached = self._price_window_cache
             if cached is not None and cached[0] == key:
                 return cached[1]
@@ -2362,27 +2376,23 @@ class ExecutorEngine:
             prices = [
                 p
                 for p in (await get_nordpool_data("config.yaml") or [])
-                if p.get("start_time") and p.get("import_price_sek_kwh") is not None
+                if p.get("start_time") and p.get(field) is not None
             ]
             prices.sort(key=lambda p: p["start_time"])
             horizon = now + timedelta(hours=hours)
             forward = [
-                float(p["import_price_sek_kwh"])
-                for p in prices
-                if now <= p["start_time"] < horizon
+                float(p[field]) for p in prices if now <= p["start_time"] < horizon
             ]
             want = max(1, round(hours))
             window = forward
             if len(forward) < want:
                 past = [
-                    float(p["import_price_sek_kwh"])
-                    for p in prices
-                    if p["start_time"] < now
+                    float(p[field]) for p in prices if p["start_time"] < now
                 ]
                 window = past[-(want - len(forward)) :] + forward
             logger.debug(
-                "Price window: %d samples for a %.0f h ask (%d forward, %d backfilled)",
-                len(window), hours, len(forward), len(window) - len(forward),
+                "Price window (%s): %d samples for a %.0f h ask (%d forward, %d backfilled)",
+                field, len(window), hours, len(forward), len(window) - len(forward),
             )
             self._price_window_cache = (key, window)
             return window
@@ -2479,10 +2489,25 @@ class ExecutorEngine:
                 or c.presence_max_price_percentile is not None
             )
         ]
+        # The pumps' gates compare an EXPORT price under surplus, so they need the
+        # export series to take a percentile of; comparing it against import
+        # percentiles would clear almost any ceiling. The tanks keep the import
+        # series they have always used.
+        needs_export_window = any(
+            c.enabled and c.surplus_run and c.max_price_percentile is not None
+            for c in self.config.cyclic_loads
+        )
         return {
             "price_window": (
                 await self._price_window(max(window_hours))
                 if window_hours
+                else []
+            ),
+            "export_price_window": (
+                await self._price_window(
+                    max(window_hours), field="export_price_sek_kwh"
+                )
+                if window_hours and needs_export_window
                 else []
             ),
             "phase_currents": phase_currents,
@@ -2623,7 +2648,8 @@ class ExecutorEngine:
                     load_power_w=load.power_kw * 1000.0,
                     import_price_sek_kwh=water_ctx["import_price"],
                     export_price_sek_kwh=water_ctx["export_price"],
-                    price_window=water_ctx["price_window"],
+                    import_price_window=water_ctx["price_window"],
+                    export_price_window=water_ctx["export_price_window"],
                     surplus_run=load.surplus_run,
                     max_price_percentile=load.max_price_percentile,
                     presence_home=await self._anyone_home(load.presence_entities),

@@ -11,6 +11,10 @@ from executor.cyclic_run import anyone_home, should_run_opportunistically
 FILTER_W = 390.0
 # A day of prices, cheap night to dear evening. P80 = 2.16, P50 = 1.10.
 WINDOW: list[float] = [0.20, 0.40, 0.60, 0.90, 1.30, 1.80, 2.40, 3.60]
+# Export runs about a krona under import here (live 2026-08-19: import 1.61-3.77
+# with P80 3.08, export P80 1.89). The gap is why the two series cannot share one
+# percentile. P80 = 1.06, P50 = 0.00.
+EXPORT_WINDOW: list[float] = [p - 1.10 for p in WINDOW]
 
 
 def _run(**kw):
@@ -23,7 +27,8 @@ def _run(**kw):
         "load_power_w": FILTER_W,
         "import_price_sek_kwh": 0.60,
         "export_price_sek_kwh": 0.40,
-        "price_window": WINDOW,
+        "import_price_window": WINDOW,
+        "export_price_window": WINDOW,
         "surplus_run": True,
         "max_price_percentile": 80.0,
         "presence_home": False,
@@ -78,7 +83,7 @@ class TestNotTheDearestHours:
     def test_the_ceiling_follows_the_market(self):
         """The same P80 permits more in an expensive week -- intent, not a level."""
         dear = [2.4, 2.6, 2.9, 3.1, 3.4, 3.8]
-        assert _run(grid_w=-4000.0, export_price_sek_kwh=2.90, price_window=dear)[0] is True
+        assert _run(grid_w=-4000.0, export_price_sek_kwh=2.90, import_price_window=dear, export_price_window=dear)[0] is True
         assert _run(grid_w=-4000.0, export_price_sek_kwh=2.90)[0] is False
 
     def test_surplus_uses_the_export_price_not_import(self):
@@ -164,10 +169,51 @@ class TestFailsClosed:
         assert "unknown" in why
 
     def test_an_empty_price_window_declines(self):
-        run, why = _run(grid_w=-4000.0, price_window=[])
+        run, why = _run(grid_w=-4000.0, import_price_window=[], export_price_window=[])
         assert run is False
         assert "price window" in why
 
     def test_no_ceiling_configured_runs_on_surplus_alone(self):
         """Explicitly unset (not uncomputable) means the owner wants no price gate."""
-        assert _run(grid_w=-4000.0, max_price_percentile=None, price_window=[])[0] is True
+        assert _run(grid_w=-4000.0, max_price_percentile=None, import_price_window=[], export_price_window=[])[0] is True
+
+
+class TestTheWindowFollowsThePrice:
+    """A percentile only means something against the series the price came from.
+
+    Found on live prices, 2026-08-19: import 1.61-3.77 (P80 3.08) while export sat
+    at P80 1.89. Judging an export price against the import percentile clears the
+    ceiling at every hour of that day -- the gate is configured, logs a ceiling, and
+    gates nothing. Same shape as the battery sign bug: two series, one convention.
+    """
+
+    def test_a_dear_export_hour_is_blocked_by_its_own_ceiling(self):
+        """1.50 is the dear tail of export (P80 1.06) but nowhere near import P80 2.16."""
+        run, why = _run(
+            grid_w=-4000.0, export_price_sek_kwh=1.50,
+            export_price_window=EXPORT_WINDOW,
+        )
+        assert run is False
+        assert "1.50" in why
+
+    def test_the_import_window_would_have_waved_it_through(self):
+        """The regression, stated as a test: same price, wrong window, wrong answer."""
+        assert _run(grid_w=-4000.0, export_price_sek_kwh=1.50,
+                    export_price_window=WINDOW)[0] is True
+
+    def test_a_genuinely_cheap_export_hour_still_runs(self):
+        assert _run(grid_w=-4000.0, export_price_sek_kwh=0.20,
+                    export_price_window=EXPORT_WINDOW)[0] is True
+
+    def test_the_presence_gate_keeps_the_import_window(self):
+        """No surplus means the kWh really is bought, so import is the right series."""
+        run, _ = _run(presence_home=True, import_price_sek_kwh=0.60,
+                      export_price_window=EXPORT_WINDOW)
+        assert run is True
+
+    def test_a_missing_export_window_declines_rather_than_borrowing_import(self):
+        """Borrowing a series a krona too high IS the silent permissiveness above."""
+        run, why = _run(grid_w=-4000.0, export_price_sek_kwh=1.50,
+                        export_price_window=None)
+        assert run is False
+        assert "price window" in why
