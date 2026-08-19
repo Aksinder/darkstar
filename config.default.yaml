@@ -158,6 +158,39 @@ water_heating:
 #                                  # day. Counted in memory: a restart grants a fresh
 #                                  # budget (the price gates and the plan floor still hold).
 
+# Real-time per-phase load balancing (main-fuse protection)
+# Ported from upstream. OBSERVE-ONLY in this build: it logs the decision it
+# would have made and actuates nothing, so its verdicts can be compared against
+# the live HA phase guard before either one is retired. Two guards actuating at
+# once is worse than either alone.
+#
+# system:
+#   grid:
+#     main_fuse_a: 25            # the fuse this guard protects
+#
+# load_balancing:
+#   enabled: false
+#   resume_delay_s: 120          # how long relief must hold before restoring
+#   resume_margin_percent: 90    # restore only below this % of the fuse. The live
+#                                # guard latched for 3.5 h because its release
+#                                # threshold sat BELOW the shed load's own draw —
+#                                # a margin below the fuse cannot do that.
+#   increase_step_a: 1           # ramp chargers back up one amp at a time
+#   sensor_stale_after_s: 30     # a phase sensor older than this is not trusted
+#   nominal_voltage_v: 220       # for phases reported in W rather than A
+#   notify_interventions: false  # notify on shed/pause; routine ramps never notify
+#   replan_after_throttled_s: 600  # replan once a charger is held down this long
+#   loads:                       # on/off loads the guard may shed
+#     - device_type: water_heater   # water_heater | ev_charger | custom_entity
+#       device_id: spa
+#       phases: [2]              # empty = unknown = counts against every phase
+#   give_way_order:              # ORDER IS THE POLICY — the top gives way first.
+#     - {kind: charger, id: easee_fmb}   # throttle to floor, then pause
+#     - {kind: shed, id: spa}            # then switch this off
+#     - {kind: shed, id: villavagn}      # only then this
+#   # Missing devices are appended automatically on load (chargers before sheds);
+#   # entries naming a device that no longer exists are dropped with a warning.
+
 # Water Heaters (Array for multiple water heaters)
 # ARC15: Replaces deferrable_loads entry for water heating
 water_heaters:
