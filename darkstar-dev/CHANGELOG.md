@@ -1,3 +1,7 @@
+## dev-20260819.0335 — 2026-08-19 03:37
+
+- Tell a human when a write never reaches the appliance
+
 ## dev-20260818.1828 — 2026-08-18 18:30
 
 - may_skip_day, and a manual override for water heaters
