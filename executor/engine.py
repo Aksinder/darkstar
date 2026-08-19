@@ -38,6 +38,7 @@ from backend.loads.service import LoadDisaggregator
 from .actions import ActionDispatcher, ActionResult, HAClient
 from .config import load_executor_config, load_yaml
 from .controller import ControllerDecision, make_decision
+from .cyclic_run import anyone_home, should_run_opportunistically
 from .fuse_shed import should_shed_for_fuse
 from .history import ExecutionHistory, ExecutionRecord
 from .override import (
@@ -249,6 +250,11 @@ class ExecutorEngine:
         self._override_state: dict[str, str] = {}
         # Escalation memory: did our correction actually reach the appliance?
         self._verify_state: dict[str, VerifyState] = {}
+        # Opportunistic pump runtime: load id -> (local day, hours spent) and the
+        # tick timestamp the hours are accumulated from.
+        self._cyclic_extra: dict[str, tuple[str, float]] = {}
+        self._cyclic_extra_ts: dict[str, float] = {}
+        self._cyclic_extra_reason: dict[str, str] = {}
 
         # Per-device EV charging state tracking
         self._ev_charger_states: dict[str, EVChargerState] = {}
@@ -1794,9 +1800,16 @@ class ExecutorEngine:
                     if self.config.cyclic_loads:
                         # A site with pumps but no tanks never entered the water
                         # chain, so build the context here rather than silently
-                        # losing fuse shedding for the pumps.
+                        # losing fuse shedding — or the opportunistic gates, which
+                        # need the same grid/battery/price reads — for the pumps.
                         if water_ctx is None and any(
-                            c.fuse_shed for c in self.config.cyclic_loads
+                            c.enabled
+                            and (
+                                c.fuse_shed
+                                or c.surplus_run
+                                or c.presence_max_price_percentile is not None
+                            )
+                            for c in self.config.cyclic_loads
                         ):
                             water_ctx = await self._water_energy_ctx(
                                 state, slot.export_price_sek_kwh
@@ -2448,24 +2461,28 @@ class ExecutorEngine:
                     self.ha_client, time.time()
                 )
 
-        needs_window = any(
-            getattr(d, "idle_hold_max_price_percentile", None) is not None
+        # One window serves every percentile consumer this tick — the tanks' idle-hold
+        # ceilings and the pumps' opportunistic gates alike. Take the LONGEST hours any
+        # of them asked for: a percentile over a superset is still computable, a missing
+        # tail is not.
+        window_hours: list[float] = [
+            float(getattr(d, "idle_hold_price_window_hours", 24.0))
             for d in self.config.water_heater_devices
-        )
+            if getattr(d, "idle_hold_max_price_percentile", None) is not None
+        ]
+        window_hours += [
+            float(c.price_window_hours)
+            for c in self.config.cyclic_loads
+            if c.enabled
+            and (
+                c.max_price_percentile is not None
+                or c.presence_max_price_percentile is not None
+            )
+        ]
         return {
             "price_window": (
-                await self._price_window(
-                    max(
-                        (
-                            float(getattr(d, "idle_hold_price_window_hours", 24.0))
-                            for d in self.config.water_heater_devices
-                            if getattr(d, "idle_hold_max_price_percentile", None)
-                            is not None
-                        ),
-                        default=24.0,
-                    )
-                )
-                if needs_window
+                await self._price_window(max(window_hours))
+                if window_hours
                 else []
             ),
             "phase_currents": phase_currents,
@@ -2542,12 +2559,17 @@ class ExecutorEngine:
         who outranks whom.
         """
         for load in self.config.cyclic_loads:
+            # Every early exit below stops the opportunistic clock. Without this a
+            # fuse shed or a control pause would keep billing the day's extra budget
+            # for time the pump demonstrably did not run.
             if not load.enabled:
+                self._cyclic_extra_ts.pop(load.id, None)
                 continue
             # Rent-out hands-off: never command a paused device on OR off.
             if await self._device_control_paused(
                 load.control_pause_entities, f"cyclic:{load.id}", load.id, pause_cache
             ):
+                self._cyclic_extra_ts.pop(load.id, None)
                 continue
 
             planned_kw = float(
@@ -2567,6 +2589,7 @@ class ExecutorEngine:
                     logger.warning(
                         "Cyclic FUSE SHED %s: %s — forcing off", load.id, why
                     )
+                    self._cyclic_extra_ts.pop(load.id, None)
                     action_results.append(
                         await self.dispatcher.set_cyclic_load(
                             load.switch_entity, False, name=load.name
@@ -2587,11 +2610,91 @@ class ExecutorEngine:
             else:
                 self._override_state.pop(load.id, None)
 
+            # Opportunistic extras go LAST: below the pause, the fuse guard and the
+            # human, and only ever adding runtime the plan did not already ask for.
+            # Skipped entirely under force_off — a human saying no outranks sunshine.
+            extra_running = False
+            if not want_on and ovr != "force_off" and water_ctx is not None:
+                run, why = should_run_opportunistically(
+                    plan_wants_on=False,
+                    power_w=await self._heater_power_w(load),
+                    grid_w=water_ctx["grid_w"],
+                    battery_w=water_ctx["battery_w"],
+                    load_power_w=load.power_kw * 1000.0,
+                    import_price_sek_kwh=water_ctx["import_price"],
+                    export_price_sek_kwh=water_ctx["export_price"],
+                    price_window=water_ctx["price_window"],
+                    surplus_run=load.surplus_run,
+                    max_price_percentile=load.max_price_percentile,
+                    presence_home=await self._anyone_home(load.presence_entities),
+                    presence_max_price_percentile=load.presence_max_price_percentile,
+                    extra_hours_today=self._cyclic_extra_hours(load.id),
+                    max_extra_hours_per_day=load.max_extra_hours_per_day,
+                )
+                if run:
+                    want_on = True
+                    extra_running = True
+                    if self._cyclic_extra_reason.get(load.id) != why:
+                        self._cyclic_extra_reason[load.id] = why
+                        logger.info("Cyclic %s extra run: %s", load.id, why)
+                elif self._cyclic_extra_reason.pop(load.id, None) is not None:
+                    logger.info("Cyclic %s extra run ended: %s", load.id, why)
+
+            self._note_cyclic_extra(load.id, time.time(), running=extra_running)
+
             action_results.append(
                 await self.dispatcher.set_cyclic_load(
                     load.switch_entity, want_on, name=load.name
                 )
             )
+
+    async def _anyone_home(self, entities: list[str]) -> bool | None:
+        """Is anyone on this load's presence list home? None when nothing is readable."""
+        if not entities or not self.ha_client:
+            return None
+        states: list[str | None] = []
+        for entity in entities:
+            with contextlib.suppress(Exception):
+                raw = await self.ha_client.get_state_value(entity)
+                states.append(None if raw is None else str(raw))
+        return anyone_home(states)
+
+    def _cyclic_extra_hours(self, load_id: str) -> float:
+        """Opportunistic run-time already spent by this load in the current local day."""
+        day, hours = self._cyclic_extra.get(load_id, ("", 0.0))
+        return hours if day == self._local_day() else 0.0
+
+    def _local_day(self) -> str:
+        """Today in the SITE's timezone. The container runs local time but comparators
+        that assume UTC have stalled this system before — so be explicit."""
+        import pytz
+
+        return datetime.now(pytz.timezone(self.config.timezone)).strftime("%Y-%m-%d")
+
+    def _note_cyclic_extra(self, load_id: str, now: float, *, running: bool) -> None:
+        """Fold this tick's elapsed time into the day's opportunistic budget.
+
+        Measured from tick to tick rather than from a commanded start, so a run that
+        the fuse guard or a force_off cuts short is billed only for what it actually
+        drew. The delta is capped at an hour to keep a clock jump from swallowing the
+        whole budget in one tick.
+
+        Held in memory only: a restart hands the load a fresh budget. That is the mild
+        direction of the two — the price gates still apply and the planner's floor is
+        untouched — but it is a real limitation, not a rounding error.
+        """
+        day = self._local_day()
+        stored_day, hours = self._cyclic_extra.get(load_id, (day, 0.0))
+        if stored_day != day:
+            stored_day, hours = day, 0.0
+        last = self._cyclic_extra_ts.get(load_id)
+        if running and last is not None and 0.0 < (now - last) <= 3600.0:
+            hours += (now - last) / 3600.0
+        self._cyclic_extra[load_id] = (stored_day, hours)
+        if running:
+            self._cyclic_extra_ts[load_id] = now
+        else:
+            self._cyclic_extra_ts.pop(load_id, None)
 
     async def _note_write_verified(
         self, device: Any, *, ok: bool, detail: str

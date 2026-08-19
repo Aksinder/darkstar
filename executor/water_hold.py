@@ -93,7 +93,7 @@ def battery_charge_w(
     return -house_signed_w
 
 
-def _has_surplus(
+def has_surplus(
     grid_w: float | None,
     battery_w: float | None,
     heater_w: float,
@@ -101,6 +101,9 @@ def _has_surplus(
     own_draw_w: float = 0.0,
 ) -> bool:
     """Exporting, or storing at least this heater's draw into the battery.
+
+    Public because the pool pumps ask the same question (executor/cyclic_run.py) and
+    two definitions of "surplus" would drift apart at exactly the wrong moment.
 
     ``own_draw_w`` is subtracted from the meter first, because a heater running ON the
     surplus has already consumed it: the meter reads ~0 precisely BECAUSE the element
@@ -151,7 +154,7 @@ def should_hold_off_write(
         (hold, reason). hold=True means "do not write; leave the appliance alone".
     """
     own = power_w or 0.0
-    surplus = _has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w, own)
+    surplus = has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w, own)
 
     if max_price_sek_kwh is not None:
         # Spare PV costs the export revenue foregone; bought energy costs import.
@@ -203,7 +206,7 @@ def should_boost_on_surplus(
     Returns (boost, reason).
     """
     own = power_w or 0.0
-    if not _has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w, own):
+    if not has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w, own):
         return False, "no surplus"
 
     if max_price_sek_kwh is not None:
