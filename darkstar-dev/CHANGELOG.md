@@ -1,3 +1,7 @@
+## dev-20260819.1658 — 2026-08-19 17:00
+
+- cyclic_loads: opportunistic surplus and presence run gates
+
 ## dev-20260819.1529 — 2026-08-19 15:31
 
 - cyclic_loads: pool pump and filter as first-class planned loads
