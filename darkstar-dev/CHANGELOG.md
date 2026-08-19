@@ -1,3 +1,7 @@
+## dev-20260819.1826 — 2026-08-19 18:28
+
+- controller: cap export_with_load_w at the discharge limit we command
+
 ## dev-20260819.1800 — 2026-08-19 18:02
 
 - load_balancer: port upstream's per-phase fuse guard (observe-only)
