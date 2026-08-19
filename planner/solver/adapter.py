@@ -78,6 +78,43 @@ def _get_config_version(config: dict[str, Any]) -> int:
     return int(config.get("config_version", 1))
 
 
+def cyclic_loads_as_heater_specs(
+    cyclic_loads_config: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Translate ``cyclic_loads:`` entries into the shape build_water_heater_inputs reads.
+
+    A pool pump and a water heater are the SAME problem to the solver: a recurring
+    daily energy need, splittable across slots, with a minimum spacing between starts
+    and a maximum gap between them. The MILP block contains no temperature term at all
+    — only the executor's actuation is temperature-shaped — so a second copy of that
+    block for pumps would be duplicated constraints to keep in sync forever, for zero
+    modelling gain.
+
+    What genuinely differs is naming and actuation, and both live outside the solver.
+    So cyclic loads are mapped onto the same primitive here and routed back out by id
+    in the executor, which drives them as switches instead of writing a temperature.
+
+    The config surface keeps honest names (``max_hours_between``, not
+    ``max_hours_between_heating``) — a pool pump should not have to be spelled as a
+    water heater in the user's own config.
+    """
+    specs: list[dict[str, Any]] = []
+    for raw in cyclic_loads_config or []:
+        if not isinstance(raw, dict):
+            continue
+        spec = dict(cast("dict[str, Any]", raw))
+        # Copy only PRESENT values: setdefault would not rescue a key that exists
+        # holding None, and float(None) is a crash rather than a default.
+        if spec.get("max_hours_between") is not None:
+            spec["max_hours_between_heating"] = spec["max_hours_between"]
+        if spec.get("max_hours_between_heating") is None:
+            spec["max_hours_between_heating"] = 24.0
+        if spec.get("min_spacing_hours") is not None:
+            spec["water_min_spacing_hours"] = spec["min_spacing_hours"]
+        specs.append(spec)
+    return specs
+
+
 def build_water_heater_inputs(
     water_heaters_config: list[dict[str, Any]],
     global_wh_cfg: dict[str, Any] | None = None,
@@ -122,9 +159,15 @@ def build_water_heater_inputs(
         if not heater_id:
             continue
 
-        # The config array uses 'water_min_spacing_hours' (with prefix) - handle both
-        spacing_hours_raw: Any = wh.get("water_min_spacing_hours") or wh.get("min_spacing_hours")
-        spacing_hours: float = float(spacing_hours_raw or 5.0)
+        # The config array uses 'water_min_spacing_hours' (with prefix) - handle both.
+        # ABSENT and ZERO must not collapse: `or 5.0` turned an explicit "no spacing"
+        # into five hours of forced separation. Found 2026-08-19 — the spa has been
+        # configured 0 since it was set up and silently ran with 5 the whole time,
+        # and a pump that wants continuous blocks would have hit the same wall.
+        spacing_hours_raw: Any = wh.get("water_min_spacing_hours")
+        if spacing_hours_raw is None:
+            spacing_hours_raw = wh.get("min_spacing_hours")
+        spacing_hours: float = 5.0 if spacing_hours_raw is None else float(spacing_hours_raw)
 
         # When top-ups disabled globally, disable per-device spacing too
         if not enable_top_ups:
@@ -865,6 +908,24 @@ def config_to_kepler_config(
     else:
         # Legacy format: no per-device support
         water_inputs = []
+
+    # Cyclic loads (pool pump, filter, ...) ride the SAME solver primitive — see
+    # cyclic_loads_as_heater_specs for why there is no second MILP block. They are
+    # routed back out by id in the executor, which switches them instead of writing
+    # a temperature.
+    cyclic_specs = cyclic_loads_as_heater_specs(
+        cast("list[dict[str, Any]]", planner_config.get("cyclic_loads", []) or [])
+    )
+    if cyclic_specs:
+        cyclic_inputs = build_water_heater_inputs(
+            cyclic_specs, global_wh, water_heater_states
+        )
+        if cyclic_inputs:
+            logger.info(
+                "Cyclic loads planned as recurring daily needs: %s",
+                ", ".join(f"{c.id} {c.min_kwh_per_day:.2f} kWh/d" for c in cyclic_inputs),
+            )
+        water_inputs = water_inputs + cyclic_inputs
 
     # For global comfort settings, use the water_heating section
     wh_cfg = global_wh

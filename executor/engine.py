@@ -1563,6 +1563,11 @@ class ExecutorEngine:
                         # activation that the very next tick's plan (temp_off) undid
                         # within 60 s — an "override" that never survived a minute.
                         boost_active = self._water_boost_active()
+                        # Bound before the water chain: the cyclic-load loop below reads it, and
+                        # that loop runs whether or not any water branch was taken (a site can
+                        # have pumps and no tanks).
+                        water_ctx: dict[str, Any] | None = None
+
                         if boost_active and self.config.water_heater_devices:
                             for device in self.config.water_heater_devices:
                                 # A control-paused device is hands-off: boost must NOT
@@ -1783,6 +1788,22 @@ class ExecutorEngine:
                                 bypass_dwell=override.override_needed,
                             )
                             action_results.append(water_result)
+
+                    # Cyclic loads ride the same plan as the water heaters and are
+                    # driven right after them, so both see one consistent slot.
+                    if self.config.cyclic_loads:
+                        # A site with pumps but no tanks never entered the water
+                        # chain, so build the context here rather than silently
+                        # losing fuse shedding for the pumps.
+                        if water_ctx is None and any(
+                            c.fuse_shed for c in self.config.cyclic_loads
+                        ):
+                            water_ctx = await self._water_energy_ctx(
+                                state, slot.export_price_sek_kwh
+                            )
+                        await self._actuate_cyclic_loads(
+                            slot, water_ctx, pause_cache, action_results
+                        )
 
                     # Control the excess-PV sink ladder (7.2-7.4). The loader
                     # synthesizes .sinks from the legacy custom_entity block, so
@@ -2504,6 +2525,73 @@ class ExecutorEngine:
         with contextlib.suppress(ValueError, TypeError):
             return float(raw)
         return None
+
+    async def _actuate_cyclic_loads(
+        self,
+        slot: Any,
+        water_ctx: dict[str, Any] | None,
+        pause_cache: dict[str, bool],
+        action_results: list[Any],
+    ) -> None:
+        """Drive the cyclic loads from the same plan the water heaters read.
+
+        They share the solver primitive (see cyclic_loads_as_heater_specs), so the
+        plan hands them back in water_heater_plans keyed by id; only the actuation
+        differs. Precedence matches the heaters exactly — pause, fuse, override,
+        plan — because a pool pump and a tank should not obey different rules about
+        who outranks whom.
+        """
+        for load in self.config.cyclic_loads:
+            if not load.enabled:
+                continue
+            # Rent-out hands-off: never command a paused device on OR off.
+            if await self._device_control_paused(
+                load.control_pause_entities, f"cyclic:{load.id}", load.id, pause_cache
+            ):
+                continue
+
+            planned_kw = float(
+                (slot.water_heater_plans or {}).get(load.id, 0.0) or 0.0
+            )
+            want_on = planned_kw > 0.0
+
+            # Fuse relief outranks the plan and the human alike.
+            if load.fuse_shed and water_ctx is not None:
+                shed, why = should_shed_for_fuse(
+                    phase_currents_a=water_ctx["phase_currents"],
+                    budget_a=water_ctx["fuse_budget_a"],
+                    heater_phases=load.phase_map,
+                    grid_w=water_ctx["grid_w"] or 0.0,
+                )
+                if shed:
+                    logger.warning(
+                        "Cyclic FUSE SHED %s: %s — forcing off", load.id, why
+                    )
+                    action_results.append(
+                        await self.dispatcher.set_cyclic_load(
+                            load.switch_entity, False, name=load.name
+                        )
+                    )
+                    continue
+
+            ovr = await self._heater_override(load)
+            if ovr == "force_on":
+                want_on = True
+            elif ovr == "force_off":
+                want_on = False
+            if ovr != "auto":
+                prev = self._override_state.get(load.id)
+                if prev != ovr:
+                    self._override_state[load.id] = ovr
+                    logger.info("Cyclic override %s: %s", load.id, ovr)
+            else:
+                self._override_state.pop(load.id, None)
+
+            action_results.append(
+                await self.dispatcher.set_cyclic_load(
+                    load.switch_entity, want_on, name=load.name
+                )
+            )
 
     async def _note_write_verified(
         self, device: Any, *, ok: bool, detail: str

@@ -114,6 +114,29 @@ water_heating:
 #     max_power_kw: 2.3          # e.g. a 10 A feed at 230 V
 #     members: [spa, villavagn_tank]
 
+# Cyclic Loads (optional) — pool pump, filter, circulation
+# A recurring daily energy need, splittable across slots, with spacing and gap
+# constraints. That is the SAME problem a water heater poses, so these ride the same
+# solver primitive rather than a second copy of the MILP block — only the actuation
+# differs: a switch, not a temperature. Give each one a load_priority entry (by id) to
+# control WHEN it may run; without one it simply meets its daily need at the cheapest
+# hours the constraints allow.
+# cyclic_loads:
+#   - id: poolpump
+#     name: "Poolpump"
+#     enabled: true
+#     switch_entity: switch.poolpump
+#     power_kw: 0.26
+#     min_kwh_per_day: 0.78        # e.g. 3 h/day; size it from pool volume / pump flow
+#     max_hours_between: 24        # max gap between runs
+#     min_spacing_hours: 0         # 0 = may run in consecutive slots (explicit 0 IS honoured)
+#     power_sensor: sensor.poolpump_power
+#     control_pause_entities: []   # hands-off while any of these is on
+#     override_entity:             # input_select auto / force_on / force_off
+#     override_timeout_minutes: 0
+#     fuse_shed: false             # let the S4 guard shed it
+#     phase_map: []                # empty = counts against every phase
+
 # Water Heaters (Array for multiple water heaters)
 # ARC15: Replaces deferrable_loads entry for water heating
 water_heaters:
