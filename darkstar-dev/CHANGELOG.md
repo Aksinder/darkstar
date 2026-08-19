@@ -1,3 +1,7 @@
+## dev-20260819.1529 — 2026-08-19 15:31
+
+- cyclic_loads: pool pump and filter as first-class planned loads
+
 ## dev-20260819.0335 — 2026-08-19 03:37
 
 - Tell a human when a write never reaches the appliance
