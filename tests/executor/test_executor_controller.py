@@ -684,6 +684,42 @@ class TestExportWithLoadCalculation:
 
         assert decision.export_with_load_w == 1700.0  # Rounded to nearest 100W
 
+    def test_export_with_load_is_capped_by_the_discharge_limit(self):
+        """We already command max_discharge_w as the battery's ceiling; asking for
+        export+load above it tells the inverter two contradictory things at once.
+
+        It also fails in the worst way: a value outside an HA number helper's range
+        makes HA reject the WHOLE write, so the export command silently does nothing
+        instead of doing less. (Found in IZZE2000's fork of upstream, 2026-07-08.)"""
+        config = ControllerConfig(max_discharge_w=5000.0)
+        controller = Controller(config, InverterConfig())
+
+        # 4 kW export on top of 3 kW house load wants 7 kW from a 5 kW battery.
+        decision = controller._follow_plan(
+            SlotPlan(export_kw=4.0, load_kw=3.0), SystemState()
+        )
+
+        assert decision.export_with_load_w == 5000.0
+        assert decision.export_power_w == 4000.0, "the plan's own export is untouched"
+
+    def test_a_request_within_the_limit_is_not_clamped(self):
+        config = ControllerConfig(max_discharge_w=5000.0)
+        controller = Controller(config, InverterConfig())
+        decision = controller._follow_plan(
+            SlotPlan(export_kw=2.0, load_kw=0.5), SystemState()
+        )
+        assert decision.export_with_load_w == 2500.0
+
+    def test_the_clamp_never_lands_above_the_limit(self):
+        """Clamping AFTER rounding, not before: rounding a clamped value to the
+        nearest step could put it back over the ceiling."""
+        config = ControllerConfig(max_discharge_w=4950.0)
+        controller = Controller(config, InverterConfig())
+        decision = controller._follow_plan(
+            SlotPlan(export_kw=4.0, load_kw=1.0), SystemState()
+        )
+        assert decision.export_with_load_w <= 4950.0
+
     def test_no_export_sets_export_with_load_to_zero(self):
         """When not exporting, export_with_load_w should be 0."""
         config = ControllerConfig()

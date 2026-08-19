@@ -287,6 +287,16 @@ class Controller:
             step = self.profile.behavior.round_step_w if self.profile else 100.0
             raw_export_with_load = export_power_w + (slot.load_kw * 1000.0)
             export_with_load_w = round(raw_export_with_load / step) * step
+            # The battery cannot discharge past the ceiling we ourselves command
+            # (_calculate_discharge_limit writes exactly this number), so asking
+            # for export+load above it is incoherent: we would be telling the
+            # inverter "at most X" and "give me more than X" in the same tick.
+            # It also fails LOUDLY in the wrong way — a value outside an HA
+            # number helper's range makes HA reject the whole write, so the
+            # export command silently does nothing rather than doing less.
+            # Clamped AFTER rounding on purpose: rounding a clamped value to the
+            # nearest step could land back above the limit.
+            export_with_load_w = min(export_with_load_w, self.config.max_discharge_w)
         else:
             export_with_load_w = 0.0
 
