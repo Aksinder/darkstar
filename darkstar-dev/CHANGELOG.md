@@ -1,3 +1,7 @@
+## dev-20260819.1800 — 2026-08-19 18:02
+
+- load_balancer: port upstream's per-phase fuse guard (observe-only)
+
 ## dev-20260819.1749 — 2026-08-19 17:51
 
 - cyclic_run: take the surplus percentile from the export series
