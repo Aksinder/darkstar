@@ -61,12 +61,12 @@ def anyone_home(states: list[str | None]) -> bool | None:
 
 
 def _ceiling(
-    price_window: list[float], percentile: float | None
+    window: list[float], percentile: float | None
 ) -> tuple[float | None, bool]:
     """(ceiling, configured). A configured-but-uncomputable ceiling blocks the run."""
     if percentile is None:
         return None, False
-    return price_percentile(price_window, percentile), True
+    return price_percentile(window, percentile), True
 
 
 def should_run_opportunistically(
@@ -78,7 +78,8 @@ def should_run_opportunistically(
     load_power_w: float,
     import_price_sek_kwh: float | None,
     export_price_sek_kwh: float | None,
-    price_window: list[float],
+    import_price_window: list[float],
+    export_price_window: list[float] | None = None,
     surplus_run: bool = False,
     max_price_percentile: float | None = None,
     presence_home: bool | None = None,
@@ -97,7 +98,15 @@ def should_run_opportunistically(
         grid_w: signed grid power, W, POSITIVE = import.
         battery_w: signed battery power, W, POSITIVE = charging.
         load_power_w: rated draw, used to size the surplus test.
-        price_window: the rolling price series the percentiles are taken over.
+        import_price_window: rolling import prices, for the no-surplus case.
+        export_price_window: rolling export prices. A percentile is only meaningful
+            against the series the compared price came FROM, and under surplus the
+            effective price is the EXPORT price -- which runs about a krona below
+            import here, so measuring it against an import percentile would clear
+            almost any ceiling and the gate would quietly stop gating. Absent, with
+            a percentile configured, the surplus gate DECLINES rather than borrowing
+            the import series: substituting a series a krona too high is exactly the
+            silent permissiveness this argument exists to prevent.
         surplus_run: enable the surplus gate.
         max_price_percentile: ceiling for the surplus gate ("inte extra dyra
             timmar" -- a HIGH percentile: block only the dearest tail).
@@ -131,13 +140,17 @@ def should_run_opportunistically(
 
     own = power_w or 0.0
     surplus = has_surplus(grid_w, battery_w, load_power_w, surplus_margin_w, own)
-    # Spare PV costs the export revenue foregone; bought energy costs import.
-    price = export_price_sek_kwh if surplus else import_price_sek_kwh
-    if price is None:
+    # Spare PV costs the export revenue foregone; bought energy costs import. The
+    # window follows the price, so like is always compared with like.
+    if surplus and export_price_sek_kwh is not None:
+        price = export_price_sek_kwh
+        window = export_price_window or []
+    else:
         price = import_price_sek_kwh
+        window = import_price_window
 
     if surplus_run and surplus:
-        cap, configured = _ceiling(price_window, max_price_percentile)
+        cap, configured = _ceiling(window, max_price_percentile)
         if not configured:
             return True, "surplus"
         if cap is None:
@@ -149,7 +162,8 @@ def should_run_opportunistically(
         return False, f"surplus but price {price:.2f} > {cap:.2f}"
 
     if presence_max_price_percentile is not None and presence_home:
-        cap, _ = _ceiling(price_window, presence_max_price_percentile)
+        # Presence without surplus means bought energy, so the import series applies.
+        cap, _ = _ceiling(window, presence_max_price_percentile)
         if cap is None:
             return False, "home but no price window"
         if price is None:

@@ -62,6 +62,9 @@ def _ctx(**over) -> dict:
         "import_price": 0.60,
         "export_price": 0.40,
         "price_window": [0.20, 0.40, 0.60, 0.90, 1.30, 1.80, 2.40, 3.60],
+        # Export runs roughly a krona under import; the gate takes its surplus
+        # percentile from THIS series, not the import one.
+        "export_price_window": [0.10, 0.20, 0.30, 0.45, 0.65, 0.90, 1.20, 1.80],
         "phase_currents": {"l1": 24.0, "l2": 24.0, "l3": 24.0},
         "fuse_budget_a": 25.0,
     }
