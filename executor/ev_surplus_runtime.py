@@ -552,6 +552,15 @@ class EVSurplusController:
             return None
         return self.cfg.fuse_limit_a - self.cfg.fuse_margin_a
 
+    def commanded_current_a(self, charger_id: str) -> float | None:
+        """The amps we last commanded this charger, or None if we never have.
+
+        Public so the fuse balancer can read the live setpoint without reaching
+        into servo internals — one owner of "what did we actually command", the
+        same reason read_phase_currents is shared rather than reimplemented.
+        """
+        return self._last_a.get(charger_id)
+
     async def read_phase_currents(
         self, ha: Any, now_ts: float
     ) -> dict[str, float] | None:

@@ -486,6 +486,85 @@ class EVChargerDeviceConfig:
     departure_time: str | None = None
 
 
+# --------------------------------------------------------------------------
+# Real-time per-phase load balancing (main-fuse protection).
+#
+# Ported from upstream ergetie/darkstar (commits b96f58c2, 5dc3c2ca, 16d0c99f),
+# which our fork never carried. Taken as a targeted port rather than a
+# cherry-pick: those commits conflict across 12 files each against our diverged
+# engine/config, while executor/load_balancer.py itself depends on nothing but
+# LoadBalancingConfig -- so the logic transplants cleanly and its 40 upstream
+# tests come along as a correctness oracle.
+# --------------------------------------------------------------------------
+
+
+class BalancedLoadType(Enum):
+    """Type of device a load-balancing entry refers to."""
+
+    EV_CHARGER = "ev_charger"
+    WATER_HEATER = "water_heater"
+    CUSTOM_ENTITY = "custom_entity"
+
+
+@dataclass
+class BalancedLoadConfig:
+    """A single shed-able on/off load managed by the real-time load balancer.
+
+    EV chargers configured with type="current" get dedicated ampere throttling
+    (see EVChargerDeviceConfig) and do not need an entry here; this is for
+    on/off shedding (water heaters, custom entities, and binary-type chargers).
+    Give-way ordering lives in LoadBalancingConfig.give_way_order, not here.
+    """
+
+    device_type: BalancedLoadType = BalancedLoadType.WATER_HEATER
+    device_id: str = ""
+    phases: list[int] = field(default_factory=lambda: [])
+    # Custom entity actuation (only used when device_type == CUSTOM_ENTITY)
+    entity: str | None = None
+    on_value: str = "1"
+    off_value: str = "0"
+
+
+@dataclass
+class GiveWayOrderEntry:
+    """One entry in the unified give-way order (top gives way first).
+
+    kind="charger" references a type="current" ev_chargers[].id (throttle to
+    floor, then pause); kind="shed" references a loads[].device_id (switch off).
+    """
+
+    kind: str = "shed"  # "charger" | "shed"
+    id: str = ""
+
+
+@dataclass
+class LoadBalancingConfig:
+    """Real-time per-phase load balancing (fuse protection) configuration."""
+
+    enabled: bool = False
+    # Sourced from system.grid.main_fuse_a in YAML; folded in here for convenience
+    # since it is always consumed alongside the rest of this config as a unit.
+    main_fuse_a: int | None = None
+    resume_delay_s: int = 120
+    resume_margin_percent: float = 90.0
+    increase_step_a: int = 1
+    sensor_stale_after_s: int = 30
+    # Fallback voltage (V) for converting a power-mode phase to current when
+    # that phase has no configured grid_voltage_l* entity. Unrelated to
+    # ControllerConfig.nominal_voltage_v (DC battery voltage).
+    nominal_voltage_v: float = 220.0
+    loads: list[BalancedLoadConfig] = field(default_factory=lambda: [])
+    # Unified give-way order across chargers and shed loads; the top entry
+    # gives way first. Self-healed on load (see heal_give_way_order).
+    give_way_order: list[GiveWayOrderEntry] = field(default_factory=lambda: [])
+    # Notify (HA notify / Discord fallback) on shed, pause, and stale-fallback
+    # transitions. Routine throttle/ramp adjustments never notify.
+    notify_interventions: bool = False
+    # Trigger one replan (via the plug/unplug replan path) after a charger has
+    # been held below its planner target (or paused) this long, continuously.
+    replan_after_throttled_s: int = 600
+
+
 @dataclass
 class NotificationConfig:
     """Notification settings per action type."""
@@ -547,6 +626,7 @@ class ExecutorConfig:
     water_heater: WaterHeaterGlobalConfig = field(default_factory=WaterHeaterGlobalConfig)
     water_heater_devices: list[WaterHeaterDeviceConfig] = field(default_factory=lambda: [])
     cyclic_loads: list[CyclicLoadConfig] = field(default_factory=lambda: [])
+    load_balancing: LoadBalancingConfig = field(default_factory=LoadBalancingConfig)
     ev_charger: EVChargerConfig = field(default_factory=EVChargerConfig)  # legacy compat
     ev_chargers: list[EVChargerDeviceConfig] = field(default_factory=lambda: [])
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
@@ -578,6 +658,141 @@ def load_yaml(path: str) -> dict[str, Any]:
     except Exception as e:
         logger.error("Failed to load YAML %s: %s", path, e)
         return {}
+
+
+def _parse_load_balancing_config(
+    data: dict[str, Any], system_data: dict[str, Any]
+) -> LoadBalancingConfig:
+    """Parse system.grid.main_fuse_a and the top-level load_balancing: section."""
+    grid_data: dict[str, Any] = (
+        system_data.get("grid", {}) if isinstance(system_data.get("grid"), dict) else {}
+    )
+    main_fuse_a_raw = grid_data.get("main_fuse_a")
+    main_fuse_a: int | None
+    try:
+        main_fuse_a = int(main_fuse_a_raw) if main_fuse_a_raw is not None else None
+    except (TypeError, ValueError):
+        logger.warning("Invalid system.grid.main_fuse_a value: %r", main_fuse_a_raw)
+        main_fuse_a = None
+
+    lb_data: dict[str, Any] = (
+        data.get("load_balancing", {}) if isinstance(data.get("load_balancing"), dict) else {}
+    )
+
+    loads_raw = lb_data.get("loads", [])
+    loads: list[BalancedLoadConfig] = []
+    if isinstance(loads_raw, list):
+        for item in cast("list[Any]", loads_raw):
+            if not isinstance(item, dict):
+                continue
+            load_item = cast("dict[str, Any]", item)
+            type_raw = str(load_item.get("device_type", "water_heater")).lower()
+            try:
+                device_type = BalancedLoadType(type_raw)
+            except ValueError:
+                logger.warning(
+                    "load_balancing.loads: unknown device_type %r, skipping entry", type_raw
+                )
+                continue
+            phases_raw = load_item.get("phases", [])
+            phases = (
+                [int(p) for p in cast("list[Any]", phases_raw)]
+                if isinstance(phases_raw, list)
+                else []
+            )
+            loads.append(
+                BalancedLoadConfig(
+                    device_type=device_type,
+                    device_id=str(load_item.get("device_id", "")),
+                    phases=phases,
+                    entity=_str_or_none(load_item.get("entity")),
+                    on_value=str(load_item.get("on_value", "1")),
+                    off_value=str(load_item.get("off_value", "0")),
+                )
+            )
+
+    give_way_raw = lb_data.get("give_way_order", [])
+    give_way_order: list[GiveWayOrderEntry] = []
+    if isinstance(give_way_raw, list):
+        for item in cast("list[Any]", give_way_raw):
+            if not isinstance(item, dict):
+                continue
+            entry_item = cast("dict[str, Any]", item)
+            kind = str(entry_item.get("kind", "")).lower()
+            entry_id = str(entry_item.get("id", ""))
+            if kind not in ("charger", "shed") or not entry_id:
+                logger.warning(
+                    "load_balancing.give_way_order: invalid entry %r, skipping", entry_item
+                )
+                continue
+            give_way_order.append(GiveWayOrderEntry(kind=kind, id=entry_id))
+
+    return LoadBalancingConfig(
+        enabled=bool(lb_data.get("enabled", False)),
+        main_fuse_a=main_fuse_a,
+        resume_delay_s=int(lb_data.get("resume_delay_s", LoadBalancingConfig.resume_delay_s)),
+        resume_margin_percent=float(
+            lb_data.get("resume_margin_percent", LoadBalancingConfig.resume_margin_percent)
+        ),
+        increase_step_a=int(lb_data.get("increase_step_a", LoadBalancingConfig.increase_step_a)),
+        sensor_stale_after_s=int(
+            lb_data.get("sensor_stale_after_s", LoadBalancingConfig.sensor_stale_after_s)
+        ),
+        nominal_voltage_v=float(
+            lb_data.get("nominal_voltage_v", LoadBalancingConfig.nominal_voltage_v)
+        ),
+        loads=loads,
+        give_way_order=give_way_order,
+        notify_interventions=bool(lb_data.get("notify_interventions", False)),
+        replan_after_throttled_s=int(
+            lb_data.get("replan_after_throttled_s", LoadBalancingConfig.replan_after_throttled_s)
+        ),
+    )
+
+
+def heal_give_way_order(lb: LoadBalancingConfig, current_type_charger_ids: list[str]) -> None:
+    """Self-heal load_balancing.give_way_order on config load (in place).
+
+    - Drops entries referencing devices that no longer exist, or chargers no
+      longer type="current" (logged warning).
+    - Appends current-type chargers missing from the list after the last
+      charger entry (at the top when there is none).
+    - Appends loads[] entries missing from the list at the end.
+    """
+    shed_ids = [ld.device_id for ld in lb.loads if ld.device_id]
+
+    healed: list[GiveWayOrderEntry] = []
+    for entry in lb.give_way_order:
+        if (entry.kind == "charger" and entry.id in current_type_charger_ids) or (
+            entry.kind == "shed" and entry.id in shed_ids
+        ):
+            healed.append(entry)
+        else:
+            logger.warning(
+                "load_balancing.give_way_order: dropping %s entry '%s' — no matching "
+                "%s (device removed or charger no longer type: current)",
+                entry.kind,
+                entry.id,
+                "type: current EV charger" if entry.kind == "charger" else "loads[] entry",
+            )
+
+    listed_chargers = {e.id for e in healed if e.kind == "charger"}
+    missing_chargers = [c for c in current_type_charger_ids if c not in listed_chargers]
+    if missing_chargers:
+        last_charger_idx = max((i for i, e in enumerate(healed) if e.kind == "charger"), default=-1)
+        for offset, charger_id in enumerate(missing_chargers):
+            healed.insert(
+                last_charger_idx + 1 + offset, GiveWayOrderEntry(kind="charger", id=charger_id)
+            )
+            logger.info("load_balancing.give_way_order: appended missing charger '%s'", charger_id)
+
+    listed_sheds = {e.id for e in healed if e.kind == "shed"}
+    for shed_id in shed_ids:
+        if shed_id not in listed_sheds:
+            healed.append(GiveWayOrderEntry(kind="shed", id=shed_id))
+            logger.info("load_balancing.give_way_order: appended missing shed load '%s'", shed_id)
+
+    lb.give_way_order = healed
 
 
 def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
@@ -612,12 +827,32 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
     has_water_heater = bool(system_data.get("has_water_heater", True))
     inverter_profile = str(system_data.get("inverter_profile", "generic"))
 
+    # Load balancing is a TOP-LEVEL key, independent of the executor: section,
+    # so it is parsed before the early return below — fuse protection must not
+    # depend on whether the executor happens to be configured.
+    load_balancing = _parse_load_balancing_config(data, system_data)
+
+    # Self-heal give_way_order against the enabled type="current" chargers.
+    ev_chargers_raw = data.get("ev_chargers", [])
+    current_type_charger_ids: list[str] = []
+    if isinstance(ev_chargers_raw, list):
+        for idx, item in enumerate(cast("list[Any]", ev_chargers_raw)):
+            if not isinstance(item, dict):
+                continue
+            charger_item = cast("dict[str, Any]", item)
+            if not charger_item.get("enabled", True):
+                continue
+            if str(charger_item.get("type", "binary")).lower() != "current":
+                continue
+            current_type_charger_ids.append(str(charger_item.get("id", f"ev_charger_{idx}")))
+    heal_give_way_order(load_balancing, current_type_charger_ids)
+
     executor_data: dict[str, Any] = (
         data.get("executor", {}) if isinstance(data.get("executor"), dict) else {}
     )
     if not executor_data:
         logger.info("No executor section in config, using defaults")
-        return ExecutorConfig(timezone=timezone)
+        return ExecutorConfig(timezone=timezone, load_balancing=load_balancing)
 
     # Parse nested configs
     inverter_data: dict[str, Any] = (
@@ -1049,6 +1284,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         water_heater=water_heater,
         water_heater_devices=water_heater_devices_list,
         cyclic_loads=cyclic_loads,
+        load_balancing=load_balancing,
         ev_charger=ev_charger,
         ev_chargers=ev_chargers_list,
         notifications=notifications,

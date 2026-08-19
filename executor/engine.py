@@ -41,6 +41,14 @@ from .controller import ControllerDecision, make_decision
 from .cyclic_run import anyone_home, should_run_opportunistically
 from .fuse_shed import should_shed_for_fuse
 from .history import ExecutionHistory, ExecutionRecord
+from .load_balancer import LoadBalancer, LoadBalancerStatus
+from .load_balancer_bridge import (
+    ev_entries,
+    ordered_entries,
+    phase_currents_to_int_keys,
+    shed_entries,
+    uniform_updated_at,
+)
 from .override import (
     OverrideResult,
     SlotPlan,
@@ -255,6 +263,14 @@ class ExecutorEngine:
         self._cyclic_extra: dict[str, tuple[str, float]] = {}
         self._cyclic_extra_ts: dict[str, float] = {}
         self._cyclic_extra_reason: dict[str, str] = {}
+        # Per-phase fuse balancer (ported from upstream). OBSERVE-ONLY for now:
+        # it computes and logs a decision every tick but actuates nothing, so its
+        # verdicts can be compared against the live guard before it is trusted
+        # with the contactors. Its own anti-flap state still advances, so what we
+        # observe is what it would actually have done.
+        self._load_balancer = LoadBalancer(self.config.load_balancing)
+        self._last_balancer_status: LoadBalancerStatus | None = None
+        self._last_logged_balancer_state: str | None = None
 
         # Per-device EV charging state tracking
         self._ev_charger_states: dict[str, EVChargerState] = {}
@@ -1886,6 +1902,16 @@ class ExecutorEngine:
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)
 
+                    # Per-phase fuse balancer, observe-only. Placed after the EV
+                    # surplus controller so the setpoints it reports are this
+                    # tick's, not last tick's. Isolated: a guard that is not yet
+                    # allowed to act must certainly not be allowed to crash a tick.
+                    if self.config.load_balancing.enabled and self.ha_client is not None:
+                        try:
+                            await self._observe_load_balancer(original_slot)
+                        except Exception as lb_exc:
+                            logger.warning("Load balancer (observe) error: %s", lb_exc)
+
                     # FMB SoC estimator (publishes the dead-reckoned FMB SoC). Isolated so a
                     # transient HA read can never break the main actuation.
                     if self._fmb_soc is not None and self.ha_client is not None:
@@ -2673,6 +2699,70 @@ class ExecutorEngine:
                     load.switch_entity, want_on, name=load.name
                 )
             )
+
+    async def _observe_load_balancer(self, slot: Any) -> None:
+        """Run one balancer tick and log what it WOULD have done.
+
+        Observe-only on purpose. The balancer is upstream code that never ran on
+        this site, and it decides the same question the live phase guard already
+        decides — who gives way when a phase is over budget. Two guards actuating
+        at once is worse than either alone, so this one watches until its verdicts
+        have been seen to agree with reality; only then does the live guard retire.
+
+        Its anti-flap state (pause clocks, shed timestamps) advances normally, so
+        what is logged is genuinely what it would have done, not a stateless guess.
+        """
+        srv = self._ev_surplus
+        if srv is None:
+            return
+
+        raw = await srv.read_phase_currents(self.ha_client, time.time())
+        phase_current = phase_currents_to_int_keys(raw)
+        now = datetime.now(pytz.timezone(self.config.timezone))
+
+        chargers = list(getattr(srv.cfg, "chargers", []) or [])
+        evs = ev_entries(
+            chargers,
+            setpoints_a={c.id: srv.commanded_current_a(c.id) for c in chargers},
+            targets_a={c.id: self._balancer_planned_a(slot, c) for c in chargers},
+        )
+        sheds = shed_entries(self.config.load_balancing.loads)
+        entries = ordered_entries(self.config.load_balancing.give_way_order, evs, sheds)
+
+        status = self._load_balancer.tick(
+            now, phase_current, uniform_updated_at(phase_current, now), entries
+        )
+        self._last_balancer_status = status
+
+        # Log on STATE CHANGE only. A guard that narrates every quiet tick trains
+        # the reader to skip its lines, which is exactly when it matters.
+        if status.state != self._last_logged_balancer_state:
+            self._last_logged_balancer_state = status.state
+            acted = [f"{o.charger_id}->{o.target_a}A" for o in status.ev_outputs if o.target_a is not None]
+            acted += [f"{o.charger_id}:pause" for o in status.ev_outputs if o.target_a is None]
+            acted += [f"{o.load_id}:shed" for o in status.shed_outputs if o.shed]
+            logger.info(
+                "Load balancer (OBSERVE, not acting) %s: %s | phases %s | would: %s",
+                status.state,
+                status.reason,
+                {p: round(a, 1) for p, a in status.phase_current_a.items()},
+                ", ".join(acted) or "nothing",
+            )
+
+    def _balancer_planned_a(self, slot: Any, charger: Any) -> float | None:
+        """The amps the PLAN wants this charger to draw, as the balancer's target.
+
+        Deliberately the plan and not the servo's own last command: the balancer
+        measures "held below target", and feeding it the servo's output as the
+        target would make every tick read as on-target, so it could never report
+        a constraint. None means the plan wants no charging at all.
+        """
+        plans = getattr(slot, "ev_charger_plans", None) or {} if slot is not None else {}
+        kw = float(plans.get(charger.id, 0.0) or 0.0)
+        if kw <= 0.0:
+            return None
+        phases = max(1, int(getattr(charger, "phases", 3) or 3))
+        return (kw * 1000.0) / (230.0 * phases)
 
     async def _anyone_home(self, entities: list[str]) -> bool | None:
         """Is anyone on this load's presence list home? None when nothing is readable."""
