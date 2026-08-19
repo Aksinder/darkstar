@@ -53,6 +53,7 @@ from .water_hold import (
     should_boost_on_surplus,
     should_hold_off_write,
 )
+from .write_verify import VerifySignal, VerifyState, note_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +247,8 @@ class ExecutorEngine:
         # heater id -> (epoch when this override was first seen, which one)
         self._override_since: dict[str, tuple[float, str]] = {}
         self._override_state: dict[str, str] = {}
+        # Escalation memory: did our correction actually reach the appliance?
+        self._verify_state: dict[str, VerifyState] = {}
 
         # Per-device EV charging state tracking
         self._ev_charger_states: dict[str, EVChargerState] = {}
@@ -1752,6 +1755,13 @@ class ExecutorEngine:
                                                 device.target_entity,
                                             )
                                         )
+                                    # Escalate only when the CORRECTION keeps losing.
+                                    # A correction loop that silently fails is worse
+                                    # than none: the log looks busy while the
+                                    # appliance does as it pleases.
+                                    await self._note_write_verified(
+                                        device, ok=not drifted, detail=why
+                                    )
                                 commit_minutes = self._planned_water_block_minutes(
                                     device.id, now
                                 )
@@ -2494,6 +2504,33 @@ class ExecutorEngine:
         with contextlib.suppress(ValueError, TypeError):
             return float(raw)
         return None
+
+    async def _note_write_verified(
+        self, device: Any, *, ok: bool, detail: str
+    ) -> None:
+        """Fold one appliance check into the escalation state and notify on change."""
+        threshold = int(getattr(device, "drift_alert_after", 3) or 0)
+        if threshold <= 0 or not getattr(device, "state_entity", None):
+            return
+        prev = self._verify_state.get(device.id, VerifyState())
+        new, signal = note_attempt(prev, ok=ok, threshold=threshold)
+        self._verify_state[device.id] = new
+        if signal is VerifySignal.ALERT:
+            logger.error(
+                "Water %s: %d consecutive failed corrections — %s",
+                device.id, new.streak, detail,
+            )
+            await self.dispatcher.notify_unverified(
+                getattr(device, "name", None) or device.id,
+                f"{detail} — {new.streak} misslyckade rättningar i rad.",
+            )
+        elif signal is VerifySignal.RECOVERED:
+            logger.info("Water %s: appliance follows commands again", device.id)
+            await self.dispatcher.notify_unverified(
+                getattr(device, "name", None) or device.id,
+                "apparaten följer kommandon igen.",
+                recovered=True,
+            )
 
     async def _water_appliance_drift(
         self, device: Any, intended: Any, off_temp: Any, power_w: float | None

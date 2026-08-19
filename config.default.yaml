@@ -192,6 +192,15 @@ water_heaters:
                                      # may_skip_day: a load allowed to sit out a whole expensive
                                      # period may stay cold for days, so there must be a way to
                                      # say "anyway".
+    drift_alert_after: 3             # Consecutive ticks the APPLIANCE may disagree with our
+                                     # intent before a human is told. Needs state_entity.
+                                     # Not 1: one tick of mismatch is normal (the write is out,
+                                     # the device has not answered). Two can be a slow
+                                     # integration. Three means the re-assertion is not landing
+                                     # — the case worth waking someone for. Alerts ONCE per
+                                     # episode, and once more when it recovers. 0 disables the
+                                     # alert; drift is still corrected, only the escalation
+                                     # goes quiet.
     override_timeout_minutes: 0      # Auto-expiry, 0 = never. A forgotten force_on cannot run
                                      # away (the appliance's thermostat caps it) but it CAN
                                      # quietly buy at peak for days.
