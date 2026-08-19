@@ -1834,6 +1834,64 @@ class ActionDispatcher:
         except Exception as e:
             logger.warning("Failed to send notification: %s", e)
 
+    async def set_cyclic_load(
+        self, entity_id: str, on: bool, *, name: str = ""
+    ) -> ActionResult:
+        """Drive a cyclic load's switch, writing only on a real change.
+
+        Reads the switch BEFORE commanding so an already-correct state costs no
+        service call — and so the result reports what the device actually said, not
+        what we hoped. Verification here is honest in a way the temperature path was
+        not: the entity we read back IS the load, not a helper standing in for it.
+        """
+        start = time.time()
+        desired = "on" if on else "off"
+        current = await self.ha.get_state_value(entity_id)
+        current_state = str(current).strip().lower() if current is not None else None
+
+        if current_state == desired:
+            return ActionResult(
+                action_type="cyclic_load",
+                success=True,
+                message=f"{name or entity_id}: already {desired}",
+                previous_value=current_state,
+                new_value=desired,
+                entity_id=entity_id,
+                skipped=True,
+                duration_ms=int((time.time() - start) * 1000),
+                error_details=None,
+            )
+
+        if self.shadow_mode:
+            logger.info("[SHADOW] Would turn %s %s", entity_id, desired)
+            return ActionResult(
+                action_type="cyclic_load",
+                success=True,
+                message=f"[SHADOW] {name or entity_id} -> {desired}",
+                previous_value=current_state,
+                new_value=desired,
+                entity_id=entity_id,
+                skipped=True,
+                duration_ms=int((time.time() - start) * 1000),
+                error_details=None,
+            )
+
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else "switch"
+        ok = await self.call_service(domain, f"turn_{desired}", entity_id)
+        verified, matched = await self._verify_action(entity_id, desired)
+        return ActionResult(
+            action_type="cyclic_load",
+            success=bool(ok),
+            message=f"{name or entity_id}: {current_state} -> {desired}",
+            previous_value=current_state,
+            new_value=desired,
+            entity_id=entity_id,
+            verified_value=verified,
+            verification_success=matched,
+            duration_ms=int((time.time() - start) * 1000),
+            error_details=None,
+        )
+
     async def notify_unverified(self, target: str, detail: str, recovered: bool = False) -> None:
         """Tell a human that a write never reached the appliance — or that it has.
 

@@ -416,6 +416,35 @@ class WaterHeaterDeviceConfig:
     absorb_cap_kwh_per_day: float | None = None
 
 
+@dataclass
+class CyclicLoadConfig:
+    """A recurring on/off load: pool pump, filter, circulation.
+
+    Same planning problem as a water heater — a daily energy need, splittable across
+    slots, with spacing and gap constraints — so it rides the SAME solver primitive
+    (see cyclic_loads_as_heater_specs in the planner adapter). What differs is only
+    the actuation: a switch, not a temperature. Keeping the config surface honest
+    matters, though: a pool pump should not have to be spelled as a water heater.
+    """
+
+    id: str
+    name: str = ""
+    switch_entity: str = ""
+    power_kw: float = 0.0
+    # Measured draw, for the same own-draw and verification logic the heaters use.
+    power_entity: str | None = None
+    # Hands-off while any of these is on (rent-out, guest mode).
+    control_pause_entities: list[str] = field(default_factory=lambda: [])
+    # input_select auto / force_on / force_off, mirroring the heaters and the EVs.
+    override_entity: str | None = None
+    override_timeout_minutes: float = 0.0
+    # Let the S4 fuse guard shed it. Same conservative phase convention as elsewhere:
+    # an empty phase_map counts against every phase.
+    fuse_shed: bool = False
+    phase_map: tuple[str, ...] = ()
+    enabled: bool = True
+
+
 DEFAULT_PENALTY_LEVELS = {
     "emergency": 10.0,
     "high": 2.0,
@@ -508,6 +537,7 @@ class ExecutorConfig:
     inverter: InverterConfig = field(default_factory=InverterConfig)
     water_heater: WaterHeaterGlobalConfig = field(default_factory=WaterHeaterGlobalConfig)
     water_heater_devices: list[WaterHeaterDeviceConfig] = field(default_factory=lambda: [])
+    cyclic_loads: list[CyclicLoadConfig] = field(default_factory=lambda: [])
     ev_charger: EVChargerConfig = field(default_factory=EVChargerConfig)  # legacy compat
     ev_chargers: list[EVChargerDeviceConfig] = field(default_factory=lambda: [])
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
@@ -741,6 +771,43 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
             )
         )
 
+    # Cyclic loads (pool pump, filter, ...) — planned like a water heater, switched
+    # like a switch. See CyclicLoadConfig.
+    cyclic_loads: list[CyclicLoadConfig] = []
+    for raw_cl in cast("list[dict[str, Any]]", data.get("cyclic_loads", []) or []):
+        if not isinstance(raw_cl, dict):
+            continue
+        cl_id = str(raw_cl.get("id") or "").strip()
+        sw = _str_or_none(raw_cl.get("switch_entity"))
+        if not cl_id or not sw:
+            logger.warning(
+                "cyclic_load %r skipped: needs both id and switch_entity", cl_id or raw_cl
+            )
+            continue
+        cyclic_loads.append(
+            CyclicLoadConfig(
+                id=cl_id,
+                name=str(raw_cl.get("name", cl_id)),
+                switch_entity=sw,
+                power_kw=float(raw_cl.get("power_kw", 0.0) or 0.0),
+                power_entity=_str_or_none(
+                    raw_cl.get("power_sensor") or raw_cl.get("sensor")
+                ),
+                control_pause_entities=_str_list(raw_cl.get("control_pause_entities")),
+                override_entity=_str_or_none(raw_cl.get("override_entity")),
+                override_timeout_minutes=float(
+                    raw_cl.get("override_timeout_minutes") or 0.0
+                ),
+                fuse_shed=bool(raw_cl.get("fuse_shed", False)),
+                phase_map=tuple(
+                    str(x).strip().lower()
+                    for x in (raw_cl.get("phase_map") or [])
+                    if str(x).strip()
+                ),
+                enabled=bool(raw_cl.get("enabled", True)),
+            )
+        )
+
     # EV Charger config (REV K25 Phase 5)
     ev_data: dict[str, Any] = (
         executor_data.get("ev_charger", {})
@@ -960,6 +1027,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         inverter=inverter,
         water_heater=water_heater,
         water_heater_devices=water_heater_devices_list,
+        cyclic_loads=cyclic_loads,
         ev_charger=ev_charger,
         ev_chargers=ev_chargers_list,
         notifications=notifications,
