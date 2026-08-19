@@ -405,6 +405,10 @@ class WaterHeaterDeviceConfig:
     # appliance's own thermostat caps the temperature) but it CAN quietly buy at peak
     # for days, so an expiry is worth setting on anything expensive.
     override_timeout_minutes: float = 0.0
+    # Consecutive ticks the appliance may disagree with our intent before we tell a
+    # human. Needs state_entity to mean anything. 0 disables the alert (drift is
+    # still corrected — only the escalation goes quiet).
+    drift_alert_after: int = 3
     # Which house phases this heater draws on (lowercase, matching the guard's
     # phase_entities keys). EMPTY = unknown => counts against EVERY phase, the same
     # conservative convention the EV phase_map uses.
@@ -458,6 +462,9 @@ class NotificationConfig:
     on_soc_target_change: bool = False
     on_override_activated: bool = True
     on_error: bool = True
+    # A write that never reached the appliance. Off by default only in the
+    # sense that no heater alerts until it has a state_entity to check.
+    on_write_unverified: bool = True
 
 
 @dataclass
@@ -717,6 +724,11 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 override_entity=_str_or_none(heater.get("override_entity")),
                 override_timeout_minutes=float(
                     heater.get("override_timeout_minutes") or 0.0
+                ),
+                drift_alert_after=int(
+                    heater.get("drift_alert_after")
+                    if heater.get("drift_alert_after") is not None
+                    else WaterHeaterDeviceConfig.drift_alert_after
                 ),
                 phase_map=tuple(
                     str(x).strip().lower()

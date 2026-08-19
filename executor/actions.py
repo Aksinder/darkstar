@@ -1834,6 +1834,25 @@ class ActionDispatcher:
         except Exception as e:
             logger.warning("Failed to send notification: %s", e)
 
+    async def notify_unverified(self, target: str, detail: str, recovered: bool = False) -> None:
+        """Tell a human that a write never reached the appliance — or that it has.
+
+        Separate from notify_error: this is not an exception, it is the quieter and
+        more dangerous case where every call SUCCEEDED and the device ignored us.
+        """
+        if not self.config.notifications.on_write_unverified:
+            return
+        if recovered:
+            await self._send_notification(
+                f"{target}: reagerar igen — {detail}",
+                title="Darkstar: kontroll återställd",
+            )
+        else:
+            await self._send_notification(
+                f"{target} följer inte Darkstars kommando.\n{detail}",
+                title="⚠️ Darkstar: skrivning gick inte igenom",
+            )
+
     async def notify_override(self, override_type: str, reason: str) -> None:
         """Send notification about an override activation."""
         if self.config.notifications.on_override_activated:
