@@ -442,6 +442,15 @@ class CyclicLoadConfig:
     # an empty phase_map counts against every phase.
     fuse_shed: bool = False
     phase_map: tuple[str, ...] = ()
+    # Opportunistic run gates ON TOP of the plan (see executor/cyclic_run.py). They
+    # can only ADD runtime, never cancel a planned block. max_extra_hours_per_day is
+    # what makes them opportunistic: unset means no room, never unlimited.
+    surplus_run: bool = False
+    max_price_percentile: float | None = None
+    presence_entities: list[str] = field(default_factory=lambda: [])
+    presence_max_price_percentile: float | None = None
+    price_window_hours: float = 24.0
+    max_extra_hours_per_day: float | None = None
     enabled: bool = True
 
 
@@ -803,6 +812,18 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                     str(x).strip().lower()
                     for x in (raw_cl.get("phase_map") or [])
                     if str(x).strip()
+                ),
+                surplus_run=bool(raw_cl.get("surplus_run", False)),
+                max_price_percentile=_float_or_none(
+                    raw_cl.get("max_price_percentile")
+                ),
+                presence_entities=_str_list(raw_cl.get("presence_entities")),
+                presence_max_price_percentile=_float_or_none(
+                    raw_cl.get("presence_max_price_percentile")
+                ),
+                price_window_hours=float(raw_cl.get("price_window_hours", 24.0) or 24.0),
+                max_extra_hours_per_day=_float_or_none(
+                    raw_cl.get("max_extra_hours_per_day")
                 ),
                 enabled=bool(raw_cl.get("enabled", True)),
             )

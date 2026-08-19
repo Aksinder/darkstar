@@ -136,6 +136,27 @@ water_heating:
 #     override_timeout_minutes: 0
 #     fuse_shed: false             # let the S4 guard shed it
 #     phase_map: []                # empty = counts against every phase
+#
+#     # --- Opportunistic extras, ON TOP of the plan above ---------------------
+#     # These can only ADD runtime. They never cancel a planned block and they sit
+#     # BELOW the control pause, the fuse guard and a human's force_off.
+#     surplus_run: false           # may also run whenever there is MEASURED surplus
+#                                  # (exporting, or charging the battery with room to
+#                                  # spare — not the same thing as exporting)
+#     max_price_percentile: 80     # ceiling for the surplus gate, as a percentile of the
+#                                  # rolling price window: "not the extra dear hours".
+#                                  # HIGH on purpose — it blocks only the dearest tail.
+#                                  # Unset = surplus alone decides.
+#     presence_entities: []        # e.g. [person.a, person.b] — may also run when
+#                                  # someone is home
+#     presence_max_price_percentile: 50  # tighter than the surplus ceiling: spare PV is
+#                                  # nearly free, company is not. Unset = gate disabled.
+#     price_window_hours: 48       # span the percentiles are taken over (feed caps ~48 h)
+#     max_extra_hours_per_day: 4   # budget for the extras. THIS is what makes them
+#                                  # opportunistic — unset means NO room, never unlimited,
+#                                  # so a forgotten knob cannot buy a pump that runs all
+#                                  # day. Counted in memory: a restart grants a fresh
+#                                  # budget (the price gates and the plan floor still hold).
 
 # Water Heaters (Array for multiple water heaters)
 # ARC15: Replaces deferrable_loads entry for water heating
