@@ -1,3 +1,7 @@
+## dev-20260820.0532 — 2026-08-20 05:35
+
+- engine: rebuild the deferrable controller when its config changes on reload
+
 ## dev-20260820.0515 — 2026-08-20 05:17
 
 - ev_surplus: auto-expiry on the manual override (mirrors the heaters)
