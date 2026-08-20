@@ -55,6 +55,8 @@ _CHAINS_KEY = "_chains"
 # the silent-rearm horizon (done_delay_s + rearm_cooldown_s = 1200 s) equals this
 # gap, so the split can only trigger when done_delay_s > 300.
 _CYCLE_MERGE_GAP_S = 1200.0
+# Paths already warned about in load_forward_slots (reset when the file appears).
+_missing_schedule_warned: set[str] = set()
 
 
 def _f(v: Any) -> float | None:
@@ -92,7 +94,16 @@ class DeferrableRuntimeConfig:
     notify_service: str | None = None
     publish_prefix: str = "darkstar_"
     slot_minutes: float = 15.0
-    schedule_path: str = "schedule.json"
+    # MUST match ExecutorConfig.schedule_path's default. These are two parsers of
+    # the same config key, and when the key is absent each falls back to its own
+    # literal — they disagreed ("schedule.json" vs "data/schedule.json") from the
+    # day this file was written until 2026-08-20, which left load_forward_slots
+    # reading a path that does not exist, returning [], and recommend_appliance_
+    # action failing open to "run" on EVERY tick. The forecast gate never gated:
+    # it armed the dishwasher at 06:44 on a peak morning and "recommended" run.
+    # Fail-open is right under deadline pressure; it is wrong as a permanent,
+    # silent state. See also test_deferrable_runtime's default-parity test.
+    schedule_path: str = "data/schedule.json"
     timezone: str = "Europe/Stockholm"
     appliances: list[DeferrableApplianceCfg] = field(default_factory=lambda: [])
 
@@ -144,7 +155,7 @@ def parse_deferrable_runtime_config(
         notify_service=raw.get("notify_service") or None,
         publish_prefix=str(raw.get("publish_prefix", "darkstar_")),
         slot_minutes=float(raw.get("slot_minutes", 15.0)),
-        schedule_path=str(executor.get("schedule_path", "schedule.json")),
+        schedule_path=str(executor.get("schedule_path", "data/schedule.json")),
         timezone=str(full_config.get("timezone", "Europe/Stockholm")),
         appliances=appliances,
     )
@@ -165,7 +176,18 @@ def load_forward_slots(schedule_path: str, now_ts: float, tz_name: str) -> list[
 
         path = Path(schedule_path)
         if not path.exists():
+            # Loud, once per path: an absent schedule means every recommendation
+            # fails open to "run" — the gate silently stops gating, which reads
+            # as a decision. A misconfigured path must not look like a quiet day.
+            if str(path) not in _missing_schedule_warned:
+                _missing_schedule_warned.add(str(path))
+                logger.warning(
+                    "Deferrable: schedule file %s does not exist — every appliance "
+                    "recommendation will fail open to 'run' until it appears",
+                    path,
+                )
             return []
+        _missing_schedule_warned.discard(str(path))
         with path.open(encoding="utf-8") as fh:
             payload = cast("dict[str, Any]", json.load(fh))
         schedule = cast("list[dict[str, Any]]", payload.get("schedule", []) or [])
