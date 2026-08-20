@@ -353,6 +353,36 @@ class ExecutorEngine:
                 self.dispatcher.config = self.config
                 self.dispatcher.shadow_mode = self.config.shadow_mode
 
+            # Rebuild the deferrable controller when ITS config changed. It parses
+            # executor.schedule_path and the deferrable_loads[] at construction, so
+            # without this a config save (schedule_path fix, a new appliance, an
+            # observe_only flip) silently kept the old wiring until an add-on
+            # restart — the same stale-until-restart trap as the dispatcher above.
+            # Only on real change: a rebuild re-reads persisted state from disk,
+            # which is cheap but not free, and an unrelated save must not do it.
+            try:
+                from .deferrable_runtime import (
+                    DeferrableApplianceController,
+                    parse_deferrable_runtime_config,
+                )
+
+                new_defer_cfg = parse_deferrable_runtime_config(self._full_config)
+                old_defer_cfg = self._deferrable.cfg if self._deferrable else None
+                if new_defer_cfg != old_defer_cfg:
+                    self._deferrable = (
+                        DeferrableApplianceController(new_defer_cfg)
+                        if new_defer_cfg
+                        else None
+                    )
+                    logger.info(
+                        "Deferrable controller rebuilt on config reload (%s)",
+                        "disabled" if new_defer_cfg is None
+                        else f"{len(new_defer_cfg.appliances)} appliances, "
+                             f"schedule={new_defer_cfg.schedule_path}",
+                    )
+            except Exception as defer_exc:
+                logger.warning("Deferrable config reload failed: %s", defer_exc)
+
             system_cfg = self._full_config.get("system", {})
             self._has_water_heater = system_cfg.get("has_water_heater", True)
             self._has_ev_charger = system_cfg.get("has_ev_charger", False)
