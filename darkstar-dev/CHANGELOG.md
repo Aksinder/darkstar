@@ -1,3 +1,7 @@
+## dev-20260820.0939 — 2026-08-20 09:41
+
+- deferrable: read WHO switched the plug, and restore the resting state
+
 ## dev-20260820.0926 — 2026-08-20 09:28
 
 - config: sweep phase_aware.weight, dead since the fuse-relief rewrite
