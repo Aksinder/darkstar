@@ -111,6 +111,16 @@ def cyclic_loads_as_heater_specs(
             spec["max_hours_between_heating"] = 24.0
         if spec.get("min_spacing_hours") is not None:
             spec["water_min_spacing_hours"] = spec["min_spacing_hours"]
+        else:
+            # Spacing DEFAULTS TO ZERO for cyclic loads, unlike tanks (5 h). Two reasons,
+            # both load-bearing. Semantics: spacing exists so tank heating does not
+            # fragment into comfortless slivers; a pump has no reheat dynamics and WANTS
+            # fragmentation freedom — max_hours_between is its real requirement.
+            # Solver cost: the spacing constraint is disjunctive, and inheriting the
+            # tanks' 5 h default measured 36 s vs 11 s on the live 2026-08-20 instance
+            # (2-vCPU box budget 240 s: timed out, dump-and-keep-plan fired, the pumps
+            # silently never entered a plan). Explicit min_spacing_hours still wins.
+            spec["water_min_spacing_hours"] = 0.0
         specs.append(spec)
     return specs
 
