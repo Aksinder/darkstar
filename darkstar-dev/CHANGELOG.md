@@ -1,3 +1,7 @@
+## dev-20260820.1658 — 2026-08-20 17:00
+
+- cyclic loads: spacing defaults to zero — the tanks' 5 h default timed out the box
+
 ## dev-20260820.1017 — 2026-08-20 10:18
 
 - deferrable: ask before restoring a manually cut plug
