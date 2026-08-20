@@ -1890,3 +1890,230 @@ class TestSinkActuationIsolation:
             if a.get("type") == "sink:bad_rung" and not a.get("success")
         ]
         assert failed and not failed[0].get("skipped")
+
+
+class TestLoadActuationIsolation:
+    """The 2026-08-20 outage contract: one load's exception in the water chain or
+    the cyclic loop is loud (recent_errors + failed ActionResult) but must never
+    stop sibling loads, the EV surplus servo, or the inverter profile actuation
+    in the same tick."""
+
+    @pytest.fixture
+    def engine(self, temp_schedule, temp_db):
+        from unittest.mock import AsyncMock
+
+        from executor.config import CyclicLoadConfig, WaterHeaterDeviceConfig
+
+        with patch("executor.engine.load_executor_config") as mock_config:
+            config = ExecutorConfig(
+                enabled=True,
+                schedule_path=temp_schedule,
+                timezone="Europe/Stockholm",
+                automation_toggle_entity="input_boolean.automation",
+                inverter=InverterConfig(),
+                water_heater=WaterHeaterConfig(),
+                notifications=NotificationConfig(),
+                controller=ControllerConfig(),
+                water_heater_devices=[
+                    WaterHeaterDeviceConfig(
+                        id="tank_a", target_entity="input_number.tank_a"
+                    ),
+                    WaterHeaterDeviceConfig(
+                        id="tank_b", target_entity="input_number.tank_b"
+                    ),
+                ],
+                cyclic_loads=[
+                    CyclicLoadConfig(
+                        id="pump_a", switch_entity="switch.pump_a", power_kw=1.0
+                    ),
+                    CyclicLoadConfig(
+                        id="pump_b", switch_entity="switch.pump_b", power_kw=1.0
+                    ),
+                ],
+            )
+            mock_config.return_value = config
+
+            with patch("executor.engine.load_yaml") as mock_yaml:
+                mock_yaml.return_value = {"input_sensors": {}}
+                with patch.object(ExecutorEngine, "_get_db_path", return_value=temp_db):
+                    engine = ExecutorEngine("config.yaml")
+
+                    mock_ha = MagicMock(spec=HAClient)
+
+                    def side_effect_get_state(entity_id):
+                        if "input_boolean" in entity_id or "automation" in entity_id:
+                            return "on"
+                        if "soc" in entity_id:
+                            return "50"
+                        return "0.0"
+
+                    mock_ha.get_state_value.side_effect = side_effect_get_state
+                    engine.ha_client = mock_ha
+
+                    from executor.actions import ActionDispatcher
+
+                    engine.dispatcher = ActionDispatcher(mock_ha, config, shadow_mode=False)
+
+                    # The downstream control whose survival this class is about:
+                    # the servo must run even when a load upstream of it raised.
+                    engine._ev_surplus = MagicMock()
+                    engine._ev_surplus.run = AsyncMock()
+                    engine._ev_surplus.fuse_battery_cap_w = MagicMock(return_value=None)
+
+                    yield engine
+
+    def _write_schedule(self, temp_schedule):
+        tz = pytz.timezone("Europe/Stockholm")
+        slot_start = datetime.now(tz) - timedelta(minutes=5)
+        schedule = make_schedule([make_slot(slot_start, soc_target=50)])
+        with Path(temp_schedule).open("w", encoding="utf-8") as f:
+            json.dump(schedule, f)
+
+    @pytest.mark.asyncio
+    async def test_cyclic_exception_does_not_stop_siblings_or_ev_servo(
+        self, engine, temp_schedule
+    ):
+        """The exact outage shape: set_cyclic_load raising AttributeError must not
+        silence the loads after it, the EV servo, or the profile actuation."""
+        from unittest.mock import AsyncMock
+
+        from executor.actions import ActionResult
+
+        self._write_schedule(temp_schedule)
+
+        ok_water = ActionResult(action_type="water_temp", success=True, message="ok")
+        ok_cyclic = ActionResult(
+            action_type="cyclic_load", success=True, message="ok",
+            entity_id="switch.pump_b",
+        )
+        engine.dispatcher.set_water_temp = AsyncMock(return_value=ok_water)
+        engine.dispatcher.set_cyclic_load = AsyncMock(
+            side_effect=[
+                AttributeError("'ActionDispatcher' object has no attribute 'call_service'"),
+                ok_cyclic,
+            ]
+        )
+        engine.dispatcher.execute = AsyncMock(return_value=[])
+
+        result = await engine.run_once()
+
+        # Both loads were attempted despite pump_a raising ...
+        assert engine.dispatcher.set_cyclic_load.call_count == 2
+        # ... the EV surplus servo still ran this tick ...
+        engine._ev_surplus.run.assert_awaited_once()
+        # ... and so did the inverter/battery profile actuation.
+        engine.dispatcher.execute.assert_awaited_once()
+        # The failure is loud: a failed non-skipped action AND a recent_errors entry.
+        failed = [
+            a
+            for a in result["actions"]
+            if a.get("type") == "cyclic:pump_a" and not a.get("success")
+        ]
+        assert failed and not failed[0].get("skipped")
+        assert any(e["type"] == "cyclic:pump_a" for e in engine.recent_errors)
+
+    @pytest.mark.asyncio
+    async def test_water_exception_does_not_stop_siblings_cyclic_or_ev_servo(
+        self, engine, temp_schedule
+    ):
+        """A throwing set_water_temp on tank_a must not stop tank_b, the cyclic
+        loads, the EV servo, or the profile actuation."""
+        from unittest.mock import AsyncMock
+
+        from executor.actions import ActionResult
+
+        self._write_schedule(temp_schedule)
+
+        ok_water = ActionResult(
+            action_type="water_temp", success=True, message="ok",
+            entity_id="input_number.tank_b",
+        )
+        ok_cyclic = ActionResult(action_type="cyclic_load", success=True, message="ok")
+        engine.dispatcher.set_water_temp = AsyncMock(
+            side_effect=[RuntimeError("HA write failed"), ok_water]
+        )
+        engine.dispatcher.set_cyclic_load = AsyncMock(return_value=ok_cyclic)
+        engine.dispatcher.execute = AsyncMock(return_value=[])
+
+        result = await engine.run_once()
+
+        # Both tanks were attempted despite tank_a raising ...
+        assert engine.dispatcher.set_water_temp.call_count == 2
+        # ... the cyclic loads after the water chain still actuated ...
+        assert engine.dispatcher.set_cyclic_load.call_count == 2
+        # ... and the EV servo and profile actuation still ran.
+        engine._ev_surplus.run.assert_awaited_once()
+        engine.dispatcher.execute.assert_awaited_once()
+        failed = [
+            a
+            for a in result["actions"]
+            if a.get("type") == "water:tank_a" and not a.get("success")
+        ]
+        assert failed and not failed[0].get("skipped")
+        assert any(e["type"] == "water:tank_a" for e in engine.recent_errors)
+
+    @pytest.mark.asyncio
+    async def test_energy_ctx_failure_degrades_but_planned_actuation_continues(
+        self, engine, temp_schedule
+    ):
+        """A failing shared _water_energy_ctx read stands the opportunistic gates
+        down for one tick but must not stop the planned cyclic actuation, the EV
+        servo, or the profile."""
+        from unittest.mock import AsyncMock
+
+        from executor.actions import ActionResult
+
+        self._write_schedule(temp_schedule)
+
+        # surplus_run makes the cyclic section build the ctx (no tank needs it).
+        engine.config.cyclic_loads[1].surplus_run = True
+        engine._water_energy_ctx = AsyncMock(side_effect=RuntimeError("sensor read failed"))
+
+        ok_water = ActionResult(action_type="water_temp", success=True, message="ok")
+        ok_cyclic = ActionResult(action_type="cyclic_load", success=True, message="ok")
+        engine.dispatcher.set_water_temp = AsyncMock(return_value=ok_water)
+        engine.dispatcher.set_cyclic_load = AsyncMock(return_value=ok_cyclic)
+        engine.dispatcher.execute = AsyncMock(return_value=[])
+
+        result = await engine.run_once()
+
+        # The planned on/off still actuated for BOTH loads, ctx or no ctx ...
+        assert engine.dispatcher.set_cyclic_load.call_count == 2
+        # ... downstream controls survived ...
+        engine._ev_surplus.run.assert_awaited_once()
+        engine.dispatcher.execute.assert_awaited_once()
+        # ... and the read failure surfaced loudly instead of dying silently.
+        failed = [
+            a
+            for a in result["actions"]
+            if a.get("type") == "cyclic:energy_ctx" and not a.get("success")
+        ]
+        assert failed
+        assert any(e["type"] == "cyclic:energy_ctx" for e in engine.recent_errors)
+
+    @pytest.mark.asyncio
+    async def test_pumps_without_tanks_still_actuate(self, engine, temp_schedule):
+        """water_ctx is bound BEFORE the water chain: a pumps-but-no-tanks site
+        (the water branch never runs) must still actuate its cyclic loads rather
+        than NameError into the outer catch."""
+        from unittest.mock import AsyncMock
+
+        from executor.actions import ActionResult
+
+        self._write_schedule(temp_schedule)
+
+        engine._has_water_heater = False
+        engine.config.water_heater_devices = []
+
+        ok_cyclic = ActionResult(action_type="cyclic_load", success=True, message="ok")
+        engine.dispatcher.set_cyclic_load = AsyncMock(return_value=ok_cyclic)
+        engine.dispatcher.set_water_temp = AsyncMock()
+        engine.dispatcher.execute = AsyncMock(return_value=[])
+
+        result = await engine.run_once()
+
+        engine.dispatcher.set_water_temp.assert_not_called()
+        assert engine.dispatcher.set_cyclic_load.call_count == 2
+        engine._ev_surplus.run.assert_awaited_once()
+        engine.dispatcher.execute.assert_awaited_once()
+        assert not any(a.get("type") == "execution_error" for a in result["actions"])
