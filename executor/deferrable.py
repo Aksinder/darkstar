@@ -124,6 +124,14 @@ class AppliancePowerConfig:
     # Worst case of a too-long cooldown is a missed defer (runs at current price),
     # never a cut. Genuine back-to-back loads within 15 min just run immediately.
     rearm_cooldown_s: float = 900.0
+    # Hand a MANUALLY cut cycle back to Darkstar after this long (0 = never, the
+    # historical behaviour). Darkstar never re-energizes a human-cut plug on its own,
+    # which is right in the moment — the human may have opened the machine, or stopped
+    # it to fix something — but wrong forever: an interrupted programme then sits dead
+    # until someone remembers it. After this delay Darkstar reclaims OWNERSHIP only;
+    # the ordinary window logic still decides when to actually re-energize, so a
+    # reclaimed cycle waits for its cheap window rather than starting on the spot.
+    manual_cut_return_s: float = 0.0
 
 
 @dataclass
@@ -138,6 +146,39 @@ class AppliancePowerState:
     switch_was_on: bool = True  # switch state at the previous tick (re-power grace)
     last_done_ts: float | None = None  # when the last cycle completed (re-arm cooldown)
     held_by_us: bool = False  # True while DARKSTAR holds the plug OFF (vs a manual cut)
+    # When a HUMAN cut the plug mid-cycle (off, pending, not held_by_us). Feeds the
+    # hand-back timer; None whenever the plug is on or the cut is ours.
+    manual_off_since: float | None = None
+
+
+def should_reclaim_after_manual_cut(
+    *,
+    pending: bool,
+    switch_on: bool,
+    held_by_us: bool,
+    manual_off_since: float | None,
+    now_ts: float,
+    manual_cut_return_s: float,
+) -> bool:
+    """Has a human-cut cycle waited long enough to come back under Darkstar's control?
+
+    Reclaims OWNERSHIP, not power: the caller sets held_by_us=True and the ordinary
+    defer/run window logic then decides when to energize. A reclaimed cycle therefore
+    waits for its cheap window instead of lurching on the moment the timer expires.
+
+    Deliberately narrow. All of these must hold:
+      * a cycle is still ``pending`` — a finished programme has nothing to resume, and
+        reclaiming an idle appliance would let Darkstar switch on a machine nobody
+        started;
+      * the plug is OFF and ``held_by_us`` is False — i.e. the cut was a human's;
+      * ``manual_cut_return_s`` > 0 — opt-in, because re-energizing something a person
+        deliberately switched off is a physical act, not a preference.
+    """
+    if manual_cut_return_s <= 0 or not pending or switch_on or held_by_us:
+        return False
+    if manual_off_since is None:
+        return False
+    return (now_ts - manual_off_since) >= manual_cut_return_s
 
 
 def update_appliance_power_state(
@@ -205,6 +246,16 @@ def update_appliance_power_state(
         last_done_ts = now_ts
         event = "done"
 
+    # Stamp / clear the manual-cut clock. Set on the first tick the plug is seen OFF
+    # while a cycle is pending; cleared whenever it is powered again. Ownership is not
+    # known here (the runtime owns held_by_us), so this is only the "off since" fact —
+    # should_reclaim_after_manual_cut() applies the ownership test.
+    manual_off_since = prev.manual_off_since
+    if switch_on or not pending:
+        manual_off_since = None
+    elif manual_off_since is None:
+        manual_off_since = now_ts
+
     return (
         AppliancePowerState(
             pending=pending,
@@ -213,6 +264,7 @@ def update_appliance_power_state(
             above_since=above_since,
             below_since=below_since,
             switch_was_on=switch_on,
+            manual_off_since=manual_off_since,
             last_done_ts=last_done_ts,
             held_by_us=prev.held_by_us,
         ),
