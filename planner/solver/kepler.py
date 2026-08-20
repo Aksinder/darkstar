@@ -906,16 +906,22 @@ class KeplerSolver:
                     )
                     total_cost.append(config.deferrable_phase_penalty_sek * overlap)
 
-        # Phase-aware imbalance cost (flag-gated, default OFF). The single-net-node
-        # balance nets a heavy phase's import against the light phases' export to ~zero,
-        # hiding the real cost. Under balanced inverter supply (pv + discharge - charge)/n,
-        # phase p still imports max(0, load*f_p - supply/n). We price that per-phase import
-        # deficit (the part the net view hides) at the slot's import price, so the solver
-        # raises discharge to cover the heavy phase — but only WHEN ECONOMIC, since each
-        # extra kWh discharged costs terminal battery value + wear and spills as export.
-        # Each phase_import var is minimised (positive objective coeff) so it settles at
-        # its true max(0, ...) lower bound (no free-variable gaming). Uses the per-hour
-        # profile when present so the cost reflects which phase is heavy at the slot's hour.
+        # Phase-aware FUSE RELIEF (flag-gated, default OFF). Not an economics term:
+        # Swedish settlement meters net all three phases momentarily (STAFS 2022:9),
+        # so per-phase import costs nothing on the invoice — the original form of
+        # this term priced it at the import price anyway, which double-charged
+        # ordinary net import (every all-phases-in-deficit slot summed to exactly
+        # the net import, re-priced on top of slot_import_cost above).
+        #
+        # What imbalance DOES burn is main-fuse headroom, in amps. Under balanced
+        # inverter supply (pv + discharge - charge)/n, the heavy phase still draws
+        # max(0, load*f_p - supply/n) from the grid; extra discharge shaves real
+        # current off it. So we price only the portion ABOVE phase_relief_start_a,
+        # at phase_relief_sek_per_a_h — zero for a comfortably balanced house, and
+        # a steep incentive to discharge when one phase nears the fuse. Each pi var
+        # is minimised (positive objective coeff) so it settles at its true
+        # max(0, ...) lower bound. Charge is subtracted from supply so the solver
+        # cannot fake phase coverage via a free charge+discharge cycle.
         if config.phase_aware_enabled and (
             config.phase_load_profile or config.phase_load_fractions
         ):
@@ -932,18 +938,24 @@ class KeplerSolver:
                 if not fracs:
                     continue
                 n_ph = len(fracs)
-                imp_pa: float = s_pa.import_price_sek_kwh
+                h_pa: float = (s_pa.end_time - s_pa.start_time).total_seconds() / 3600.0
+                if h_pa <= 0.0:
+                    continue
+                # kWh a phase may draw this slot before the penalty starts: A * V * h.
+                relief_kwh: float = config.phase_relief_start_a * 0.23 * h_pa
+                # SEK per kWh above the threshold, from SEK per ampere-hour.
+                relief_price: float = config.phase_relief_sek_per_a_h / 0.23
                 # Real balanced supply to the house = PV + battery discharge - battery
-                # charge (charging consumes from the AC bus). Subtracting charge is
-                # essential: with pv+discharge alone the solver fakes phase coverage via a
-                # free charge+discharge cycle that nets zero real supply.
+                # charge (charging consumes from the AC bus).
                 supply_pa: Any = s_pa.pv_kwh + discharge[t] - charge[t]
                 for k, f in enumerate(fracs):
                     pi: Any = pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
-                        f"phase_imp_{t}_{k}", lowBound=0.0
+                        f"phase_over_{t}_{k}", lowBound=0.0
                     )
-                    prob += pi >= s_pa.load_kwh * f - supply_pa / n_ph  # type: ignore[operator]
-                    total_cost.append(pi * imp_pa * config.phase_aware_weight)
+                    prob += (  # type: ignore[operator]
+                        pi >= s_pa.load_kwh * f - supply_pa / n_ph - relief_kwh
+                    )
+                    total_cost.append(pi * relief_price)
 
         # Terminal SoC Target (BIDIRECTIONAL soft constraint)
         # Penalize both being UNDER target (risk) AND OVER target (missed discharge opportunity)

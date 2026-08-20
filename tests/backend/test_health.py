@@ -344,14 +344,21 @@ def _write_schedule(tmp_path, gap_sek: float, slot_costs: list[float]):
     (tmp_path / "data" / "schedule.json").write_text(json.dumps(payload))
 
 
-def test_realism_gap_warning_when_material(tmp_path, monkeypatch):
+def test_realism_gap_surfaces_as_imbalance_info_when_material(tmp_path, monkeypatch):
+    """Reframed 2026-08-20: Swedish meters net phases momentarily (STAFS 2022:9),
+    so the gap is a phase-imbalance indicator (fuse headroom), never lost money.
+    The old warning text recommended enabling phase_aware "for the economics" —
+    which steered this site into double-priced import. Severity info, message in
+    kWh, guidance about amps."""
     monkeypatch.chdir(tmp_path)
     _write_schedule(tmp_path, gap_sek=3.0, slot_costs=[1.0] * 10)  # 30% of 10 SEK gross
     checker = _make_checker({})
     issues = checker.check_plan_realism()
     assert len(issues) == 1
-    assert issues[0].severity == "warning"
-    assert "realism gap" in issues[0].message.lower()
+    assert issues[0].severity == "info"
+    assert "phase imbalance" in issues[0].message.lower()
+    assert "amps, not money" in issues[0].guidance
+    assert "consider enabling" not in issues[0].guidance.lower()
 
 
 def test_realism_gap_silent_when_small(tmp_path, monkeypatch):

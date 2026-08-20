@@ -223,12 +223,18 @@ class HealthChecker:
         return issues
 
     def check_plan_realism(self) -> list[HealthIssue]:
-        """Warn when the plan's own realism simulation says its value is materially overstated.
+        """Surface the realism gap as a PHASE-IMBALANCE indicator, not lost money.
 
-        The planner computes realism_gap_sek (phase-aware replay vs the single-net-node
-        plan) on every run and, until now, nothing consumed it. Surface it once it is
-        both absolutely (>= 2 SEK over the horizon) and relatively (>= 20% of the plan's
-        gross value) significant, so a structurally optimistic plan can't hide.
+        The realism simulation computes what per-phase billing would cost over the
+        net-node plan. Swedish settlement meters net all three phases momentarily
+        (STAFS 2022:9 2 kap. 7 §, confirmed by Energimarknadsinspektionen), so that
+        delta never reaches the invoice here — the gap's kWh (extra_import_kwh) are
+        still worth surfacing, because energy crossing phases is fuse headroom being
+        burnt on the heavy phase. History: until 2026-08-20 this warning recommended
+        enabling phase_aware "for the economics", which steered this site into a
+        term that double-priced ordinary import — the opposite of help. Thresholds
+        unchanged (>= 2 SEK-equivalent and >= 20% of plan gross value) so the signal
+        still only fires when the imbalance is material.
         """
         issues: list[HealthIssue] = []
         try:
@@ -261,17 +267,25 @@ class HealthChecker:
                     if gross_value_sek >= 1.0
                     else " (plan value near zero)"
                 )
+                extra_kwh = float(realism.get("extra_import_kwh", 0.0) or 0.0)
                 issues.append(
                     HealthIssue(
                         category="planner",
-                        severity="warning",
-                        message=f"Plan realism gap {gap:.2f} SEK{pct_part}",
+                        severity="info",
+                        message=(
+                            f"Phase imbalance: {extra_kwh:.1f} kWh crosses phases over "
+                            f"the plan horizon (hypothetical {gap:.2f} SEK{pct_part})"
+                        ),
                         guidance=(
-                            "The phase-aware realism simulation expects the plan to under-"
-                            "perform its own cost estimate by this much (per-phase import "
-                            "the single-net-node solver can't see). Consider enabling "
-                            "phase_aware in the planner or reviewing phase balance; large "
-                            "persistent gaps mean the plan's economics are optimistic."
+                            "One phase imports while the others export. Swedish meters "
+                            "net all phases momentarily (STAFS 2022:9), so this costs "
+                            "nothing on the invoice — but it is real fuse headroom being "
+                            "burnt on the chronically heavy phase. Review the phase "
+                            "balance (move single-phase loads off the heavy phase), or "
+                            "enable phase_aware fuse relief so the planner buys extra "
+                            "discharge when a phase approaches the main fuse. Do NOT "
+                            "expect an economic gain from either: this signal is about "
+                            "amps, not money."
                         ),
                     )
                 )
