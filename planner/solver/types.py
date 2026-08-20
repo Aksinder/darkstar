@@ -311,17 +311,35 @@ class KeplerConfig:
     # Map of load id -> resolved LoadPriority. Empty => no WTP applied to any load.
     load_priorities: dict[str, LoadPriority] = field(default_factory=lambda: {})
 
-    # ---- Phase-aware imbalance cost (flag-gated, default OFF) ----
-    # The single-net-node LP nets a heavy phase's import against the light phases'
-    # export to ~zero, hiding the real cost (buy high on the heavy phase, sell low on
-    # the others). When enabled, the solver prices that hidden EXTRA into the objective
-    # and may discharge the battery to raise balanced supply and cover the heavy phase —
-    # but only WHEN ECONOMIC (the import avoided must beat the export spilled on the
-    # light phases plus the battery value spent). phase_load_fractions is the static
-    # per-phase split; phase_load_profile is the per-hour {hour: {A,B,C}} forecast used
-    # when present so the cost reflects which phase is heavy at each slot's hour.
+    # ---- Phase-aware FUSE RELIEF (flag-gated, default OFF) ----
+    # Repurposed 2026-08-20 (owner: "phase_aware borde bara vara ett verktyg for att
+    # hjalpa till att fixa snedbelastning"). The original term priced per-phase import
+    # at the import price, as if each phase were billed separately. Swedish settlement
+    # meters net all three phases momentarily (STAFS 2022:9 2 kap. 7 §, confirmed by
+    # Energimarknadsinspektionen), so that cost does not exist on the invoice here —
+    # and the term double-priced ordinary net import on top of the objective's own
+    # import cost, taxing night arbitrage charging and cheap-hour loads for nothing.
+    #
+    # What IS real about imbalance is the main fuse: a chronically heavy phase burns
+    # headroom in AMPS regardless of billing. Extra balanced discharge shaves real
+    # current off the heavy phase (supply/3 each). So the term now prices only the
+    # heavy phase's grid current ABOVE a relief threshold, in SEK per ampere-hour —
+    # zero when every phase is comfortably inside the fuse, steep enough to buy
+    # discharge when one approaches it. No import-price coupling at all.
+    #
+    # Limitation, stated honestly: the per-phase deficit is computed from the BASE
+    # load forecast split (phase_load_fractions/profile). Solver-scheduled loads
+    # (water blocks, EV plans) are not phase-attributed yet, so relief comes from
+    # discharge, not from moving those loads off the heavy phase's dear hours.
     phase_aware_enabled: bool = False
-    phase_aware_weight: float = 1.0  # scales the imbalance EXTRA (1.0 = full economic cost)
+    # Start penalizing when a phase's grid draw exceeds this many amperes (~230 V).
+    # Default 20 A leaves 5 A of margin on a 25 A main fuse.
+    phase_relief_start_a: float = 20.0
+    # Penalty per ampere-hour above the threshold. 2.0 makes ~1 kWh of extra
+    # discharge (≈1.45 A off the heavy phase for an hour) worth ~2.9 SEK of relief —
+    # comfortably above wear + terminal value, so the solver acts near the fuse and
+    # only there.
+    phase_relief_sek_per_a_h: float = 2.0
     phase_load_fractions: dict[str, float] | None = None
     phase_load_profile: dict[int, dict[str, float]] | None = None
 

@@ -502,19 +502,25 @@ load_priority:
     #   #                             #   human can still say "heat it anyway".
     #   #                             #   Recommended for the VVB (e.g. 45-55).
 
-# Phase-aware imbalance cost in the planner (default OFF). The single-net-node solver
-# nets a heavy phase's import against the light phases' export to ~zero, hiding the real
-# cost (buy high on the heavy phase, sell low on the others). When enabled, the planner
-# PRICES that hidden extra and may discharge the battery to cover the heavy phase — but
-# only WHEN ECONOMIC (the avoided import beats the spilled export + battery value spent),
-# so the battery covers phase load "when necessary", not always. It uses the per-hour
-# phase profile learned by phase_observer (fractions_by_hour in phase_model.json) so the
-# cost reflects which phase is heavy at each slot's hour. Requires phase_observer to have
-# learned a phase split; with none, this is inert.
+# Phase-aware FUSE RELIEF in the planner (default OFF). NOT an economics knob:
+# Swedish settlement meters net all three phases momentarily (STAFS 2022:9 2 kap. 7 §,
+# confirmed by Energimarknadsinspektionen), so per-phase import never reaches the
+# invoice — an earlier version of this feature priced it anyway, which double-charged
+# ordinary night import and taxed arbitrage charging for nothing. What imbalance DOES
+# burn is main-fuse headroom, in amps: a chronically heavy phase runs hot regardless
+# of billing. When enabled, the planner penalizes a phase's grid draw ABOVE
+# relief_start_a and buys extra balanced discharge (supply/3 off each phase) when one
+# approaches the fuse — and does nothing at all for a comfortably balanced house.
+# Uses the per-hour phase profile learned by phase_observer (fractions_by_hour in
+# phase_model.json); with no learned split, this is inert. Limitation: only the BASE
+# load is phase-attributed — solver-scheduled loads (water blocks, EV plans) are not,
+# so relief comes from discharge, not from moving those loads.
 phase_aware:
   enabled: false
-  weight: 1.0                        # scales the imbalance cost (1.0 = full economic value;
-                                     #   lower = gentler nudge, higher = cover more aggressively)
+  relief_start_a: 20                 # start penalizing when a phase draws more than this (A);
+                                     #   20 leaves 5 A margin on a 25 A main fuse
+  relief_sek_per_a_h: 2.0            # penalty per ampere-hour above the threshold — steep on
+                                     #   purpose: this is fuse protection, not arbitrage
 
 # Phase-aware observability (Observe phase of docs/designs/phase-aware-load-modeling.md).
 # Read-only: learns each metered device's electrical phase by correlating its power

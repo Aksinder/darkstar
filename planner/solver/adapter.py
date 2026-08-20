@@ -1144,11 +1144,19 @@ def config_to_kepler_config(
         planner_config
     )
 
-    # Phase-aware imbalance cost (flag-gated). Load the learned static/per-hour phase
-    # split so the solver can price the per-phase grid cost the net-node view hides.
+    # Phase-aware fuse relief (flag-gated). Loads the learned static/per-hour phase
+    # split so the solver can shave real amps off a phase approaching the main fuse.
+    # NOT an economics term — Swedish meters net phases momentarily (STAFS 2022:9),
+    # see the comment block in types.py. The old "weight" knob is gone with the old
+    # billing model; the knobs are now the relief threshold (A) and the price (SEK/Ah).
     phase_cfg: dict[str, Any] = planner_config.get("phase_aware", {}) or {}
     kepler_cfg.phase_aware_enabled = bool(phase_cfg.get("enabled", False))
-    kepler_cfg.phase_aware_weight = float(phase_cfg.get("weight", 1.0))
+    kepler_cfg.phase_relief_start_a = float(
+        phase_cfg.get("relief_start_a", KeplerConfig.phase_relief_start_a)
+    )
+    kepler_cfg.phase_relief_sek_per_a_h = float(
+        phase_cfg.get("relief_sek_per_a_h", KeplerConfig.phase_relief_sek_per_a_h)
+    )
     if kepler_cfg.phase_aware_enabled:
         from backend.learning.phase_learning import load_phase_fractions, load_phase_profile
 
