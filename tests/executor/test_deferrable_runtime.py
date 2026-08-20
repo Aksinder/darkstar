@@ -626,3 +626,72 @@ class TestScheduleTwoParsersOneFile:
         with caplog.at_level(logging.WARNING, logger="darkstar.deferrable"):
             load_forward_slots(missing, 3000.0, "Europe/Stockholm")
         assert any("fail open" in r.message for r in caplog.records)
+
+
+class TestManualCutHandback:
+    """End-to-end: a human cuts the plug mid-cycle, Darkstar reclaims it after the
+    configured delay and resumes it at the cheap window — not the instant the timer
+    expires. Owner request 2026-08-20."""
+
+    def _cfg(self, return_minutes):
+        from executor.deferrable_runtime import parse_deferrable_runtime_config
+
+        return parse_deferrable_runtime_config(
+            {
+                "executor": {
+                    "deferrable_appliances": {"enabled": True, "observe_only": False},
+                    "schedule_path": "data/schedule.json",
+                },
+                "deferrable_loads": [
+                    {
+                        "id": "dishwasher",
+                        "name": "Diskmaskin",
+                        "power_sensor": "sensor.dw_power",
+                        "switch_entity": "switch.dw",
+                        "manual_cut_return_minutes": return_minutes,
+                    }
+                ],
+            }
+        )
+
+    def test_the_knob_parses_into_seconds(self):
+        cfg = self._cfg(60)
+        assert cfg is not None
+        assert cfg.appliances[0].power.manual_cut_return_s == 3600.0
+
+    def test_absent_means_off(self):
+        cfg = self._cfg(0)
+        assert cfg is not None
+        assert cfg.appliances[0].power.manual_cut_return_s == 0.0
+
+    def test_a_reclaimed_cycle_waits_for_its_window_not_the_timer(self):
+        """The timer hands back OWNERSHIP; price still decides when it runs."""
+        from executor.deferrable import (
+            AppliancePowerState,
+            recommend_appliance_action,
+            should_reclaim_after_manual_cut,
+        )
+
+        cut_at, now = 1000.0, 1000.0 + 3600.0
+        assert should_reclaim_after_manual_cut(
+            pending=True, switch_on=False, held_by_us=False,
+            manual_off_since=cut_at, now_ts=now, manual_cut_return_s=3600.0,
+        )
+        # Reclaimed => held_by_us. The dear hour still defers it.
+        state = AppliancePowerState(pending=True, held_by_us=True)
+        slots = _dear_then_cheap(now)
+        action, window_start = recommend_appliance_action(slots, now, 2, None)
+        assert action == "defer"
+        assert window_start is not None and window_start > now
+        # And the actuation branch keeps a reclaimed hold OFF while deferring.
+        assert state.pending and state.held_by_us and action == "defer"
+
+
+def _dear_then_cheap(now_ts):
+    """Two dear slots, then two cheap ones."""
+    from executor.deferrable import WindowSlot
+
+    return [
+        WindowSlot(start_ts=now_ts + i * 900.0, import_price_sek_kwh=p)
+        for i, p in enumerate([3.0, 3.0, 1.0, 1.0])
+    ]

@@ -424,6 +424,16 @@ deferrable_loads: []
   #   off_threshold_w: 3            # sustained draw < this => cycle done
   #   start_debounce_s: 3           # draw must stay above on_threshold this long to arm
   #   done_delay_s: 300             # draw must stay below off_threshold this long to call it done
+  #   manual_cut_return_minutes: 0  # hand a HUMAN-cut cycle back to Darkstar after this long
+  #                                 #   (0 = never, the historical behaviour). Darkstar never
+  #                                 #   re-energizes a plug a person switched off — right in
+  #                                 #   the moment (they may have opened the machine), wrong
+  #                                 #   forever (the interrupted programme sits dead until
+  #                                 #   someone remembers it). This hands back OWNERSHIP only:
+  #                                 #   the cycle then waits for its cheap window like any
+  #                                 #   other, it does not start when the timer expires.
+  #                                 #   Opt-in on purpose — re-energizing something a person
+  #                                 #   deliberately switched off is a physical act.
   #   override_entity: input_boolean.washing_machine_override  # optional: force run now (skip deferral)
   #   # --- Scheduling deadline ---
   #   deadline_mode: cheapest_within_hours   # or: hard_deadline

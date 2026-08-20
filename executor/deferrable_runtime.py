@@ -34,6 +34,7 @@ from .deferrable import (
     AppliancePowerState,
     WindowSlot,
     recommend_appliance_action,
+    should_reclaim_after_manual_cut,
     update_appliance_power_state,
 )
 
@@ -141,6 +142,8 @@ def parse_deferrable_runtime_config(
                     start_debounce_s=float(c.get("start_debounce_s", 3.0)),
                     done_delay_s=float(c.get("done_delay_s", 300.0)),
                     power_scale=float(c.get("power_scale", 1.0)),
+                    manual_cut_return_s=float(c.get("manual_cut_return_minutes", 0.0) or 0.0)
+                    * 60.0,
                 ),
                 seed_duration_min=float(c.get("duration_min", 120.0)),
                 deadline_mode=str(c.get("deadline_mode", "cheapest_within_hours")),
@@ -447,6 +450,27 @@ class DeferrableApplianceController:
             #    deadline forces / override demands. A plug the USER cut (held_by_us
             #    False) is never re-energized — manual off wins, pending or not.
             #  - IDLE / DONE: hands off entirely.
+            # Hand a manually cut cycle back to Darkstar once its timer expires. Done
+            # BEFORE the actuation block so the reclaimed hold flows straight into the
+            # ordinary defer/run logic below: the cycle waits for its cheap window
+            # rather than snapping on the instant the timer runs out.
+            if should_reclaim_after_manual_cut(
+                pending=new_state.pending,
+                switch_on=switch_on,
+                held_by_us=new_state.held_by_us,
+                manual_off_since=new_state.manual_off_since,
+                now_ts=now_ts,
+                manual_cut_return_s=app.power.manual_cut_return_s,
+            ):
+                new_state.held_by_us = True
+                new_state.manual_off_since = None
+                logger.info(
+                    "Deferrable: %s reclaimed after manual cut (%.0f min) — Darkstar "
+                    "will resume it at its next scheduled window",
+                    app.id,
+                    app.power.manual_cut_return_s / 60.0,
+                )
+
             plug_cmd: str | None = None
             if (
                 not cfg.observe_only
