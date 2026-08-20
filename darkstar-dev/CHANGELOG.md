@@ -1,3 +1,7 @@
+## dev-20260820.1017 — 2026-08-20 10:18
+
+- deferrable: ask before restoring a manually cut plug
+
 ## dev-20260820.0939 — 2026-08-20 09:41
 
 - deferrable: read WHO switched the plug, and restore the resting state
