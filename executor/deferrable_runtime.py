@@ -30,9 +30,12 @@ from pathlib import Path
 from typing import Any, cast
 
 from .deferrable import (
+    CUT_BY_HUMAN,
+    CUT_BY_US,
     AppliancePowerConfig,
     AppliancePowerState,
     WindowSlot,
+    classify_plug_cut,
     recommend_appliance_action,
     should_reclaim_after_manual_cut,
     update_appliance_power_state,
@@ -228,6 +231,10 @@ class DeferrableApplianceController:
     ):
         self.cfg = cfg
         self._state_file = state_file
+        # Darkstar's own HA user id, discovered once from a sensor only Darkstar writes.
+        # None until discovered (or if discovery fails) — every consumer degrades to the
+        # conservative reading, never to "that was us".
+        self._own_user_id: str | None = None
         # Default the ledger next to the state file (data/ in production), so a
         # custom state location — e.g. a test tmp dir — keeps both together.
         self._ledger_file = ledger_file or str(
@@ -366,8 +373,17 @@ class DeferrableApplianceController:
             )
             power = _f(power_raw) or 0.0
             override = await self._read_on(ha, app.override_entity)
-            sw_raw = (
-                await ha.get_state_value(app.switch_entity) if app.switch_entity else None
+            sw_state = (
+                await ha.get_state(app.switch_entity) if app.switch_entity else None
+            )
+            sw_raw = sw_state.get("state") if isinstance(sw_state, dict) else None
+            # HA stamps the context that produced the state: a service call carries the
+            # calling user's id, a device reporting itself carries None. Free here — the
+            # same read that gives us on/off tells us whose hand it was.
+            sw_user_id = (
+                (sw_state.get("context") or {}).get("user_id")
+                if isinstance(sw_state, dict)
+                else None
             )
             switch_readable = sw_raw is not None and str(sw_raw) not in (
                 "unknown",
@@ -397,6 +413,26 @@ class DeferrableApplianceController:
 
             new_state, event = update_appliance_power_state(prev, power, switch_on, now_ts, app.power)
             new_state.held_by_us = prev.held_by_us and not switch_on
+            # A named hand on the plug outranks our own memory of holding it. Without
+            # this, a person switching off a plug Darkstar already held stayed invisible
+            # (the state never changes, only the context does) and Darkstar would
+            # re-energize it at the next window, overriding them.
+            if not switch_on and switch_readable:
+                actor = classify_plug_cut(
+                    context_user_id=sw_user_id,
+                    darkstar_user_id=await self._darkstar_user_id(ha),
+                    held_by_us=new_state.held_by_us,
+                )
+                if actor == CUT_BY_HUMAN and new_state.held_by_us:
+                    logger.info(
+                        "Deferrable: %s — a person switched the plug off while we held "
+                        "it; releasing our hold to them",
+                        app.id,
+                    )
+                    new_state.held_by_us = False
+                    new_state.manual_off_since = now_ts
+                elif actor == CUT_BY_US:
+                    new_state.manual_off_since = None
             self._state[app.id] = new_state
 
             # Cycle-chain tracking for the ledger. A genuine "armed" event starts a
@@ -454,21 +490,23 @@ class DeferrableApplianceController:
             # BEFORE the actuation block so the reclaimed hold flows straight into the
             # ordinary defer/run logic below: the cycle waits for its cheap window
             # rather than snapping on the instant the timer runs out.
-            if should_reclaim_after_manual_cut(
-                pending=new_state.pending,
+            reclaimed = should_reclaim_after_manual_cut(
                 switch_on=switch_on,
                 held_by_us=new_state.held_by_us,
                 manual_off_since=new_state.manual_off_since,
                 now_ts=now_ts,
                 manual_cut_return_s=app.power.manual_cut_return_s,
-            ):
+            )
+            if reclaimed:
                 new_state.held_by_us = True
                 new_state.manual_off_since = None
                 logger.info(
-                    "Deferrable: %s reclaimed after manual cut (%.0f min) — Darkstar "
-                    "will resume it at its next scheduled window",
+                    "Deferrable: %s reclaimed after manual cut (%.0f min) — %s",
                     app.id,
                     app.power.manual_cut_return_s / 60.0,
+                    "resuming at its next scheduled window"
+                    if new_state.pending
+                    else "restoring the plug to its resting ON state",
                 )
 
             plug_cmd: str | None = None
@@ -490,6 +528,11 @@ class DeferrableApplianceController:
                         # run/override: keep a powered plug on, or release OUR hold.
                         desired_on = True
                     # else: user-cut plug (off, not ours) — hands off.
+                elif reclaimed:
+                    # IDLE and reclaimed: restore the resting state. Start detection
+                    # watches the appliance's own draw, so a plug left off is not a
+                    # machine kept safe — it is a detector switched off.
+                    desired_on = True
                 if desired_on is not None and desired_on != switch_on:
                     try:
                         ok = await ha.set_switch(app.switch_entity, desired_on)
@@ -558,6 +601,29 @@ class DeferrableApplianceController:
         if override:
             return "armed"
         return "waiting" if action == "defer" else "armed"
+
+    async def _darkstar_user_id(self, ha: Any) -> str | None:
+        """Darkstar's own HA user id, discovered once and cached for the process.
+
+        Read from a sensor only Darkstar writes: HA stamps our published state with the
+        context of our own token, so reading one back names us unambiguously. One HTTP
+        read per process, and a failure simply leaves it None — callers then fall back
+        to the conservative reading rather than guessing that a cut was ours.
+        """
+        if self._own_user_id is not None or not self.cfg.appliances:
+            return self._own_user_id
+        oid = f"sensor.{self.cfg.publish_prefix}{_slug(self.cfg.appliances[0].id)}_state"
+        try:
+            st = await ha.get_state(oid)
+        except Exception as exc:
+            logger.debug("Deferrable: could not discover own user id: %s", exc)
+            return None
+        if isinstance(st, dict):
+            uid = (st.get("context") or {}).get("user_id")
+            if uid:
+                self._own_user_id = str(uid)
+                logger.info("Deferrable: Darkstar's HA user id is %s", self._own_user_id)
+        return self._own_user_id
 
     async def _publish(
         self, ha: Any, app: DeferrableApplianceCfg, st: AppliancePowerState,

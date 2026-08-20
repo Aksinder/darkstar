@@ -424,7 +424,7 @@ deferrable_loads: []
   #   off_threshold_w: 3            # sustained draw < this => cycle done
   #   start_debounce_s: 3           # draw must stay above on_threshold this long to arm
   #   done_delay_s: 300             # draw must stay below off_threshold this long to call it done
-  #   manual_cut_return_minutes: 0  # hand a HUMAN-cut cycle back to Darkstar after this long
+  #   manual_cut_return_minutes: 0  # hand a HUMAN-cut plug back to Darkstar after this long
   #                                 #   (0 = never, the historical behaviour). Darkstar never
   #                                 #   re-energizes a plug a person switched off — right in
   #                                 #   the moment (they may have opened the machine), wrong
@@ -432,8 +432,16 @@ deferrable_loads: []
   #                                 #   someone remembers it). This hands back OWNERSHIP only:
   #                                 #   the cycle then waits for its cheap window like any
   #                                 #   other, it does not start when the timer expires.
-  #                                 #   Opt-in on purpose — re-energizing something a person
-  #                                 #   deliberately switched off is a physical act.
+  #                                 #   An IDLE plug is restored to ON instead: start
+  #                                 #   detection watches the appliance's own draw, so a
+  #                                 #   plug left off is not a machine kept safe — it is a
+  #                                 #   detector switched off, and the next cycle can never
+  #                                 #   be seen. Opt-in on purpose, and worth setting LONG
+  #                                 #   (hours): a manual off means "leave it alone".
+  #                                 #   Darkstar also reads HA's context.user_id on the
+  #                                 #   switch, so a person switching off a plug Darkstar
+  #                                 #   was already holding releases it to them — the state
+  #                                 #   never changes there, only the context does.
   #   override_entity: input_boolean.washing_machine_override  # optional: force run now (skip deferral)
   #   # --- Scheduling deadline ---
   #   deadline_mode: cheapest_within_hours   # or: hard_deadline
