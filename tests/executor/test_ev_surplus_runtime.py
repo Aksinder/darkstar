@@ -256,3 +256,90 @@ class TestDepartureVacation:
         await EVSurplusController(cfg).run(ha, now_ts=1000.0)
         sets = [c for c in ha.calls if c[1] == "set_value"]
         assert sets and sets[0][3]["value"] >= 10.0  # forced well above the 5 A min
+
+
+class TestOverrideTimeout:
+    """A forgotten force must expire. The heaters have had this from the start; the
+    EVs did not, and the failure mode is worse here: a forgotten Tesla force_on
+    grid-charges at 16 A three-phase to the car's own limit, at any price, forever.
+    """
+
+    def _cfg(self, timeout_min):
+        raw = _cfg_dict()
+        for c in raw["ev_surplus"]["chargers"]:
+            if c["id"] == "tesla":
+                c["override_timeout_minutes"] = timeout_min
+        return parse_ev_surplus_config(raw)
+
+    def _no_surplus_forced_on(self):
+        """No surplus at a dear price: only a live force_on starts the Tesla."""
+        return FakeHA(_states(**{
+            "sensor.pv": "0", "sensor.grid": "2000", "sensor.price": "2.5",
+            "input_select.tesla_mode": "force_on",
+        }))
+
+    @staticmethod
+    def _tesla_started(ha):
+        return ("switch", "turn_on", "switch.tesla", None) in ha.calls
+
+    @pytest.mark.asyncio
+    async def test_parses_the_timeout(self):
+        cfg = self._cfg(90.0)
+        tesla = next(c for c in cfg.chargers if c.id == "tesla")
+        assert tesla.override_timeout_minutes == 90.0
+
+    @pytest.mark.asyncio
+    async def test_force_expires_back_to_auto(self):
+        ctrl = EVSurplusController(self._cfg(30.0))
+        ha = self._no_surplus_forced_on()
+        await ctrl.run(ha, now_ts=1000.0)
+        assert self._tesla_started(ha)
+        # 31 minutes later the same helper still says force_on — but the clock ran out.
+        ha2 = self._no_surplus_forced_on()
+        await ctrl.run(ha2, now_ts=1000.0 + 31 * 60.0)
+        assert not self._tesla_started(ha2)
+
+    @pytest.mark.asyncio
+    async def test_inside_the_window_the_force_holds(self):
+        """The write guard remembers the car is already ON, so 'holds' shows as
+        the ABSENCE of a stop — exactly what a live force feels like."""
+        ctrl = EVSurplusController(self._cfg(30.0))
+        await ctrl.run(self._no_surplus_forced_on(), now_ts=1000.0)
+        ha2 = self._no_surplus_forced_on()
+        await ctrl.run(ha2, now_ts=1000.0 + 29 * 60.0)
+        assert ("switch", "turn_off", "switch.tesla", None) not in ha2.calls
+
+    @pytest.mark.asyncio
+    async def test_timeout_zero_never_expires(self):
+        """0 is the explicit 'never' — the pre-existing behaviour, not a trap."""
+        ctrl = EVSurplusController(self._cfg(0.0))
+        await ctrl.run(self._no_surplus_forced_on(), now_ts=1000.0)
+        ha2 = self._no_surplus_forced_on()
+        await ctrl.run(ha2, now_ts=1000.0 + 48 * 3600.0)
+        assert ("switch", "turn_off", "switch.tesla", None) not in ha2.calls
+
+    @pytest.mark.asyncio
+    async def test_flipping_back_to_auto_resets_the_clock(self):
+        """auto -> force_on again starts a FRESH window, not the old one's tail."""
+        ctrl = EVSurplusController(self._cfg(30.0))
+        await ctrl.run(self._no_surplus_forced_on(), now_ts=1000.0)
+        # Human returns it to auto...
+        ha_auto = FakeHA(_states(**{
+            "sensor.pv": "0", "sensor.grid": "2000", "sensor.price": "2.5",
+            "input_select.tesla_mode": "auto",
+        }))
+        await ctrl.run(ha_auto, now_ts=1000.0 + 20 * 60.0)
+        # ...and forces again 25 min after the FIRST force: fresh 30-min window.
+        ha3 = self._no_surplus_forced_on()
+        await ctrl.run(ha3, now_ts=1000.0 + 25 * 60.0)
+        assert self._tesla_started(ha3)
+
+    @pytest.mark.asyncio
+    async def test_switching_force_direction_resets_the_clock(self):
+        """force_off -> force_on is a NEW decision; it gets its own window."""
+        ctrl = EVSurplusController(self._cfg(30.0))
+        ha_off = FakeHA(_states(**{"input_select.tesla_mode": "force_off"}))
+        await ctrl.run(ha_off, now_ts=1000.0)
+        ha_on = self._no_surplus_forced_on()
+        await ctrl.run(ha_on, now_ts=1000.0 + 25 * 60.0)
+        assert self._tesla_started(ha_on)

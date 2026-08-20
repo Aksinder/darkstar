@@ -990,6 +990,10 @@ executor:
       #   power_entity: sensor.easee_niska_it_power
       #   plug_entity: binary_sensor.easee_ev_plugged_in
       #   override_entity: input_select.darkstar_ev_easee_mode
+      #   override_timeout_minutes: 180   # a force expires back to auto after this
+      #                                   # (0 = never). A forgotten force_on would
+      #                                   # otherwise grid-charge at max, at any
+      #                                   # price, indefinitely.
       #   soc_entity: input_number.fmb_soc        # dead-reckoned FMB SoC (from fmb_soc_estimator)
       #   capacity_kwh: 28
       #   vacation_target_soc: 15                 # vacation: cap FMB at 15%, solar-only (no departure)
@@ -1004,6 +1008,7 @@ executor:
       #   plug_entity: binary_sensor.white_betty_charge_cable
       #   home_entity: device_tracker.white_betty_location
       #   override_entity: input_select.darkstar_ev_tesla_mode
+      #   override_timeout_minutes: 180
       #   wake_entity: button.white_betty_wake   # A sleeping car answers switch.turn_on with
       #                                          # HTTP 500, so a plugged-in car sitting on
       #                                          # surplus never starts. On an actuation

@@ -50,6 +50,12 @@ class EVSurplusChargerCfg:
     home_entity: str | None = None  # device_tracker; absent => assume home
     home_states: tuple[str, ...] = ("home",)
     override_entity: str | None = None  # input_select auto/force_on/force_off
+    # A force expires back to auto after this many minutes (0 = never). The heaters
+    # have had this from the start; the EVs did not, and the failure mode is worse
+    # here: a forgotten Tesla force_on grid-charges at 16 A three-phase to the car's
+    # own limit, at any price, indefinitely. The clock starts when the selection is
+    # first SEEN (the executor may have been down when it was flipped).
+    override_timeout_minutes: float = 0.0
     # Optional button that wakes a sleeping car (e.g. button.white_betty_wake).
     # A sleeping Tesla answers switch.turn_on with HTTP 500, so a plugged-in car
     # sitting on surplus can never start. On an actuation failure the runtime
@@ -372,6 +378,7 @@ def parse_ev_surplus_config(
                 home_entity=c.get("home_entity") or None,
                 home_states=tuple(c.get("home_states", ["home"])),
                 override_entity=c.get("override_entity") or None,
+                override_timeout_minutes=float(c.get("override_timeout_minutes", 0.0) or 0.0),
                 wake_entity=c.get("wake_entity") or None,
                 trust_commanded_draw=bool(c.get("trust_commanded_draw", True)),
                 priority=int(c.get("priority", 0)),
@@ -519,6 +526,8 @@ class EVSurplusController:
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
         self._last_cmd_ts: dict[str, float] = {}
+        # charger id -> (epoch when this override was first seen, which one)
+        self._override_since: dict[str, tuple[float, str]] = {}
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
         """Battery charge-setpoint cap for the engine, or None when the guard is off.
@@ -689,12 +698,39 @@ class EVSurplusController:
             return resolved
         return str(v).lower() in {s.lower() for s in states}
 
-    async def _read_override(self, ha: Any, entity: str | None) -> str:
-        if not entity:
+    async def _read_override(self, ha: Any, c: EVSurplusChargerCfg, now_ts: float) -> str:
+        """This charger's manual override, with auto-expiry.
+
+        Same semantics as engine._heater_override: the clock starts when the
+        selection is first SEEN, not when the helper changed — the executor may
+        have been down. Anything unreadable or unrecognised degrades to auto,
+        never to a stuck force. timeout 0 = never expires (explicit choice).
+        """
+        if not c.override_entity:
             return "auto"
-        v = await ha.get_state_value(entity)
+        v = await ha.get_state_value(c.override_entity)
         val = str(v).lower() if v else "auto"
-        return val if val in ("auto", "force_on", "force_off") else "auto"
+        if val not in ("auto", "force_on", "force_off"):
+            val = "auto"
+
+        timeout_min = float(c.override_timeout_minutes or 0.0)
+        if val == "auto":
+            self._override_since.pop(c.id, None)
+            return "auto"
+        if timeout_min <= 0:
+            return val
+
+        since, seen = self._override_since.get(c.id, (now_ts, val))
+        if seen != val:
+            since = now_ts
+        self._override_since[c.id] = (since, val)
+        if (now_ts - since) >= timeout_min * 60.0:
+            logger.info(
+                "EV override %s: %s expired after %.0f min — back to auto",
+                c.id, val, timeout_min,
+            )
+            return "auto"
+        return val
 
     async def _read_priority_order(self, ha: Any) -> list[str] | None:
         """Resolve the manual priority selector to a charger ordering, else None.
@@ -722,7 +758,7 @@ class EVSurplusController:
                 unreadable_default=False,
             ),
             self._read_on(ha, c.home_entity, c.home_states, True, unreadable_default=False),
-            self._read_override(ha, c.override_entity),
+            self._read_override(ha, c, now_ts),
             self._read_f(ha, c.soc_entity, None),
             self._read_f(ha, c.target_soc_entity, None),
             self._read_attr_f(ha, c.departure_entity, "timestamp", None),
