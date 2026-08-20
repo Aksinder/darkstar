@@ -1,3 +1,7 @@
+## dev-20260820.0926 — 2026-08-20 09:28
+
+- config: sweep phase_aware.weight, dead since the fuse-relief rewrite
+
 ## dev-20260820.0801 — 2026-08-20 08:03
 
 - phase_aware: repurpose from phantom billing cost to fuse relief
