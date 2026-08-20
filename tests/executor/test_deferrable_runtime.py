@@ -16,14 +16,31 @@ TZ = pytz.timezone("Europe/Stockholm")
 
 
 class FakeHA:
-    def __init__(self, states):
+    def __init__(self, states, context_user_ids=None):
         self.states = states
         self.published: dict[str, tuple] = {}
         self.notifications: list[tuple] = []
         self.calls: list[tuple] = []
+        # entity -> context.user_id, so tests can say WHOSE hand touched a switch.
+        # Absent means the device reported its own state (HA sends user_id None).
+        self.context_user_ids = context_user_ids or {}
 
     async def get_state_value(self, entity):
         return self.states.get(entity)
+
+    async def get_state(self, entity):
+        """Full HA state object, including the context that produced it."""
+        if entity not in self.states and entity not in self.context_user_ids:
+            return None
+        return {
+            "state": self.states.get(entity),
+            "attributes": {},
+            "context": {
+                "id": "test",
+                "parent_id": None,
+                "user_id": self.context_user_ids.get(entity),
+            },
+        }
 
     async def set_state(self, entity_id, state, attributes=None):
         self.published[entity_id] = (state, attributes or {})
@@ -674,7 +691,7 @@ class TestManualCutHandback:
 
         cut_at, now = 1000.0, 1000.0 + 3600.0
         assert should_reclaim_after_manual_cut(
-            pending=True, switch_on=False, held_by_us=False,
+            switch_on=False, held_by_us=False,
             manual_off_since=cut_at, now_ts=now, manual_cut_return_s=3600.0,
         )
         # Reclaimed => held_by_us. The dear hour still defers it.
@@ -695,3 +712,143 @@ def _dear_then_cheap(now_ts):
         WindowSlot(start_ts=now_ts + i * 900.0, import_price_sek_kwh=p)
         for i, p in enumerate([3.0, 3.0, 1.0, 1.0])
     ]
+
+
+class TestPlugOwnershipEndToEnd:
+    """The runtime side of context-based attribution and the resting-state restore."""
+
+    DARKSTAR = "97f1bc39f6184ab2a90da66a62f8b234"
+    ROBERT = "613be4dd2bd54547bbe603f15be64363"
+
+    def _cfg(self, return_minutes=60):
+        from executor.deferrable_runtime import parse_deferrable_runtime_config
+
+        return parse_deferrable_runtime_config(
+            {
+                "executor": {
+                    "deferrable_appliances": {"enabled": True, "observe_only": False},
+                    "schedule_path": "data/schedule.json",
+                },
+                "deferrable_loads": [
+                    {
+                        "id": "dishwasher",
+                        "name": "Diskmaskin",
+                        "power_sensor": "sensor.dw_power",
+                        "switch_entity": "switch.dw",
+                        "manual_cut_return_minutes": return_minutes,
+                    }
+                ],
+            }
+        )
+
+    def _controller(self, cfg, tmp_path):
+        from executor.deferrable_runtime import DeferrableApplianceController
+
+        return DeferrableApplianceController(
+            cfg, state_file=str(tmp_path / "state.json")
+        )
+
+    def _ha(self, switch="off", cutter=None):
+        return FakeHA(
+            {"sensor.dw_power": "0", "switch.dw": switch},
+            context_user_ids={"switch.dw": cutter},
+        )
+
+    @staticmethod
+    def _dt(ts):
+        from datetime import datetime
+
+        return datetime.fromtimestamp(ts)
+
+    @pytest.mark.asyncio
+    async def test_it_discovers_its_own_user_id_from_its_own_sensor(self, tmp_path):
+        """Nothing but Darkstar writes sensor.darkstar_*, so reading one back names us."""
+        cfg = self._cfg()
+        ctrl = self._controller(cfg, tmp_path)
+        ha = self._ha()
+        ha.context_user_ids["sensor.darkstar_dishwasher_state"] = self.DARKSTAR
+        ha.states["sensor.darkstar_dishwasher_state"] = "idle"
+        assert await ctrl._darkstar_user_id(ha) == self.DARKSTAR
+
+    @pytest.mark.asyncio
+    async def test_discovery_failure_leaves_it_unknown(self, tmp_path):
+        """And unknown must degrade to the conservative reading, never to 'that was us'."""
+        ctrl = self._controller(self._cfg(), tmp_path)
+        assert await ctrl._darkstar_user_id(self._ha()) is None
+
+    @pytest.mark.asyncio
+    async def test_a_human_cut_releases_a_hold_darkstar_thought_it_owned(self, tmp_path):
+        from executor.deferrable import AppliancePowerState
+
+        ctrl = self._controller(self._cfg(), tmp_path)
+        ctrl._own_user_id = self.DARKSTAR
+        ctrl._state["dishwasher"] = AppliancePowerState(
+            pending=True, held_by_us=True, switch_was_on=False
+        )
+        await ctrl.run(self._ha(cutter=self.ROBERT), 1000.0, self._dt(1000.0), shadow=False)
+        assert ctrl._state["dishwasher"].held_by_us is False
+
+    @pytest.mark.asyncio
+    async def test_our_own_cut_resumes_but_a_human_cut_does_not(self, tmp_path):
+        """The behavioural difference attribution buys. Same state on both runs — a
+        pending cycle, plug off, Darkstar believing it holds it, and a plan that says
+        run. Ours resumes; a person's hand does not get overridden."""
+        from executor.deferrable import AppliancePowerState
+
+        def _run_with(cutter, tmp):
+            ctrl = self._controller(self._cfg(), tmp)
+            ctrl._own_user_id = self.DARKSTAR
+            ctrl._state["dishwasher"] = AppliancePowerState(
+                pending=True, held_by_us=True, switch_was_on=False
+            )
+            return ctrl, self._ha(cutter=cutter)
+
+        ctrl_ours, ha_ours = _run_with(self.DARKSTAR, tmp_path)
+        await ctrl_ours.run(ha_ours, 1000.0, self._dt(1000.0), shadow=False)
+        assert ("switch", "turn_on", "switch.dw", None) in ha_ours.calls
+
+        ctrl_theirs, ha_theirs = _run_with(self.ROBERT, tmp_path)
+        await ctrl_theirs.run(ha_theirs, 1000.0, self._dt(1000.0), shadow=False)
+        assert not [c for c in ha_theirs.calls if c[1] == "turn_on"]
+        assert ctrl_theirs._state["dishwasher"].held_by_us is False
+
+    @pytest.mark.asyncio
+    async def test_an_idle_plug_is_restored_to_its_resting_state(self, tmp_path):
+        """A plug left off is a start detector switched off — the next person loads
+        the machine, presses start, and nothing happens."""
+        from executor.deferrable import AppliancePowerState
+
+        ctrl = self._controller(self._cfg(return_minutes=60), tmp_path)
+        ctrl._own_user_id = self.DARKSTAR
+        ctrl._state["dishwasher"] = AppliancePowerState(
+            pending=False, held_by_us=False, manual_off_since=1000.0
+        )
+        ha = self._ha(cutter=self.ROBERT)
+        await ctrl.run(ha, 1000.0 + 3601.0, self._dt(1000.0 + 3601.0), shadow=False)
+        assert ("switch", "turn_on", "switch.dw", None) in ha.calls
+
+    @pytest.mark.asyncio
+    async def test_it_waits_out_the_timer_first(self, tmp_path):
+        from executor.deferrable import AppliancePowerState
+
+        ctrl = self._controller(self._cfg(return_minutes=60), tmp_path)
+        ctrl._own_user_id = self.DARKSTAR
+        ctrl._state["dishwasher"] = AppliancePowerState(
+            pending=False, held_by_us=False, manual_off_since=1000.0
+        )
+        ha = self._ha(cutter=self.ROBERT)
+        await ctrl.run(ha, 1000.0 + 60.0, self._dt(1000.0 + 60.0), shadow=False)
+        assert not [c for c in ha.calls if c[1] == "turn_on"]
+
+    @pytest.mark.asyncio
+    async def test_zero_never_restores(self, tmp_path):
+        from executor.deferrable import AppliancePowerState
+
+        ctrl = self._controller(self._cfg(return_minutes=0), tmp_path)
+        ctrl._own_user_id = self.DARKSTAR
+        ctrl._state["dishwasher"] = AppliancePowerState(
+            pending=False, held_by_us=False, manual_off_since=1000.0
+        )
+        ha = self._ha(cutter=self.ROBERT)
+        await ctrl.run(ha, 1000.0 + 999999.0, self._dt(1000.0 + 999999.0), shadow=False)
+        assert not [c for c in ha.calls if c[1] == "turn_on"]

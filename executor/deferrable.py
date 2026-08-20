@@ -151,30 +151,76 @@ class AppliancePowerState:
     manual_off_since: float | None = None
 
 
+# HA stamps every state with the context that produced it. A service call carries the
+# calling user's id; a device reporting its own state carries None. So an OFF plug whose
+# context names a user OTHER than Darkstar's own token was switched off by a person —
+# observed fact, not inference from our own memory.
+CUT_BY_US = "ours"
+CUT_BY_HUMAN = "human"
+CUT_BY_UNKNOWN = "unknown"
+
+
+def classify_plug_cut(
+    *,
+    context_user_id: str | None,
+    darkstar_user_id: str | None,
+    held_by_us: bool,
+) -> str:
+    """Who is responsible for this plug being off?
+
+    A named user that is not ours beats our own bookkeeping: if a person switched it
+    off, it does not matter what Darkstar believes it was holding. That ordering is the
+    point of reading the context at all — ``held_by_us`` is memory, and memory survives
+    neither a lost state file nor a command we only think landed.
+
+    ``None`` context means the device reported its own state rather than anyone
+    commanding it (a reboot, an integration refresh), so it decides nothing; we fall
+    back to what we remember, and to UNKNOWN when we remember nothing. UNKNOWN is
+    treated as a human cut by callers — never re-energize what you cannot prove you
+    switched off yourself.
+    """
+    if (
+        context_user_id is not None
+        and darkstar_user_id is not None
+        and context_user_id != darkstar_user_id
+    ):
+        return CUT_BY_HUMAN
+    if held_by_us:
+        return CUT_BY_US
+    if context_user_id is not None and darkstar_user_id is None:
+        # Someone commanded it and we cannot yet prove it was not us. Conservative.
+        return CUT_BY_UNKNOWN
+    return CUT_BY_UNKNOWN
+
+
 def should_reclaim_after_manual_cut(
     *,
-    pending: bool,
     switch_on: bool,
     held_by_us: bool,
     manual_off_since: float | None,
     now_ts: float,
     manual_cut_return_s: float,
 ) -> bool:
-    """Has a human-cut cycle waited long enough to come back under Darkstar's control?
+    """Has a human-cut plug waited long enough to come back under Darkstar's control?
 
-    Reclaims OWNERSHIP, not power: the caller sets held_by_us=True and the ordinary
-    defer/run window logic then decides when to energize. A reclaimed cycle therefore
-    waits for its cheap window instead of lurching on the moment the timer expires.
+    Reclaims OWNERSHIP, not power. What the caller does with it depends on the state:
+      * a cycle still ``pending`` — set held_by_us and let the ordinary defer/run window
+        logic decide, so the interrupted programme resumes at its cheap window rather
+        than lurching on the moment the timer expires;
+      * an IDLE appliance — restore the plug to ON, its resting state.
 
-    Deliberately narrow. All of these must hold:
-      * a cycle is still ``pending`` — a finished programme has nothing to resume, and
-        reclaiming an idle appliance would let Darkstar switch on a machine nobody
-        started;
-      * the plug is OFF and ``held_by_us`` is False — i.e. the cut was a human's;
-      * ``manual_cut_return_s`` > 0 — opt-in, because re-energizing something a person
-        deliberately switched off is a physical act, not a preference.
+    That second case was excluded in the first draft, on the reasoning that reclaiming
+    an idle appliance would let Darkstar switch on a machine nobody started. The owner
+    corrected the premise (2026-08-20): the resting state here IS plug-on, because start
+    detection watches for the appliance's own power draw. A plug left off is not a
+    machine kept safe, it is a detector switched off — the next person loads the
+    dishwasher, presses start, and nothing happens. Energizing an idle plug draws
+    nothing on its own; it only makes the appliance available again.
+
+    Still opt-in (``manual_cut_return_s`` > 0) and still deliberately slow, because
+    re-energizing something a person switched off is a physical act, not a preference.
     """
-    if manual_cut_return_s <= 0 or not pending or switch_on or held_by_us:
+    if manual_cut_return_s <= 0 or switch_on or held_by_us:
         return False
     if manual_off_since is None:
         return False
@@ -251,7 +297,7 @@ def update_appliance_power_state(
     # known here (the runtime owns held_by_us), so this is only the "off since" fact —
     # should_reclaim_after_manual_cut() applies the ownership test.
     manual_off_since = prev.manual_off_since
-    if switch_on or not pending:
+    if switch_on:
         manual_off_since = None
     elif manual_off_since is None:
         manual_off_since = now_ts
