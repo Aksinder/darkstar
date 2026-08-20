@@ -1,3 +1,7 @@
+## dev-20260820.0801 — 2026-08-20 08:03
+
+- phase_aware: repurpose from phantom billing cost to fuse relief
+
 ## dev-20260820.0532 — 2026-08-20 05:35
 
 - engine: rebuild the deferrable controller when its config changes on reload
