@@ -1,3 +1,7 @@
+## dev-20260820.1801 — 2026-08-20 18:03
+
+- actions: set_cyclic_load called call_service on the wrong object — live outage
+
 ## dev-20260820.1658 — 2026-08-20 17:00
 
 - cyclic loads: spacing defaults to zero — the tanks' 5 h default timed out the box
