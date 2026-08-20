@@ -1307,3 +1307,68 @@ class TestSetSink:
         ha.call_service.assert_any_call(
             "climate", "set_hvac_mode", "climate.villavagn", {"hvac_mode": "cool"}
         )
+
+
+class TestCyclicLoadDispatch:
+    """set_cyclic_load on the REAL dispatcher.
+
+    The original implementation said self.call_service — a method that lives on the
+    HA CLIENT, not the dispatcher — and every test passed anyway, because the engine
+    tests replaced set_cyclic_load with an AsyncMock and nothing ever ran the real
+    method. Live, the first tick where a pump needed a write (2026-08-20 18:39)
+    raised AttributeError, the engine's outer try logged it as 'Failed to execute
+    async actions', and everything downstream in the block — the EV servo included —
+    was dead for over an hour while a car charged at 14 A through the evening peak
+    on the home battery. These tests exist so a self.<missing-attr> in this method
+    can never again hide behind a mocked dispatcher.
+    """
+
+    @pytest.fixture
+    def base_config(self):
+        from executor.config import ExecutorConfig, NotificationConfig
+
+        return ExecutorConfig(notifications=NotificationConfig())
+
+    def _dispatcher(self, base_config, current="on"):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.get_state_value = AsyncMock(return_value=current)
+        ha_client.call_service = AsyncMock(return_value=True)
+        return ActionDispatcher(
+            ha_client=ha_client, config=base_config, shadow_mode=False
+        ), ha_client
+
+    @pytest.mark.asyncio
+    async def test_a_real_write_goes_through_the_ha_client(self, base_config):
+        """The exact live failure: switch on, plan wants off."""
+        dispatcher, ha = self._dispatcher(base_config, current="on")
+        result = await dispatcher.set_cyclic_load("switch.poolpump", False, name="Poolpump")
+        assert result.success is True
+        assert result.skipped is False
+        ha.call_service.assert_awaited_once_with("switch", "turn_off", "switch.poolpump")
+
+    @pytest.mark.asyncio
+    async def test_already_correct_state_writes_nothing(self, base_config):
+        dispatcher, ha = self._dispatcher(base_config, current="off")
+        result = await dispatcher.set_cyclic_load("switch.poolpump", False)
+        assert result.skipped is True
+        ha.call_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notify_unverified_also_runs_for_real(self, base_config):
+        """The other method added in the same change — same blind spot, same sweep."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+
+        ha_client = MagicMock()
+        ha_client.call_service = AsyncMock(return_value=True)
+        base_config.notifications.on_write_unverified = True
+        base_config.notifications.service = "notify.notify_robert_emilia"
+        dispatcher = ActionDispatcher(
+            ha_client=ha_client, config=base_config, shadow_mode=False
+        )
+        await dispatcher.notify_unverified("Spa", "3 misslyckade rättningar")

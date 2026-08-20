@@ -1877,7 +1877,15 @@ class ActionDispatcher:
             )
 
         domain = entity_id.split(".", 1)[0] if "." in entity_id else "switch"
-        ok = await self.call_service(domain, f"turn_{desired}", entity_id)
+        # self.HA.call_service — the dispatcher has no such method itself. The original
+        # line said self.call_service and passed every test, because the tests faked
+        # the DISPATCHER with an object that happened to have one. Live it raised
+        # AttributeError on the first tick where a pump needed a write (2026-08-20
+        # 18:39), and the engine's outer try swallowed it as "Failed to execute async
+        # actions" — killing everything downstream in the block, including the EV
+        # servo, which left a car charging at 14 A unmanaged through the evening peak
+        # while the home battery covered it. One attribute, one hour of blackout.
+        ok = await self.ha.call_service(domain, f"turn_{desired}", entity_id)
         verified, matched = await self._verify_action(entity_id, desired)
         return ActionResult(
             action_type="cyclic_load",
