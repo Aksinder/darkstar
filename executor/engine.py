@@ -1608,6 +1608,12 @@ class ExecutorEngine:
                 pause_cache: dict[str, bool] = {}
                 # REV UI11 Phase 7: Execute async actions
                 try:
+                    # Bound before the water chain: the cyclic-load loop below reads
+                    # it, and that loop runs whether or not any water branch was taken
+                    # (a site can have pumps and no tanks) — bound INSIDE the water
+                    # branch, where it used to live, the pumps-only case is a NameError.
+                    water_ctx: dict[str, Any] | None = None
+
                     # Control Water Heater Temperature (per-device)
                     if self._has_water_heater:
                         # Manual boost outranks the plan and is RE-ASSERTED every tick
@@ -1615,35 +1621,59 @@ class ExecutorEngine:
                         # activation that the very next tick's plan (temp_off) undid
                         # within 60 s — an "override" that never survived a minute.
                         boost_active = self._water_boost_active()
-                        # Bound before the water chain: the cyclic-load loop below reads it, and
-                        # that loop runs whether or not any water branch was taken (a site can
-                        # have pumps and no tanks).
-                        water_ctx: dict[str, Any] | None = None
 
                         if boost_active and self.config.water_heater_devices:
                             for device in self.config.water_heater_devices:
-                                # A control-paused device is hands-off: boost must NOT
-                                # force it ON either — leave it to the human.
-                                if await self._device_control_paused(
-                                    device.control_pause_entities,
-                                    f"water:{device.id}",
-                                    device.id,
-                                    pause_cache,
-                                ):
-                                    continue
-                                water_result = await self.dispatcher.set_water_temp(
-                                    self.config.water_heater.temp_boost,
-                                    device.target_entity,
-                                    bypass_dwell=True,
-                                )
+                                # Exception-isolated per device, like the sink rungs:
+                                # one tank's failure must not abort its siblings, the
+                                # cyclic loads, or the controllers further down the
+                                # block. The failed ActionResult stays loud via
+                                # recent_errors + the ws broadcast.
+                                try:
+                                    # A control-paused device is hands-off: boost must
+                                    # NOT force it ON either — leave it to the human.
+                                    if await self._device_control_paused(
+                                        device.control_pause_entities,
+                                        f"water:{device.id}",
+                                        device.id,
+                                        pause_cache,
+                                    ):
+                                        continue
+                                    water_result = await self.dispatcher.set_water_temp(
+                                        self.config.water_heater.temp_boost,
+                                        device.target_entity,
+                                        bypass_dwell=True,
+                                    )
+                                except Exception as water_exc:
+                                    water_result = self._isolated_failure(
+                                        f"water:{device.id}",
+                                        device.target_entity,
+                                        water_exc,
+                                        f"Water {device.id} boost",
+                                    )
                                 action_results.append(water_result)
                         elif boost_active and getattr(
                             self.config.water_heater, "target_entity", None
                         ):
-                            water_result = await self.dispatcher.set_water_temp(
-                                self.config.water_heater.temp_boost,
-                                bypass_dwell=True,
-                            )
+                            try:
+                                water_result = await self.dispatcher.set_water_temp(
+                                    self.config.water_heater.temp_boost,
+                                    bypass_dwell=True,
+                                )
+                            except Exception as water_exc:
+                                water_result = self._isolated_failure(
+                                    "water_temp",
+                                    cast(
+                                        "str | None",
+                                        getattr(
+                                            self.config.water_heater,
+                                            "target_entity",
+                                            None,
+                                        ),
+                                    ),
+                                    water_exc,
+                                    "Water boost (legacy)",
+                                )
                             action_results.append(water_result)
                         elif override.override_needed and self.config.water_heater_devices:
                             # An active override (safety slot-failure-fallback / force_stop)
@@ -1654,20 +1684,30 @@ class ExecutorEngine:
                             # decision through the per-device path so EVERY tank is actually
                             # actuated, bypassing the dwell for an immediate forced OFF.
                             for device in self.config.water_heater_devices:
-                                # A control-paused device is hands-off: even a safety
-                                # forced-OFF must not command it — leave it to the human.
-                                if await self._device_control_paused(
-                                    device.control_pause_entities,
-                                    f"water:{device.id}",
-                                    device.id,
-                                    pause_cache,
-                                ):
-                                    continue
-                                water_result = await self.dispatcher.set_water_temp(
-                                    decision.water_temp,
-                                    device.target_entity,
-                                    bypass_dwell=True,
-                                )
+                                # Exception-isolated per device (see the boost loop).
+                                try:
+                                    # A control-paused device is hands-off: even a
+                                    # safety forced-OFF must not command it — leave
+                                    # it to the human.
+                                    if await self._device_control_paused(
+                                        device.control_pause_entities,
+                                        f"water:{device.id}",
+                                        device.id,
+                                        pause_cache,
+                                    ):
+                                        continue
+                                    water_result = await self.dispatcher.set_water_temp(
+                                        decision.water_temp,
+                                        device.target_entity,
+                                        bypass_dwell=True,
+                                    )
+                                except Exception as water_exc:
+                                    water_result = self._isolated_failure(
+                                        f"water:{device.id}",
+                                        device.target_entity,
+                                        water_exc,
+                                        f"Water {device.id} forced-off",
+                                    )
                                 action_results.append(water_result)
                         elif decision.water_temps and self.config.water_heater_devices:
                             # New multi-device format: control each heater independently.
@@ -1690,155 +1730,204 @@ class ExecutorEngine:
                                 or getattr(d, "surplus_boost", False)
                                 for d in self.config.water_heater_devices
                             )
-                            water_ctx = (
-                                await self._water_energy_ctx(
-                                    state, slot.export_price_sek_kwh
+                            try:
+                                water_ctx = (
+                                    await self._water_energy_ctx(
+                                        state, slot.export_price_sek_kwh
+                                    )
+                                    if needs_ctx
+                                    else None
                                 )
-                                if needs_ctx
-                                else None
-                            )
+                            except Exception as ctx_exc:
+                                # Degrade, don't die: without the ctx the boost /
+                                # idle-hold / fuse extras stand down for one tick,
+                                # but the PLANNED temperatures below still actuate.
+                                water_ctx = None
+                                action_results.append(
+                                    self._isolated_failure(
+                                        "water:energy_ctx",
+                                        None,
+                                        ctx_exc,
+                                        "Water energy-context read",
+                                    )
+                                )
                             for device in self.config.water_heater_devices:
-                                # Rent-out hands-off: skip a control-paused device
-                                # entirely (do NOT command on OR off).
-                                if await self._device_control_paused(
-                                    device.control_pause_entities,
-                                    f"water:{device.id}",
-                                    device.id,
-                                    pause_cache,
-                                ):
-                                    continue
-                                temp = decision.water_temps.get(
-                                    device.id, self.config.water_heater.temp_off
-                                )
-                                off_temp = (
-                                    device.temp_off
-                                    if device.temp_off is not None
-                                    else self.config.water_heater.temp_off
-                                )
-                                if water_ctx is not None:
-                                    heater_w = await self._heater_power_w(device)
-                                    # Fuse relief outranks everything below: the plan,
-                                    # the boost and the idle-hold all assume the main
-                                    # can carry the load.
-                                    if getattr(device, "fuse_shed", False):
-                                        shed, why = should_shed_for_fuse(
-                                            phase_currents_a=water_ctx["phase_currents"],
-                                            budget_a=water_ctx["fuse_budget_a"],
-                                            heater_phases=getattr(
-                                                device, "phase_map", ()
-                                            ),
-                                            grid_w=water_ctx["grid_w"] or 0.0,
-                                        )
-                                        if shed:
-                                            logger.warning(
-                                                "Water FUSE SHED %s: %s — forcing off",
-                                                device.id, why,
+                                # Exception-isolated per device, like the sink rungs:
+                                # one tank's failure must not abort its siblings, the
+                                # cyclic loads, or the controllers further down the
+                                # block. The failed ActionResult stays loud via
+                                # recent_errors + the ws broadcast.
+                                try:
+                                    # Rent-out hands-off: skip a control-paused device
+                                    # entirely (do NOT command on OR off).
+                                    if await self._device_control_paused(
+                                        device.control_pause_entities,
+                                        f"water:{device.id}",
+                                        device.id,
+                                        pause_cache,
+                                    ):
+                                        continue
+                                    temp = decision.water_temps.get(
+                                        device.id, self.config.water_heater.temp_off
+                                    )
+                                    off_temp = (
+                                        device.temp_off
+                                        if device.temp_off is not None
+                                        else self.config.water_heater.temp_off
+                                    )
+                                    if water_ctx is not None:
+                                        heater_w = await self._heater_power_w(device)
+                                        # Fuse relief outranks everything below: the
+                                        # plan, the boost and the idle-hold all assume
+                                        # the main can carry the load.
+                                        if getattr(device, "fuse_shed", False):
+                                            shed, why = should_shed_for_fuse(
+                                                phase_currents_a=water_ctx[
+                                                    "phase_currents"
+                                                ],
+                                                budget_a=water_ctx["fuse_budget_a"],
+                                                heater_phases=getattr(
+                                                    device, "phase_map", ()
+                                                ),
+                                                grid_w=water_ctx["grid_w"] or 0.0,
                                             )
+                                            if shed:
+                                                logger.warning(
+                                                    "Water FUSE SHED %s: %s — forcing off",
+                                                    device.id, why,
+                                                )
+                                                action_results.append(
+                                                    await self.dispatcher.set_water_temp(
+                                                        int(off_temp),
+                                                        device.target_entity,
+                                                        bypass_dwell=True,
+                                                    )
+                                                )
+                                                continue
+
+                                        # Manual override. Below the fuse shed on
+                                        # purpose — a human asking for hot water must
+                                        # not be allowed to overload the main — but
+                                        # above everything that reasons about price,
+                                        # which is the whole point.
+                                        ovr = await self._heater_override(device)
+                                        if ovr == "force_off":
+                                            temp = int(off_temp)
+                                        elif ovr == "force_on":
+                                            temp = (
+                                                device.temp_normal
+                                                if device.temp_normal is not None
+                                                else self.config.water_heater.temp_normal
+                                            )
+                                        if ovr != "auto":
+                                            prev = self._override_state.get(device.id)
+                                            if prev != ovr:
+                                                self._override_state[device.id] = ovr
+                                                logger.info(
+                                                    "Water override %s: %s -> %s C",
+                                                    device.id, ovr, temp,
+                                                )
                                             action_results.append(
                                                 await self.dispatcher.set_water_temp(
-                                                    int(off_temp),
+                                                    int(temp),
                                                     device.target_entity,
                                                     bypass_dwell=True,
                                                 )
                                             )
                                             continue
+                                        self._override_state.pop(device.id, None)
 
-                                    # Manual override. Below the fuse shed on purpose —
-                                    # a human asking for hot water must not be allowed
-                                    # to overload the main — but above everything that
-                                    # reasons about price, which is the whole point.
-                                    ovr = await self._heater_override(device)
-                                    if ovr == "force_off":
-                                        temp = int(off_temp)
-                                    elif ovr == "force_on":
-                                        temp = (
-                                            device.temp_normal
-                                            if device.temp_normal is not None
-                                            else self.config.water_heater.temp_normal
+                                        # Free-and-cheap: push to the boost target.
+                                        # This OVERRIDES the plan, which cannot see
+                                        # real-time surplus (the planner's own boost
+                                        # path needs excess_pv_sink, deliberately off
+                                        # since the phantom-water incident).
+                                        boosted = self._water_surplus_boost(
+                                            device, heater_w, water_ctx,
+                                            heated_today_map.get(device.id),
                                         )
-                                    if ovr != "auto":
-                                        prev = self._override_state.get(device.id)
-                                        if prev != ovr:
-                                            self._override_state[device.id] = ovr
-                                            logger.info(
-                                                "Water override %s: %s -> %s C",
-                                                device.id, ovr, temp,
+                                        if boosted is not None:
+                                            temp = boosted
+                                        # Self-thermostatted heaters (spa): leave an
+                                        # idle or surplus-fed appliance alone instead
+                                        # of throwing away its standing warmth with an
+                                        # off-write.
+                                        elif self._water_idle_hold(
+                                            device, temp, off_temp, heater_w, water_ctx
+                                        ):
+                                            continue
+                                        # Reality check: the write below is gated
+                                        # against OUR helper, so a device someone else
+                                        # moved would never be corrected. Compare the
+                                        # appliance itself and re-assert through a
+                                        # nudge when they disagree.
+                                        drifted, why = await self._water_appliance_drift(
+                                            device, temp, off_temp, heater_w
+                                        )
+                                        if drifted:
+                                            logger.warning(
+                                                "Water %s drift: %s — re-asserting %s C",
+                                                device.id, why, temp,
                                             )
-                                        action_results.append(
-                                            await self.dispatcher.set_water_temp(
-                                                int(temp),
-                                                device.target_entity,
-                                                bypass_dwell=True,
+                                            action_results.append(
+                                                await self.dispatcher.set_water_temp(
+                                                    self._drift_nudge_value(
+                                                        device, int(temp), int(off_temp)
+                                                    ),
+                                                    device.target_entity,
+                                                )
                                             )
+                                        # Escalate only when the CORRECTION keeps
+                                        # losing. A correction loop that silently
+                                        # fails is worse than none: the log looks busy
+                                        # while the appliance does as it pleases.
+                                        await self._note_write_verified(
+                                            device, ok=not drifted, detail=why
                                         )
-                                        continue
-                                    self._override_state.pop(device.id, None)
-
-                                    # Free-and-cheap: push to the boost target. This
-                                    # OVERRIDES the plan, which cannot see real-time
-                                    # surplus (the planner's own boost path needs
-                                    # excess_pv_sink, deliberately off since the
-                                    # phantom-water incident).
-                                    boosted = self._water_surplus_boost(
-                                        device, heater_w, water_ctx,
-                                        heated_today_map.get(device.id),
+                                    commit_minutes = self._planned_water_block_minutes(
+                                        device.id, now
                                     )
-                                    if boosted is not None:
-                                        temp = boosted
-                                    # Self-thermostatted heaters (spa): leave an idle or
-                                    # surplus-fed appliance alone instead of throwing
-                                    # away its standing warmth with an off-write.
-                                    elif self._water_idle_hold(
-                                        device, temp, off_temp, heater_w, water_ctx
-                                    ):
-                                        continue
-                                    # Reality check: the write below is gated against
-                                    # OUR helper, so a device someone else moved would
-                                    # never be corrected. Compare the appliance itself
-                                    # and re-assert through a nudge when they disagree.
-                                    drifted, why = await self._water_appliance_drift(
-                                        device, temp, off_temp, heater_w
+                                    water_result = await self.dispatcher.set_water_temp(
+                                        temp,
+                                        device.target_entity,
+                                        commit_minutes=commit_minutes,
+                                        heated_today_kwh=heated_today_map.get(device.id),
+                                        min_kwh_per_day=min_kwh_map.get(device.id),
                                     )
-                                    if drifted:
-                                        logger.warning(
-                                            "Water %s drift: %s — re-asserting %s C",
-                                            device.id, why, temp,
+                                    action_results.append(water_result)
+                                except Exception as water_exc:
+                                    action_results.append(
+                                        self._isolated_failure(
+                                            f"water:{device.id}",
+                                            device.target_entity,
+                                            water_exc,
+                                            f"Water {device.id} actuation",
                                         )
-                                        action_results.append(
-                                            await self.dispatcher.set_water_temp(
-                                                self._drift_nudge_value(
-                                                    device, int(temp), int(off_temp)
-                                                ),
-                                                device.target_entity,
-                                            )
-                                        )
-                                    # Escalate only when the CORRECTION keeps losing.
-                                    # A correction loop that silently fails is worse
-                                    # than none: the log looks busy while the
-                                    # appliance does as it pleases.
-                                    await self._note_write_verified(
-                                        device, ok=not drifted, detail=why
                                     )
-                                commit_minutes = self._planned_water_block_minutes(
-                                    device.id, now
-                                )
-                                water_result = await self.dispatcher.set_water_temp(
-                                    temp,
-                                    device.target_entity,
-                                    commit_minutes=commit_minutes,
-                                    heated_today_kwh=heated_today_map.get(device.id),
-                                    min_kwh_per_day=min_kwh_map.get(device.id),
-                                )
-                                action_results.append(water_result)
                         elif getattr(self.config.water_heater, "target_entity", None):
                             # Legacy fallback: old-format schedule or single heater.
                             # An active override (safety slot-failure-fallback OFF or
                             # force_stop) must bypass the dwell so a forced OFF is
                             # honored immediately; normal plan calls respect the dwell.
-                            water_result = await self.dispatcher.set_water_temp(
-                                decision.water_temp,
-                                bypass_dwell=override.override_needed,
-                            )
+                            try:
+                                water_result = await self.dispatcher.set_water_temp(
+                                    decision.water_temp,
+                                    bypass_dwell=override.override_needed,
+                                )
+                            except Exception as water_exc:
+                                water_result = self._isolated_failure(
+                                    "water_temp",
+                                    cast(
+                                        "str | None",
+                                        getattr(
+                                            self.config.water_heater,
+                                            "target_entity",
+                                            None,
+                                        ),
+                                    ),
+                                    water_exc,
+                                    "Water actuation (legacy)",
+                                )
                             action_results.append(water_result)
 
                     # Cyclic loads ride the same plan as the water heaters and are
@@ -1857,12 +1946,38 @@ class ExecutorEngine:
                             )
                             for c in self.config.cyclic_loads
                         ):
-                            water_ctx = await self._water_energy_ctx(
-                                state, slot.export_price_sek_kwh
+                            try:
+                                water_ctx = await self._water_energy_ctx(
+                                    state, slot.export_price_sek_kwh
+                                )
+                            except Exception as ctx_exc:
+                                # Degrade, don't die: with no ctx the fuse and
+                                # opportunistic gates stand down for one tick, but
+                                # the PLANNED on/off below still actuates.
+                                action_results.append(
+                                    self._isolated_failure(
+                                        "cyclic:energy_ctx",
+                                        None,
+                                        ctx_exc,
+                                        "Cyclic energy-context read",
+                                    )
+                                )
+                        # Belt to the per-load braces inside: nothing raised here may
+                        # reach the outer catch, where it would take the sinks and the
+                        # EV servo down with it (the 2026-08-20 outage's blast path).
+                        try:
+                            await self._actuate_cyclic_loads(
+                                slot, water_ctx, pause_cache, action_results
                             )
-                        await self._actuate_cyclic_loads(
-                            slot, water_ctx, pause_cache, action_results
-                        )
+                        except Exception as cyc_exc:
+                            action_results.append(
+                                self._isolated_failure(
+                                    "cyclic_loads",
+                                    None,
+                                    cyc_exc,
+                                    "Cyclic load actuation",
+                                )
+                            )
 
                     # Control the excess-PV sink ladder (7.2-7.4). The loader
                     # synthesizes .sinks from the legacy custom_entity block, so
@@ -2624,6 +2739,26 @@ class ExecutorEngine:
             return float(raw)
         return None
 
+    def _isolated_failure(
+        self, action_type: str, entity_id: str | None, exc: Exception, what: str
+    ) -> ActionResult:
+        """One load's exception as a loud failed ActionResult instead of a dead tick.
+
+        The isolation contract the sink rungs established: the failure reaches
+        recent_errors and the ws broadcast through the normal failed-result path,
+        while every load and controller after it still runs. The 2026-08-20 outage
+        was one AttributeError riding the outer async-actions catch — fate-sharing,
+        not the bug itself, is what silenced the EV servo for 69 minutes.
+        """
+        logger.error("%s error (isolated): %s", what, exc)
+        return ActionResult(
+            action_type=action_type,
+            success=False,
+            message=f"{what} failed: {exc!s}",
+            entity_id=entity_id,
+            error_details=str(exc),
+        )
+
     async def _actuate_cyclic_loads(
         self,
         slot: Any,
@@ -2640,95 +2775,111 @@ class ExecutorEngine:
         who outranks whom.
         """
         for load in self.config.cyclic_loads:
-            # Every early exit below stops the opportunistic clock. Without this a
-            # fuse shed or a control pause would keep billing the day's extra budget
-            # for time the pump demonstrably did not run.
-            if not load.enabled:
-                self._cyclic_extra_ts.pop(load.id, None)
-                continue
-            # Rent-out hands-off: never command a paused device on OR off.
-            if await self._device_control_paused(
-                load.control_pause_entities, f"cyclic:{load.id}", load.id, pause_cache
-            ):
-                self._cyclic_extra_ts.pop(load.id, None)
-                continue
-
-            planned_kw = float(
-                (slot.water_heater_plans or {}).get(load.id, 0.0) or 0.0
-            )
-            want_on = planned_kw > 0.0
-
-            # Fuse relief outranks the plan and the human alike.
-            if load.fuse_shed and water_ctx is not None:
-                shed, why = should_shed_for_fuse(
-                    phase_currents_a=water_ctx["phase_currents"],
-                    budget_a=water_ctx["fuse_budget_a"],
-                    heater_phases=load.phase_map,
-                    grid_w=water_ctx["grid_w"] or 0.0,
-                )
-                if shed:
-                    logger.warning(
-                        "Cyclic FUSE SHED %s: %s — forcing off", load.id, why
-                    )
+            # Exception-isolated per load, like the sink rungs: one pump's failure
+            # is loud (failed ActionResult -> recent_errors + ws broadcast) but must
+            # never stop the loads after it — or, via the outer async-actions catch,
+            # the sinks and the EV servo. Fate-sharing here is what turned one
+            # AttributeError into the 69-minute unmanaged-EV outage of 2026-08-20.
+            try:
+                # Every early exit below stops the opportunistic clock. Without this a
+                # fuse shed or a control pause would keep billing the day's extra
+                # budget for time the pump demonstrably did not run.
+                if not load.enabled:
                     self._cyclic_extra_ts.pop(load.id, None)
-                    action_results.append(
-                        await self.dispatcher.set_cyclic_load(
-                            load.switch_entity, False, name=load.name
-                        )
-                    )
+                    continue
+                # Rent-out hands-off: never command a paused device on OR off.
+                if await self._device_control_paused(
+                    load.control_pause_entities, f"cyclic:{load.id}", load.id, pause_cache
+                ):
+                    self._cyclic_extra_ts.pop(load.id, None)
                     continue
 
-            ovr = await self._heater_override(load)
-            if ovr == "force_on":
-                want_on = True
-            elif ovr == "force_off":
-                want_on = False
-            if ovr != "auto":
-                prev = self._override_state.get(load.id)
-                if prev != ovr:
-                    self._override_state[load.id] = ovr
-                    logger.info("Cyclic override %s: %s", load.id, ovr)
-            else:
-                self._override_state.pop(load.id, None)
-
-            # Opportunistic extras go LAST: below the pause, the fuse guard and the
-            # human, and only ever adding runtime the plan did not already ask for.
-            # Skipped entirely under force_off — a human saying no outranks sunshine.
-            extra_running = False
-            if not want_on and ovr != "force_off" and water_ctx is not None:
-                run, why = should_run_opportunistically(
-                    plan_wants_on=False,
-                    power_w=await self._heater_power_w(load),
-                    grid_w=water_ctx["grid_w"],
-                    battery_w=water_ctx["battery_w"],
-                    load_power_w=load.power_kw * 1000.0,
-                    import_price_sek_kwh=water_ctx["import_price"],
-                    export_price_sek_kwh=water_ctx["export_price"],
-                    import_price_window=water_ctx["price_window"],
-                    export_price_window=water_ctx["export_price_window"],
-                    surplus_run=load.surplus_run,
-                    max_price_percentile=load.max_price_percentile,
-                    presence_home=await self._anyone_home(load.presence_entities),
-                    presence_max_price_percentile=load.presence_max_price_percentile,
-                    extra_hours_today=self._cyclic_extra_hours(load.id),
-                    max_extra_hours_per_day=load.max_extra_hours_per_day,
+                planned_kw = float(
+                    (slot.water_heater_plans or {}).get(load.id, 0.0) or 0.0
                 )
-                if run:
+                want_on = planned_kw > 0.0
+
+                # Fuse relief outranks the plan and the human alike.
+                if load.fuse_shed and water_ctx is not None:
+                    shed, why = should_shed_for_fuse(
+                        phase_currents_a=water_ctx["phase_currents"],
+                        budget_a=water_ctx["fuse_budget_a"],
+                        heater_phases=load.phase_map,
+                        grid_w=water_ctx["grid_w"] or 0.0,
+                    )
+                    if shed:
+                        logger.warning(
+                            "Cyclic FUSE SHED %s: %s — forcing off", load.id, why
+                        )
+                        self._cyclic_extra_ts.pop(load.id, None)
+                        action_results.append(
+                            await self.dispatcher.set_cyclic_load(
+                                load.switch_entity, False, name=load.name
+                            )
+                        )
+                        continue
+
+                ovr = await self._heater_override(load)
+                if ovr == "force_on":
                     want_on = True
-                    extra_running = True
-                    if self._cyclic_extra_reason.get(load.id) != why:
-                        self._cyclic_extra_reason[load.id] = why
-                        logger.info("Cyclic %s extra run: %s", load.id, why)
-                elif self._cyclic_extra_reason.pop(load.id, None) is not None:
-                    logger.info("Cyclic %s extra run ended: %s", load.id, why)
+                elif ovr == "force_off":
+                    want_on = False
+                if ovr != "auto":
+                    prev = self._override_state.get(load.id)
+                    if prev != ovr:
+                        self._override_state[load.id] = ovr
+                        logger.info("Cyclic override %s: %s", load.id, ovr)
+                else:
+                    self._override_state.pop(load.id, None)
 
-            self._note_cyclic_extra(load.id, time.time(), running=extra_running)
+                # Opportunistic extras go LAST: below the pause, the fuse guard and
+                # the human, and only ever adding runtime the plan did not already ask
+                # for. Skipped entirely under force_off — a human saying no outranks
+                # sunshine.
+                extra_running = False
+                if not want_on and ovr != "force_off" and water_ctx is not None:
+                    run, why = should_run_opportunistically(
+                        plan_wants_on=False,
+                        power_w=await self._heater_power_w(load),
+                        grid_w=water_ctx["grid_w"],
+                        battery_w=water_ctx["battery_w"],
+                        load_power_w=load.power_kw * 1000.0,
+                        import_price_sek_kwh=water_ctx["import_price"],
+                        export_price_sek_kwh=water_ctx["export_price"],
+                        import_price_window=water_ctx["price_window"],
+                        export_price_window=water_ctx["export_price_window"],
+                        surplus_run=load.surplus_run,
+                        max_price_percentile=load.max_price_percentile,
+                        presence_home=await self._anyone_home(load.presence_entities),
+                        presence_max_price_percentile=load.presence_max_price_percentile,
+                        extra_hours_today=self._cyclic_extra_hours(load.id),
+                        max_extra_hours_per_day=load.max_extra_hours_per_day,
+                    )
+                    if run:
+                        want_on = True
+                        extra_running = True
+                        if self._cyclic_extra_reason.get(load.id) != why:
+                            self._cyclic_extra_reason[load.id] = why
+                            logger.info("Cyclic %s extra run: %s", load.id, why)
+                    elif self._cyclic_extra_reason.pop(load.id, None) is not None:
+                        logger.info("Cyclic %s extra run ended: %s", load.id, why)
 
-            action_results.append(
-                await self.dispatcher.set_cyclic_load(
-                    load.switch_entity, want_on, name=load.name
+                self._note_cyclic_extra(load.id, time.time(), running=extra_running)
+
+                action_results.append(
+                    await self.dispatcher.set_cyclic_load(
+                        load.switch_entity, want_on, name=load.name
+                    )
                 )
-            )
+            except Exception as load_exc:
+                action_results.append(
+                    self._isolated_failure(
+                        f"cyclic:{load.id}",
+                        load.switch_entity,
+                        load_exc,
+                        f"Cyclic load {load.id} actuation",
+                    )
+                )
 
     async def _observe_load_balancer(self, slot: Any) -> None:
         """Run one balancer tick and log what it WOULD have done.
