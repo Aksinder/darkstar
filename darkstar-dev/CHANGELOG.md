@@ -1,3 +1,7 @@
+## dev-20260820.1827 — 2026-08-20 18:28
+
+- engine: per-load isolation for the water chain and cyclic loop — no more shared fate
+
 ## dev-20260820.1801 — 2026-08-20 18:03
 
 - actions: set_cyclic_load called call_service on the wrong object — live outage
