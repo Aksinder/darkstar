@@ -442,6 +442,16 @@ deferrable_loads: []
   #                                 #   switch, so a person switching off a plug Darkstar
   #                                 #   was already holding releases it to them — the state
   #                                 #   never changes there, only the context does.
+  #   manual_cut_ask: false         # when the timer expires, ASK instead of acting: an
+  #                                 #   actionable notification ("Slå på igen" / "Låt vara
+  #                                 #   av") goes to deferrable_appliances.notify_service.
+  #                                 #   Ignoring it keeps the plug off, and the question
+  #                                 #   re-arms one interval later. The "Slå på igen" tap is
+  #                                 #   handled by an HA automation on the
+  #                                 #   mobile_app_notification_action event
+  #                                 #   (DARKSTAR_PLUG_ON_<ID>) — Darkstar sees the plug come
+  #                                 #   on and needs no side channel. Falls back to restoring
+  #                                 #   directly when no notify_service is configured.
   #   override_entity: input_boolean.washing_machine_override  # optional: force run now (skip deferral)
   #   # --- Scheduling deadline ---
   #   deadline_mode: cheapest_within_hours   # or: hard_deadline

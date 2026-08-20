@@ -132,6 +132,13 @@ class AppliancePowerConfig:
     # the ordinary window logic still decides when to actually re-energize, so a
     # reclaimed cycle waits for its cheap window rather than starting on the spot.
     manual_cut_return_s: float = 0.0
+    # When the hand-back timer expires, ASK rather than act: send an actionable
+    # notification offering "turn it back on" / "leave it off". Silently energizing
+    # something a person switched off is the one part of this feature that touches the
+    # physical world without being asked, so the default is to put the choice back to
+    # them. Ignoring the notification simply keeps the plug off — the safe outcome
+    # needs no tap — and Darkstar asks again one interval later.
+    manual_cut_ask: bool = False
 
 
 @dataclass
@@ -149,6 +156,9 @@ class AppliancePowerState:
     # When a HUMAN cut the plug mid-cycle (off, pending, not held_by_us). Feeds the
     # hand-back timer; None whenever the plug is on or the cut is ours.
     manual_off_since: float | None = None
+    # When we last asked the owner whether to restore this plug. Stops the question
+    # repeating every tick, and re-arms the ask one interval later.
+    restore_asked_at: float | None = None
 
 
 # HA stamps every state with the context that produced it. A service call carries the
@@ -191,6 +201,37 @@ def classify_plug_cut(
         # Someone commanded it and we cannot yet prove it was not us. Conservative.
         return CUT_BY_UNKNOWN
     return CUT_BY_UNKNOWN
+
+
+def restore_decision(
+    *,
+    reclaim_due: bool,
+    ask: bool,
+    can_notify: bool,
+    restore_asked_at: float | None,
+    now_ts: float,
+    manual_cut_return_s: float,
+) -> str:
+    """What to do when the hand-back timer expires: "restore" | "ask" | "wait".
+
+    Asking is the honest default where a notification can actually reach someone:
+    restoring is the only part of this feature that energizes something a person
+    deliberately switched off, so the choice goes back to them rather than being
+    taken on their behalf.
+
+    An unanswered question is not a failure — silence keeps the plug off, which is the
+    conservative outcome, and the ask re-arms one interval later so a notification
+    missed at 3am is not the end of it. With no notify service configured there is
+    nobody to ask, so we fall back to restoring: a promise of "hand it back after N
+    minutes" that silently never fires would be worse than acting.
+    """
+    if not reclaim_due:
+        return "wait"
+    if not (ask and can_notify):
+        return "restore"
+    if restore_asked_at is None:
+        return "ask"
+    return "ask" if (now_ts - restore_asked_at) >= manual_cut_return_s else "wait"
 
 
 def should_reclaim_after_manual_cut(
