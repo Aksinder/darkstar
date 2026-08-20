@@ -37,6 +37,7 @@ from .deferrable import (
     WindowSlot,
     classify_plug_cut,
     recommend_appliance_action,
+    restore_decision,
     should_reclaim_after_manual_cut,
     update_appliance_power_state,
 )
@@ -147,6 +148,7 @@ def parse_deferrable_runtime_config(
                     power_scale=float(c.get("power_scale", 1.0)),
                     manual_cut_return_s=float(c.get("manual_cut_return_minutes", 0.0) or 0.0)
                     * 60.0,
+                    manual_cut_ask=bool(c.get("manual_cut_ask", False)),
                 ),
                 seed_duration_min=float(c.get("duration_min", 120.0)),
                 deadline_mode=str(c.get("deadline_mode", "cheapest_within_hours")),
@@ -433,6 +435,9 @@ class DeferrableApplianceController:
                     new_state.manual_off_since = now_ts
                 elif actor == CUT_BY_US:
                     new_state.manual_off_since = None
+            if switch_on:
+                # Answered — by a tap, by the app, by anyone. Nothing left to ask.
+                new_state.restore_asked_at = None
             self._state[app.id] = new_state
 
             # Cycle-chain tracking for the ledger. A genuine "armed" event starts a
@@ -497,9 +502,22 @@ class DeferrableApplianceController:
                 now_ts=now_ts,
                 manual_cut_return_s=app.power.manual_cut_return_s,
             )
-            if reclaimed:
+            decision = restore_decision(
+                reclaim_due=reclaimed,
+                ask=app.power.manual_cut_ask,
+                can_notify=bool(cfg.notify_service) and not shadow,
+                restore_asked_at=new_state.restore_asked_at,
+                now_ts=now_ts,
+                manual_cut_return_s=app.power.manual_cut_return_s,
+            )
+            if decision == "ask":
+                new_state.restore_asked_at = now_ts
+                await self._ask_about_restore(ha, app, new_state.pending)
+                reclaimed = False  # the plug stays off until a human says otherwise
+            elif decision == "restore":
                 new_state.held_by_us = True
                 new_state.manual_off_since = None
+                new_state.restore_asked_at = None
                 logger.info(
                     "Deferrable: %s reclaimed after manual cut (%.0f min) — %s",
                     app.id,
@@ -508,6 +526,8 @@ class DeferrableApplianceController:
                     if new_state.pending
                     else "restoring the plug to its resting ON state",
                 )
+            else:
+                reclaimed = False
 
             plug_cmd: str | None = None
             if (
@@ -601,6 +621,44 @@ class DeferrableApplianceController:
         if override:
             return "armed"
         return "waiting" if action == "defer" else "armed"
+
+    async def _ask_about_restore(
+        self, ha: Any, app: DeferrableApplianceCfg, pending: bool
+    ) -> None:
+        """Put the choice back to the owner as an actionable notification.
+
+        Two buttons, and the safe one needs no tap: ignoring this leaves the plug off.
+        "Turn it on" is handled by an HA automation listening for
+        mobile_app_notification_action — Darkstar deliberately does not act on the tap
+        itself, because the plug going ON is the signal it already reads every tick.
+
+        The tag makes a later ask REPLACE the earlier one rather than stacking a new
+        card every interval.
+        """
+        what = (
+            "En påbörjad körning avbröts"
+            if pending
+            else "Kontakten har varit avstängd"
+        )
+        await ha.send_notification(
+            self.cfg.notify_service,
+            app.name,
+            f"{what} i {app.power.manual_cut_return_s / 3600.0:.0f} h. "
+            "Ska den fortsätta vara av, eller slår vi på igen?",
+            {
+                "tag": f"darkstar_plug_{_slug(app.id)}",
+                "actions": [
+                    {
+                        "action": f"DARKSTAR_PLUG_ON_{_slug(app.id).upper()}",
+                        "title": "Slå på igen",
+                    },
+                    {
+                        "action": f"DARKSTAR_PLUG_KEEP_OFF_{_slug(app.id).upper()}",
+                        "title": "Låt vara av",
+                    },
+                ],
+            },
+        )
 
     async def _darkstar_user_id(self, ha: Any) -> str | None:
         """Darkstar's own HA user id, discovered once and cached for the process.

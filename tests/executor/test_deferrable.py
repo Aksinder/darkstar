@@ -167,3 +167,48 @@ class TestWhoTouchedThePlug:
         from executor.deferrable import CUT_BY_UNKNOWN
 
         assert self._who(darkstar_user_id=None, held_by_us=False) == CUT_BY_UNKNOWN
+
+
+class TestRestoreDecision:
+    """Owner, 2026-08-20: 240 min hand-back, "men skicka en actionable notifiering
+    där jag får frågan om den fortsatt skall vara av eller om vi ska slå på igen".
+
+    Asking is the honest default: restoring is the one part of the feature that
+    energizes something a person deliberately switched off, so the choice goes back
+    to them. Silence keeps the plug off — the safe outcome needs no tap.
+    """
+
+    def _decide(self, **kw):
+        from executor.deferrable import restore_decision
+
+        base = {
+            "reclaim_due": True,
+            "ask": True,
+            "can_notify": True,
+            "restore_asked_at": None,
+            "now_ts": 100_000.0,
+            "manual_cut_return_s": 14_400.0,
+        }
+        base.update(kw)
+        return restore_decision(**base)
+
+    def test_asks_instead_of_acting(self):
+        assert self._decide() == "ask"
+
+    def test_does_not_repeat_the_question_every_tick(self):
+        assert self._decide(restore_asked_at=100_000.0 - 60.0) == "wait"
+
+    def test_asks_again_one_interval_later(self):
+        """A notification missed at 3am is not the end of it."""
+        assert self._decide(restore_asked_at=100_000.0 - 14_400.0) == "ask"
+
+    def test_no_notify_service_falls_back_to_restoring(self):
+        """A promise of "hand it back after N minutes" that silently never fires
+        would be worse than acting."""
+        assert self._decide(can_notify=False) == "restore"
+
+    def test_ask_disabled_restores_directly(self):
+        assert self._decide(ask=False) == "restore"
+
+    def test_nothing_due_nothing_happens(self):
+        assert self._decide(reclaim_due=False) == "wait"
