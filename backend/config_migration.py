@@ -126,6 +126,15 @@ DEPRECATED_NESTED_KEYS = {
         "low_soc_export_floor",  # Moved to export.export_floor_soc_percent
         "excess_pv_threshold_kw",  # Removed: excess PV now handled by planner
     ],
+    "phase_aware": [
+        # Died with the billing model it scaled (2026-08-20). phase_aware used to price
+        # per-phase import at the import price, and "weight" scaled that cost. Swedish
+        # settlement meters net all three phases momentarily (STAFS 2022:9), so the cost
+        # was never real — the term is now fuse relief in amps, tuned by relief_start_a
+        # and relief_sek_per_a_h. Left in place, "weight" reads like a live knob to the
+        # next person who opens the config, which is the actual harm: nothing consumes it.
+        "weight",
+    ],
 }
 
 

@@ -73,6 +73,59 @@ class TestDeprecatedKeyRemoval:
         assert "soc_target_entity" not in result["executor"]["inverter"]
 
 
+class TestPhaseAwareWeightRemoval:
+    """phase_aware.weight died with the billing model it scaled (2026-08-20).
+
+    The term used to price per-phase import at the import price; "weight" scaled that
+    cost. Swedish meters net all three phases momentarily (STAFS 2022:9), so the cost
+    was never real, and the term is now fuse relief tuned in amps. Nothing reads
+    "weight" any more — but left in the config it reads like a live knob, which is the
+    actual harm. There is no API path that deletes a key (config/save only merges), so
+    the deprecation sweep is what cleans existing installs.
+    """
+
+    def test_weight_is_swept(self):
+        from backend.config_migration import remove_deprecated_keys
+
+        config = {
+            "phase_aware": {
+                "enabled": False,
+                "relief_start_a": 20,
+                "relief_sek_per_a_h": 2.0,
+                "weight": 1.0,
+            }
+        }
+        result, changed = remove_deprecated_keys(config)
+        assert changed is True
+        assert "weight" not in result["phase_aware"]
+
+    def test_the_live_knobs_survive(self):
+        from backend.config_migration import remove_deprecated_keys
+
+        config = {
+            "phase_aware": {
+                "enabled": True,
+                "relief_start_a": 18,
+                "relief_sek_per_a_h": 3.0,
+                "weight": 1.0,
+            }
+        }
+        result, _ = remove_deprecated_keys(config)
+        assert result["phase_aware"] == {
+            "enabled": True,
+            "relief_start_a": 18,
+            "relief_sek_per_a_h": 3.0,
+        }
+
+    def test_a_config_without_it_is_untouched(self):
+        from backend.config_migration import remove_deprecated_keys
+
+        config = {"phase_aware": {"enabled": False, "relief_start_a": 20}}
+        result, changed = remove_deprecated_keys(config)
+        assert changed is False
+        assert result["phase_aware"] == {"enabled": False, "relief_start_a": 20}
+
+
 class TestInverterKeyMigration:
     """Test migration of system.inverter.max_power_kw to max_ac_power_kw."""
 
