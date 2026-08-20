@@ -564,3 +564,65 @@ class TestCycleLedger:
         rows = self._rows(ledger)
         assert len(rows) == 1
         assert rows[0]["armed_ts"] == pytest.approx(t + 3.0)
+
+
+class TestScheduleTwoParsersOneFile:
+    """ExecutorConfig and DeferrableRuntimeConfig both parse executor.schedule_path,
+    each with its own fallback literal. They disagreed ("schedule.json" vs
+    "data/schedule.json") from the day the runtime was written until 2026-08-20:
+    with the key absent from the live config, the deferrable gate read a path
+    that does not exist, got [], and failed open to "run" every tick — it armed
+    the dishwasher on a peak morning and "recommended" running it. A silent
+    permanent fail-open reads as a decision; this pins the defaults together."""
+
+    def test_the_defaults_agree(self):
+        from executor.config import ExecutorConfig
+        from executor.deferrable_runtime import DeferrableRuntimeConfig
+
+        assert DeferrableRuntimeConfig.schedule_path == ExecutorConfig.schedule_path
+
+    def test_an_absent_key_parses_to_the_same_path_in_both(self):
+        from executor.config import ExecutorConfig
+        from executor.deferrable_runtime import parse_deferrable_runtime_config
+
+        cfg = parse_deferrable_runtime_config(
+            {"executor": {"deferrable_appliances": {"enabled": True}}}
+        )
+        assert cfg is not None
+        assert cfg.schedule_path == ExecutorConfig.schedule_path
+
+    def test_a_missing_schedule_file_is_loud_but_only_once(self, tmp_path, caplog):
+        import logging
+
+        from executor.deferrable_runtime import (
+            _missing_schedule_warned,
+            load_forward_slots,
+        )
+
+        missing = str(tmp_path / "nope" / "schedule.json")
+        _missing_schedule_warned.discard(missing)
+        with caplog.at_level(logging.WARNING, logger="darkstar.deferrable"):
+            assert load_forward_slots(missing, 1000.0, "Europe/Stockholm") == []
+            assert load_forward_slots(missing, 2000.0, "Europe/Stockholm") == []
+        hits = [r for r in caplog.records if "fail open" in r.message]
+        assert len(hits) == 1, "once per path, not per tick"
+
+    def test_the_warning_rearms_when_the_file_appears(self, tmp_path, caplog):
+        import json as _json
+        import logging
+
+        from executor.deferrable_runtime import (
+            _missing_schedule_warned,
+            load_forward_slots,
+        )
+
+        path = tmp_path / "schedule.json"
+        missing = str(path)
+        _missing_schedule_warned.discard(missing)
+        load_forward_slots(missing, 1000.0, "Europe/Stockholm")
+        path.write_text(_json.dumps({"schedule": []}))
+        load_forward_slots(missing, 2000.0, "Europe/Stockholm")  # file exists: clears
+        path.unlink()
+        with caplog.at_level(logging.WARNING, logger="darkstar.deferrable"):
+            load_forward_slots(missing, 3000.0, "Europe/Stockholm")
+        assert any("fail open" in r.message for r in caplog.records)
