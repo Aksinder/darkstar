@@ -263,6 +263,7 @@ class ExecutorEngine:
         self._cyclic_extra: dict[str, tuple[str, float]] = {}
         self._cyclic_extra_ts: dict[str, float] = {}
         self._cyclic_extra_reason: dict[str, str] = {}
+        self._cyclic_no_plan_logged: dict[str, bool] = {}
         # Per-phase fuse balancer (ported from upstream). OBSERVE-ONLY for now:
         # it computes and logs a decision every tick but actuates nothing, so its
         # verdicts can be compared against the live guard before it is trusted
@@ -2794,9 +2795,24 @@ class ExecutorEngine:
                     self._cyclic_extra_ts.pop(load.id, None)
                     continue
 
-                planned_kw = float(
-                    (slot.water_heater_plans or {}).get(load.id, 0.0) or 0.0
-                )
+                plans = slot.water_heater_plans or {}
+                if load.id not in plans:
+                    # ABSENT is not OFF. A plan that predates this load's config, or
+                    # a kept-previous plan after a solver timeout, has no opinion
+                    # about it — and 2026-08-21 07:26 showed what treating that as
+                    # 0 kW does: both pumps switched off on the first tick after a
+                    # timeout, the filter included, for the rest of the day. Hands
+                    # off, and say so once rather than every minute.
+                    if not self._cyclic_no_plan_logged.get(load.id):
+                        self._cyclic_no_plan_logged[load.id] = True
+                        logger.info(
+                            "Cyclic %s: not in the current plan — leaving it alone",
+                            load.id,
+                        )
+                    self._cyclic_extra_ts.pop(load.id, None)
+                    continue
+                self._cyclic_no_plan_logged.pop(load.id, None)
+                planned_kw = float(plans.get(load.id, 0.0) or 0.0)
                 want_on = planned_kw > 0.0
 
                 # Fuse relief outranks the plan and the human alike.

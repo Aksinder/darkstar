@@ -304,6 +304,40 @@ class PlannerPipeline:
                     "Config warning: has_solar=true but solar kwp is 0. PV forecasts will be zero."
                 )
 
+    def _preschedule_cyclic_loads(
+        self, config: dict[str, Any], slots: list[Any]
+    ) -> dict[str, dict[int, float]]:
+        """Greedy price-curve schedule for cyclic_loads (see planner/cyclic_preschedule.py)."""
+        from planner.cyclic_preschedule import (
+            CyclicSpec,
+            PriceSlot,
+            preschedule_cyclic_loads,
+        )
+
+        raw = cast("list[dict[str, Any]]", config.get("cyclic_loads", []) or [])
+        specs: list[CyclicSpec] = []
+        for c in raw:
+            if not isinstance(c, dict) or not c.get("id"):
+                continue
+            gap = c.get("max_hours_between")
+            specs.append(
+                CyclicSpec(
+                    id=str(c["id"]),
+                    power_kw=float(c.get("power_kw", 0.0) or 0.0),
+                    min_kwh_per_day=float(c.get("min_kwh_per_day", 0.0) or 0.0),
+                    max_hours_between=float(gap) if gap is not None else None,
+                    enabled=bool(c.get("enabled", True)),
+                )
+            )
+        if not specs:
+            return {}
+        wh_cfg = cast("dict[str, Any]", config.get("water_heating", {}) or {})
+        return preschedule_cyclic_loads(
+            specs,
+            [PriceSlot(s.start_time, float(s.import_price_sek_kwh)) for s in slots],
+            defer_up_to_hours=float(wh_cfg.get("defer_up_to_hours", 0.0) or 0.0),
+        )
+
     def _apply_overrides(self, config: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
         """Apply configuration overrides recursively."""
         new_config = copy.deepcopy(config)
@@ -714,6 +748,26 @@ class PlannerPipeline:
             max_dc_input_kw = float(max_dc_input_kw)
 
         kepler_input = planner_to_kepler_input(future_df, initial_soc_kwh, max_dc_input_kw)
+
+        # Cyclic loads (pool pump, filter): planned HERE, greedily against the price
+        # curve, and handed to the solver as FIXED base load. As solver devices they
+        # timed the box out (planner/cyclic_preschedule.py has the measurements).
+        cyclic_plan = self._preschedule_cyclic_loads(active_config, kepler_input.slots)
+        for by_slot in cyclic_plan.values():
+            for t, kw in by_slot.items():
+                if 0 <= t < len(kepler_input.slots):
+                    kepler_input.slots[t].load_kwh += kw * (
+                        (kepler_input.slots[t].end_time - kepler_input.slots[t].start_time)
+                        .total_seconds() / 3600.0
+                    )
+        if cyclic_plan:
+            logger.info(
+                "Cyclic loads pre-scheduled (fixed load, outside the MILP): %s",
+                ", ".join(
+                    f"{lid} {len(by_slot)} slots"
+                    for lid, by_slot in cyclic_plan.items()
+                ),
+            )
         # Deferrable household loads: pass through any pending-run state gathered
         # from HA (id, pending, learned duration/energy). Absent => nothing
         # scheduled (feature is opt-in and off by default).
@@ -1115,6 +1169,21 @@ class PlannerPipeline:
         # Restore water_heating_kw (it was set in schedule_water_heating but overwritten above)
         if water_heating_series is not None:
             final_df["water_heating_kw"] = water_heating_series
+
+        # Pumps into the schedule: the executor reads per-slot water_heaters[id] and
+        # switches the load — same contract as before, only the planner changed.
+        # A pump is written into EVERY slot (0.0 where off), never left absent: the
+        # executor treats a missing key as "no plan for this load, hands off", and
+        # an explicit 0.0 as "off on purpose". Both must be expressible.
+        if cyclic_plan and "water_heaters" in final_df.columns:
+            merged: list[dict[str, float]] = []
+            for pos, (_idx, row) in enumerate(final_df.iterrows()):
+                base = row["water_heaters"]
+                entry: dict[str, float] = dict(base) if isinstance(base, dict) else {}
+                for load_id, by_slot in cyclic_plan.items():
+                    entry[load_id] = float(by_slot.get(pos, 0.0))
+                merged.append(entry)
+            final_df["water_heaters"] = merged
 
         # 6. Manual Plan
         final_df = apply_manual_plan(final_df, active_config)

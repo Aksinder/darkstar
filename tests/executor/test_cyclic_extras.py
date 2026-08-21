@@ -179,3 +179,38 @@ class TestPrecedence:
         with patch("executor.engine.time.time", return_value=1000.0):
             await engine._actuate_cyclic_loads(_slot(0.0), None, {}, results)
         assert engine.dispatcher.set_cyclic_load.call_args[0][1] is False
+
+
+class TestAbsentIsNotOff:
+    """2026-08-21 07:26: the pumps' plan timed out, the kept-previous plan had no entry
+    for them, and the executor read that as 0 kW — switching both off, filter
+    included, for the rest of the day. A plan with no opinion must leave the load
+    alone; only an explicit 0.0 means "off on purpose"."""
+
+    @pytest.mark.asyncio
+    async def test_a_load_missing_from_the_plan_is_left_alone(self, tmp_path):
+        engine = _engine([_load()], tmp_path)
+        results: list = []
+        with patch("executor.engine.time.time", return_value=1000.0):
+            await engine._actuate_cyclic_loads(
+                SimpleNamespace(water_heater_plans={"some_other_load": 1.0}),
+                _ctx(grid_w=2000.0),  # no surplus either: nothing may turn it on
+                {},
+                results,
+            )
+        engine.dispatcher.set_cyclic_load.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_zero_still_means_off(self, tmp_path):
+        engine = _engine([_load()], tmp_path)
+        assert await _tick(engine, _ctx(grid_w=2000.0), 1000.0, plan_kw=0.0) is False
+
+    @pytest.mark.asyncio
+    async def test_an_empty_plan_dict_is_absent_too(self, tmp_path):
+        engine = _engine([_load()], tmp_path)
+        results: list = []
+        with patch("executor.engine.time.time", return_value=1000.0):
+            await engine._actuate_cyclic_loads(
+                SimpleNamespace(water_heater_plans={}), _ctx(grid_w=2000.0), {}, results
+            )
+        engine.dispatcher.set_cyclic_load.assert_not_called()

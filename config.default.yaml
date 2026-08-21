@@ -115,12 +115,16 @@ water_heating:
 #     members: [spa, villavagn_tank]
 
 # Cyclic Loads (optional) — pool pump, filter, circulation
-# A recurring daily energy need, splittable across slots, with spacing and gap
-# constraints. That is the SAME problem a water heater poses, so these ride the same
-# solver primitive rather than a second copy of the MILP block — only the actuation
-# differs: a switch, not a temperature. Give each one a load_priority entry (by id) to
-# control WHEN it may run; without one it simply meets its daily need at the cheapest
-# hours the constraints allow.
+# A recurring daily energy need with a maximum gap between runs. Planned GREEDILY
+# against the price curve, outside the MILP (planner/cyclic_preschedule.py): the
+# cheapest whole hours per day until the need is met, then the cheapest hour inside
+# any gap longer than max_hours_between. Their consumption enters the solver as fixed
+# base load — zero new variables. They rode the water-heater primitive for two days
+# and timed the 2-vCPU box out twice over loads worth a couple of kronor a day.
+# What that gives up (shifting a pump to soak a forecast surplus) the executor's
+# measured surplus_run / presence gates cover live. min_spacing_hours is no longer
+# read here. A load ABSENT from the current plan is left alone by the executor;
+# only an explicit 0 kW means off.
 # cyclic_loads:
 #   - id: poolpump
 #     name: "Poolpump"
