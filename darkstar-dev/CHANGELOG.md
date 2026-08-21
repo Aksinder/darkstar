@@ -1,3 +1,7 @@
+## dev-20260821.0708 — 2026-08-21 07:10
+
+- cyclic loads: plan pumps greedily outside the MILP; absent from plan is not off
+
 ## dev-20260820.1827 — 2026-08-20 18:28
 
 - engine: per-load isolation for the water chain and cyclic loop — no more shared fate
