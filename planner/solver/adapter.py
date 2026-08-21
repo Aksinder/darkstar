@@ -919,23 +919,12 @@ def config_to_kepler_config(
         # Legacy format: no per-device support
         water_inputs = []
 
-    # Cyclic loads (pool pump, filter, ...) ride the SAME solver primitive — see
-    # cyclic_loads_as_heater_specs for why there is no second MILP block. They are
-    # routed back out by id in the executor, which switches them instead of writing
-    # a temperature.
-    cyclic_specs = cyclic_loads_as_heater_specs(
-        cast("list[dict[str, Any]]", planner_config.get("cyclic_loads", []) or [])
-    )
-    if cyclic_specs:
-        cyclic_inputs = build_water_heater_inputs(
-            cyclic_specs, global_wh, water_heater_states
-        )
-        if cyclic_inputs:
-            logger.info(
-                "Cyclic loads planned as recurring daily needs: %s",
-                ", ".join(f"{c.id} {c.min_kwh_per_day:.2f} kWh/d" for c in cyclic_inputs),
-            )
-        water_inputs = water_inputs + cyclic_inputs
+    # Cyclic loads (pool pump, filter) are NOT solver devices any more. They rode the
+    # water primitive for two days (see cyclic_loads_as_heater_specs, kept for its
+    # config-shape mapping) and timed the 2-vCPU box out twice: ~30 hourly binaries
+    # per pump plus rolling max-gap windows, for loads worth a few kronor a day. They
+    # are now pre-scheduled greedily in the pipeline (planner/cyclic_preschedule.py)
+    # and enter the solver as FIXED base load — zero new variables.
 
     # For global comfort settings, use the water_heating section
     wh_cfg = global_wh

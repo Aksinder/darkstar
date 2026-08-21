@@ -1965,7 +1965,17 @@ class TestLoadActuationIsolation:
     def _write_schedule(self, temp_schedule):
         tz = pytz.timezone("Europe/Stockholm")
         slot_start = datetime.now(tz) - timedelta(minutes=5)
-        schedule = make_schedule([make_slot(slot_start, soc_target=50)])
+        slot = make_slot(slot_start, soc_target=50)
+        # Every load EXPLICITLY in the plan (0 kW = off on purpose). A load absent
+        # from the plan is left alone by design since 2026-08-21 — these tests are
+        # about isolation, so they must put the loads in the plan to be actuated.
+        slot["water_heaters"] = {
+            "tank_a": {"heating_kw": 0.0},
+            "tank_b": {"heating_kw": 0.0},
+            "pump_a": {"heating_kw": 0.0},
+            "pump_b": {"heating_kw": 0.0},
+        }
+        schedule = make_schedule([slot])
         with Path(temp_schedule).open("w", encoding="utf-8") as f:
             json.dump(schedule, f)
 
