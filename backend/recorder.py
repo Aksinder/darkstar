@@ -546,15 +546,38 @@ async def record_observation_from_current_state(
                     # EV branch above — a re-record must not zero a good value).
                     logger.debug(f"Water {heater_id}: snapshot fallback={device_kwh:.3f} kWh")
 
+    # Cyclic loads (pool pump, filter): planned loads since 2026-08-21, so they are
+    # recorded per device like the tanks — the planner credits heated_today from the
+    # SAME store rows, which is what stops every replan from re-demanding the full
+    # daily need (the tanks' old "walking block"). Kept out of the water aggregate
+    # (not hot water), but subtracted from base load below: the pre-scheduler adds
+    # their consumption back as fixed solver load, and a base-load forecast that
+    # still contains it would count them twice.
+    cyclic_kwh = 0.0
+    for cyclic in config.get("cyclic_loads", []) or []:
+        if not isinstance(cyclic, dict) or not cyclic.get("enabled", True):
+            continue
+        sensor = cyclic.get("power_sensor") or cyclic.get("sensor")
+        load_id = str(cyclic.get("id", ""))
+        if not sensor or not load_id:
+            continue
+        energy = await get_energy_from_power_history(str(sensor), slot_start, slot_end)
+        if energy is not None:
+            cyclic_kwh += energy
+            water_heater_energy[load_id] = energy
+            logger.debug(f"Cyclic {load_id}: history energy={energy:.3f} kWh")
+
     # Isolate base load: subtract known deferrable loads from total load.
     # Apply when load represents total consumption (cumulative sensor, or power snapshot without
     # disaggregator). Skip when disaggregator already provided base-load-only power_kw.
-    if (used_cumulative_load or not disaggregator) and (ev_charging_kwh > 0 or water_kwh > 0):
-        base_load_kwh = load_kwh - ev_charging_kwh - water_kwh
+    if (used_cumulative_load or not disaggregator) and (
+        ev_charging_kwh > 0 or water_kwh > 0 or cyclic_kwh > 0
+    ):
+        base_load_kwh = load_kwh - ev_charging_kwh - water_kwh - cyclic_kwh
         if base_load_kwh < 0:
             logger.warning(
                 f"Negative base load: total={load_kwh:.3f}kWh, EV={ev_charging_kwh:.3f}kWh, "
-                f"water={water_kwh:.3f}kWh. Clamping to 0."
+                f"water={water_kwh:.3f}kWh, cyclic={cyclic_kwh:.3f}kWh. Clamping to 0."
             )
             base_load_kwh = 0.0
         load_kwh = base_load_kwh

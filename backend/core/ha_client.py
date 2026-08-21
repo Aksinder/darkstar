@@ -321,6 +321,14 @@ async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, fl
     result: dict[str, float] = {}
     try:
         water_heaters = [wh for wh in config.get("water_heaters", []) if wh.get("enabled", True)]
+        # Cyclic loads are credited by the same rule: the recorder writes their
+        # per-slot energy under their id, and the pre-scheduler deducts it from
+        # today's need exactly as kepler does for a tank. Same clamp, same
+        # zero-on-uncertainty direction (over-run a filter, never under-run it).
+        water_heaters = water_heaters + [
+            c for c in (config.get("cyclic_loads", []) or [])
+            if isinstance(c, dict) and c.get("enabled", True)
+        ]
         if not water_heaters:
             return {}
 
@@ -562,6 +570,33 @@ async def get_initial_state(
         logger.warning("heated_today: initial-state crediting failed, using 0.0: %s", exc)
         water_heater_states = []
         water_heated_today_kwh = 0.0
+
+    # Cyclic loads: when did each last run? The pre-scheduler's max-gap rule is
+    # anchored here, so a filter that last ran at 16:11 is not left idle until
+    # tomorrow's cheap hours just because the first planned hour lies beyond the
+    # gap. Read from the switch: ON = running now; OFF = its last_changed.
+    cyclic_load_states: list[dict[str, Any]] = []
+    for cyclic in config.get("cyclic_loads", []) or []:
+        if not isinstance(cyclic, dict) or not cyclic.get("enabled", True):
+            continue
+        cid = str(cyclic.get("id", ""))
+        sw = cyclic.get("switch_entity")
+        if not cid or not sw:
+            continue
+        entry_c: dict[str, Any] = {"id": cid, "heated_today_kwh": 0.0, "last_run_end": None}
+        for st in water_heater_states:
+            if st.get("id") == cid:
+                entry_c["heated_today_kwh"] = float(st.get("heated_today_kwh", 0.0) or 0.0)
+        try:
+            raw = await get_ha_entity_state(str(sw))
+            if raw:
+                if str(raw.get("state", "")).lower() == "on":
+                    entry_c["last_run_end"] = datetime.now(UTC).isoformat()
+                elif raw.get("last_changed"):
+                    entry_c["last_run_end"] = str(raw["last_changed"])
+        except Exception as exc:
+            logger.debug("cyclic %s: switch read failed (%s); no gap anchor", cid, exc)
+        cyclic_load_states.append(entry_c)
 
     # Per-device EV state fetching
     has_ev_charger = system_config.get("has_ev_charger", False)
@@ -828,6 +863,7 @@ async def get_initial_state(
         # Per-tank measured heated-today (pipeline consumes this into
         # water_heated_today_by_id; kepler subtracts it from min_kwh_per_day).
         "water_heater_states": water_heater_states,
+        "cyclic_load_states": cyclic_load_states,
         # Legacy scalar fields (backward compat)
         "ev_soc_percent": ev_soc_percent,
         "ev_plugged_in": ev_plugged_in,

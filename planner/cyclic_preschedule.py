@@ -45,7 +45,28 @@ class CyclicSpec:
     min_kwh_per_day: float
     max_hours_between: float | None = None
     heated_today_kwh: float = 0.0  # energy already delivered in bucket 0
+    # When the load last ran (or now, if running). Anchors the max-gap rule: without
+    # it the first planned hour could sit arbitrarily far from the last real run —
+    # observed 2026-08-21: filter off at 16:11, next planned hour 01:00, a 9 h gap
+    # against a 6 h rule, because the rule only looked BETWEEN planned hours.
+    last_run_end: datetime | None = None
     enabled: bool = True
+
+
+def _as_naive_like(dt: datetime | None, reference: datetime) -> datetime | None:
+    """Bring ``dt`` into the same awareness as the slot timestamps so they compare.
+
+    HA hands us an aware ISO timestamp; the planner's slots may be aware or naive
+    depending on the caller. Comparing the two raises — and a raise here would take
+    the whole plan down over a pump's gap anchor.
+    """
+    if dt is None:
+        return None
+    if reference.tzinfo is None and dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    if reference.tzinfo is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=reference.tzinfo)
+    return dt
 
 
 def _hour_key(dt: datetime) -> datetime:
@@ -94,7 +115,8 @@ def preschedule_cyclic_loads(
         if not spec.enabled or spec.power_kw <= 0:
             continue
         chosen: set[datetime] = set()
-        last_on: datetime | None = None  # carries across buckets for the gap rule
+        # The gap clock starts at the last REAL run, then carries across buckets.
+        last_on: datetime | None = _as_naive_like(spec.last_run_end, slots[0].start_time)
         for bi, key in enumerate(bucket_keys):
             bhours = buckets[key]
             need_kwh = spec.min_kwh_per_day - (spec.heated_today_kwh if bi == 0 else 0.0)

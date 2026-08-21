@@ -112,3 +112,39 @@ class TestEdges:
 
     def test_empty_slots(self):
         assert preschedule_cyclic_loads([CyclicSpec("a", 0.3, 1.0)], []) == {}
+
+
+class TestGapAnchoredAtLastRealRun:
+    """2026-08-21: the filter switched off at 16:11 and the next planned hour was
+    01:00 — a 9 h gap against a 6 h rule — because the rule only looked BETWEEN
+    planned hours. last_run_end seeds the clock at the last real run.
+
+    Scene: planning from 16:00, dear until 21, cheap 22-23. A 2 h need picks 22+23
+    on price alone. With a 4 h gap rule anchored at a 16:00 last run, something
+    must run by 20:00."""
+
+    def test_first_pick_must_fall_within_the_gap_of_the_last_run(self):
+        slots = _day(PRICES)[16 * 4:]
+        plan = preschedule_cyclic_loads(
+            [CyclicSpec("bog", 0.39, 0.78, max_hours_between=4,
+                        last_run_end=T0 + timedelta(hours=16))],
+            slots,
+        )["bog"]
+        first = min(slots[i].start_time for i in plan)
+        assert first <= T0 + timedelta(hours=20), first
+
+    def test_without_an_anchor_price_alone_decides(self):
+        slots = _day(PRICES)[16 * 4:]
+        plan = preschedule_cyclic_loads(
+            [CyclicSpec("bog", 0.39, 0.78, max_hours_between=4)], slots
+        )["bog"]
+        assert _hours(plan, slots) == [22, 23]
+
+    def test_an_aware_anchor_against_naive_slots_does_not_raise(self):
+        from datetime import UTC
+
+        slots = _day(PRICES)[16 * 4:]
+        aware = (T0 + timedelta(hours=16)).astimezone(UTC)
+        preschedule_cyclic_loads(
+            [CyclicSpec("bog", 0.39, 0.78, max_hours_between=4, last_run_end=aware)], slots
+        )
