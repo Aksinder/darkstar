@@ -8,16 +8,15 @@ Coordinates Input → Strategy → Solver → Output flow.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import pandas as pd
 import pytz
-
-if TYPE_CHECKING:
-    from datetime import datetime
 
 from backend.core.version import get_version
 from backend.learning.store import LearningStore
@@ -305,27 +304,46 @@ class PlannerPipeline:
                 )
 
     def _preschedule_cyclic_loads(
-        self, config: dict[str, Any], slots: list[Any]
+        self,
+        config: dict[str, Any],
+        slots: list[Any],
+        states: list[dict[str, Any]] | None = None,
     ) -> dict[str, dict[int, float]]:
-        """Greedy price-curve schedule for cyclic_loads (see planner/cyclic_preschedule.py)."""
+        """Greedy price-curve schedule for cyclic_loads (see planner/cyclic_preschedule.py).
+
+        ``states`` (from get_initial_state) carries per-load heated_today_kwh — measured,
+        so a replan deducts what already ran instead of re-demanding the whole day —
+        and last_run_end, which anchors the max-gap rule at the last real run.
+        """
         from planner.cyclic_preschedule import (
             CyclicSpec,
             PriceSlot,
             preschedule_cyclic_loads,
         )
 
+        by_id: dict[str, dict[str, Any]] = {
+            str(st.get("id")): st for st in (states or []) if st.get("id")
+        }
         raw = cast("list[dict[str, Any]]", config.get("cyclic_loads", []) or [])
         specs: list[CyclicSpec] = []
         for c in raw:
             if not isinstance(c, dict) or not c.get("id"):
                 continue
             gap = c.get("max_hours_between")
+            st = by_id.get(str(c["id"]), {})
+            last_run_end: datetime | None = None
+            raw_end = st.get("last_run_end")
+            if raw_end:
+                with contextlib.suppress(ValueError, TypeError):
+                    last_run_end = datetime.fromisoformat(str(raw_end).replace("Z", "+00:00"))
             specs.append(
                 CyclicSpec(
                     id=str(c["id"]),
                     power_kw=float(c.get("power_kw", 0.0) or 0.0),
                     min_kwh_per_day=float(c.get("min_kwh_per_day", 0.0) or 0.0),
                     max_hours_between=float(gap) if gap is not None else None,
+                    heated_today_kwh=float(st.get("heated_today_kwh", 0.0) or 0.0),
+                    last_run_end=last_run_end,
                     enabled=bool(c.get("enabled", True)),
                 )
             )
@@ -752,7 +770,11 @@ class PlannerPipeline:
         # Cyclic loads (pool pump, filter): planned HERE, greedily against the price
         # curve, and handed to the solver as FIXED base load. As solver devices they
         # timed the box out (planner/cyclic_preschedule.py has the measurements).
-        cyclic_plan = self._preschedule_cyclic_loads(active_config, kepler_input.slots)
+        cyclic_plan = self._preschedule_cyclic_loads(
+            active_config,
+            kepler_input.slots,
+            cast("list[dict[str, Any]]", initial_state.get("cyclic_load_states", []) or []),
+        )
         for by_slot in cyclic_plan.values():
             for t, kw in by_slot.items():
                 if 0 <= t < len(kepler_input.slots):
