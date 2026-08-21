@@ -1,3 +1,7 @@
+## dev-20260821.1418 — 2026-08-21 14:20
+
+- cyclic loads: remember what ran (heated_today) and when (gap anchored at last run)
+
 ## dev-20260821.0708 — 2026-08-21 07:10
 
 - cyclic loads: plan pumps greedily outside the MILP; absent from plan is not off
