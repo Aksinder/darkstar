@@ -83,6 +83,12 @@ class DeferrableApplianceCfg:
     switch_entity: str | None = None
     override_entity: str | None = None
     typical_minutes_sensor: str | None = None  # learned duration; falls back to seed
+    energy_sensor_learned: str | None = None  # learned per-cycle kWh; falls back to seed
+    seed_energy_kwh: float = 0.0  # cycle energy when nothing is learned yet
+    # What an hour of waiting is worth, in SEK. 0 = off (absolute cheapest window,
+    # the historical behaviour). See cheapest_window_start for why this is a price
+    # per hour and not a percentage.
+    wait_cost_sek_per_hour: float = 0.0
     power: AppliancePowerConfig = field(default_factory=AppliancePowerConfig)
     seed_duration_min: float = 120.0
     deadline_mode: str = "cheapest_within_hours"  # or "hard_deadline"
@@ -140,6 +146,9 @@ def parse_deferrable_runtime_config(
                 switch_entity=c.get("switch_entity") or None,
                 override_entity=c.get("override_entity") or None,
                 typical_minutes_sensor=f"sensor.{prefix}{_slug(lid)}_typical_minutes",
+                energy_sensor_learned=f"sensor.{prefix}{_slug(lid)}_last_cycle_energy",
+                seed_energy_kwh=float(c.get("energy_kwh", 0.0) or 0.0),
+                wait_cost_sek_per_hour=float(c.get("wait_cost_sek_per_hour", 0.0) or 0.0),
                 power=AppliancePowerConfig(
                     on_threshold_w=float(c.get("on_threshold_w", 10.0)),
                     off_threshold_w=float(c.get("off_threshold_w", 3.0)),
@@ -478,8 +487,16 @@ class DeferrableApplianceController:
                 )
                 duration_slots = max(1, math.ceil(duration_min / cfg.slot_minutes))
                 deadline_ts = self._deadline_ts(app, now_dt, new_state.start_ts)
+                # Cycle energy turns the price curve into kronor so the wait price is
+                # comparable with it. Learned first, seed second; without either the
+                # penalty stays off rather than scoring a dimensionless number.
+                energy_kwh = _f(
+                    await ha.get_state_value(app.energy_sensor_learned or "")
+                ) or app.seed_energy_kwh
                 action, window_start = recommend_appliance_action(
-                    slots, now_ts, duration_slots, deadline_ts
+                    slots, now_ts, duration_slots, deadline_ts,
+                    energy_kwh=energy_kwh,
+                    wait_cost_sek_per_hour=app.wait_cost_sek_per_hour,
                 )
 
             # Fas 3 — plug actuation (only outside observe/shadow, only on a readable

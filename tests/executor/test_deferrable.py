@@ -212,3 +212,102 @@ class TestRestoreDecision:
 
     def test_nothing_due_nothing_happens(self):
         assert self._decide(reclaim_due=False) == "wait"
+
+
+class TestWaitingIsNotFree:
+    """Owner, 2026-08-22: the dishwasher armed at 13:27 was deferred to 01:30 the next
+    morning over a 23:00 start that cost SEVEN ÖRE more. Formally optimal; not what
+    anyone means by "run it when power is cheap".
+
+    wait_cost_sek_per_hour prices the delay so the cheapest block only wins when it
+    wins by more than the wait is worth.
+    """
+
+    # The real curve from that evening (hourly, SEK/kWh total): dear now, an evening
+    # peak, then a long flat cheap night that keeps creeping down by a few öre.
+    CURVE = [
+        2.11, 2.05, 1.96, 1.64, 1.46,   # 15:00-19:00
+        1.10, 1.00,                      # 22:00, 23:00
+        0.98, 0.96, 0.95, 0.94, 0.94,   # 00:00-04:00
+    ]
+    ENERGY = 1.5  # kWh, ~2 h cycle
+
+    def _slots(self):
+        from executor.deferrable import WindowSlot
+
+        return [WindowSlot(start_ts=i * 3600.0, import_price_sek_kwh=p)
+                for i, p in enumerate(self.CURVE)]
+
+    def _pick(self, wait_cost):
+        from executor.deferrable import cheapest_window_start
+
+        return cheapest_window_start(
+            self._slots(), now_ts=0.0, duration_slots=2, deadline_ts=None,
+            energy_kwh=self.ENERGY, wait_cost_sek_per_hour=wait_cost,
+        )
+
+    def test_off_by_default_keeps_chasing_the_last_ore(self):
+        """The historical behaviour, pinned: the flat night's very cheapest block."""
+        assert self._pick(0.0) == 10 * 3600.0  # 04:00-ish, the bottom of the curve
+
+    def test_a_small_wait_price_takes_the_earlier_near_tie(self):
+        """5 öre an hour is enough to stop paying hours for öre — it lands at the
+        start of the cheap night instead of its deepest point."""
+        picked = self._pick(0.05)
+        assert picked is not None
+        assert picked <= 7 * 3600.0
+
+    def test_it_still_refuses_the_expensive_now(self):
+        """The point is not impatience: avoiding the 2.11 peak is worth real money and
+        must survive the wait price."""
+        assert self._pick(0.05) != 0.0
+
+    def test_a_large_wait_price_runs_immediately(self):
+        """At 1 SEK/h the delay dwarfs any spread in this curve."""
+        assert self._pick(1.0) == 0.0
+
+    def test_no_energy_means_no_penalty(self):
+        """Without kWh there is no way to turn a price curve into kronor; scoring a
+        dimensionless sum against SEK/h would be nonsense, so it stays off."""
+        from executor.deferrable import cheapest_window_start
+
+        with_energy = cheapest_window_start(
+            self._slots(), 0.0, 2, None, energy_kwh=0.0, wait_cost_sek_per_hour=1.0)
+        assert with_energy == self._pick(0.0)
+
+    def test_the_deadline_still_binds(self):
+        from executor.deferrable import cheapest_window_start
+
+        picked = cheapest_window_start(
+            self._slots(), 0.0, 2, deadline_ts=4 * 3600.0,
+            energy_kwh=self.ENERGY, wait_cost_sek_per_hour=0.05)
+        assert picked is not None and picked + 2 * 3600.0 <= 4 * 3600.0
+
+    def test_a_block_in_progress_is_not_credited_for_the_past(self):
+        """Delay is clamped at zero: a slot that started before now must not earn a
+        negative wait cost and win on that."""
+        from executor.deferrable import WindowSlot, cheapest_window_start
+
+        slots = [WindowSlot(start_ts=i * 3600.0, import_price_sek_kwh=p)
+                 for i, p in enumerate([2.0, 1.0, 1.0])]
+        # now is inside slot 0; slot 1-2 is genuinely cheaper and must win.
+        assert cheapest_window_start(
+            slots, now_ts=1800.0, duration_slots=2, deadline_ts=None,
+            energy_kwh=1.0, wait_cost_sek_per_hour=0.05) == 3600.0
+
+    def test_the_owners_exact_case(self):
+        """23:00 vs 01:30 on the real numbers: 1.49 vs 1.42 SEK, 2.5 h apart.
+        Break-even wait price is 0.07/2.5 = 2.8 öre per hour."""
+        from executor.deferrable import WindowSlot, cheapest_window_start
+
+        # Two candidates only, priced so the blocks cost exactly 1.49 and 1.42.
+        slots = [
+            WindowSlot(start_ts=0.0, import_price_sek_kwh=1.49 / 1.5),
+            WindowSlot(start_ts=2.5 * 3600.0, import_price_sek_kwh=1.42 / 1.5),
+        ]
+        cheap_wins = cheapest_window_start(
+            slots, 0.0, 1, None, energy_kwh=1.5, wait_cost_sek_per_hour=0.02)
+        early_wins = cheapest_window_start(
+            slots, 0.0, 1, None, energy_kwh=1.5, wait_cost_sek_per_hour=0.05)
+        assert cheap_wins == 2.5 * 3600.0, "below break-even: still waits"
+        assert early_wins == 0.0, "above break-even: runs earlier"

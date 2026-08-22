@@ -428,6 +428,22 @@ deferrable_loads: []
   #   off_threshold_w: 3            # sustained draw < this => cycle done
   #   start_debounce_s: 3           # draw must stay above on_threshold this long to arm
   #   done_delay_s: 300             # draw must stay below off_threshold this long to call it done
+  #   wait_cost_sek_per_hour: 0     # what an hour of waiting is worth, in SEK. 0 = off
+  #                                 #   (absolute cheapest window, the historical
+  #                                 #   behaviour). Each candidate window is scored on
+  #                                 #   its electricity cost PLUS the price of the delay
+  #                                 #   before it starts, so the cheapest block only wins
+  #                                 #   when it wins by more than the wait is worth.
+  #                                 #   Live case 2026-08-22: a dishwasher armed 13:27
+  #                                 #   was deferred to 01:30 next morning over a 23:00
+  #                                 #   start costing SEVEN ÖRE more. Break-even there
+  #                                 #   was 2.8 öre/h; 0.05 starts it at 23:00 and still
+  #                                 #   refuses the 2.11 SEK evening peak.
+  #                                 #   A price per hour, not a percentage: a percentage
+  #                                 #   means different things at 0.9 and 3.6 SEK/kWh.
+  #                                 #   Needs the cycle energy (learned last_cycle_energy,
+  #                                 #   else the energy_kwh seed) to convert a price curve
+  #                                 #   into kronor; without it the penalty stays off.
   #   manual_cut_return_minutes: 0  # hand a HUMAN-cut plug back to Darkstar after this long
   #                                 #   (0 = never, the historical behaviour). Darkstar never
   #                                 #   re-energizes a plug a person switched off — right in

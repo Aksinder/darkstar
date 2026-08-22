@@ -52,8 +52,11 @@ def cheapest_window_start(
     now_ts: float,
     duration_slots: int,
     deadline_ts: float | None,
+    *,
+    energy_kwh: float = 0.0,
+    wait_cost_sek_per_hour: float = 0.0,
 ) -> float | None:
-    """Start ts of the cheapest contiguous ``duration_slots`` block.
+    """Start ts of the best contiguous ``duration_slots`` block.
 
     Considers only blocks that start at/after the current slot and finish at/before
     ``deadline_ts``. Returns the winning block's start ts, or ``None`` if the run can't
@@ -61,6 +64,20 @@ def cheapest_window_start(
     This is the forecast-aware core: it costs the WHOLE cycle against the forward price
     curve, so it never starts a long run right before a peak the way a "cheap right now?"
     trigger does.
+
+    **Waiting is not free.** With ``wait_cost_sek_per_hour`` > 0 (and a known
+    ``energy_kwh``) each candidate is scored on its ELECTRICITY cost plus the price of
+    the delay before it starts, so the cheapest block only wins if it wins by more than
+    the wait is worth. Observed 2026-08-22: a dishwasher armed at 13:27 was deferred to
+    01:30 the next morning over a 23:00 start that cost SEVEN ÖRE more — formally
+    optimal, and not what anyone means by "run it when power is cheap". The default is
+    0.0, which is exactly the old absolute-cheapest behaviour.
+
+    The wait price is in SEK per hour, so it is a real preference the owner can reason
+    about ("I'll pay 5 öre to have it done an hour sooner") rather than a percentage
+    that means different things at 0.9 and 3.6 SEK/kWh. Without ``energy_kwh`` there is
+    no way to convert a price curve into kronor, so the penalty stays off rather than
+    being applied to a dimensionless number.
     """
     n = len(slots)
     if duration_slots <= 0 or n < duration_slots:
@@ -68,8 +85,13 @@ def cheapest_window_start(
     slot_len = (slots[1].start_ts - slots[0].start_ts) if n >= 2 else 900.0
     # Allow the in-progress current slot to count as a valid start.
     earliest_start = now_ts - slot_len
+    # Energy per slot: the cycle's kWh spread evenly over its duration. This is what
+    # turns "sum of prices" into kronor, and it is the same assumption the caller's
+    # duration_slots already encodes.
+    kwh_per_slot = (energy_kwh / duration_slots) if duration_slots > 0 else 0.0
+    penalise = wait_cost_sek_per_hour > 0.0 and energy_kwh > 0.0
     best_start: float | None = None
-    best_cost: float | None = None
+    best_score: float | None = None
     for i in range(n - duration_slots + 1):
         block = slots[i : i + duration_slots]
         start_ts = block[0].start_ts
@@ -78,9 +100,17 @@ def cheapest_window_start(
             continue
         if deadline_ts is not None and end_ts > deadline_ts:
             continue
-        cost = sum(s.import_price_sek_kwh for s in block)
-        if best_cost is None or cost < best_cost:
-            best_cost = cost
+        price_sum = sum(s.import_price_sek_kwh for s in block)
+        if penalise:
+            # Kronor, comparable across candidates: electricity + the cost of waiting.
+            # Delay is clamped at zero so a block already in progress is not credited
+            # for starting in the past.
+            delay_h = max(0.0, (start_ts - now_ts)) / 3600.0
+            score = price_sum * kwh_per_slot + wait_cost_sek_per_hour * delay_h
+        else:
+            score = price_sum
+        if best_score is None or score < best_score:
+            best_score = score
             best_start = start_ts
     return best_start
 
@@ -90,13 +120,20 @@ def recommend_appliance_action(
     now_ts: float,
     duration_slots: int,
     deadline_ts: float | None,
+    *,
+    energy_kwh: float = 0.0,
+    wait_cost_sek_per_hour: float = 0.0,
 ) -> tuple[str, float | None]:
     """Forecast-aware recommendation for an armed cycle.
 
-    Returns ``("run", None)`` when the cheapest window has started (or the run can't
+    Returns ``("run", None)`` when the chosen window has started (or the run can't
     fit before the deadline => run now), else ``("defer", window_start_ts)``.
+    See cheapest_window_start for what ``wait_cost_sek_per_hour`` buys.
     """
-    start = cheapest_window_start(slots, now_ts, duration_slots, deadline_ts)
+    start = cheapest_window_start(
+        slots, now_ts, duration_slots, deadline_ts,
+        energy_kwh=energy_kwh, wait_cost_sek_per_hour=wait_cost_sek_per_hour,
+    )
     if start is None:
         return ("run", None)  # cannot fit before deadline -> run now
     if start <= now_ts:
