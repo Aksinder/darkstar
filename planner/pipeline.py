@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import copy
 import logging
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -20,6 +21,7 @@ import pytz
 
 from backend.core.version import get_version
 from backend.learning.store import LearningStore
+from planner.coarse_tail import coarsen_slots, expand_result
 from planner.errors import PlannerError, PlannerErrorCode
 from planner.inputs.data_prep import apply_safety_margins, floored_load_margin, prepare_df
 from planner.inputs.learning import load_learning_overlays
@@ -806,6 +808,31 @@ class PlannerPipeline:
             float(_peak_elapsed_raw) if _peak_elapsed_raw is not None else None
         )
 
+        # Coarse-tail horizon (planner/coarse_tail.py): keep the full look-ahead,
+        # drop resolution beyond the first day. The MILP is superlinear in slot
+        # count — 96 slots solve in 3.5 s where 192 take 25.6 — and the 04:00
+        # instance (176 slots; the horizon is LONGEST in the small hours) drove 23
+        # timeouts on 2026-08-22. Expanded back to the 15-min grid after the solve,
+        # so nothing downstream can tell.
+        kepler_cfg_ct = cast("dict[str, Any]", active_config.get("kepler", {}) or {})
+        fine_hours = float(kepler_cfg_ct.get("coarse_tail_fine_hours", 0.0) or 0.0)
+        coarse_groups: list[list[int]] | None = None
+        fine_slots = list(kepler_input.slots)
+        if fine_hours > 0:
+            coarse_slots, coarse_groups = coarsen_slots(fine_slots, fine_hours)
+            if len(coarse_slots) < len(fine_slots):
+                logger.info(
+                    "Coarse tail: %d slots -> %d variables (%.0f h look-ahead kept, "
+                    "fine for the first %.0f h)",
+                    len(fine_slots), len(coarse_slots),
+                    (fine_slots[-1].end_time - fine_slots[0].start_time).total_seconds()
+                    / 3600.0,
+                    fine_hours,
+                )
+                kepler_input = replace(kepler_input, slots=coarse_slots)
+            else:
+                coarse_groups = None
+
         kepler_config = config_to_kepler_config(
             active_config,
             overrides,
@@ -1154,6 +1181,11 @@ class PlannerPipeline:
                 if water_slots:
                     save_last_anti_legionella(sqlite_path, now_slot.to_pydatetime())
                     logger.info("Anti-legionella cycle scheduled, timestamp saved.")
+
+        # Back onto the 15-minute grid before anything else sees it: the join below
+        # asserts equal length, and the executor reads these slots verbatim.
+        if coarse_groups is not None:
+            result = expand_result(result, coarse_groups, fine_slots)
 
         # Convert result back to DataFrame
         capacity = kepler_config.capacity_kwh
