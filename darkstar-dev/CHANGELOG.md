@@ -1,3 +1,7 @@
+## dev-20260822.2341 — 2026-08-22 23:43
+
+- deferrable: price the waiting — stop chasing öre with hours
+
 ## dev-20260822.1235 — 2026-08-22 12:37
 
 - planner: coarse-tail horizon — full look-ahead, a quarter of the variables
