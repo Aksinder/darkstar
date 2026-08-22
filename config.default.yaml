@@ -786,6 +786,28 @@ kepler:
   # (cheaper than the penalty) was preferred over curtailing.
   curtailment_penalty_sek: 0.001       # SEK/kWh soft cost for clipping otherwise-unusable solar
 
+  # Coarse-tail horizon: keep the full look-ahead, drop RESOLUTION beyond this many
+  # hours (15-min slots until then, hourly after). 0 = off (uniform 15-min).
+  #
+  # The MILP is superlinear in slot count — measured on this site 2026-08-22, three
+  # tanks + two EVs + two pumps at real prices: 96 slots 3.5 s, 128 slots 6.9 s,
+  # 176 slots 15.4 s, 192 slots 25.6 s. Doubling the horizon costs 7x the time. The
+  # horizon is LONGEST in the small hours (tomorrow's prices arrive at 13:00 the day
+  # before), which is why 23 of that day's timeouts landed between 04:00 and 08:59 —
+  # each one throwing the plan away and keeping a staler one.
+  #
+  # Standard receding-horizon practice: the far end of the plan is re-solved long
+  # before it is executed, so its resolution buys nothing. Rolling 8 h backtest,
+  # replanning hourly and executing only the first hour of each plan:
+  #   uniform            27.61 SEK billed, solve avg 19.4 s, worst 31.7 s
+  #   coarse_tail 24     25.61 SEK billed, solve avg  4.8 s, worst  8.4 s
+  #   coarse_tail 12     25.18 SEK billed, solve avg  2.5 s, worst  4.5 s
+  # Cheaper as well as faster, because the uniform solve is the one that runs out of
+  # budget and has to accept a degraded incumbent. (Synthetic tiled day — indicative
+  # on cost, solid on time.) The result is expanded back to the 15-minute grid before
+  # it leaves the planner, so the executor and schedule file are unchanged.
+  coarse_tail_fine_hours: 0            # 24 recommended; 12 if the box is still tight
+
 # =============================================================================
 # Home Assistant Integration
 # =============================================================================
