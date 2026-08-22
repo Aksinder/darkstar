@@ -1,3 +1,7 @@
+## dev-20260822.1235 — 2026-08-22 12:37
+
+- planner: coarse-tail horizon — full look-ahead, a quarter of the variables
+
 ## dev-20260821.1418 — 2026-08-21 14:20
 
 - cyclic loads: remember what ran (heated_today) and when (gap anchored at last run)
