@@ -108,3 +108,79 @@ async def test_failed_stop_does_not_wake():
     ha = SleepyHA(_states(**{"sensor.tesla_soc": "95", "sensor.grid": "3000"}))
     await ctrl.run(ha, now_ts=1000.0, shadow=False)
     assert not _wake_presses(ha)
+
+
+# ---------------------------------------------------------------------------
+# The failure ledger, after 2026-08-23.
+# ---------------------------------------------------------------------------
+
+
+def _wake_cfg_with_override():
+    raw = _wake_cfg()
+    for c in raw["ev_surplus"]["chargers"]:
+        if c["id"] == "tesla":
+            c["override_entity"] = "input_select.tesla_mode"
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_a_departure_resets_the_backoff():
+    """Two failures from a visit three hours earlier met the returning car with
+    'fail #3, 480 s' — eight idle minutes with sun to spare. A car that leaves
+    takes its failure history with it."""
+    ctrl, _ = _controller(_wake_cfg())
+    ha = SleepyHA(_surplus_states())
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    await ctrl.run(ha, now_ts=1200.0, shadow=False)
+    assert ctrl._act_fail["tesla"][1] >= 1
+    # The car drives off: unplugged and away.
+    gone = SleepyHA(_surplus_states())
+    gone.states["binary_sensor.tesla_plug"] = "off"
+    await ctrl.run(gone, now_ts=1300.0, shadow=False)
+    assert "tesla" not in ctrl._act_fail
+    assert "tesla" not in ctrl._last_wake_ts
+
+
+@pytest.mark.asyncio
+async def test_a_protective_command_retries_every_tick():
+    """Reducing is the safe direction and the cost of not reducing is immediate —
+    the home battery or the grid feeds the car meanwhile. Stops and reductions
+    do not earn the escalating backoff; starts and increases still do."""
+    ctrl, _ = _controller(_wake_cfg_with_override())
+    # A car we believe is ON at 14 A that a human just forced OFF: a STOP.
+    ctrl._last_a["tesla"] = 14.0
+    ctrl._last_switch["tesla"] = True
+    ha = SleepyHA(_states(**{"input_select.tesla_mode": "force_off", "sensor.grid": "3000",
+                             "sensor.tesla_power": "9000"}))
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    assert ctrl._act_fail["tesla"][1] == 1
+    n_calls = len([c for c in ha.calls if c[2] == "switch.tesla"])
+    # 70 s later — inside what WOULD be a 120 s start backoff — the stop is retried.
+    await ctrl.run(ha, now_ts=1070.0, shadow=False)
+    assert len([c for c in ha.calls if c[2] == "switch.tesla"]) > n_calls
+
+
+@pytest.mark.asyncio
+async def test_a_failed_stop_on_a_drawing_car_wakes_it():
+    """The old rule skipped the wake on every failed stop ('the car isn't drawing
+    anyway') — false for a car that started itself, which is exactly when a stop
+    matters most."""
+    ctrl, _ = _controller(_wake_cfg_with_override())
+    ctrl._last_a["tesla"] = 14.0
+    ctrl._last_switch["tesla"] = True
+    ha = SleepyHA(_states(**{"input_select.tesla_mode": "force_off", "sensor.grid": "3000",
+                             "sensor.tesla_power": "9000"}))
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    assert len(_wake_presses(ha)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_stop_on_an_idle_car_does_not_wake(caplog):
+    """And the old rule's actual case still holds: nothing is drawing, let it sleep."""
+    ctrl, _ = _controller(_wake_cfg_with_override())
+    ctrl._last_a["tesla"] = 14.0
+    ctrl._last_switch["tesla"] = True
+    ha = SleepyHA(_states(**{"input_select.tesla_mode": "force_off", "sensor.grid": "3000",
+                             "sensor.tesla_power": "0"}))
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    assert not _wake_presses(ha)
