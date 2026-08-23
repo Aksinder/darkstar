@@ -67,6 +67,21 @@ class EVSurplusConfig:
     # and restores the plain SoC gate.
     battery_capacity_kwh: float = 0.0
     battery_charge_efficiency: float = 0.95
+    # EV-priority battery cap (2026-08-23). The reserve gate above decides when the
+    # cars may COUNT the battery's inflow as headroom — but nothing ever told the
+    # battery to stop TAKING it. In self-consumption the inverter soaks whatever DC
+    # surplus it wants first and the servo only ever sees the remainder, so the two
+    # fought: the servo raised the car when the battery paused, the battery took it
+    # back, the servo lowered the car. Observed live 2026-08-23 11:40-11:45: a Tesla
+    # at 45 % pinned to 6 A under 14.5 kW of PV while the battery (82 %) took the
+    # rest, 2.3 kW imported meanwhile. With this on, the servo also emits a cap on
+    # the battery's charge setpoint = what the cars leave over THIS tick (see
+    # ev_priority_battery_cap_w). Off by default; live rollout is an owner decision.
+    ev_priority_battery_cap_enabled: bool = False
+    # The cap only moves when it changes by at least this much (W). The dispatcher
+    # has no write threshold on this register — only exact-match dedup — so an
+    # unhysteresised cap would write the inverter every tick it drifts.
+    ev_priority_cap_hysteresis_w: float = 200.0
     # Slack the forecast must show BEYOND the battery's remaining need. It absorbs the
     # house load (which eats the same PV) and forecast error, because remaining_solar
     # is gross production, not what actually reaches the battery. Too small and the
@@ -480,8 +495,75 @@ def _deadline_required_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
     return min(required_w, _charger_max_w(c))
 
 
+@dataclass
+class EVSurplusTick:
+    """What compute_ev_surplus worked out this tick, for callers that need more than
+    the commands — without changing the return type that 76 call sites depend on.
+
+    ``demand``: at least one auto charger is plugged, home, below its SoC target and
+    not dwell-inhibited — i.e. something that could take more. ``target_total_w`` is
+    the DAMPED fleet target (after gain/deadband/cold-start), which is the number the
+    battery cap must be derived from: deriving it from a re-measured grid instead is
+    exactly the limit cycle this exists to kill.
+    """
+
+    current_total_w: float = 0.0
+    target_total_w: float = 0.0
+    fleet_max_w: float = 0.0
+    demand: bool = False
+    reserve_active: bool = False
+    computed: bool = False
+
+
+def ev_priority_battery_cap_w(
+    inputs: EVSurplusInputs,
+    cfg: EVSurplusConfig,
+    tick: EVSurplusTick,
+    plan_battery_charge_w: float,
+) -> float | None:
+    """Max battery charge SETPOINT (W) that leaves the cars what they were told to take
+    this tick — or None, meaning "do not touch the battery".
+
+    The honest accounting: everything not feeding the house right now is
+    ``spare = battery_charge + car_draw - grid_import`` (= PV minus house load, by the
+    meter identity grid = house + battery + cars - pv). The cars were just told to
+    draw ``target_total_w`` of it; the battery may have the rest::
+
+        cap = max(plan_battery_charge, spare - target_total)
+
+    Derived from the SAME tick's target, not from the grid a tick later: as the cars
+    ramp, the battery's share shrinks geometrically toward "spare minus fleet max" and
+    never takes anything back, because the cap follows the target rather than the
+    meter. In the deadband (target == current) the cap equals the battery's present
+    charge — a fixed point, not a kick.
+
+    FAIL-SAFE DIRECTION IS THE OPPOSITE OF THE FUSE CAP. The fuse cap returns 0 when
+    blind because the main fuse is never gambled with. Capping the home battery on a
+    bad read is an energy LOSS with no safety upside, so every doubt returns None:
+
+    * the feature is off (default);
+    * the reserve is active — the owner's existing "battery wins now" verdict, with
+      its own hysteresis; a second rule here would oscillate against it;
+    * the battery is discharging (the cars are already backing off, unconditionally);
+    * no car could take more (no demand);
+    * the tick was not computed (skipped, fail-safe stop).
+
+    The plan's own battery charge is a FLOOR: the solver booked that energy for a
+    reason (an evening peak), and this cap must never undercut it. That also keeps the
+    cap inert across an arbitrage night — no sun, no cars on surplus.
+    """
+    if not cfg.ev_priority_battery_cap_enabled:
+        return None
+    if not tick.computed or not tick.demand or tick.reserve_active:
+        return None
+    if inputs.battery_w < 0.0:
+        return None
+    spare_w = max(0.0, inputs.battery_w + tick.current_total_w - inputs.grid_w)
+    return max(0.0, plan_battery_charge_w, spare_w - tick.target_total_w)
+
+
 def compute_ev_surplus(
-    inputs: EVSurplusInputs, cfg: EVSurplusConfig
+    inputs: EVSurplusInputs, cfg: EVSurplusConfig, tick_out: EVSurplusTick | None = None
 ) -> list[ChargerCommand]:
     """Return per-charger commands that steer EV draw toward the allowed energy budget.
 
@@ -636,6 +718,20 @@ def compute_ev_surplus(
 
     fleet_max_w = sum(_charger_max_w(c) for c in chargeable)
     target_total_w = max(0.0, min(fleet_max_w, target_total_w))
+
+    if tick_out is not None:
+        tick_out.current_total_w = current_total_w
+        tick_out.target_total_w = target_total_w
+        tick_out.fleet_max_w = fleet_max_w
+        # Demand = a car that could take more than it draws. A fleet pinned at its
+        # max has nothing to gain from a battery cap; neither has one whose only
+        # charger is waiting out its min-off dwell.
+        tick_out.demand = any(
+            not c.start_inhibited and _charger_max_w(c) > c.current_power_w + 1.0
+            for c in chargeable
+        )
+        tick_out.reserve_active = battery_reserve_active(inputs, cfg)
+        tick_out.computed = True
 
     why = (
         f"grid={inputs.grid_w:.0f}W batt={inputs.battery_w:.0f}W "

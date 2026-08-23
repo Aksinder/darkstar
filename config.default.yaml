@@ -1043,6 +1043,23 @@ executor:
                                         # sunny days short; lower it if the cars never get
                                         # a sunny hour.
       battery_fill_margin_hysteresis_kwh: 2.0  # extra slack needed to RELEASE once engaged
+      # EV-priority battery cap (2026-08-23). The yield gate above decides when the
+      # cars may COUNT the battery's inflow — but nothing told the battery to stop
+      # TAKING it: in self-consumption the inverter soaks whatever DC surplus it wants
+      # first and the servo only ever sees the remainder, so the two fought (a Tesla
+      # pinned to 6 A under 14.5 kW of PV while the 82 % battery took the rest, then
+      # the car drove off at 37 %). With this on, the servo also caps the battery's
+      # max charge power to what the cars leave over THIS tick, derived from the same
+      # tick's damped car target — never from a re-measured grid, which is what made
+      # the oscillation. Inert when: the reserve is active (battery first, same gate,
+      # same hysteresis), the battery is discharging, no car could take more, the
+      # servo skipped the tick, or the slot is a forced charge/export/override. The
+      # plan's own charge_kw is a floor. Floored at 100 W: the SH10RT register is
+      # min 10 / step 100 and rejects 0 (leaving the OLD setpoint in place).
+      ev_priority_battery_cap:
+        enabled: false
+        hysteresis_w: 200                # the cap only moves by >= this; this register has
+                                         #   no write threshold downstream, only exact dedup
     write_guard:
       min_step_a: 2.0                   # only rewrite current when target moves >= this many A
       min_interval_s: 90                # ...and at least this long since the last write (a STOP bypasses it)

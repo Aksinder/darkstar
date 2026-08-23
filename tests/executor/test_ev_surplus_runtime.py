@@ -343,3 +343,76 @@ class TestOverrideTimeout:
         ha_on = self._no_surplus_forced_on()
         await ctrl.run(ha_on, now_ts=1000.0 + 25 * 60.0)
         assert self._tesla_started(ha_on)
+
+
+class TestEvPriorityCapRuntime:
+    """The runtime side: parse, compute each tick, hysteresis, and None on every
+    tick that did not compute — a stale cap must never outlive its tick."""
+
+    def _raw(self, enabled=True, hysteresis=200.0):
+        raw = _cfg_dict()
+        raw["ev_surplus"]["policy"]["ev_priority_battery_cap"] = {
+            "enabled": enabled, "hysteresis_w": hysteresis,
+        }
+        # A reserve that is clearly inactive: lots of sun, battery well below yield.
+        raw["ev_surplus"]["policy"].update({
+            "battery_yield_soc": 95.0, "battery_capacity_kwh": 16.0,
+            "battery_fill_margin_kwh": 3.0,
+        })
+        raw["ev_surplus"]["remaining_solar_entity"] = "sensor.remaining"
+        return raw
+
+    @pytest.mark.asyncio
+    async def test_parses_the_flag(self):
+        cfg = parse_ev_surplus_config(self._raw())
+        assert cfg.policy.ev_priority_battery_cap_enabled is True
+        assert cfg.policy.ev_priority_cap_hysteresis_w == 200.0
+        assert parse_ev_surplus_config(_cfg_dict()).policy.ev_priority_battery_cap_enabled is False
+
+    @pytest.mark.asyncio
+    async def test_a_computed_tick_exposes_a_cap(self):
+        ctrl = EVSurplusController(parse_ev_surplus_config(self._raw()))
+        # Battery soaking 7 kW, Tesla at 3 kW, grid flat: the plan-scenario numbers.
+        ha = FakeHA(_states(**{
+            "sensor.grid": "0", "sensor.batt": "7000", "sensor.soc": "80",
+            "sensor.remaining": "30", "sensor.tesla_power": "3000",
+            "binary_sensor.easee_plug": "off",
+        }))
+        await ctrl.run(ha, now_ts=1000.0)
+        cap = ctrl.ev_priority_battery_cap_w(1000.0)
+        assert cap is not None and 0.0 < cap < 7000.0
+
+    @pytest.mark.asyncio
+    async def test_disabled_exposes_nothing(self):
+        ctrl = EVSurplusController(parse_ev_surplus_config(self._raw(enabled=False)))
+        ha = FakeHA(_states(**{"sensor.batt": "7000", "sensor.soc": "80",
+                               "sensor.remaining": "30", "sensor.tesla_power": "3000"}))
+        await ctrl.run(ha, now_ts=1000.0)
+        assert ctrl.ev_priority_battery_cap_w(1000.0) is None
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_tick_clears_the_cap(self):
+        """Core sensors dark => the tick is skipped => no cap survives from before."""
+        ctrl = EVSurplusController(parse_ev_surplus_config(self._raw()))
+        ha = FakeHA(_states(**{"sensor.batt": "7000", "sensor.soc": "80",
+                               "sensor.remaining": "30", "sensor.tesla_power": "3000"}))
+        await ctrl.run(ha, now_ts=1000.0)
+        assert ctrl.ev_priority_battery_cap_w(1000.0) is not None
+        dark = FakeHA({k: v for k, v in ha.states.items() if k != "sensor.grid"})
+        await ctrl.run(dark, now_ts=1060.0)
+        assert ctrl.ev_priority_battery_cap_w(1060.0) is None
+
+    @pytest.mark.asyncio
+    async def test_small_drift_does_not_move_the_cap(self):
+        """No write threshold exists on this register downstream; the hysteresis
+        here is what keeps a drifting cap from writing the inverter every tick."""
+        ctrl = EVSurplusController(parse_ev_surplus_config(self._raw(hysteresis=200.0)))
+        ctrl._update_ev_priority_cap(3500.0)
+        ctrl._update_ev_priority_cap(3420.0)   # 80 W drift: held
+        assert ctrl.last_ev_priority_cap_w == 3500.0
+        ctrl._update_ev_priority_cap(3200.0)   # 300 W: moves
+        assert ctrl.last_ev_priority_cap_w == 3200.0
+        ctrl._update_ev_priority_cap(None)     # release is never delayed
+        assert ctrl.last_ev_priority_cap_w is None
+        ctrl._update_ev_priority_cap(50.0)     # appearance is never delayed
+        assert ctrl.last_ev_priority_cap_w == 50.0

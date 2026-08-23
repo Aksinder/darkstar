@@ -429,3 +429,115 @@ class TestReviewFixes:
         decision = SimpleNamespace(charge_value=9500.0, max_charge=9500.0)
         ExecutorEngine._apply_fuse_battery_cap(eng, decision)
         assert decision.charge_value == 1000.0
+
+
+class TestCombinedBatteryCap:
+    """_apply_fuse_battery_cap now min()-composes two servo caps: the fuse guard and
+    the EV-priority cap (2026-08-23). Same in-place clamp, same two fields, one
+    floor — and the floor is the second finding of that day."""
+
+    def _eng(self, fuse=None, ev=None, accessor=True):
+        from types import SimpleNamespace
+
+        from executor.engine import ExecutorEngine
+
+        class Bare:
+            pass
+
+        eng = Bare()
+        eng.config = SimpleNamespace(inverter=SimpleNamespace(control_unit="W"))
+        servo = SimpleNamespace(fuse_battery_cap_w=lambda _ts: fuse)
+        if accessor:
+            servo.ev_priority_battery_cap_w = lambda _ts: ev
+        eng._ev_surplus = servo
+        return eng, ExecutorEngine._apply_fuse_battery_cap
+
+    @staticmethod
+    def _decision(**over):
+        from types import SimpleNamespace
+
+        base = dict(charge_value=9500.0, max_charge=9500.0,
+                    mode_intent="self_consumption", source="plan")
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def test_the_tighter_cap_wins(self):
+        eng, cap = self._eng(fuse=2350.0, ev=1500.0)
+        d = self._decision()
+        cap(eng, d)
+        assert d.charge_value == 1500.0 and d.max_charge == 1500.0
+
+    def test_ev_cap_alone_applies(self):
+        eng, cap = self._eng(fuse=None, ev=800.0)
+        d = self._decision()
+        cap(eng, d)
+        assert d.max_charge == 800.0
+
+    def test_no_caps_leaves_the_decision_alone(self):
+        eng, cap = self._eng(fuse=None, ev=None)
+        d = self._decision()
+        cap(eng, d)
+        assert d.max_charge == 9500.0
+
+    def test_the_floor_is_100_w_never_0(self):
+        """number.battery_max_charge_power is min 10 / step 100 on the SH10RT: a 0 W
+        write is out of range, HA rejects it and the OLD setpoint stays — which is
+        what the fuse cap's blind-sensor 0.0 had silently been doing here."""
+        for fuse, ev in ((0.0, None), (None, 0.0), (0.0, 0.0), (40.0, None)):
+            eng, cap = self._eng(fuse=fuse, ev=ev)
+            d = self._decision()
+            cap(eng, d)
+            assert d.charge_value == 100.0 and d.max_charge == 100.0, (fuse, ev)
+
+    def test_a_magicmock_servo_never_becomes_a_cap(self):
+        """The engine tests stand in a MagicMock for the servo; its accessor returns
+        another MagicMock, which must read as 'no cap', not as a number."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from executor.engine import ExecutorEngine
+
+        class Bare:
+            pass
+
+        eng = Bare()
+        eng.config = SimpleNamespace(inverter=SimpleNamespace(control_unit="W"))
+        eng._ev_surplus = MagicMock()
+        eng._ev_surplus.fuse_battery_cap_w = MagicMock(return_value=None)
+        d = self._decision()
+        ExecutorEngine._apply_fuse_battery_cap(eng, d)
+        assert d.max_charge == 9500.0
+
+    def test_an_old_servo_without_the_accessor_still_works(self):
+        eng, cap = self._eng(fuse=2350.0, accessor=False)
+        d = self._decision()
+        cap(eng, d)
+        assert d.max_charge == 2400.0
+
+    def test_an_override_is_not_second_guessed_by_a_car(self):
+        """A human's force_charge is an explicit statement about the battery. The
+        fuse still applies (it always does); the EV cap steps aside."""
+        eng, cap = self._eng(fuse=None, ev=800.0)
+        d = self._decision(source="override", mode_intent="charge")
+        cap(eng, d)
+        assert d.max_charge == 9500.0
+        eng, cap = self._eng(fuse=2350.0, ev=800.0)
+        d = self._decision(source="override", mode_intent="charge")
+        cap(eng, d)
+        assert d.max_charge == 2400.0
+
+    def test_planned_charge_and_export_modes_are_left_to_the_plan(self):
+        for mode in ("charge", "export"):
+            eng, cap = self._eng(fuse=None, ev=800.0)
+            d = self._decision(mode_intent=mode)
+            cap(eng, d)
+            assert d.max_charge == 9500.0, mode
+
+    def test_idle_is_capped_too(self):
+        """idle is the mode the controller picks while an EV charges, and it writes
+        {{max_charge}} just like self_consumption — leaving it out would reopen the
+        exact scenario."""
+        eng, cap = self._eng(fuse=None, ev=800.0)
+        d = self._decision(mode_intent="idle")
+        cap(eng, d)
+        assert d.max_charge == 800.0

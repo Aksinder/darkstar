@@ -3423,7 +3423,12 @@ class ExecutorEngine:
             logger.debug("Battery cost update skipped: %s", e)
 
     def _apply_fuse_battery_cap(self, decision: Any) -> None:
-        """Fuse guard (25 A/phase): cap the battery's commanded charge power.
+        """Cap the battery's commanded charge power: fuse guard AND EV priority.
+
+        Two servo-computed caps, min()-composed, applied in place right before
+        dispatcher.execute — the only call site. Fuse guard (25 A/phase) below; the
+        EV-priority cap is the return channel the reserve gate never had: it tells
+        the battery to leave the cars the surplus they were just told to take.
 
         The battery is the guard's only non-EV shed lever — planner grid-charging
         (9.5 kW ≈ 13.8 A on every phase) stacked on the 1-phase VVB block can exceed
@@ -3449,15 +3454,45 @@ class ExecutorEngine:
         )
         if unit != "W":
             return
-        cap = self._ev_surplus.fuse_battery_cap_w(time.time())
-        if cap is None:
+        now = time.time()
+        caps: list[tuple[str, float]] = []
+
+        fuse_cap = self._ev_surplus.fuse_battery_cap_w(now)
+        if isinstance(fuse_cap, int | float):
+            caps.append(("Fuse guard", float(fuse_cap)))
+
+        # EV-priority cap (2026-08-23): the servo's "what the cars leave over this
+        # tick". Only while the decision leaves the battery to soak PV on its own —
+        # self_consumption/idle from the PLAN. A forced charge, an export block or a
+        # human override is an explicit statement about the battery and is not
+        # second-guessed by a car. getattr + isinstance: the engine tests stand in a
+        # MagicMock for the servo, and a MagicMock must never become a cap.
+        ev_cap = None
+        ev_accessor = getattr(self._ev_surplus, "ev_priority_battery_cap_w", None)
+        if (
+            callable(ev_accessor)
+            and getattr(decision, "source", "plan") != "override"
+            and getattr(decision, "mode_intent", None) in ("self_consumption", "idle")
+        ):
+            ev_cap = ev_accessor(now)
+        if isinstance(ev_cap, int | float):
+            caps.append(("EV priority", float(ev_cap)))
+
+        if not caps:
             return
-        cap = round(cap / 100.0) * 100.0
+        label, cap = min(caps, key=lambda c: c[1])
+        # Rounded to 100 W so the 10 s meter jitter doesn't defeat the dispatcher's
+        # write dedup — and FLOORED at 100 W, never 0: number.battery_max_charge_power
+        # is min 10 / step 100 on the SH10RT, and a 0 W write is out of range — HA
+        # rejects it and the OLD setpoint stays. The fuse cap's blind-sensor 0.0 had
+        # been that silent no-op on this site until 2026-08-23.
+        cap = max(100.0, round(cap / 100.0) * 100.0)
         for field_name in ("charge_value", "max_charge"):
             val = getattr(decision, field_name, None)
             if isinstance(val, int | float) and val > cap:
                 logger.info(
-                    "Fuse guard: capping battery %s %.0f -> %.0f W",
+                    "%s: capping battery %s %.0f -> %.0f W",
+                    label,
                     field_name,
                     val,
                     cap,
