@@ -23,11 +23,13 @@ from .ev_surplus import (
     ChargerState,
     EVSurplusConfig,
     EVSurplusInputs,
+    EVSurplusTick,
     WriteGuardConfig,
     battery_fill_slack_kwh,
     battery_reserve_active,
     battery_tier_active,
     compute_ev_surplus,
+    ev_priority_battery_cap_w,
     fuse_battery_charge_cap_w,
     should_write_current,
 )
@@ -312,6 +314,12 @@ def parse_ev_surplus_config(
         battery_assist_floor_soc=float(ba.get("floor_soc", 40.0)),
         battery_assist_allowance_w=float(ba.get("allowance_w", 6000.0)),
         battery_assist_soc_hysteresis=float(ba.get("soc_hysteresis", 3.0)),
+        ev_priority_battery_cap_enabled=bool(
+            (pol.get("ev_priority_battery_cap") or {}).get("enabled", False)
+        ),
+        ev_priority_cap_hysteresis_w=float(
+            (pol.get("ev_priority_battery_cap") or {}).get("hysteresis_w", 200.0)
+        ),
         gain=float(pol.get("gain", 0.5)),
         deadband_w=float(pol.get("deadband_w", 250.0)),
         # NOTE: must match the pure-layer default (1.0) — a diverging parse default
@@ -526,6 +534,10 @@ class EVSurplusController:
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
         self._last_cmd_ts: dict[str, float] = {}
+        # EV-priority battery cap for the engine (see ev_priority_battery_cap_w).
+        # None = do not touch the battery. Reset to None on every skipped or
+        # fail-safe tick, so a stale cap can never outlive the tick that computed it.
+        self.last_ev_priority_cap_w: float | None = None
         # charger id -> (epoch when this override was first seen, which one)
         self._override_since: dict[str, tuple[float, str]] = {}
 
@@ -552,6 +564,34 @@ class EVSurplusController:
             grid_w=self.last_grid_w,
             ev_alloc_a=self.last_ev_alloc_a,
         )
+
+    def _update_ev_priority_cap(self, cap: float | None) -> None:
+        """Store this tick's cap, with hysteresis against register churn.
+
+        The dispatcher dedups battery writes by exact value only (no threshold on
+        this register), so a cap that drifts by a few watts per tick would write the
+        inverter every tick. It moves only when the change is at least
+        ev_priority_cap_hysteresis_w — or when it appears or disappears, which must
+        never be delayed: "disappear" is the release back to full charging.
+        """
+        prev = self.last_ev_priority_cap_w
+        if cap is None or prev is None:
+            self.last_ev_priority_cap_w = cap
+            return
+        if abs(cap - prev) >= self.cfg.policy.ev_priority_cap_hysteresis_w:
+            self.last_ev_priority_cap_w = cap
+
+    def ev_priority_battery_cap_w(self, now_ts: float) -> float | None:
+        """Battery charge-setpoint cap so the cars get the surplus first, or None.
+
+        None means "do not touch the battery" — the opposite fail-safe of
+        fuse_battery_cap_w, on purpose: capping the home battery on a doubt is an
+        energy loss, not a safety win. ``now_ts`` is accepted for signature parity
+        with the fuse accessor; the value is always this tick's, never older, because
+        every skipped tick resets it.
+        """
+        del now_ts
+        return self.last_ev_priority_cap_w
 
     @property
     def fuse_budget_a(self) -> float | None:
@@ -850,6 +890,7 @@ class EVSurplusController:
         """
         cfg = self.cfg
         if not cfg.enabled or not cfg.chargers:
+            self.last_ev_priority_cap_w = None
             return {"enabled": False}
 
         # Read all sources AND all chargers concurrently. Serial awaits here meant ~14 HA
@@ -883,7 +924,9 @@ class EVSurplusController:
                     self._core_skip_since = now_ts
                 elif (now_ts - self._core_skip_since) > self.cfg.fuse_stale_after_s:
                     await self._failsafe_stop_all(ha, now_ts, "core sensors dark", shadow)
+                    self.last_ev_priority_cap_w = None
                     return {"enabled": True, "fuse_failsafe": "core sensors dark"}
+            self.last_ev_priority_cap_w = None
             return {"enabled": True, "skipped": "core sensors unreadable"}
         self._core_skip_since = None
         pv_w = src[0] or 0.0
@@ -906,6 +949,7 @@ class EVSurplusController:
                     or (now_ts - self.last_phase_ok_ts) > self.cfg.fuse_stale_after_s
                 ):
                     await self._failsafe_stop_all(ha, now_ts, "phase sensors stale", shadow)
+                    self.last_ev_priority_cap_w = None
                     return {"enabled": True, "fuse_failsafe": "phase sensors stale"}
                 # Briefly stale: proceed with NO increases (pure clamp holds/reduces).
                 phase_currents = {}
@@ -989,7 +1033,13 @@ class EVSurplusController:
             plan_battery_charge_w=max(0.0, plan_battery_charge_kw) * 1000.0,
             phase_currents_a=phase_currents, chargers=states,
         )
-        commands = compute_ev_surplus(inputs, cfg.policy)
+        tick = EVSurplusTick()
+        commands = compute_ev_surplus(inputs, cfg.policy, tick_out=tick)
+        self._update_ev_priority_cap(
+            ev_priority_battery_cap_w(
+                inputs, cfg.policy, tick, max(0.0, plan_battery_charge_kw) * 1000.0
+            )
+        )
         if cfg.fuse_guard_enabled:
             _alloc: dict[str, float] = {}
             _by_id = {s2.id: s2 for s2 in states}

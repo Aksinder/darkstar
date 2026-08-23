@@ -113,3 +113,42 @@ class TestEndToEnd:
             _inputs(50.0, 20.0, battery_w=-3000.0, chargers=[self._tesla_at(40.0)]), CFG
         )
         assert not cmds[0].switch_on
+
+
+class TestReserveAndTheBatteryCap:
+    """The EV-priority battery cap (2026-08-23) reuses THIS gate as its 'battery
+    wins' verdict — one rule, one hysteresis. Pinned here so the two can never
+    disagree: whenever the reserve claims the inflow, the cap steps aside."""
+
+    def _cap(self, soc, remaining, prev=False):
+        from dataclasses import replace
+
+        from executor.ev_surplus import (
+            EVSurplusTick,
+            compute_ev_surplus,
+            ev_priority_battery_cap_w,
+        )
+
+        cfg = replace(CFG, ev_priority_battery_cap_enabled=True)
+        inputs = _inputs(soc, remaining, prev=prev, chargers=[_tesla(current_power_w=3000.0)])
+        tick = EVSurplusTick()
+        compute_ev_surplus(inputs, cfg, tick_out=tick)
+        return ev_priority_battery_cap_w(inputs, cfg, tick, 4000.0), tick
+
+    def test_sunny_morning_caps_the_battery_for_the_car(self):
+        cap, tick = self._cap(soc=50.0, remaining=20.0)
+        assert not tick.reserve_active
+        assert cap is not None
+
+    def test_late_afternoon_reserve_releases_the_battery(self):
+        cap, tick = self._cap(soc=50.0, remaining=6.0)
+        assert tick.reserve_active
+        assert cap is None
+
+    def test_the_cap_follows_the_gates_hysteresis(self):
+        """Engaged at 3 kWh slack, released only at 5: a cap that used its own
+        threshold would flap against the gate in the 3-5 kWh band."""
+        cap_engaged, tick = self._cap(soc=50.0, remaining=12.5, prev=True)
+        assert tick.reserve_active and cap_engaged is None
+        cap_released, tick2 = self._cap(soc=50.0, remaining=12.5, prev=False)
+        assert not tick2.reserve_active and cap_released is not None
