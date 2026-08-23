@@ -1,3 +1,7 @@
+## dev-20260823.1145 — 2026-08-23 11:47
+
+- ev_surplus: the return channel — cap the battery's charge power for the cars
+
 ## dev-20260822.2341 — 2026-08-22 23:43
 
 - deferrable: price the waiting — stop chasing öre with hours
