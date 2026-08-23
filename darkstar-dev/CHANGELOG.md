@@ -1,3 +1,7 @@
+## dev-20260823.1547 — 2026-08-23 15:48
+
+- ev_surplus: a car that starts itself is ON — reality over memory, and a failure ledger that forgets
+
 ## dev-20260823.1145 — 2026-08-23 11:47
 
 - ev_surplus: the return channel — cap the battery's charge power for the cars
