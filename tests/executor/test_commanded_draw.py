@@ -141,3 +141,69 @@ async def test_the_car_stays_on_through_its_own_ramp_up():
     )
     await ctrl.run(ha, now_ts=STALE_NOW, shadow=True)
     assert ctrl._last_a["tesla"] > 0.0, "servo switched off the load it just created"
+
+
+# ---------------------------------------------------------------------------
+# Reality over memory (2026-08-23): a car that started ITSELF.
+#
+# 13:46:41 the Tesla was plugged in and began charging at 11 kW on its own. The
+# servo had switched it off at 11:46, so its memory said OFF, and _is_on prefers
+# the commanded state — an 11 kW load was modelled as "off", the servo decided to
+# START it, switch.turn_on on an already-charging car failed, and in its model
+# there was never a running car to REDUCE. 42 minutes of battery + grid into the
+# car. A clear, provably fresh draw against a remembered OFF means the world moved
+# without us: adopt it.
+# ---------------------------------------------------------------------------
+
+LATER = "2026-08-15T10:12:00+00:00"  # well after the command
+
+
+@pytest.mark.asyncio
+async def test_a_self_started_car_is_adopted_as_on():
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 0.0          # we stopped it earlier...
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    # ...and a reading from AFTER that stop shows 11 kW: it started itself.
+    ha = TimedHA(_states(**{"sensor.tesla_power": "11000"}), {"sensor.tesla_power": LATER})
+    st = await _read(ctrl, ha, cfg, now_ts=_epoch(LATER) + 30)
+    assert st.commanded_on is True
+    assert st.current_power_w == 11000.0
+    # The amp memory is synced to what it draws, so the next command is a
+    # REDUCTION from 11 kW — not a start.
+    assert ctrl._last_a["tesla"] == pytest.approx(11000.0 / (3 * 230.0))
+    assert ctrl._last_switch["tesla"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_stale_reading_is_still_lag_not_a_self_start():
+    """The pre-existing rule, unchanged: a reading that predates our stop is the
+    sensor lagging us, and is substituted with 0 — never adopted as a start."""
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 0.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "11000"}), {"sensor.tesla_power": BEFORE})
+    st = await _read(ctrl, ha, cfg, now_ts=STALE_NOW)
+    assert st.commanded_on is False
+    assert st.current_power_w == 0.0
+
+
+@pytest.mark.asyncio
+async def test_no_timestamp_means_no_proof_means_no_adoption():
+    """Without last_updated we cannot tell lag from a self-start; memory stands."""
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 0.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "11000"}), {})
+    st = await _read(ctrl, ha, cfg, now_ts=_epoch(LATER))
+    assert st.commanded_on is False
+
+
+@pytest.mark.asyncio
+async def test_a_trickle_is_not_a_self_start():
+    """Below half the minimum on-power it is noise or a battery heater, not a charge."""
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 0.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "300"}), {"sensor.tesla_power": LATER})
+    st = await _read(ctrl, ha, cfg, now_ts=_epoch(LATER))
+    assert st.commanded_on is False

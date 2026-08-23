@@ -808,6 +808,16 @@ class EVSurplusController:
             power = 0.0
         plugged = bool(res[1])
         at_home = bool(res[2])
+        if not plugged or not at_home:
+            # A car that left takes its failure history with it. The backoff ledger
+            # is about THIS car's API right now; carried across a departure it met
+            # the returning car with "fail #3, 480 s" (2026-08-23 17:29) for two
+            # failures from a visit three hours earlier — eight idle minutes with
+            # sun to spare. Same for the wake cooldown.
+            if c.id in self._act_fail or c.id in self._last_wake_ts:
+                logger.debug("EV surplus: %s away — clearing failure backoff", c.id)
+            self._act_fail.pop(c.id, None)
+            self._last_wake_ts.pop(c.id, None)
         override = str(res[3])
         soc = cast("float | None", res[4])
         target = cast("float | None", res[5])
@@ -845,6 +855,40 @@ class EVSurplusController:
             commanded_on = self._last_a[c.id] > 0.0
         elif c.id in self._last_switch:
             commanded_on = self._last_switch[c.id]
+        # REALITY OVER MEMORY (2026-08-23). A Tesla plugged in at 13:46 and started
+        # ITSELF at 11 kW. The servo's memory said OFF (it had switched the car off at
+        # 11:46), and _is_on prefers the commanded state — so the pure layer modelled
+        # an 11 kW load as "off", decided to START it, and switch.turn_on on an
+        # already-charging car failed with HTTP 500, four times, into backoff. In its
+        # model there was never a running car to REDUCE, so the reduce headroom (-6 kW)
+        # demanded was never sent: 42 minutes of 7 kW out of the home battery and
+        # 4 kW of import straight into the car. A clear measured draw against a
+        # remembered OFF means the world moved without us: adopt it, and sync the
+        # amp memory so the next command is a reduction from what it draws, not a
+        # start. The opposite lag (we commanded ON, the sensor still reads 0) is the
+        # trust_commanded_draw case below and stays as it is.
+        # Only on a reading PROVABLY newer than our last command: a sensor still
+        # showing the old draw from before our stop is lag (the trust_commanded_draw
+        # case), not a car that started itself. No timestamp = no proof = no
+        # adoption; the live client always supplies last_updated, the bare test
+        # fakes deliberately do not.
+        _cmd_ts = self._last_cmd_ts.get(c.id)
+        _reading_fresh = power_ts is not None and (_cmd_ts is None or power_ts > _cmd_ts)
+        if (
+            commanded_on is False
+            and _reading_fresh
+            and power is not None
+            and power > max(500.0, 0.5 * c.min_current_a * c.phases * c.voltage_v)
+        ):
+            logger.info(
+                "EV surplus: %s is drawing %.0f W while remembered OFF — adopting "
+                "reality (it started itself)",
+                c.id, power,
+            )
+            commanded_on = True
+            if c.id in self._last_a:
+                self._last_a[c.id] = power / (c.phases * c.voltage_v)
+            self._last_switch[c.id] = True
         # Close the loop on our own actuation. The control law is
         # "target = measured draw + headroom", so a car that has just eaten the export
         # while its power sensor still reads 0 is indistinguishable from a cloud — and
@@ -1081,8 +1125,23 @@ class EVSurplusController:
             if ccfg is None:
                 continue
             fail = self._act_fail.get(cmd.id)
+            # Is this command PROTECTIVE — a stop, or a reduction below what the car
+            # draws or was last told? Reducing is the safe direction, and the cost of
+            # NOT reducing is real and immediate (the home battery or the grid feeds
+            # the car meanwhile). Protective commands retry every tick; only starts
+            # and increases earn the escalating backoff that spares a sleeping car.
+            last_a = self._last_a.get(cmd.id)
+            drawing_w = next((st.current_power_w for st in states if st.id == cmd.id), 0.0)
+            protective = (not cmd.switch_on) or (
+                cmd.set_current_a is not None
+                and last_a is not None
+                and cmd.set_current_a < last_a
+            )
             if fail is not None:
-                backoff_s = min(900.0, 120.0 * (2.0 ** (fail[1] - 1)))
+                backoff_s = (
+                    60.0 if protective
+                    else min(900.0, 120.0 * (2.0 ** (fail[1] - 1)))
+                )
                 if (now_ts - fail[0]) < backoff_s:
                     continue  # in failure backoff — spare the (Tesla) API
             try:
@@ -1094,9 +1153,15 @@ class EVSurplusController:
                 self._act_fail[cmd.id] = (now_ts, n)
                 # A sleeping car is the dominant failure cause (switch.turn_on ->
                 # HTTP 500). Press its wake button once per WAKE_COOLDOWN_S so the
-                # backoff retry finds it awake; only for commands that wanted it ON
-                # (a failed stop needs no wake — the car isn't drawing anyway).
-                if ccfg.wake_entity and cmd.switch_on and not (shadow or ccfg.shadow):
+                # retry finds it awake. Wake when the command would CHANGE what the
+                # car does: a start on a car not drawing, or a stop/reduce on a car
+                # that IS drawing. The old rule skipped the wake on every failed
+                # stop ("the car isn't drawing anyway") — false for a car that
+                # started itself, which is exactly when a stop matters most.
+                wants_change = (cmd.switch_on and drawing_w < 100.0) or (
+                    protective and drawing_w >= 100.0
+                )
+                if ccfg.wake_entity and wants_change and not (shadow or ccfg.shadow):
                     last_wake = self._last_wake_ts.get(cmd.id, float("-inf"))
                     if (now_ts - last_wake) >= 300.0:
                         self._last_wake_ts[cmd.id] = now_ts
@@ -1112,9 +1177,15 @@ class EVSurplusController:
                             logger.warning(
                                 "EV surplus: wake press failed for %s", cmd.id
                             )
+                # The reason is logged HERE because a failed command never reaches
+                # the applied list — until now the servo's intent for a failing car
+                # was invisible, which is what made this outage take an hour to read.
                 logger.exception(
-                    "EV surplus: actuation failed for %s (fail #%d, backoff %.0fs) — continuing",
-                    cmd.id, n, min(900.0, 120.0 * (2.0 ** (n - 1))),
+                    "EV surplus: actuation failed for %s (fail #%d, backoff %.0fs, "
+                    "wanted on=%s a=%s, drawing %.0f W: %s) — continuing",
+                    cmd.id, n,
+                    60.0 if protective else min(900.0, 120.0 * (2.0 ** (n - 1))),
+                    cmd.switch_on, cmd.set_current_a, drawing_w, cmd.reason,
                 )
                 continue
             self._act_fail.pop(cmd.id, None)
