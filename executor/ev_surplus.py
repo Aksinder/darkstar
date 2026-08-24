@@ -29,6 +29,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Battery power (W) below which the EV-priority cap treats the home battery as
+# genuinely discharging rather than idle. Sign alone would chatter around zero.
+_CAP_DISCHARGE_DEADBAND_W = 100.0
+
 
 @dataclass
 class EVSurplusConfig:
@@ -505,13 +509,19 @@ class EVSurplusTick:
 
     ``demand``: at least one auto charger is plugged, home, below its SoC target and
     not dwell-inhibited — i.e. something that could take more. ``target_total_w`` is
-    the DAMPED fleet target (after gain/deadband/cold-start), which is the number the
-    battery cap must be derived from: deriving it from a re-measured grid instead is
-    exactly the limit cycle this exists to kill.
+    the DAMPED fleet target (after gain/deadband/cold-start).
+
+    ``commanded_on_total_w`` is what the cars were actually TOLD to take this tick
+    (sum over commands with ``switch_on``), and it — not ``target_total_w`` — is the
+    number the battery cap derives from. The two differ exactly where it matters: a
+    target below a charger's start threshold commands the car OFF, so the target is
+    an intention nobody consumes. Deriving the cap from a re-measured grid instead of
+    either is the limit cycle this whole mechanism exists to kill.
     """
 
     current_total_w: float = 0.0
     target_total_w: float = 0.0
+    commanded_on_total_w: float = 0.0
     fleet_max_w: float = 0.0
     demand: bool = False
     reserve_active: bool = False
@@ -559,10 +569,24 @@ def ev_priority_battery_cap_w(
         return None
     if not tick.computed or not tick.demand or tick.reserve_active:
         return None
-    if inputs.battery_w < 0.0:
+    # A car must actually be COMMANDED ON this tick. `demand` alone is "a plugged car
+    # below its ceiling" — true all night for a car merely parked on the charger (live
+    # 2026-08-24: 353 clamps overnight, flapping 9500<->100 W against the controller).
+    # And `target_total_w > 0` is not enough either: below a charger's start threshold
+    # the servo commands it OFF while the cold-start kick still reports the full
+    # headroom as the target, so every morning ramp in the ~0.25-4.8 kW band would pin
+    # the battery to its 100 W floor while the PV exported — a stable fixed point,
+    # since capping the battery does not change the car's start decision (headroom
+    # counts the battery's inflow either way). No commanded draw, no claim.
+    if tick.commanded_on_total_w <= 0.0:
+        return None
+    # Discharge means the cars are already backing off unconditionally. Use a small
+    # deadband, not sign: a battery hovering at 0 W (dawn, cloud edges) would other-
+    # wise flip None<->value every tick, and each flip is an inverter register write.
+    if inputs.battery_w < -_CAP_DISCHARGE_DEADBAND_W:
         return None
     spare_w = max(0.0, inputs.battery_w + tick.current_total_w - inputs.grid_w)
-    return max(0.0, plan_battery_charge_w, spare_w - tick.target_total_w)
+    return max(0.0, plan_battery_charge_w, spare_w - tick.commanded_on_total_w)
 
 
 def compute_ev_surplus(
@@ -910,4 +934,11 @@ def compute_ev_surplus(
                 ChargerCommand(c.id, switch_on=True, set_current_a=None,
                                target_power_w=max_w, reason=f"on (binary, {tag}); {why}")
             )
+    if tick_out is not None:
+        # What the fleet was actually told to draw. Filled here (not with the rest of
+        # the tick above) because it is only knowable after pass 2 has decided each
+        # charger's on/off — which is precisely the information the battery cap needs.
+        tick_out.commanded_on_total_w = sum(
+            cmd.target_power_w for cmd in commands if cmd.switch_on
+        )
     return commands
