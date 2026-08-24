@@ -1,3 +1,7 @@
+## dev-20260824.0823 — 2026-08-24 08:25
+
+- Price integrity: internal spot as servo source, fail-open C3, negative fetch memo
+
 ## dev-20260823.1547 — 2026-08-23 15:48
 
 - ev_surplus: a car that starts itself is ON — reality over memory, and a failure ledger that forgets
