@@ -56,6 +56,7 @@ from .override import (
     evaluate_overrides,
 )
 from .water_hold import (
+    NO_SURPLUS_REASON,
     battery_charge_w,
     detect_appliance_drift,
     price_percentile,
@@ -264,6 +265,9 @@ class ExecutorEngine:
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
         self._water_hold_state: dict[str, tuple[bool, str]] = {}
         self._water_boost_state: dict[str, tuple[bool, str]] = {}
+        # Monotonic deadline until which a started surplus boost is held ON
+        # despite momentary loss of surplus (surplus_boost_min_minutes).
+        self._water_boost_hold_until: dict[str, float] = {}
         # heater id -> (epoch when this override was first seen, which one)
         self._override_since: dict[str, tuple[float, str]] = {}
         self._override_state: dict[str, str] = {}
@@ -3222,6 +3226,42 @@ class ExecutorEngine:
                 "Water surplus-boost %s: %s (%s)",
                 device.id, "ON" if boost else "off", reason,
             )
+        hold_minutes = float(getattr(device, "surplus_boost_min_minutes", 0.0) or 0.0)
+        now_mono = time.monotonic()
+        if boost:
+            # Arm/extend the hold only on a genuine surplus tick.
+            if hold_minutes > 0.0:
+                self._water_boost_hold_until[device.id] = now_mono + hold_minutes * 60.0
+        else:
+            hold_until = self._water_boost_hold_until.get(device.id)
+            # A price/vacation/daily-cap refusal must win instantly — the hold exists to
+            # ride out NOISE in the measured surplus, not to keep heating through an
+            # expensive hour. Only "no surplus" is held against.
+            #
+            # But "no surplus" is checked FIRST inside should_boost_on_surplus, so it
+            # masks a simultaneous price refusal. Re-check the price here, against the
+            # IMPORT side: with the surplus gone the held kWh is genuinely bought, so
+            # that — not the export price — is what the ceiling must judge. Unknown
+            # price does not hold (fails closed, like the rest of this module).
+            ceiling = self._heater_price_ceiling(device, ctx)
+            dip_price = ctx.get("import_price")
+            price_allows_hold = ceiling is None or (
+                dip_price is not None and dip_price <= ceiling
+            )
+            if (
+                hold_until is not None
+                and now_mono < hold_until
+                and reason == NO_SURPLUS_REASON
+                and price_allows_hold
+            ):
+                logger.info(
+                    "Water surplus-boost %s: surplus dipped, holding the boost "
+                    "(%.0f s of %.0f min left)",
+                    device.id, hold_until - now_mono, hold_minutes,
+                )
+                boost = True
+            elif hold_until is not None:
+                self._water_boost_hold_until.pop(device.id, None)
         if not boost:
             return None
         return (

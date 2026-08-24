@@ -42,6 +42,11 @@ DEFAULT_IDLE_POWER_W = 100.0
 # meter noise around zero is not surplus.
 DEFAULT_SURPLUS_MARGIN_W = 200.0
 
+# The one refusal that means "the measurement moved", not "this is a bad idea".
+# The engine's surplus-boost hold rides out THIS reason only: a price/vacation/daily-cap
+# refusal must take effect on the same tick it appears.
+NO_SURPLUS_REASON = "no surplus"
+
 
 def price_percentile(prices: list[float], percentile: float) -> float | None:
     """The ``percentile``-th value of a price window, linear-interpolated (numpy type 7).
@@ -207,7 +212,7 @@ def should_boost_on_surplus(
     """
     own = power_w or 0.0
     if not has_surplus(grid_w, battery_w, heater_power_w, surplus_margin_w, own):
-        return False, "no surplus"
+        return False, NO_SURPLUS_REASON
 
     if max_price_sek_kwh is not None:
         price = export_price_sek_kwh
