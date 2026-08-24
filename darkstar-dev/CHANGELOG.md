@@ -1,3 +1,7 @@
+## dev-20260824.1649 — 2026-08-24 16:51
+
+- Water: anti-short-cycle hold for the surplus boost
+
 ## dev-20260824.1307 — 2026-08-24 13:09
 
 - Spa: drive the climate mode; EV cap: gate on commanded draw, not intent
