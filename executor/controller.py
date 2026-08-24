@@ -58,7 +58,7 @@ class ControllerDecision:
 
     export_power_w: float = 0.0  # Planned grid export power in Watts
     export_with_load_w: float = 0.0  # Export power + house load (for Fronius export mode)
-    export_price_sek_kwh: float = 0.0  # Effective export price for this slot (C3 curtailment)
+    export_price_sek_kwh: float | None = None  # Effective export price; None = unknown (C3 stands down)
 
     # User's configured max limits (for templates like {{max_charge}})
     max_charge: float = 0.0
@@ -202,6 +202,9 @@ class Controller:
             control_unit=unit,
             source="override",
             reason=override.reason,
+            # The slot's price is known even under an override — dropping it would
+            # make C3 stand down (None = unknown) for every override tick.
+            export_price_sek_kwh=slot.export_price_sek_kwh,
         )
 
     def _follow_plan(self, slot: SlotPlan, state: SystemState) -> ControllerDecision:

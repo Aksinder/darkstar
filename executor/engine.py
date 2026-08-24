@@ -69,6 +69,16 @@ logger = logging.getLogger(__name__)
 EXECUTOR_VERSION = "1.0.0"
 
 
+def _parse_optional_price(raw: Any) -> float | None:
+    """A price field that may be absent: None stays None (unknown), never 0.0."""
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class EVChargerState:
     """Per-device EV charger runtime state."""
@@ -248,6 +258,7 @@ class ExecutorEngine:
 
         # Idle-hold: (hour iso, import price) memo — recomputed once per hour.
         self._import_price_cache: tuple[str, float] | None = None
+        self._spot_price_cache: tuple[str, float] | None = None
         self._price_window_cache: tuple[tuple[str, str, float], list[float]] | None = None
 
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
@@ -2030,6 +2041,15 @@ class ExecutorEngine:
                     # charging, which is precisely when the bridge must keep working.
                     if self._ev_surplus is not None and self.ha_client is not None:
                         try:
+                            # Resolve the price BEFORE stamping now_ts: a slow fetch
+                            # inside the argument list would hand run() a stale clock
+                            # (skewing min_on/min_off holds and the phase-staleness
+                            # stamp). Skip it entirely for a disabled servo.
+                            _servo_spot = (
+                                await self._current_spot_price()
+                                if self._ev_surplus.cfg.enabled
+                                else None
+                            )
                             await self._ev_surplus.run(
                                 self.ha_client,
                                 time.time(),
@@ -2044,6 +2064,7 @@ class ExecutorEngine:
                                     if original_slot is not None
                                     else 0.0
                                 ),
+                                internal_spot_price_sek=_servo_spot,
                             )
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)
@@ -2468,7 +2489,10 @@ class ExecutorEngine:
             water_heating_boost=water_heating_boost,
             custom_entity_active=custom_entity_active,
             sinks=sinks,
-            export_price_sek_kwh=float(slot_data.get("export_price_sek_kwh", 0.0) or 0.0),
+            # None (NOT 0.0) when the schedule lacks the field or the slot is stale:
+            # a coerced 0.0 read as "export is worthless" defeats every fail-closed
+            # price gate downstream (water surplus-boost, cyclic gates, C3).
+            export_price_sek_kwh=_parse_optional_price(slot_data.get("export_price_sek_kwh")),
         )
 
     async def _current_import_price(self) -> float | None:
@@ -2503,6 +2527,45 @@ class ExecutorEngine:
                     return price
         except Exception as e:
             logger.debug("Idle-hold: import price unavailable: %s", e)
+        return None
+
+    async def _current_spot_price(self) -> float | None:
+        """Raw day-ahead spot (excl. VAT/fees) for the current 15-min slot, or None.
+
+        Memoized per slot start. The EV servo's price tiers are written in spot terms;
+        this is their primary source — the HA price_entity is only a fallback (it
+        produced a stuck literal 0 during the 2026-08-24 Nordpool outage, which a
+        value check cannot catch since genuinely negative/zero spot is legitimate).
+        """
+        try:
+            import pytz
+
+            from backend.core.prices import get_nordpool_data
+
+            tz = pytz.timezone(self.config.timezone)
+            now = datetime.now(tz)
+            slot_key = now.replace(
+                minute=(now.minute // 15) * 15, second=0, microsecond=0
+            ).isoformat()
+            cached = self._spot_price_cache
+            if cached is not None and cached[0] == slot_key:
+                return cached[1]
+
+            prices = await get_nordpool_data("config.yaml")
+            if not prices:
+                return None
+            for p in prices:
+                st = p.get("start_time")
+                et = p.get("end_time")
+                if st and et and st <= now < et:
+                    raw = p.get("spot_price_sek_kwh")
+                    if raw is None:
+                        return None
+                    price = float(raw)
+                    self._spot_price_cache = (slot_key, price)
+                    return price
+        except Exception as e:
+            logger.debug("EV surplus: internal spot price unavailable: %s", e)
         return None
 
     async def _price_window(

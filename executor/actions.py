@@ -524,6 +524,7 @@ class ActionDispatcher:
         # C3: feed-in limit to restore to after a curtailment window. Captured lazily the moment
         # before the first clamp when export_curtailment.restore_limit_w is left at 0 (auto).
         self._restore_export_limit_w: float | None = None
+        self._curtail_unknown_warn_ts: float = -1e12  # rate-limits the unknown-price warning
         # Manual-ON respect for switch-type water targets: what WE last commanded per
         # entity (so a human's ON is distinguishable from our own), and until when a
         # detected manual ON is honored as an implicit boost. In-memory: an add-on
@@ -1508,7 +1509,9 @@ class ActionDispatcher:
         except (ValueError, TypeError, HACallError):
             return None
 
-    async def _apply_export_curtailment(self, export_price_sek_kwh: float) -> ActionResult | None:
+    async def _apply_export_curtailment(
+        self, export_price_sek_kwh: float | None
+    ) -> ActionResult | None:
         """Price-conditioned export curtailment (C3).
 
         method="number" (legacy): clamp the feed-in NUMBER to 0 W below the
@@ -1519,7 +1522,21 @@ class ActionDispatcher:
         is truly unlimited and never risks an out-of-range number write.
         """
         cc = self.config.export_curtailment
-        if export_price_sek_kwh < cc.threshold_sek_per_kwh:
+        if export_price_sek_kwh is None:
+            # Unknown price (stale/missing schedule): fail OPEN — fall through to the
+            # restore branch below. Holding a 0 W clamp on unknown data forfeits ~1
+            # SEK/kWh of export for the whole outage, while restoring during a genuinely
+            # negative slot costs only the rare, shallow negative price. This matches
+            # the pre-None stale-schedule behavior (coerced 0.0 with threshold 0.0
+            # restored), now with an explicit trace.
+            now_mono = time.monotonic()
+            if now_mono - self._curtail_unknown_warn_ts > 3600.0:
+                self._curtail_unknown_warn_ts = now_mono
+                logger.warning(
+                    "Export curtailment: price unknown (stale schedule?) — restoring "
+                    "normal export until a price returns"
+                )
+        elif export_price_sek_kwh < cc.threshold_sek_per_kwh:
             if cc.method == "switch":
                 logger.info(
                     "Export curtailment ACTIVE (switch method): effective export %.3f < %.3f "

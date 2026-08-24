@@ -28,6 +28,14 @@ PRICE_COMPONENT_ENTITY_KEYS = (
 # this prevents a bare input_number (37.5 öre) being read as 37.5 SEK (a 100x pricing error).
 _ORE_MAGNITUDE_CEILING_SEK = 5.0
 
+# Negative-result memo: after a failed/empty Nordpool fetch, don't re-attempt for this
+# long. Several executor-tick consumers (EV servo spot, water idle-hold, battery cost
+# tracker) call get_nordpool_data every ~60 s; without this, an upstream outage makes
+# every tick block on a doomed ~10 s fetch inside the actuation path. Monotonic clock;
+# benign races (worst case one extra attempt) are acceptable.
+_FETCH_FAIL_MEMO_S = 300.0
+_fetch_fail_until: float = 0.0
+
 
 async def get_nordpool_data(
     config_path: str = "config.yaml",
@@ -92,6 +100,11 @@ async def get_nordpool_data(
     resolution_minutes = nordpool_config.get("resolution_minutes", 60)
 
     import asyncio
+    import time as _time
+
+    global _fetch_fail_until
+    if _time.monotonic() < _fetch_fail_until:
+        return []
 
     prices_client = Prices(currency=currency)
 
@@ -163,15 +176,18 @@ async def get_nordpool_data(
                 print(f"Warning: Failed to get D+1 price forecast fallback: {exc}")
 
         if not all_entries:
+            _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
             return []
 
         processed = _process_nordpool_data(all_entries, config)
         cache_sync.set(cache_key, processed, ttl_seconds=3600.0)
         return processed
     except TimeoutError:
+        _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
         print("Warning: Nordpool price fetch timed out after 10 seconds, returning empty data")
         return []
     except Exception as exc:
+        _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
         print(f"Warning: Failed to fetch Nordpool prices: {exc}")
         import traceback
 
@@ -388,6 +404,10 @@ def _process_nordpool_data(
             {
                 "start_time": start_time,
                 "end_time": end_time,
+                # Raw day-ahead spot (excl. VAT/fees). Consumers whose thresholds are
+                # written in spot terms (EV servo tiers, export curtailment) need this;
+                # deriving it back out of the fee-and-VAT-laden totals is lossy.
+                "spot_price_sek_kwh": round(entry["value"] / 1000.0, 5),
                 "import_price_sek_kwh": import_price,
                 "export_price_sek_kwh": export_price,
             }
@@ -430,6 +450,7 @@ async def get_current_slot_prices(config: dict[str, Any]) -> dict[str, float] | 
         for slot in price_data:
             if slot["start_time"] <= now < slot["end_time"]:
                 return {
+                    "spot_price_sek_kwh": slot.get("spot_price_sek_kwh"),
                     "import_price_sek_kwh": slot["import_price_sek_kwh"],
                     "export_price_sek_kwh": slot["export_price_sek_kwh"],
                 }

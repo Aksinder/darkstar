@@ -11,9 +11,9 @@ live grid + battery + price and nudges the EV current toward a target. The energ
 is a 3-tier source policy:
 
 1. **Solar surplus** — always: any PV beyond house load goes to the cars.
-2. **Cheap / negative grid** — when ``import_price <= cheap_grid_price``: allow up to
+2. **Cheap / negative grid** — when ``import_price < cheap_grid_price`` (strictly): allow up to
    ``cheap_grid_allowance_w`` of grid import for the cars.
-3. **Home battery** — only when ``import_price <= battery_assist_max_price`` (e.g. ``0`` =
+3. **Home battery** — only when ``import_price < battery_assist_max_price`` (strictly; ``0`` =
    negative price) AND a lot of solar is still forecast today
    (``remaining_solar_kwh >= battery_assist_min_remaining_solar_kwh``) AND the battery is
    above ``battery_assist_floor_soc``: then let the battery discharge up to
@@ -40,7 +40,7 @@ class EVSurplusConfig:
     cheap_grid_allowance_w: float = 3680.0  # how much grid import to allow for EV when cheap
     # Tier 3 — home battery, only under negative price + lots of solar still to come.
     battery_assist_enabled: bool = False
-    battery_assist_max_price_sek: float = 0.0  # only assist when import_price <= this (<=0 = negative)
+    battery_assist_max_price_sek: float = 0.0  # only assist when import_price is strictly below this (0 = only negative)
     battery_assist_min_remaining_solar_kwh: float = 8.0  # need this much PV still forecast today
     battery_assist_floor_soc: float = 30.0  # never discharge the home battery below this for EV
     battery_assist_allowance_w: float = 4000.0  # cap on battery discharge fed to the cars
@@ -391,7 +391,10 @@ def battery_tier_active(inputs: EVSurplusInputs, cfg: EVSurplusConfig) -> bool:
     )
     return (
         cfg.battery_assist_enabled
-        and inputs.import_price_sek <= cfg.battery_assist_max_price_sek
+        # Strict <: the documented 'max_price 0.0 = only NEGATIVE prices' must not be
+        # satisfied by an exactly-zero reading — the signature of a dead price
+        # sensor coerced through float(0) (live incident 2026-08-24).
+        and inputs.import_price_sek < cfg.battery_assist_max_price_sek
         and inputs.remaining_solar_kwh >= cfg.battery_assist_min_remaining_solar_kwh
         and inputs.battery_soc_percent > floor
     )
@@ -652,7 +655,8 @@ def compute_ev_surplus(
     # --- Tier gating (only the auto-managed chargers share the surplus budget) ---
     cheap_grid = (
         cfg.cheap_grid_price_sek is not None
-        and inputs.import_price_sek <= cfg.cheap_grid_price_sek
+        # Strict < for the same dead-sensor-reads-0 reason as battery_assist.
+        and inputs.import_price_sek < cfg.cheap_grid_price_sek
     )
     grid_setpoint_w = cfg.cheap_grid_allowance_w if cheap_grid else 0.0
 
