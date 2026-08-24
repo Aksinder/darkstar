@@ -400,6 +400,17 @@ class WaterHeaterDeviceConfig:
     # the bridge's fan_only and would stop the circulation pump.
     climate_heat_mode: str | None = None
     surplus_boost: bool = False
+    # Anti-short-cycle hold for the surplus boost, MINUTES. Measured surplus moves
+    # faster than an appliance should: on 2026-08-24 the spa's true surplus (export +
+    # battery charge + its own draw) went 3.6 kW -> -0.1 kW -> 3.1 kW inside seven
+    # minutes as other loads came and went, and the boost followed it tick for tick.
+    # The relay path's min-on dwell cannot help here: it lives behind a
+    # switch./input_boolean. branch and a hardcoded 50 C on-threshold, so a 20-40 C
+    # helper-driven appliance never had any. Once boosted, keep boosting for this long
+    # even if surplus briefly vanishes. The price ceiling and vacation still win
+    # immediately — the hold buys time against noise, not against an expensive hour.
+    # 0 = off (previous behaviour).
+    surplus_boost_min_minutes: float = 0.0
     # Let the S4 fuse guard force this heater OFF when a phase it sits on exceeds the
     # house budget. A tank waits an hour happily; a car may be leaving in the morning,
     # so without this the guard sheds the expensive option to save the cheap one.
@@ -1004,6 +1015,9 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 state_entity=_str_or_none(heater.get("state_entity")),
                 climate_heat_mode=_str_or_none(heater.get("climate_heat_mode")),
                 surplus_boost=bool(heater.get("surplus_boost", False)),
+                surplus_boost_min_minutes=float(
+                    heater.get("surplus_boost_min_minutes") or 0.0
+                ),
                 fuse_shed=bool(heater.get("fuse_shed", False)),
                 override_entity=_str_or_none(heater.get("override_entity")),
                 override_timeout_minutes=float(
