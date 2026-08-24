@@ -252,6 +252,20 @@ class TestParseSlotPlan:
 
         assert slot.export_kw == 8.0  # 2 kWh * 4 = 8 kW
 
+    def test_export_price_preserved(self, engine):
+        slot = engine._parse_slot_plan({"export_price_sek_kwh": -0.05})
+        assert slot.export_price_sek_kwh == -0.05
+
+    def test_missing_export_price_is_none_not_zero(self, engine):
+        """Absent price must be UNKNOWN (None) — a coerced 0.0 read as 'export is
+        worthless' and defeated every fail-closed price gate downstream."""
+        slot = engine._parse_slot_plan({"battery_charge_kw": 1.0})
+        assert slot.export_price_sek_kwh is None
+
+    def test_garbage_export_price_is_none(self, engine):
+        slot = engine._parse_slot_plan({"export_price_sek_kwh": "n/a"})
+        assert slot.export_price_sek_kwh is None
+
     def test_handles_missing_fields(self, engine):
         """Handles missing/null fields gracefully."""
         slot_data = {

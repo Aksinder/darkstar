@@ -88,7 +88,7 @@ executor:
       cheap_grid_allowance_w: 3680
       battery_assist:
         enabled: false
-        max_price_sek: 0.0          # battery helps only when spot <= this (0 = negative)
+        max_price_sek: 0.0          # battery helps only when spot is strictly below this (0 = only negative)
         min_remaining_solar_kwh: 8.0
         floor_soc: 40.0
     chargers:

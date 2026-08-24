@@ -416,3 +416,93 @@ class TestEvPriorityCapRuntime:
         assert ctrl.last_ev_priority_cap_w is None
         ctrl._update_ev_priority_cap(50.0)     # appearance is never delayed
         assert ctrl.last_ev_priority_cap_w == 50.0
+
+
+class TestPriceSourceResolution:
+    """Internal spot series first; price_entity only as fallback; 999 when both dark."""
+
+    @pytest.mark.asyncio
+    async def test_internal_price_wins_over_sensor(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states(**{"sensor.price": "0"}))  # dead-sensor signature
+        out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=1.23)
+        assert out["price_sek"] == 1.23
+        assert out["price_source"] == "internal"
+
+    @pytest.mark.asyncio
+    async def test_sensor_fallback_when_internal_unavailable(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states(**{"sensor.price": "0.42"}))
+        out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=None)
+        assert out["price_sek"] == 0.42
+        assert out["price_source"] == "entity"
+
+    @pytest.mark.asyncio
+    async def test_fail_expensive_when_both_dark(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states(**{"sensor.price": "unavailable"}))
+        out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=None)
+        assert out["price_sek"] == 999.0
+        assert out["price_source"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_fallback_warning_rate_limited(self, caplog):
+        import logging
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states())
+        with caplog.at_level(logging.WARNING, logger="darkstar.ev_surplus"):
+            await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=None)
+            await ctl.run(ha, 1060.0, shadow=True, internal_spot_price_sek=None)
+        warns = [r for r in caplog.records if "falling back to" in r.message]
+        assert len(warns) == 1
+        # Internal recovers => warn state resets; next outage warns again.
+        await ctl.run(ha, 1120.0, shadow=True, internal_spot_price_sek=0.5)
+        with caplog.at_level(logging.WARNING, logger="darkstar.ev_surplus"):
+            await ctl.run(ha, 1180.0, shadow=True, internal_spot_price_sek=None)
+        warns = [r for r in caplog.records if "falling back to" in r.message]
+        assert len(warns) == 2
+
+    @pytest.mark.asyncio
+    async def test_sensor_zero_is_not_trusted_in_fallback(self):
+        # The dead-template signature: float(0) on 'unavailable'. Indistinguishable
+        # from genuine zero spot, so fallback mode refuses it (999, tiers closed).
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states(**{"sensor.price": "0"}))
+        out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=None)
+        assert out["price_sek"] == 999.0
+        assert out["price_source"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_sensor_negative_is_not_trusted_in_fallback(self):
+        # Only the internal series may authorize the negative-price tiers.
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states(**{"sensor.price": "-0.10"}))
+        out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=None)
+        assert out["price_sek"] == 999.0
+        assert out["price_source"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_internal_negative_is_trusted(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states())
+        out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=-0.10)
+        assert out["price_sek"] == -0.10
+        assert out["price_source"] == "internal"
+
+    @pytest.mark.asyncio
+    async def test_warns_even_without_fallback_entity(self, caplog):
+        import logging
+        cfg = parse_ev_surplus_config(_cfg_dict(price_entity=""))
+        ctl = EVSurplusController(cfg)
+        ha = FakeHA(_states())
+        with caplog.at_level(logging.WARNING, logger="darkstar.ev_surplus"):
+            out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=None)
+        assert out["price_source"] == "default"
+        assert any("paid tiers closed" in r.message for r in caplog.records)

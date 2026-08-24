@@ -455,3 +455,48 @@ class TestEvPriorityBatteryCap:
         assert caps == sorted(caps, reverse=True), caps
         assert abs(cars[-1] + caps[-1] - spare) < 600.0, "sums to the surplus"
         assert cars[-1] > 9000.0, "the car ends up with nearly all of it"
+
+
+class TestPriceGateStrictness:
+    """The 2026-08-24 incident class: a dead price sensor coerced through float(0)
+    reads as a legitimate 0.0. The tiers' gates are STRICTLY less-than so that
+    exactly-zero — the dead-sensor signature — never satisfies 'only negative'."""
+
+    def _cfg_assist(self, **kw):
+        base = dict(
+            enabled=True,
+            battery_assist_enabled=True,
+            battery_assist_max_price_sek=0.0,
+            battery_assist_min_remaining_solar_kwh=8.0,
+            battery_assist_floor_soc=30.0,
+            battery_assist_allowance_w=6000.0,
+        )
+        base.update(kw)
+        return EVSurplusConfig(**base)
+
+    def test_exact_zero_does_not_open_battery_assist(self):
+        # price == max_price_sek == 0.0 must NOT engage (documented '0 = only negative').
+        out = compute_ev_surplus(
+            _inputs(import_price_sek=0.0, remaining_solar_kwh=10.0,
+                    battery_soc_percent=80.0, grid_w=0.0),
+            self._cfg_assist(),
+        )
+        assert out[0].switch_on is False
+
+    def test_truly_negative_still_opens_battery_assist(self):
+        out = compute_ev_surplus(
+            _inputs(import_price_sek=-0.01, remaining_solar_kwh=10.0,
+                    battery_soc_percent=80.0, grid_w=0.0),
+            self._cfg_assist(),
+        )
+        assert out[0].switch_on and out[0].target_power_w > 0
+
+    def test_exact_threshold_does_not_open_cheap_grid(self):
+        cfg = _cfg(cheap_grid_price_sek=0.30, cheap_grid_allowance_w=6000.0)
+        out = compute_ev_surplus(_inputs(import_price_sek=0.30, grid_w=0.0), cfg)
+        assert out[0].switch_on is False
+
+    def test_below_threshold_opens_cheap_grid(self):
+        cfg = _cfg(cheap_grid_price_sek=0.30, cheap_grid_allowance_w=6000.0)
+        out = compute_ev_surplus(_inputs(import_price_sek=0.29, grid_w=0.0), cfg)
+        assert out[0].switch_on and out[0].target_power_w > 0

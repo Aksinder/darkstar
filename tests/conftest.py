@@ -45,3 +45,14 @@ def setup_test_env():
             db_path.unlink()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_nordpool_fail_memo():
+    """The negative-fetch memo is a module global; a test that exercises a failed
+    fetch must not silence get_nordpool_data for every later test."""
+    from backend.core import prices
+
+    prices._fetch_fail_until = 0.0
+    yield
+    prices._fetch_fail_until = 0.0

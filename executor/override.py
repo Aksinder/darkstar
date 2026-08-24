@@ -104,7 +104,8 @@ class SlotPlan:
     # files without the key get {first_sink_id: custom_entity_active} synthesized
     # at parse time (rolling-deploy compatibility).
     sinks: dict[str, bool] = field(default_factory=lambda: {})
-    export_price_sek_kwh: float = 0.0  # Effective export price for this slot (C3 curtailment)
+    # None = price unknown (missing field / stale schedule); consumers fail closed.
+    export_price_sek_kwh: float | None = None
 
 
 class OverrideEvaluator:

@@ -153,3 +153,37 @@ class TestSwitchMethod:
         assert result is None  # already off — no write, no EEPROM churn
         ha.set_switch.assert_not_awaited()
         assert _export_writes(ha) == []
+
+
+class TestUnknownPrice:
+    """None = price unknown (stale/missing schedule). C3 fails OPEN: restore normal
+    export. A coerced 0.0 used to clamp export on stale schedules (fail-closed for
+    revenue); holding an existing clamp on unknown data would forfeit ~1 SEK/kWh for
+    the whole outage while a genuine negative slot is rare and shallow."""
+
+    @pytest.mark.asyncio
+    async def test_none_price_restores_normal_export(self):
+        # Device currently clamped (limit reads 0): unknown price must restore.
+        d, ha = _dispatcher(
+            ExportCurtailmentConfig(enabled=True, restore_limit_w=3720), current_limit="0"
+        )
+        await d._apply_export_curtailment(None)
+        assert 3720.0 in _export_writes(ha)
+
+    @pytest.mark.asyncio
+    async def test_none_price_releases_active_clamp(self):
+        # Clamp active, then the price goes unknown: fail open — the clamp is
+        # released so a planner freeze cannot silently zero export for hours.
+        d, ha = _dispatcher(
+            ExportCurtailmentConfig(enabled=True, restore_limit_w=3720), current_limit="0"
+        )
+        await d._apply_export_curtailment(-0.05)
+        await d._apply_export_curtailment(None)
+        assert _export_writes(ha)[-1] == 3720.0
+
+    @pytest.mark.asyncio
+    async def test_none_price_never_clamps(self):
+        # Whatever else it does, unknown price must not CREATE a clamp.
+        d, ha = _dispatcher(ExportCurtailmentConfig(enabled=True, restore_limit_w=0))
+        await d._apply_export_curtailment(None)
+        assert 0.0 not in _export_writes(ha)

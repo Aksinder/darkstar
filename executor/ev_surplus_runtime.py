@@ -513,6 +513,7 @@ class EVSurplusController:
         # meter snapshot (review-caught).
         self.last_ev_alloc_a: dict[str, float] = {}
         self._core_skip_since: float | None = None
+        self._price_fallback_warn_ts: float | None = None
         # S3 continuity hold: (held_w, until_ts) per charger. Kepler's 15-min replans
         # can flip equivalent-cost slot checkerboards; without a hold each flip would
         # stop/start the car (Tesla wakes, Easee relay churn). A started plan floor is
@@ -925,6 +926,7 @@ class EVSurplusController:
         shadow: bool = False,
         plan_kw: dict[str, float] | None = None,
         plan_battery_charge_kw: float = 0.0,
+        internal_spot_price_sek: float | None = None,
     ) -> dict[str, Any]:
         """One control cycle. Returns a summary (for logging / UI).
 
@@ -945,7 +947,7 @@ class EVSurplusController:
             self._read_f(ha, cfg.grid_power_entity, None),
             self._read_f(ha, cfg.battery_power_entity, None),
             self._read_f(ha, cfg.battery_soc_entity, 0.0),
-            self._read_f(ha, cfg.price_entity, 999.0),
+            self._read_f(ha, cfg.price_entity, None),
             self._read_f(ha, cfg.remaining_solar_entity, 0.0),
             self._read_on(ha, cfg.vacation_entity, ("on", "true"), False),
             self._read_priority_order(ha),
@@ -978,7 +980,51 @@ class EVSurplusController:
         battery_w = src[2]
         # Unknown home-battery SoC must DISABLE battery assist (0), never enable it (100).
         soc = src[3] if src[3] is not None else 0.0
-        price = src[4] if src[4] is not None else 999.0
+        # Price source: Darkstar's own spot series first (direct Nordpool fetch with
+        # cache + D+1 forecast fallback), price_entity only as a last resort. The HA
+        # sensor chain served a stuck literal 0 during the 2026-08-24 outage — a value
+        # the tiers cannot reject, since genuinely zero/negative spot is what
+        # battery_assist exists FOR. 999.0 (fail-expensive) closes the paid tiers.
+        if internal_spot_price_sek is not None:
+            price = internal_spot_price_sek
+            price_source = "internal"
+            self._price_fallback_warn_ts = None
+        else:
+            # Fallback sensor values are only trusted when STRICTLY positive: the
+            # dead-template signature (float(0) on 'unavailable') is indistinguishable
+            # from genuine zero/negative spot, and internal-source loss correlates with
+            # sensor-chain loss (both feed from Nordpool — the 2026-08-24 outage killed
+            # both, and the stuck 0 would have opened cheap_grid at peak prices). Only
+            # the internal series may authorize the negative-price tiers.
+            sensor_price = src[4]
+            if sensor_price is not None and sensor_price > 0.0:
+                price = sensor_price
+                price_source = "entity"
+            else:
+                price = 999.0
+                price_source = "default"
+            # Warn on internal-source loss even with no fallback configured — a
+            # silently closed paid tier (999) is itself worth surfacing.
+            if (
+                self._price_fallback_warn_ts is None
+                or (now_ts - self._price_fallback_warn_ts) > 3600.0
+            ):
+                self._price_fallback_warn_ts = now_ts
+                if price_source == "entity":
+                    logger.warning(
+                        "EV surplus: internal spot price unavailable — falling back to "
+                        "price_entity %s (%.2f SEK/kWh). Sensor values cannot be "
+                        "validity-checked; paid tiers trust this number.",
+                        cfg.price_entity,
+                        price,
+                    )
+                else:
+                    logger.warning(
+                        "EV surplus: internal spot price unavailable and no usable "
+                        "price_entity fallback (%s) — paid tiers closed (999.0), "
+                        "solar-only until a price source recovers.",
+                        "unreadable or <= 0" if cfg.price_entity else "not configured",
+                    )
         remaining_solar = src[5] or 0.0
         vacation = bool(src[6])
         priority_order = cast("list[str] | None", src[7])
@@ -1191,10 +1237,10 @@ class EVSurplusController:
             self._act_fail.pop(cmd.id, None)
             applied.append({"id": cmd.id, "on": cmd.switch_on, "a": cmd.set_current_a, "why": cmd.reason})
 
-        logger.info("EV surplus: grid=%.0fW batt=%.0fW soc=%.0f%% price=%.2f vac=%s -> %s",
-                    grid_w, battery_w, soc, price, vacation,
+        logger.info("EV surplus: grid=%.0fW batt=%.0fW soc=%.0f%% price=%.2f(%s) vac=%s -> %s",
+                    grid_w, battery_w, soc, price, price_source, vacation,
                     [(a["id"], a["on"], a["a"]) for a in applied])
-        return {"enabled": True, "applied": applied}
+        return {"enabled": True, "applied": applied, "price_sek": price, "price_source": price_source}
 
     async def _actuate(self, ha: Any, ccfg: EVSurplusChargerCfg, cmd: Any, now_ts: float, shadow: bool) -> None:
         # Per-charger shadow (rollout gate): suppress service calls but keep the full

@@ -1012,11 +1012,15 @@ executor:
     grid_power_entity: ""               # signed grid power (+import), e.g. sensor.meter_active_power
     battery_power_entity: ""            # signed battery power (+charge), e.g. sensor.battery_charging_power_signed
     battery_soc_entity: ""              # home battery SoC %, e.g. sensor.battery_level
-    price_entity: ""                    # spot price SEK/kWh, e.g. sensor.spot_price_sek_kwh
+    price_entity: ""                    # FALLBACK spot price SEK/kWh (e.g. sensor.spot_price_sek_kwh).
+                                        # The servo primarily reads Darkstar's own Nordpool spot series;
+                                        # this sensor is only consulted when that is unavailable. Sensor
+                                        # values cannot be validity-checked (a dead template coerced via
+                                        # float(0) reads as a legitimate 0). Blank => no fallback (999).
     remaining_solar_entity: ""          # optional kWh still forecast today; blank => battery-assist tier inert
     vacation_entity: ""                 # input_boolean.vacation_mode; flips per-charger vacation_target_soc
     policy:
-      cheap_grid_price_sek: 0.30        # allow grid for EV when spot <= this (blank/absent => solar only)
+      cheap_grid_price_sek: 0.30        # allow grid for EV when spot is STRICTLY below this (blank/absent => solar only)
       cheap_grid_allowance_w: 3680      # max grid import to give the cars when cheap
       gain: 0.5                         # control damping (0-1)
       deadband_w: 250                   # hold within this power error (anti-jitter)
@@ -1024,7 +1028,7 @@ executor:
       start_hysteresis: 0.15            # extra headroom (frac of min) an OFF charger needs to start
       battery_assist:
         enabled: false
-        max_price_sek: 0.0              # battery only helps when spot <= this (0 = negative)
+        max_price_sek: 0.0              # battery only helps when spot is STRICTLY below this (0 = only negative prices)
         min_remaining_solar_kwh: 8.0    # ...and this much PV still forecast today
         floor_soc: 40.0                 # never pull the home battery below this for cars
         allowance_w: 6000               # cap on battery -> car
