@@ -1,3 +1,7 @@
+## dev-20260824.1307 — 2026-08-24 13:09
+
+- Spa: drive the climate mode; EV cap: gate on commanded draw, not intent
+
 ## dev-20260824.0823 — 2026-08-24 08:25
 
 - Price integrity: internal spot as servo source, fail-open C3, negative fetch memo
