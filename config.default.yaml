@@ -252,6 +252,16 @@ water_heaters:
                                      # AND measured draw against its own intent each tick,
                                      # re-asserting on a mismatch (the switch path already
                                      # self-heals this way). Empty = no reality check.
+    climate_heat_mode:               # hvac_mode to FORCE on a climate state_entity when the
+                                     # appliance sits in a non-heating mode (LayZSpa: fan_only)
+                                     # while the plan intends heat. Without it the only
+                                     # correction is nudging target_entity — which just asks the
+                                     # HA bridge to relay again, and the bridge is often exactly
+                                     # what failed (live 2026-08-24: 3 failed corrections in a
+                                     # row, twice). Set e.g. "heat" to drive the climate entity
+                                     # directly. HEAT DIRECTION ONLY — "off" on the appliance is
+                                     # not the bridge's fan_only and would stop the circulation
+                                     # pump, so the off path keeps using the helper.
     fuse_shed: false                 # Let the S4 fuse guard force this heater OFF when a phase
                                      # it sits on exceeds the HOUSE budget (25 A less margin).
                                      # Without it the guard sheds cars and battery charging only,

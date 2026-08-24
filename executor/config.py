@@ -390,6 +390,15 @@ class WaterHeaterDeviceConfig:
     # appliance's mode and measured draw against its own intent each tick and
     # re-asserts on a mismatch, the way the switch path already self-heals.
     state_entity: str | None = None
+    # hvac_mode to force on a climate ``state_entity`` when the appliance sits in a
+    # non-heating mode (LayZSpa: fan_only) while the plan intends heat. Nudging the
+    # helper only asks the HA bridge to relay the target again — if the bridge missed
+    # it, or the tub's own panel moved the mode, that never lands and the correction
+    # loop just logs. Set (e.g. "heat") to let the executor drive the climate entity
+    # directly. Unset = old behaviour, helper nudge only. Heat direction ONLY: the OFF
+    # direction stays with the helper, since "off" on the appliance is not the same as
+    # the bridge's fan_only and would stop the circulation pump.
+    climate_heat_mode: str | None = None
     surplus_boost: bool = False
     # Let the S4 fuse guard force this heater OFF when a phase it sits on exceeds the
     # house budget. A tank waits an hour happily; a car may be leaving in the morning,
@@ -993,6 +1002,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                     heater.get("power_sensor") or heater.get("sensor")
                 ),
                 state_entity=_str_or_none(heater.get("state_entity")),
+                climate_heat_mode=_str_or_none(heater.get("climate_heat_mode")),
                 surplus_boost=bool(heater.get("surplus_boost", False)),
                 fuse_shed=bool(heater.get("fuse_shed", False)),
                 override_entity=_str_or_none(heater.get("override_entity")),

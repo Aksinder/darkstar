@@ -386,12 +386,17 @@ class TestEvPriorityBatteryCap:
         return ev_priority_battery_cap_w(inputs, cfg, tick, plan_w), tick
 
     def test_the_battery_gets_what_the_cars_leave(self):
-        """spare 10 kW: car 3, battery 7, grid 0. Target = 3 + 0.5*7 = 6.5 kW,
-        so the cap is 3.5 kW — the scenario from the plan, to the watt."""
+        """spare 10 kW: car 3, battery 7, grid 0. Target = 3 + 0.5*7 = 6.5 kW, but
+        the car is COMMANDED 9.0 A = 6.21 kW (amps are quantized), so the battery
+        gets 3.79 kW. Deriving the cap from the commanded draw rather than the raw
+        target is what makes car + battery sum to the spare exactly — the old
+        target-derived 3.5 kW left 290 W allocated to nobody, i.e. exported."""
         cap, tick = self._run(battery_w=7000.0, car_w=3000.0)
         assert tick.computed and tick.demand and not tick.reserve_active
         assert tick.target_total_w == pytest.approx(6500.0)
-        assert cap == pytest.approx(3500.0)
+        assert tick.commanded_on_total_w == pytest.approx(6210.0)
+        assert cap == pytest.approx(3790.0)
+        assert tick.commanded_on_total_w + cap == pytest.approx(10000.0)
 
     def test_off_by_default(self):
         cap, _ = self._run(battery_w=7000.0, car_w=3000.0, enabled=False)
@@ -421,40 +426,49 @@ class TestEvPriorityBatteryCap:
         cap, _ = self._run(battery_w=7000.0, car_w=3000.0, plan_w=4000.0)
         assert cap == pytest.approx(4000.0)
 
-    def test_in_the_deadband_the_cap_is_the_present_charge(self):
-        """Nothing to hand over: target == current, so cap == battery_w. A fixed
-        point, not a kick."""
+    def test_a_car_being_stopped_has_no_claim(self):
+        """Target 3 kW is below the charger's 4.14 kW minimum, so the servo commands
+        the car OFF. This test previously asserted cap == 100 W — pinning the home
+        battery to its floor while the car was being told to stop, which is the
+        daylight half of the 2026-08-24 flap. Nobody is drawing: hands off."""
         cap, tick = self._run(battery_w=100.0, car_w=3000.0)
         assert tick.target_total_w == pytest.approx(3000.0)
-        assert cap == pytest.approx(100.0)
+        assert tick.commanded_on_total_w == 0.0
+        assert cap is None
 
     def test_grid_import_is_not_spare(self):
         """Battery 4 kW, car 5 kW, but 2 kW of that is being IMPORTED: only 7 kW is
         really surplus, so the cap is what is left of seven after the target."""
         cap, tick = self._run(battery_w=4000.0, car_w=5000.0, grid_w=2000.0)
-        # headroom = -2000 + 4000 = 2000 -> target 6000; spare 7000 -> cap 1000
+        # headroom = -2000 + 4000 = 2000 -> target 6000, commanded 6210 (9.0 A);
+        # spare 7000 -> cap 790, and 6210 + 790 == 7000 exactly.
         assert tick.target_total_w == pytest.approx(6000.0)
-        assert cap == pytest.approx(1000.0)
+        assert cap == pytest.approx(790.0)
 
     def test_convergence_without_oscillation(self):
         """THE anti-hunt proof. Iterate the closed loop: each tick the car draws what
-        it was told last tick and the battery charges at last tick's cap. The car
-        must climb monotonically and the cap fall monotonically — no reversal —
-        toward car = min(spare, fleet max), battery = the rest."""
+        it was COMMANDED last tick and the battery charges at last tick's cap. The car
+        must climb monotonically and the cap fall monotonically — no reversal — to a
+        fixed point where car + battery is exactly the surplus (nothing exported,
+        nothing imported, no hunting)."""
         spare = 10000.0
         car, batt = 3000.0, 7000.0
         cars, caps = [], []
         for _ in range(10):
             cap, tick = self._run(battery_w=batt, car_w=car)
             assert cap is not None
-            cars.append(tick.target_total_w)
+            cars.append(tick.commanded_on_total_w)
             caps.append(cap)
-            car = tick.target_total_w
+            car = tick.commanded_on_total_w
             batt = min(cap, spare - car)  # the inverter takes at most the cap
+            # Every tick allocates the whole surplus and no more.
+            assert car + cap == pytest.approx(spare)
         assert cars == sorted(cars), cars
         assert caps == sorted(caps, reverse=True), caps
-        assert abs(cars[-1] + caps[-1] - spare) < 600.0, "sums to the surplus"
-        assert cars[-1] > 9000.0, "the car ends up with nearly all of it"
+        # Settles: the last several ticks are one repeated fixed point.
+        assert len(set(cars[-5:])) == 1, cars
+        assert len(set(caps[-5:])) == 1, caps
+        assert cars[-1] > 8500.0, "the car ends up with nearly all of it"
 
 
 class TestPriceGateStrictness:
@@ -500,3 +514,93 @@ class TestPriceGateStrictness:
         cfg = _cfg(cheap_grid_price_sek=0.30, cheap_grid_allowance_w=6000.0)
         out = compute_ev_surplus(_inputs(import_price_sek=0.29, grid_w=0.0), cfg)
         assert out[0].switch_on and out[0].target_power_w > 0
+
+
+class TestCapIdleCarRegression:
+    """Live 2026-08-24: the cap fired 353 times overnight and flapped the inverter's
+    charge limit 9500<->100 W every ~2 min, with a Tesla merely parked on the charger
+    and the servo feeding it nothing. `demand` ("plugged and below its ceiling") is
+    true all night; the missing condition is that the servo actually ALLOCATED power."""
+
+    def _cap(self, *, battery_w, car_w, grid_w, plan_w=0.0, price=1.0):
+        from executor.ev_surplus import EVSurplusTick, ev_priority_battery_cap_w
+
+        cfg = _cfg(
+            ev_priority_battery_cap_enabled=True,
+            battery_yield_soc=95.0, battery_capacity_kwh=16.0, battery_fill_margin_kwh=3.0,
+        )
+        inputs = _inputs(
+            battery_w=battery_w, grid_w=grid_w, battery_soc_percent=80.0,
+            remaining_solar_kwh=30.0, import_price_sek=price,
+            chargers=[_charger(current_power_w=car_w)], plan_battery_charge_w=plan_w,
+        )
+        tick = EVSurplusTick()
+        compute_ev_surplus(inputs, cfg, tick_out=tick)
+        return ev_priority_battery_cap_w(inputs, cfg, tick, plan_w), tick
+
+    def test_idle_night_plugged_car_does_not_cap(self):
+        # The overnight signature: importing, battery flat, expensive price => the
+        # servo allocates nothing. The battery must be left alone.
+        cap, tick = self._cap(battery_w=0.0, car_w=0.0, grid_w=1465.0)
+        assert tick.demand is True  # the car IS plugged and below its ceiling...
+        assert tick.target_total_w == 0.0  # ...but gets nothing
+        assert cap is None  # ...so no claim on the battery
+
+    def test_battery_hovering_at_zero_does_not_flap(self):
+        # Sign-only discharge test made None<->value alternate tick to tick around
+        # 0 W; each flip is an inverter register write. This must exercise the
+        # DISCHARGE guard, so the car has to be genuinely commanded on — otherwise
+        # the commanded-allocation gate returns None first and the assertion is
+        # vacuous (it was, before adversarial review caught it).
+        caps = []
+        for battery_w in (-99.0, -50.0, -1.0, 0.0, 1.0, 50.0, 99.0):
+            cap, tick = self._cap(battery_w=battery_w, car_w=6000.0, grid_w=-3000.0)
+            assert tick.commanded_on_total_w > 0.0, "the guard under test must be reached"
+            caps.append(cap)
+        # Every one of them resolves the same way: no None<->value alternation across
+        # the zero crossing, so no register write is provoked by meter noise.
+        assert all(c is not None for c in caps), caps
+        assert max(caps) - min(caps) < 200.0, caps  # inside the runtime's hysteresis
+
+    def test_clear_discharge_below_the_deadband_hands_off(self):
+        cap, tick = self._cap(battery_w=-500.0, car_w=6000.0, grid_w=-3000.0)
+        assert tick.commanded_on_total_w > 0.0
+        assert cap is None
+
+    def test_clear_discharge_still_hands_off(self):
+        cap, _ = self._cap(battery_w=-3000.0, car_w=6000.0, grid_w=0.0)
+        assert cap is None
+
+    def test_real_surplus_still_caps(self):
+        # The feature must still work: sun, battery absorbing, car commanded ON.
+        cap, tick = self._cap(battery_w=7000.0, car_w=3000.0, grid_w=0.0)
+        assert tick.commanded_on_total_w > 0.0
+        assert cap == pytest.approx(3790.0)
+
+    def test_surplus_below_the_start_threshold_leaves_the_battery_alone(self):
+        # The daylight twin of the overnight bug (found in adversarial review): the
+        # cold-start kick reports the FULL headroom as target_total_w even when the
+        # car cannot start on it, so a target-derived gate pinned the battery to
+        # 100 W across the whole morning ramp while the PV exported. It is a stable
+        # fixed point, not a transient: capping the battery does not change the
+        # car's start decision, because headroom counts the battery's inflow either way.
+        for surplus in (500.0, 1500.0, 2500.0, 3500.0, 4000.0):
+            cap, tick = self._cap(battery_w=surplus, car_w=0.0, grid_w=0.0)
+            assert tick.commanded_on_total_w == 0.0, f"car should not start on {surplus} W"
+            assert cap is None, f"surplus {surplus} W: battery must stay free, got {cap}"
+
+    def test_jitter_across_the_deadband_does_not_flap_the_cap(self):
+        # Meter noise around the 250 W deadband made the cap alternate None<->0,
+        # i.e. an inverter register write per tick. With no car commanded on, every
+        # tick is None regardless of which side of the band the noise lands.
+        caps = [
+            self._cap(battery_w=w, car_w=0.0, grid_w=0.0)[0]
+            for w in (240.0, 265.0, 235.0, 270.0, 245.0, 260.0, 238.0, 262.0)
+        ]
+        assert caps == [None] * 8, caps
+
+    def test_plan_floor_survives_the_new_gate(self):
+        # No allocation to cars => None, even with a plan floor: the controller's own
+        # 9500 W write already implements "battery takes what it wants".
+        cap, _ = self._cap(battery_w=0.0, car_w=0.0, grid_w=1465.0, plan_w=4000.0)
+        assert cap is None

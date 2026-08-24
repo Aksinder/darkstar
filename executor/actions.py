@@ -888,6 +888,80 @@ class ActionDispatcher:
             duration_ms=duration_ms,
         )
 
+    async def force_heater_climate_mode(
+        self, entity: str, hvac_mode: str, *, setpoint_c: float | None = None
+    ) -> ActionResult:
+        """Drive a thermostatted heater's climate entity straight into a heating mode.
+
+        The helper->bridge path only re-relays a CHANGED helper value; when the bridge
+        misses it, or the appliance's own panel moves the mode, no amount of nudging
+        the helper reaches the device. This bypasses the bridge for the heat direction
+        only (see WaterHeaterDevice.climate_heat_mode).
+
+        Idempotent: no service call when the entity already reports ``hvac_mode``.
+        """
+        start = time.time()
+        state = await self.ha.get_state(entity)
+        current_mode = state.get("state") if state else None
+        attrs: dict[str, Any] = (state or {}).get("attributes", {}) or {}
+        current_sp = attrs.get("temperature")
+
+        mode_ok = current_mode == hvac_mode
+        sp_ok = (
+            setpoint_c is None
+            or (isinstance(current_sp, int | float) and abs(float(current_sp) - setpoint_c) <= 0.5)
+        )
+
+        def _result(success: bool, message: str, *, skipped: bool = False) -> ActionResult:
+            return ActionResult(
+                action_type="water_climate_mode",
+                success=success,
+                message=message,
+                previous_value=current_mode,
+                new_value=hvac_mode,
+                entity_id=entity,
+                skipped=skipped,
+                duration_ms=int((time.time() - start) * 1000),
+            )
+
+        if mode_ok and sp_ok:
+            return _result(True, f"Already {hvac_mode}", skipped=True)
+
+        if self.shadow_mode:
+            logger.info(
+                "[SHADOW] Would force %s %s -> %s (setpoint %s)",
+                entity, current_mode, hvac_mode, setpoint_c,
+            )
+            return _result(True, f"[SHADOW] Would force {current_mode} -> {hvac_mode}", skipped=True)
+
+        try:
+            if not mode_ok:
+                await self.ha.call_service(
+                    "climate", "set_hvac_mode", entity, {"hvac_mode": hvac_mode}
+                )
+            if setpoint_c is not None and not sp_ok:
+                await self.ha.call_service(
+                    "climate", "set_temperature", entity, {"temperature": setpoint_c}
+                )
+        except HACallError as e:
+            logger.error("Failed to force climate mode on %s: %s", entity, e)
+            return ActionResult(
+                action_type="water_climate_mode",
+                success=False,
+                message=f"Failed: {e}",
+                previous_value=current_mode,
+                new_value=hvac_mode,
+                entity_id=entity,
+                error_details=str(e),
+                duration_ms=int((time.time() - start) * 1000),
+            )
+
+        logger.info(
+            "Water climate correction: %s %s -> %s (setpoint %s)",
+            entity, current_mode, hvac_mode, setpoint_c,
+        )
+        return _result(True, f"Forced {current_mode} -> {hvac_mode}")
+
     async def set_water_temp(
         self,
         target: int,

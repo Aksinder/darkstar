@@ -1372,3 +1372,73 @@ class TestCyclicLoadDispatch:
             ha_client=ha_client, config=base_config, shadow_mode=False
         )
         await dispatcher.notify_unverified("Spa", "3 misslyckade rättningar")
+
+
+class TestForceHeaterClimateMode:
+    """Direct climate correction for a thermostatted heater (the spa). Idempotency
+    matters: this runs on every drifted tick, and each service call wakes the tub."""
+
+    def _dispatcher(self, state, setpoint=None, shadow=False):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from executor.actions import ActionDispatcher
+        from executor.config import ExecutorConfig, InverterConfig
+
+        ha = MagicMock()
+        ha.get_state = AsyncMock(
+            return_value={"state": state, "attributes": {"temperature": setpoint}}
+        )
+        ha.call_service = AsyncMock(return_value=True)
+        d = ActionDispatcher(
+            ha_client=ha,
+            config=ExecutorConfig(inverter=InverterConfig()),
+            shadow_mode=shadow,
+        )
+        return d, ha
+
+    def _services(self, ha):
+        return [(c.args[0], c.args[1]) for c in ha.call_service.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_fan_only_is_driven_to_heat(self):
+        d, ha = self._dispatcher("fan_only", setpoint=20)
+        res = await d.force_heater_climate_mode("climate.spa", "heat", setpoint_c=40.0)
+        assert res.success and not res.skipped
+        assert ("climate", "set_hvac_mode") in self._services(ha)
+        assert ("climate", "set_temperature") in self._services(ha)
+
+    @pytest.mark.asyncio
+    async def test_already_correct_writes_nothing(self):
+        d, ha = self._dispatcher("heat", setpoint=40)
+        res = await d.force_heater_climate_mode("climate.spa", "heat", setpoint_c=40.0)
+        assert res.skipped is True
+        ha.call_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_right_mode_wrong_setpoint_only_writes_setpoint(self):
+        d, ha = self._dispatcher("heat", setpoint=38)
+        await d.force_heater_climate_mode("climate.spa", "heat", setpoint_c=40.0)
+        assert self._services(ha) == [("climate", "set_temperature")]
+
+    @pytest.mark.asyncio
+    async def test_setpoint_tolerance(self):
+        d, ha = self._dispatcher("heat", setpoint=40.4)
+        res = await d.force_heater_climate_mode("climate.spa", "heat", setpoint_c=40.0)
+        assert res.skipped is True
+        ha.call_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_writes_nothing(self):
+        d, ha = self._dispatcher("fan_only", setpoint=20, shadow=True)
+        res = await d.force_heater_climate_mode("climate.spa", "heat", setpoint_c=40.0)
+        assert res.skipped is True
+        ha.call_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ha_failure_is_reported_not_raised(self):
+        from executor.actions import HACallError
+
+        d, ha = self._dispatcher("fan_only", setpoint=20)
+        ha.call_service = AsyncMock(side_effect=HACallError("boom"))
+        res = await d.force_heater_climate_mode("climate.spa", "heat", setpoint_c=40.0)
+        assert res.success is False and "boom" in (res.error_details or "")

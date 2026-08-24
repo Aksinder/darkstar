@@ -89,3 +89,112 @@ class TestUnknowns:
 
     def test_no_intent_no_drift(self):
         assert _drift(intended_temp=None)[0] is False
+
+
+class TestClimateModeCorrection:
+    """Detecting the drift was never the problem — correcting it was. The old
+    correction only nudged the HELPER, asking the HA bridge to relay the target
+    again; when the bridge is what failed (or the tub's own panel moved the mode),
+    nothing reaches the device and the loop just logs (live: two ERRORs on
+    2026-08-24, spa in fan_only while the plan intended 40C). Owner directive:
+    Darkstar must change the mode itself when it means to heat."""
+
+    def _engine(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from executor.engine import ExecutorEngine
+
+        eng = ExecutorEngine.__new__(ExecutorEngine)
+        eng.dispatcher = SimpleNamespace(
+            force_heater_climate_mode=AsyncMock(return_value="forced")
+        )
+        return eng
+
+    def _device(self, **kw):
+        from types import SimpleNamespace
+
+        base = dict(
+            id="spa",
+            state_entity="climate.layzspa_temperature_control",
+            climate_heat_mode="heat",
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    async def _call(self, eng, device, intended, off=20):
+        return await eng._force_heater_heat_mode(device, intended, off)
+
+    def test_forces_heat_mode_when_intending_heat(self):
+        import asyncio
+
+        eng = self._engine()
+        dev = self._device()
+        res = asyncio.run(self._call(eng, dev, 40))
+        assert res == "forced"
+        eng.dispatcher.force_heater_climate_mode.assert_awaited_once_with(
+            "climate.layzspa_temperature_control", "heat", setpoint_c=40.0
+        )
+
+    def test_off_direction_is_left_to_the_helper(self):
+        # Writing "off" to the appliance is not the bridge's fan_only — it would stop
+        # the circulation pump and throw away the warmth idle-hold protects.
+        import asyncio
+
+        eng = self._engine()
+        res = asyncio.run(self._call(eng, self._device(), 20))
+        assert res is None
+        eng.dispatcher.force_heater_climate_mode.assert_not_awaited()
+
+    def test_inert_without_the_config_knob(self):
+        import asyncio
+
+        eng = self._engine()
+        res = asyncio.run(self._call(eng, self._device(climate_heat_mode=None), 40))
+        assert res is None
+        eng.dispatcher.force_heater_climate_mode.assert_not_awaited()
+
+    def test_inert_for_a_non_climate_state_entity(self):
+        import asyncio
+
+        eng = self._engine()
+        dev = self._device(state_entity="sensor.vvb_state")
+        res = asyncio.run(self._call(eng, dev, 40))
+        assert res is None
+        eng.dispatcher.force_heater_climate_mode.assert_not_awaited()
+
+    def test_a_failing_correction_never_kills_the_tick(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        eng = self._engine()
+        eng.dispatcher.force_heater_climate_mode = AsyncMock(side_effect=RuntimeError("HA down"))
+        assert asyncio.run(self._call(eng, self._device(), 40)) is None
+
+
+class TestForcedOffUsesPerDeviceOffTemp:
+    """The slot-failure fallback carries ONE global off-temp (40 here: the tanks run
+    60 and rest at 40). The spa's bridge maps its whole 20-40 scale onto heat, so
+    that same 40 commanded the spa to MAXIMUM heat — a 'safety water OFF' that runs
+    a 1.8 kW element at any price for the length of a planner outage. Found in
+    adversarial review 2026-08-24; pre-existing, and the worst spa hazard there was."""
+
+    def _pick(self, decision_temp, device_off):
+        """Mirror the engine's per-device resolution (engine.py forced-OFF branch)."""
+        from types import SimpleNamespace
+
+        device = SimpleNamespace(id="spa", temp_off=device_off)
+        off_temp = decision_temp
+        dev_off = getattr(device, "temp_off", None)
+        if dev_off is not None:
+            off_temp = dev_off
+        return off_temp
+
+    def test_spa_gets_its_own_off_not_the_global(self):
+        assert self._pick(40, 20) == 20  # NOT 40 = spa maximum
+
+    def test_tank_without_its_own_off_falls_back_to_global(self):
+        assert self._pick(40, None) == 40
+
+    def test_device_off_wins_even_when_equal(self):
+        assert self._pick(40, 40) == 40

@@ -1708,8 +1708,20 @@ class ExecutorEngine:
                                         pause_cache,
                                     ):
                                         continue
+                                    # The override carries ONE global off-temp, but
+                                    # "off" is per-device: the tanks run 60 and rest
+                                    # at 40, while the spa's bridge maps its whole
+                                    # 20-40 scale onto heat — so the global 40 would
+                                    # command the spa to MAXIMUM heat at 1.8 kW, at
+                                    # any price, for the length of a planner outage.
+                                    # A safety forced-OFF must mean off on every
+                                    # appliance, so prefer the device's own temp_off.
+                                    off_temp = decision.water_temp
+                                    dev_off = getattr(device, "temp_off", None)
+                                    if dev_off is not None:
+                                        off_temp = dev_off
                                     water_result = await self.dispatcher.set_water_temp(
-                                        decision.water_temp,
+                                        off_temp,
                                         device.target_entity,
                                         bypass_dwell=True,
                                     )
@@ -1881,6 +1893,15 @@ class ExecutorEngine:
                                                 "Water %s drift: %s — re-asserting %s C",
                                                 device.id, why, temp,
                                             )
+                                            # Heat direction: drive the climate entity
+                                            # directly when configured. The helper nudge
+                                            # below only asks the bridge to relay again,
+                                            # which is exactly what already failed.
+                                            climate_res = await self._force_heater_heat_mode(
+                                                device, int(temp), int(off_temp)
+                                            )
+                                            if climate_res is not None:
+                                                action_results.append(climate_res)
                                             action_results.append(
                                                 await self.dispatcher.set_water_temp(
                                                     self._drift_nudge_value(
@@ -2068,6 +2089,13 @@ class ExecutorEngine:
                             )
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)
+                            # run() clears the cap on every early RETURN but cannot on
+                            # a RAISE (e.g. a renamed entity 404, which _retry_with_backoff
+                            # re-raises unwrapped). _apply_fuse_battery_cap still runs
+                            # below and would keep applying the last computed cap every
+                            # tick — pinning the battery indefinitely on stale data.
+                            with contextlib.suppress(Exception):
+                                self._ev_surplus.last_ev_priority_cap_w = None
 
                     # Per-phase fuse balancer, observe-only. Placed after the EV
                     # surplus controller so the setpoints it reports are this
@@ -3122,6 +3150,31 @@ class ExecutorEngine:
             power_w=power_w,
             idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
         )
+
+    async def _force_heater_heat_mode(
+        self, device: Any, intended: int, off_temp: int
+    ) -> Any | None:
+        """Force a drifted climate heater into its heating mode, or None if N/A.
+
+        Heat direction only: writing "off" to the appliance is not the same as the
+        bridge's fan_only (it would stop the circulation pump and lose the standing
+        warmth idle-hold exists to protect), so the OFF direction keeps using the
+        helper nudge.
+        """
+        mode = getattr(device, "climate_heat_mode", None)
+        entity = getattr(device, "state_entity", None)
+        if not mode or not entity or not str(entity).startswith("climate."):
+            return None
+        if intended <= off_temp:
+            return None
+        try:
+            return await self.dispatcher.force_heater_climate_mode(
+                entity, mode, setpoint_c=float(intended)
+            )
+        except Exception as exc:
+            # Never let the correction kill the tick — the helper nudge still runs.
+            logger.warning("Water %s: climate mode correction failed: %s", device.id, exc)
+            return None
 
     def _drift_nudge_value(self, device: Any, intended: int, off_temp: int) -> int:
         """A neighbouring target that lands in the SAME branch of the HA bridge.
