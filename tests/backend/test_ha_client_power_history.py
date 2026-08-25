@@ -237,3 +237,89 @@ class TestGetEnergyFromPowerHistory:
             result = await get_energy_from_power_history("sensor.ev_power", START, END)
 
         assert result is None
+
+
+class TestTimeWeightedIntegration:
+    """The rewrite that made cycling loads meterable (2026-08-25).
+
+    State-change history is event-driven: a 5-minute burst contributes dozens of
+    samples, a long idle stretch one. The old unweighted mean was dominated by
+    whichever mode CHANGED most, not by time — the house VVB's 3.5 kW bursts
+    credited 0.000 kWh. Each sample must cover exactly the span to the next one.
+    """
+
+    def _ts(self, minutes: float) -> str:
+        return (START + timedelta(minutes=minutes)).isoformat()
+
+    def _state(self, val: str, minutes: float, unit: str = "kW") -> dict:
+        return {
+            "state": val,
+            "last_changed": self._ts(minutes),
+            "attributes": {"unit_of_measurement": unit},
+        }
+
+    def test_the_live_burst_case(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        # The 20:46-20:51 incident shape: idle, then 3.5 kW for 5 min, then idle.
+        states = [
+            self._state("0.0", 0.0),
+            self._state("3.5", 1.0),   # burst starts 1 min in
+            self._state("0.0", 6.0),   # ends 5 min later
+        ]
+        kwh = integrate_power_history_kwh(states, START, END)
+        # 3.5 kW x 5/60 h = 0.2917 kWh. The old mean gave (0+3.5+0)/3 x 0.25 = 0.29
+        # only by numerical coincidence of this tiny example; with the real dozens
+        # of idle samples it collapsed toward 0.
+        assert kwh == pytest.approx(3.5 * 5 / 60, abs=0.001)
+
+    def test_many_idle_samples_do_not_dilute_the_burst(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        # 20 idle chatter samples around one 5-minute 3.5 kW burst. The unweighted
+        # mean would give (3.5/21) * 0.25 = 0.042 kWh; time-weighting must not care
+        # how often the idle side chatters.
+        states = [self._state("0.0", m) for m in [0, 0.2, 0.4, 0.6, 0.8]]
+        states += [self._state("3.5", 1.0)]
+        states += [self._state("0.0", 6.0 + m) for m in [0, 0.5, 1, 2, 3, 4, 5, 6, 7, 8]]
+        kwh = integrate_power_history_kwh(states, START, END)
+        assert kwh == pytest.approx(3.5 * 5 / 60, abs=0.001)
+
+    def test_start_state_before_window_is_clamped(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        # HA includes the state valid AT window start with an earlier timestamp.
+        states = [self._state("2.0", -30.0), self._state("0.0", 7.5)]
+        kwh = integrate_power_history_kwh(states, START, END)
+        assert kwh == pytest.approx(2.0 * 7.5 / 60, abs=0.001)
+
+    def test_last_value_holds_across_an_unavailable_gap(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [
+            self._state("3.5", 0.0),
+            {"state": "unavailable", "last_changed": self._ts(5.0), "attributes": {}},
+            self._state("0.0", 10.0),
+        ]
+        # The unavailable sample is skipped; 3.5 kW carries 0->10 min.
+        kwh = integrate_power_history_kwh(states, START, END)
+        assert kwh == pytest.approx(3.5 * 10 / 60, abs=0.001)
+
+    def test_watts_are_normalized_with_timestamps(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [self._state("3500", 0.0, unit="W"), self._state("0", 7.5, unit="W")]
+        kwh = integrate_power_history_kwh(states, START, END)
+        assert kwh == pytest.approx(3.5 * 7.5 / 60, abs=0.001)
+
+    def test_bare_values_fall_back_to_the_legacy_mean(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [{"state": "4.0", "attributes": {"unit_of_measurement": "kW"}}] * 3
+        assert integrate_power_history_kwh(states, START, END) == pytest.approx(1.0)
+
+    def test_no_numeric_samples_is_none(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [{"state": "unavailable", "attributes": {}}]
+        assert integrate_power_history_kwh(states, START, END) is None

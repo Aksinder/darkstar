@@ -219,7 +219,7 @@ class TestRecorderDeltaLogic:
                     side_effect=mock_get_ha_sensor_kw_normalized,
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 # Create mock LearningStore
                 mock_store = MagicMock()
@@ -275,7 +275,7 @@ class TestRecorderDeltaLogic:
                     side_effect=mock_get_ha_sensor_kw_normalized,
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -337,7 +337,7 @@ class TestRecorderDeltaLogic:
                     side_effect=mock_get_ha_sensor_kw_normalized,
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -427,7 +427,7 @@ class TestRecorderDeltaLogic:
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1015,7 +1015,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1100,7 +1100,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1180,7 +1180,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1261,7 +1261,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.logger") as mock_logger,
             ):
                 mock_store = MagicMock()
@@ -1343,7 +1343,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1426,7 +1426,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1520,7 +1520,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1610,7 +1610,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1682,7 +1682,7 @@ class TestLoadIsolationFromDeferrableLoads:
                     new_callable=AsyncMock,
                     return_value=None,
                 ),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
             ):
                 mock_store = MagicMock()
                 mock_store.get_system_state = AsyncMock(return_value=None)
@@ -1760,7 +1760,7 @@ class TestLoadIsolationFromDeferrableLoads:
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -1844,7 +1844,7 @@ class TestLoadIsolationFromDeferrableLoads:
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -1922,7 +1922,7 @@ class TestLoadIsolationFromDeferrableLoads:
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -2001,7 +2001,7 @@ class TestLoadIsolationFromDeferrableLoads:
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch(
                     "backend.recorder.get_energy_from_power_history",
                     side_effect=mock_history_none,
@@ -2102,7 +2102,7 @@ class TestLoadIsolationFromDeferrableLoads:
                         "backend.recorder.get_ha_entity_state",
                         side_effect=mock_get_ha_entity_state,
                     ),
-                    patch("backend.recorder.get_current_slot_prices", return_value=None),
+                    patch("backend.recorder.get_nordpool_data", return_value=None),
                     patch(
                         "backend.recorder.get_energy_from_power_history",
                         side_effect=mock_history,
@@ -2213,7 +2213,7 @@ class TestPerDeviceEVRecording:
                 patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=mock_sensor_kw),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -2279,7 +2279,7 @@ class TestPerDeviceEVRecording:
                 patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=mock_sensor_kw),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=lambda e: None),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", return_value=None),
             ):
                 mock_store = MagicMock()
@@ -2343,7 +2343,7 @@ class TestPerDeviceEVRecording:
                 patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=mock_sensor_kw),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=lambda e: None),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -2439,7 +2439,7 @@ class TestPerDeviceWaterHeaterRecording:
                 patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=mock_sensor_kw),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -2505,7 +2505,7 @@ class TestPerDeviceWaterHeaterRecording:
                 patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=mock_sensor_kw),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_float),
                 patch("backend.recorder.get_ha_entity_state", return_value=None),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", return_value=None),
             ):
                 mock_store = MagicMock()
@@ -2570,7 +2570,7 @@ class TestPerDeviceWaterHeaterRecording:
                 patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=mock_sensor_kw),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_float),
                 patch("backend.recorder.get_ha_entity_state", return_value=None),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", return_value=None),
             ):
                 mock_store = MagicMock()
@@ -2813,7 +2813,7 @@ class TestPVEnergyFromPowerHistory:
                     side_effect=mock_get_ha_sensor_kw_normalized,
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -2878,7 +2878,7 @@ class TestPVEnergyFromPowerHistory:
                     side_effect=mock_get_ha_sensor_kw_normalized,
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -2949,7 +2949,7 @@ class TestPVEnergyFromPowerHistory:
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
                 patch("backend.recorder.get_ha_entity_state", side_effect=mock_get_ha_entity_state),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -3000,7 +3000,7 @@ class TestPVEnergyFromPowerHistory:
                     side_effect=mock_get_ha_sensor_kw_normalized,
                 ),
                 patch("backend.recorder.get_ha_sensor_float", side_effect=mock_get_ha_sensor_float),
-                patch("backend.recorder.get_current_slot_prices", return_value=None),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
                 patch("backend.recorder.get_energy_from_power_history", side_effect=mock_history),
             ):
                 mock_store = MagicMock()
@@ -3018,3 +3018,46 @@ class TestPVEnergyFromPowerHistory:
                     record = df.iloc[0].to_dict()
 
                     assert record["pv_kwh"] == pytest.approx(1.0, abs=0.01)
+
+
+class TestFinishedSlotBounds:
+    """The recorder must meter the just-FINISHED quarter, not the just-started one.
+
+    Live 2026-08-25: the window was [21:00, 21:15) computed at 21:00:09 — a 9 s
+    sliver of the future extrapolated to 15 min. Cycling loads (the house VVB's
+    5-min 3.5 kW bursts) credited 0.000 kWh, the min_kwh_per_day floor never
+    cleared, and the solver re-booked an already-hot tank at peak price nightly.
+    """
+
+    def test_seconds_after_the_boundary(self):
+        import pytz
+
+        from backend.recorder import finished_slot_bounds
+
+        tz = pytz.timezone("Europe/Stockholm")
+        now = tz.localize(datetime(2026, 8, 25, 21, 0, 9))
+        start, end = finished_slot_bounds(now)
+        assert start == tz.localize(datetime(2026, 8, 25, 20, 45))
+        assert end == tz.localize(datetime(2026, 8, 25, 21, 0))
+
+    def test_mid_slot_invocation_still_gets_the_previous_complete_slot(self):
+        import pytz
+
+        from backend.recorder import finished_slot_bounds
+
+        tz = pytz.timezone("Europe/Stockholm")
+        now = tz.localize(datetime(2026, 8, 25, 21, 7, 30))
+        start, end = finished_slot_bounds(now)
+        assert start == tz.localize(datetime(2026, 8, 25, 20, 45))
+        assert end == tz.localize(datetime(2026, 8, 25, 21, 0))
+
+    def test_midnight_crossing(self):
+        import pytz
+
+        from backend.recorder import finished_slot_bounds
+
+        tz = pytz.timezone("Europe/Stockholm")
+        now = tz.localize(datetime(2026, 8, 26, 0, 0, 12))
+        start, end = finished_slot_bounds(now)
+        assert start == tz.localize(datetime(2026, 8, 25, 23, 45))
+        assert end == tz.localize(datetime(2026, 8, 26, 0, 0))

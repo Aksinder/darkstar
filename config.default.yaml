@@ -202,7 +202,25 @@ water_heaters:
     name: "Main Water Heater"        # Display name in UI
     enabled: true                    # Master toggle for this heater
     power_kw: 3.0                    # Rated power consumption (kW)
-    min_kwh_per_day: 6.0             # Minimum daily energy requirement (kWh)
+    min_kwh_per_day: 6.0             # Minimum daily energy requirement (kWh). The solver
+                                     # prices a shortfall at the reliability penalty
+                                     # (15 SEK/kWh at comfort_level 3), which outvotes any
+                                     # spot hour — so unless shortfall_gate is on, this is
+                                     # booked at ANY price whenever the day bucket is unmet,
+                                     # however full the tank happens to be.
+    shortfall_gate:                  # Book the floor only when hot water would actually run
+                                     # out before the next cheap window (needs type: thermal
+                                     # + volume_litres, i.e. a tracked tank). Only ever
+                                     # LOWERS min_kwh_per_day; any unknown input (stale tank
+                                     # state, no forecast) keeps the full floor, so blind
+                                     # means "heat as before", never "skip".
+      enabled: false                 # Default off — opt in per tank.
+      comfort_c: 40                  # Below this the stored energy is not a shower.
+      shower_litres: 60              # One shower, in litres AT comfort_c (~2.1 kWh each).
+      margin_showers: 1.5            # Reserve held back on top of the forecast draw.
+      margin_from_hour_weekday: 18   # The reserve applies from this local hour...
+      margin_from_hour_weekend: 14   # ...earlier at weekends, when showers start earlier.
+      max_horizon_hours: 16          # Never bet on a cheap window further out than this.
     max_hours_between_heating: 8     # Max comfort gap between heating cycles
     water_min_spacing_hours: 4       # Minimum gap between heating starts
     sensor: ''                       # Home Assistant entity for power reading
