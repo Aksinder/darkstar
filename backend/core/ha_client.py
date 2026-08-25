@@ -226,41 +226,93 @@ async def get_energy_from_power_history(
         if not data or not data[0]:
             return None
 
-        states = data[0]
-        kw_values: list[float] = []
-        unit: str | None = None
-
-        for state in states:
-            state_val = state.get("state", "")
-            if state_val in ("unknown", "unavailable", "", None):
-                continue
-
-            try:
-                value = float(state_val)
-            except (TypeError, ValueError):
-                continue
-
-            if unit is None:
-                attributes = state.get("attributes", {})
-                unit = str(attributes.get("unit_of_measurement", "")).upper()
-
-            if unit == "W":
-                kw_values.append(value / 1000.0)
-            elif unit == "MW":
-                kw_values.append(value * 1000.0)
-            else:
-                kw_values.append(value)  # Assume kW
-
-        if not kw_values:
-            return None
-
-        mean_kw = sum(kw_values) / len(kw_values)
-        duration_hours = (end - start).total_seconds() / 3600.0
-        return mean_kw * duration_hours
+        return integrate_power_history_kwh(data[0], start, end)
 
     except Exception as exc:
         logger.warning("get_energy_from_power_history(%s): %s", entity_id, exc)
         return None
+
+
+def integrate_power_history_kwh(
+    states: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+) -> float | None:
+    """Time-weighted integral of a power-sensor history over [start, end], in kWh.
+
+    The old implementation was an UNWEIGHTED mean of the state changes times the
+    window length. State-change history is event-driven, so a 5-minute element
+    burst contributes dozens of samples while a long idle stretch contributes
+    one — the mean was dominated by whichever mode changed most often, not by
+    time. Live consequence (2026-08-25): the house VVB's 3.5 kW bursts landed as
+    0.000 kWh whenever the (mis-chosen) window caught the idle side, and would
+    have been over-counted with a correct window. Each sample now covers exactly
+    the span until the next sample (clamped to the window), i.e. the standard
+    step-function integral of HA state history.
+
+    A sample whose value is unknown/unavailable/unparsable is skipped and the
+    previous numeric value carries across the gap — the sensor's last report is
+    the best estimate of what the element was doing while the sensor was mute.
+
+    Samples without a parsable timestamp fall back to the legacy mean-times-
+    duration estimate, so callers that only have bare values still get an answer.
+    Returns None when no numeric samples exist at all.
+    """
+    points: list[tuple[datetime, float]] = []
+    bare_kw: list[float] = []
+    unit: str | None = None
+
+    for state in states:
+        state_val = state.get("state", "")
+        if state_val in ("unknown", "unavailable", "", None):
+            continue
+        try:
+            value = float(state_val)
+        except (TypeError, ValueError):
+            continue
+
+        if unit is None:
+            attributes = state.get("attributes", {})
+            unit = str(attributes.get("unit_of_measurement", "")).upper()
+        if unit == "W":
+            kw = value / 1000.0
+        elif unit == "MW":
+            kw = value * 1000.0
+        else:
+            kw = value  # Assume kW
+
+        raw_ts = state.get("last_changed") or state.get("last_updated")
+        ts: datetime | None = None
+        if isinstance(raw_ts, str):
+            try:
+                ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            except ValueError:
+                ts = None
+        elif isinstance(raw_ts, datetime):
+            ts = raw_ts
+        if ts is not None and ts.tzinfo is None:
+            # HA timestamps are UTC when the offset is missing.
+            ts = ts.replace(tzinfo=UTC)
+
+        if ts is None:
+            bare_kw.append(kw)
+        else:
+            points.append((ts, kw))
+
+    if not points:
+        if not bare_kw:
+            return None
+        duration_hours = (end - start).total_seconds() / 3600.0
+        return (sum(bare_kw) / len(bare_kw)) * duration_hours
+
+    points.sort(key=lambda p: p[0])
+    total_kwh = 0.0
+    for i, (ts, kw) in enumerate(points):
+        seg_start = max(ts, start)
+        seg_end = min(points[i + 1][0], end) if i + 1 < len(points) else end
+        if seg_end > seg_start:
+            total_kwh += kw * (seg_end - seg_start).total_seconds() / 3600.0
+    return total_kwh
 
 
 async def get_ha_bool(entity_id: str) -> bool:

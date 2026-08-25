@@ -397,9 +397,9 @@ class TestGatherSensorReadsBatchExecution:
                     return_value=None,
                 ),
                 patch(
-                    "backend.recorder.get_current_slot_prices",
+                    "backend.recorder.get_nordpool_data",
                     new_callable=AsyncMock,
-                    return_value=(0.0, 0.0, 0.0),
+                    return_value=[],
                 ),
                 patch("backend.recorder.LearningStore") as mock_store_cls,
                 patch("backend.recorder.RecorderStateStore") as mock_state_store_cls,

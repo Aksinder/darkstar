@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import json
 import logging
 from dataclasses import replace
 from datetime import datetime
@@ -44,6 +45,11 @@ from planner.strategy.s_index import (
     derive_battery_value_sek_per_kwh,
 )
 from planner.vacation_state import load_last_anti_legionella, save_last_anti_legionella
+from planner.water_shortfall import (
+    ShortfallConfig,
+    dynamic_floor_kwh,
+    hours_to_cheap_window,
+)
 
 logger = logging.getLogger("darkstar.planner")
 
@@ -83,6 +89,111 @@ def resolve_vacation_enabled(config_enabled: bool, ha_vacation: bool, entity_wir
     if entity_wired:
         return ha_vacation
     return config_enabled or ha_vacation
+
+
+def _load_hot_water_states(path: str = "data/hot_water_state.json") -> dict[str, dict]:
+    """The tank estimator's persisted state, or {} when it is not available.
+
+    Written every ~300 s by the cycle publisher running in this same process.
+    Unreadable/missing is normal on a cold start and must not be an error — the
+    gate then keeps the configured floor, which is the pre-gate behaviour.
+    """
+    try:
+        with Path(path).open() as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _apply_water_shortfall_gate(
+    heaters: list[Any],
+    heaters_cfg: list[dict[str, Any]],
+    slots: list[Any],
+    now_local: Any,
+    heated_today_by_id: dict[str, float],
+) -> None:
+    """Relax each gated tank's daily floor to its forecast shortfall, in place.
+
+    Only ever lowers. Any missing input keeps the configured value, so a stale
+    state file or an unreadable forecast degrades to the old unconditional floor
+    rather than to a cold tank.
+    """
+    if not heaters or not heaters_cfg:
+        return
+    cfg_by_id = {str(c.get("id")): c for c in heaters_cfg if c.get("id")}
+    states = _load_hot_water_states()
+
+    for h in heaters:
+        raw = cfg_by_id.get(h.id)
+        if not raw:
+            continue
+        gate_raw = raw.get("shortfall_gate") or {}
+        if not gate_raw.get("enabled", False):
+            continue
+        cfg = ShortfallConfig(
+            enabled=True,
+            comfort_c=float(gate_raw.get("comfort_c", 40.0)),
+            t_cold_c=float(raw.get("t_cold_c", gate_raw.get("t_cold_c", 10.0))),
+            shower_litres=float(gate_raw.get("shower_litres", 60.0)),
+            margin_showers=float(gate_raw.get("margin_showers", 1.5)),
+            margin_from_hour_weekday=float(gate_raw.get("margin_from_hour_weekday", 18.0)),
+            margin_from_hour_weekend=float(gate_raw.get("margin_from_hour_weekend", 14.0)),
+            max_horizon_hours=float(gate_raw.get("max_horizon_hours", 16.0)),
+        )
+        volume = raw.get("volume_litres")
+        state = states.get(h.id) or {}
+        stored = state.get("stored_kwh")
+        draw_kw = state.get("learned_draw_kw")
+
+        wait_h = hours_to_cheap_window(
+            slots, now_local, heater_kw=h.power_kw, max_horizon_hours=cfg.max_horizon_hours
+        )
+
+        loss_kwh = 0.0
+        if wait_h is not None and volume:
+            try:
+                from planner.thermal import WaterTankModel
+
+                tank = WaterTankModel(
+                    volume_litres=float(volume),
+                    t_cold_c=cfg.t_cold_c,
+                    t_max_c=float(raw.get("t_max_c", 85.0)),
+                    ua_w_per_k=float(raw.get("ua_w_per_k", 2.0)),
+                )
+                temp_now = cfg.t_cold_c + (
+                    float(stored) * 1000.0 / tank.heat_capacity_wh_per_k
+                    if stored is not None
+                    else 0.0
+                )
+                loss_kwh = tank.standby_loss_kwh(temp_now, min(wait_h, cfg.max_horizon_hours))
+            except Exception:
+                # Do NOT swallow silently: a bare except here hid a
+                # property-called-as-method TypeError that zeroed this term on
+                # every single evaluation, and no test could see it because the
+                # unit tests inject standby_loss_kwh directly.
+                logger.exception("Water shortfall gate %s: standby loss unavailable", h.id)
+                loss_kwh = 0.0
+
+        new_floor, reason = dynamic_floor_kwh(
+            configured_min_kwh=h.min_kwh_per_day,
+            heated_today_kwh=float(heated_today_by_id.get(h.id, 0.0) or 0.0),
+            stored_kwh=stored,
+            volume_litres=float(volume) if volume else None,
+            learned_draw_kw=draw_kw,
+            standby_loss_kwh=loss_kwh,
+            hours_to_cheap=wait_h,
+            now_local=now_local,
+            cfg=cfg,
+        )
+        if new_floor != h.min_kwh_per_day:
+            logger.info(
+                "Water shortfall gate %s: floor %.2f -> %.2f kWh (%s)",
+                h.id, h.min_kwh_per_day, new_floor, reason,
+            )
+            h.min_kwh_per_day = new_floor
+        else:
+            logger.info("Water shortfall gate %s: floor unchanged (%s)", h.id, reason)
 
 
 def _calculate_excess_pv_flags(
@@ -867,6 +978,20 @@ class PlannerPipeline:
                 len(excess_pv_flags),
                 excess_pv_sink,
             )
+
+        # Shortfall-risk gate: relax the blunt daily kWh floor to what the tank
+        # will actually be short before the next cheap window. Placed AFTER the
+        # excess-PV flags on purpose — those use min_kwh_per_day as a "typical
+        # household draw" baseline for deciding which slots have spare PV, and
+        # that question is about the household, not about tonight's tank level.
+        # Mutating the heaters here mirrors the anti-legionella override below.
+        _apply_water_shortfall_gate(
+            kepler_config.water_heaters,
+            active_config.get("water_heaters", []) or [],
+            kepler_input.slots,
+            now_slot,
+            water_heated_today_by_id,
+        )
 
         # Rev O1: Disable water heating in Kepler if no water heater (task 3.4)
         if not has_water_heater:

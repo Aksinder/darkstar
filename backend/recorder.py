@@ -18,7 +18,7 @@ from backend.core.ha_client import (
     get_ha_sensor_float,
     get_ha_sensor_kw_normalized,
 )
-from backend.core.prices import get_current_slot_prices
+from backend.core.prices import get_nordpool_data
 from backend.learning.backfill import BackfillEngine
 
 # Local imports
@@ -28,6 +28,20 @@ from backend.validation import get_max_energy_per_slot, validate_energy_values
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("recorder")
+
+
+def finished_slot_bounds(now: datetime) -> tuple[datetime, datetime]:
+    """[start, end) of the most recently COMPLETED 15-minute slot at ``now``.
+
+    The recorder wakes a few seconds after each quarter boundary; the only slot
+    with complete data is the one that just ended — one block back from where
+    ``now`` lands. (A mid-slot invocation, e.g. the first run after startup,
+    also gets the previous complete slot: the running quarter is unfinished and
+    unmeasurable either way.)
+    """
+    minute_block = (now.minute // 15) * 15
+    current_block = now.replace(minute=minute_block, second=0, microsecond=0)
+    return current_block - timedelta(minutes=15), current_block
 
 
 class RecorderStateStore:
@@ -206,12 +220,20 @@ async def record_observation_from_current_state(
         state_store = RecorderStateStore()
         state_store.load()
 
-    # Identify the just-finished slot (or current instant)
+    # Identify the just-FINISHED slot. The recorder wakes a few seconds after each
+    # quarter boundary; the only slot with complete data is the one that just
+    # ended, i.e. one block BACK from where "now" lands. The old code took the
+    # just-STARTED block, so every history integral covered a 9-40 s sliver of
+    # the future quarter extrapolated to 15 min: continuously-running loads came
+    # out roughly right by luck, while cycling loads (the house VVB's 5-minute
+    # 3.5 kW bursts) were a coin flip and usually 0.000 — which kept the
+    # min_kwh_per_day comfort floor permanently unmet and re-booked the tank at
+    # peak prices every replan (live 2026-08-25). The cumulative-counter deltas
+    # in this same observation already describe the finished quarter (they span
+    # [previous run, now]), so this also re-keys the row to the slot its data
+    # actually belongs to — prices, savings and realism now join the right slot.
     now = datetime.now(tz)
-    # Round down to nearest 15 min
-    minute_block = (now.minute // 15) * 15
-    slot_start = now.replace(minute=minute_block, second=0, microsecond=0)
-    slot_end = slot_start + timedelta(minutes=15)
+    slot_start, slot_end = finished_slot_bounds(now)
 
     # Gather Data
     input_sensors = config.get("input_sensors", {})
@@ -658,14 +680,25 @@ async def record_observation_from_current_state(
         await store.set_system_state("last_known_soc", str(soc_percent))
 
     # Fetch Price Data (REV // Complete Cost Reality Fix)
-    prices = await get_current_slot_prices(config)
-    import_price = prices.get("import_price_sek_kwh") if prices else None
-    export_price = prices.get("export_price_sek_kwh") if prices else None
+    # The row describes the just-FINISHED slot (slot_start), so the price must be
+    # looked up for THAT slot — get_current_slot_prices would return the slot
+    # containing "now", one step later, mispricing every observation by one slot.
+    import_price = None
+    export_price = None
+    try:
+        _price_series = await get_nordpool_data()
+        for _p in _price_series or []:
+            if _p["start_time"] <= slot_start < _p["end_time"]:
+                import_price = _p.get("import_price_sek_kwh")
+                export_price = _p.get("export_price_sek_kwh")
+                break
+    except Exception as _price_exc:
+        logger.warning(f"Price lookup for {slot_start} failed: {_price_exc}")
 
-    if prices:
+    if import_price is not None:
         logger.info(f"Price data fetched: Import={import_price:.4f}, Export={export_price:.4f}")
     else:
-        logger.warning("Failed to fetch price data for current observation")
+        logger.warning("Failed to fetch price data for observation slot %s", slot_start)
 
     # Construct Record
     record = {

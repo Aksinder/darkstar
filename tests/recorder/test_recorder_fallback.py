@@ -27,7 +27,7 @@ async def test_recorder_fallback_logic():
             mock_get_sensor.side_effect = lambda entity: 50.0 if entity == "sensor.soc" else 0.0
             # Mock prices
             with patch(
-                "backend.recorder.get_current_slot_prices", new_callable=AsyncMock
+                "backend.recorder.get_nordpool_data", new_callable=AsyncMock
             ) as mock_prices:
                 mock_prices.return_value = {}
 
@@ -49,7 +49,7 @@ async def test_recorder_fallback_logic():
             mock_get_sensor.side_effect = lambda entity: None if entity == "sensor.soc" else 0.0
 
             with patch(
-                "backend.recorder.get_current_slot_prices", new_callable=AsyncMock
+                "backend.recorder.get_nordpool_data", new_callable=AsyncMock
             ) as mock_prices:
                 mock_prices.return_value = {}
 
@@ -73,7 +73,7 @@ async def test_recorder_fallback_logic():
             mock_get_sensor.side_effect = lambda entity: None if entity == "sensor.soc" else 0.0
 
             with patch(
-                "backend.recorder.get_current_slot_prices", new_callable=AsyncMock
+                "backend.recorder.get_nordpool_data", new_callable=AsyncMock
             ) as mock_prices:
                 mock_prices.return_value = {}
 
@@ -94,7 +94,7 @@ async def test_recorder_fallback_logic():
             mock_get_sensor.side_effect = lambda entity: None if entity == "sensor.soc" else 0.0
 
             with patch(
-                "backend.recorder.get_current_slot_prices", new_callable=AsyncMock
+                "backend.recorder.get_nordpool_data", new_callable=AsyncMock
             ) as mock_prices:
                 mock_prices.return_value = {}
 
