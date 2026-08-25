@@ -1,3 +1,7 @@
+## dev-20260825.1946 — 2026-08-25 19:48
+
+- Recorder: meter the finished slot, integrate time-weighted, price by slot key
+
 ## dev-20260824.1649 — 2026-08-24 16:51
 
 - Water: anti-short-cycle hold for the surplus boost
