@@ -35,6 +35,12 @@ def get_git_version() -> str:
         return "dev"
 
 
+# The single source of truth for where the executor reads the plan. The reader in
+# planner/pipeline.py imports this — a divergence here is what kept the mid-block
+# lock and plan-stability anchor inert in production until 2026-08-26.
+SCHEDULE_JSON_PATH = "data/schedule.json"
+
+
 async def save_schedule_to_json(
     schedule_df: pd.DataFrame,
     config: dict[str, Any],
@@ -43,7 +49,7 @@ async def save_schedule_to_json(
     s_index_debug: dict[str, Any] | None,
     window_responsibilities: list[dict[str, Any]],
     planner_state: dict[str, Any],
-    output_path: str = "data/schedule.json",
+    output_path: str = SCHEDULE_JSON_PATH,
 ) -> None:
     """
     Save the final schedule to schedule.json in the required format.
@@ -105,5 +111,12 @@ async def save_schedule_to_json(
                 return o.isoformat()
             return super().default(o)
 
-    with Path(output_path).open("w", encoding="utf-8") as f:
+    # Atomic write: the executor reads this file every tick, and a reader that
+    # catches a truncating rewrite gets half a JSON document (live 2026-08-26
+    # 04:36: "Failed to load schedule: Expecting value: line 2398"). Write to a
+    # sibling temp file and rename over — same pattern as the config writer.
+    out = Path(output_path)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, cls=DateTimeEncoder)
+    tmp.replace(out)

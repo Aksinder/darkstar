@@ -145,7 +145,7 @@ def _dump_failed_solve_instance(
             "used_solver": used_solver,
             "solve_duration_s": round(solve_duration_s, 3),
             "chain_duration_s": round(chain_duration_s, 3),
-            "time_limit_s": SOLVER_TIME_LIMIT_S,
+            "time_limit_s": config.solver_time_limit_s or SOLVER_TIME_LIMIT_S,
             **(extra or {}),
             "config": dataclasses.asdict(config),
             "input": dataclasses.asdict(input_data),
@@ -998,7 +998,16 @@ class KeplerSolver:
         # objective next to the symmetry breaker. Empty => no anchor active.
         anchor_reward_terms: list[Any] = []
         if water_enabled:
-            avg_slot_hours: float = sum(slot_hours) / len(slot_hours) if slot_hours else 0.25
+            # Per-slot wall-clock accounting. The coarse tail makes the grid
+            # non-uniform (15-min head + hourly tail); a single averaged slot
+            # length credited fine slots 1.48x what they deliver and coarse
+            # hours 2.7x less, stretched the 4 h spacing to 10 h on the tail,
+            # and squeezed the block window in the head (live 2026-08-26).
+            # H[k] = wall-clock hours from slot 0 up to (not incl.) slot k.
+            H: list[float] = [0.0]
+            for _h in slot_hours:
+                H.append(H[-1] + _h)
+            h_unit: float = min(slot_hours) if slot_hours else 0.25
 
             # Soft-cap overage price: just above the boost reward so reward-farming
             # beyond the cap nets negative per kWh, yet orders of magnitude below the
@@ -1019,8 +1028,6 @@ class KeplerSolver:
 
             for heater in water_heaters:
                 d = heater.id
-                # Per-device kWh per slot (power differs between heaters)
-                kwh_per_slot: float = heater.power_kw * avg_slot_hours
 
                 # Constraint 1: Per-device, per-day daily minimum (task 2.4)
                 for i, day in enumerate(sorted_days):
@@ -1035,7 +1042,10 @@ class KeplerSolver:
 
                     if day_min_kwh > 0:
                         prob += (  # type: ignore[operator]
-                            pulp.lpSum(water_heat[d][t] for t in day_slot_indices) * kwh_per_slot
+                            heater.power_kw
+                            * pulp.lpSum(
+                                water_heat[d][t] * slot_hours[t] for t in day_slot_indices
+                            )
                             >= day_min_kwh - water_min_kwh_violation[d][i]
                         )
 
@@ -1086,11 +1096,12 @@ class KeplerSolver:
                             cap_remaining = heater.absorb_cap_kwh_per_day
                         overage: Any = water_absorb_overage[d][i]
                         prob += (  # type: ignore[operator]
-                            pulp.lpSum(  # type: ignore[reportUnknownMemberType]
-                                water_heat[d][t] + (water_boost[d][t] if d in water_boost else 0)
+                            heater.power_kw
+                            * pulp.lpSum(  # type: ignore[reportUnknownMemberType]
+                                (water_heat[d][t] + (water_boost[d][t] if d in water_boost else 0))
+                                * slot_hours[t]
                                 for t in day_slot_indices
                             )
-                            * kwh_per_slot
                             <= cap_remaining + overage
                         )
                         total_cost.append(absorb_overage_penalty * overage)
@@ -1119,29 +1130,64 @@ class KeplerSolver:
                             # (satiation) and at the energy actually heated.
                             prob += served <= day_min_kwh  # type: ignore[operator]
                             prob += served <= (  # type: ignore[operator]
-                                pulp.lpSum(water_heat[d][t] for t in day_slot_indices)
-                                * kwh_per_slot
+                                heater.power_kw
+                                * pulp.lpSum(
+                                    water_heat[d][t] * slot_hours[t] for t in day_slot_indices
+                                )
                             )
                             total_cost.append(-wtp_d * served)
 
-                # Constraint 2: Per-device soft block breaker (task 2.5)
+                # Constraint 2: Per-device soft block breaker (task 2.5).
+                # Hours-based on the (possibly mixed) grid: for each start t, find
+                # the smallest window whose wall-clock span EXCEEDS max_block_hours
+                # and cap the ON-hours inside it (in h_unit quanta) at the span
+                # budget. On a uniform grid this reduces exactly to the old
+                # "max_block_slots+1 window <= max_block_slots" form, including
+                # the floor-quantization of non-divisible max_block_hours.
                 if config.water_block_penalty_sek > 0:
-                    max_block_slots: int = max(1, int(config.max_block_hours / avg_slot_hours))
-                    window_size: int = max_block_slots + 1
-                    for t in range(T - window_size + 1):
+                    eff_block_h: float = max(config.max_block_hours, h_unit)
+                    e: int = 0
+                    for t in range(T):
+                        if e < t:
+                            e = t
+                        while e < T and H[e + 1] - H[t] <= eff_block_h:
+                            e += 1
+                        if e >= T:
+                            break  # tail windows never exceed the span; same drop as before
+                        # Count-based cap: the window [t, e] is the SMALLEST whose
+                        # wall-clock span exceeds max_block_hours, so the only
+                        # illegal pattern inside it is ALL slots ON (a contiguous
+                        # run longer than the allowance). Cap the count at
+                        # window-size-minus-one; every legal pattern fits exactly.
+                        # An hours-weighted budget was tried first and brute-force
+                        # review proved it charged legal boundary-straddling
+                        # blocks ~12 SEK of phantom overshoot — enough to push
+                        # heating into pricier hours and re-create the block walk.
+                        # Uniform grids: byte-identical to the pre-2026-08-26
+                        # max_block_slots formulation.
                         prob += (  # type: ignore[operator]
-                            pulp.lpSum(water_heat[d][j] for j in range(t, t + window_size))
-                            <= max_block_slots + block_overshoot[d][t]
+                            pulp.lpSum(water_heat[d][j] for j in range(t, e + 1))
+                            <= (e - t) + block_overshoot[d][t]
                         )
 
-                # Constraint 3: Per-device hard spacing constraint (task 2.6)
+                # Constraint 3: Per-device hard spacing constraint (task 2.6).
+                # Wall-clock lookback: a start at t requires every slot whose END
+                # lies within min_spacing_hours before t's start to be OFF. On a
+                # uniform grid with spacing a multiple of the slot length (every
+                # production config) this is byte-equivalent to the old
+                # slot-counted window; on the coarse tail the old count of 10
+                # slots spanned 10 HOURS instead of the intended 4.
                 if heater.min_spacing_hours > 0 and d in water_start:
-                    spacing_slots: int = max(1, int(heater.min_spacing_hours / avg_slot_hours))
-                    M: int = spacing_slots
+                    lookbacks: list[list[int]] = []
+                    lo: int = 0
                     for t in range(T):
-                        start_idx: int = max(0, t - spacing_slots)
+                        while lo < t and H[t] - H[lo + 1] >= heater.min_spacing_hours:
+                            lo += 1
+                        lookbacks.append(list(range(lo, t)))
+                    M: int = max(1, max((len(j) for j in lookbacks), default=1))
+                    for t in range(1, T):
                         prob += (  # type: ignore[operator]
-                            pulp.lpSum(water_heat[d][j] for j in range(start_idx, t))
+                            pulp.lpSum(water_heat[d][j] for j in lookbacks[t])
                             + water_start[d][t] * M  # type: ignore[operator]
                             <= M
                         )
@@ -1193,9 +1239,16 @@ class KeplerSolver:
                     anchor_in: list[int] = sorted(t for t in heater.anchor_on_slots if 0 <= t < T)
                     if not anchor_in:
                         continue
-                    kwh_per_slot_a: float = heater.power_kw * avg_slot_hours
-                    costs_sorted: list[float] = sorted(
-                        _slot_heat_cost(t, kwh_per_slot_a) for t in range(T)
+                    # Per-slot energies: a coarse tail slot carries 4x a fine
+                    # slot's energy, so both the anchored cost and the comparison
+                    # must be energy-matched, not slot-count-matched.
+                    slot_kwh_a: list[float] = [heater.power_kw * slot_hours[t] for t in range(T)]
+                    unit_sorted: list[tuple[float, float]] = sorted(
+                        (
+                            (_slot_heat_cost(t, slot_kwh_a[t]) / slot_kwh_a[t], slot_kwh_a[t])
+                            for t in range(T)
+                            if slot_kwh_a[t] > 0
+                        ),
                     )
                     # Gate each CONTIGUOUS block independently: one relocatable block
                     # must not drop the anchor for the others (nor couple a cross-day pair).
@@ -1210,8 +1263,21 @@ class KeplerSolver:
                     blocks.append(block)
                     for blk in blocks:
                         k = len(blk)
-                        anchored_cost = sum(_slot_heat_cost(t, kwh_per_slot_a) for t in blk)
-                        cheapest_cost = sum(costs_sorted[:k])
+                        anchored_cost = sum(_slot_heat_cost(t, slot_kwh_a[t]) for t in blk)
+                        block_energy: float = sum(slot_kwh_a[t] for t in blk)
+                        # Energy-matched cheapest alternative: greedily take the
+                        # cheapest unit-cost slots until the block's energy is
+                        # covered, pro-rating the final slot. On a uniform grid
+                        # this takes exactly k whole slots — identical to the old
+                        # "k cheapest slot costs" comparison.
+                        cheapest_cost = 0.0
+                        remaining: float = block_energy
+                        for unit_cost, kwh_avail in unit_sorted:
+                            if remaining <= 1e-12:
+                                break
+                            take = min(kwh_avail, remaining)
+                            cheapest_cost += unit_cost * take
+                            remaining -= take
                         bonus_total = anchor_bonus * k
                         if anchored_cost - cheapest_cost > bonus_total:
                             logger.info(
@@ -1392,6 +1458,15 @@ class KeplerSolver:
         # Note: pulp.LpProblem construction happened above, so 'build_time' here is mostly
         # just the overhead of writing the LP file in prob.solve()
 
+        # Effective solver budget/gap: kepler.solver config when set, else the
+
+        # module defaults. Dumps record the effective value.
+
+        _limit_s: float = config.solver_time_limit_s or SOLVER_TIME_LIMIT_S
+
+        _gap_rel: float = config.solver_gap_rel or 0.01
+
+
         used_solver: str = "highs"
         # Per-attempt timer: solve_is_time_boxed, the SOLVER_TIMEOUT mapping and the
         # degraded-quality WARNING all reason about the solver that produced
@@ -1410,10 +1485,23 @@ class KeplerSolver:
             # process-global scheduler returns kNotset (-> NotSolved) if a later
             # solve in the same process passes a DIFFERENT thread count.
             # Missing highspy => prob.solve raises PulpSolverError -> CBC below.
+            _extra_opts: dict[str, Any] = dict(config.solver_highs_options or {})
+            for _reserved in ("msg", "timeLimit", "gapRel", "threads"):
+                if _reserved in _extra_opts:
+                    # A collision raises TypeError inside this try, which the
+                    # no-highspy except would swallow — silently demoting every
+                    # solve to CBC. Use time_limit_s/gap_rel for these instead.
+                    logger.warning(
+                        "kepler.solver.highs_options: dropping reserved key %r "
+                        "(use time_limit_s/gap_rel)",
+                        _reserved,
+                    )
+                    _extra_opts.pop(_reserved)
             solver_cmd: Any = pulp.HiGHS(  # type: ignore[reportUnknownMemberType]
                 msg=False,
-                timeLimit=SOLVER_TIME_LIMIT_S,
-                gapRel=0.01,
+                timeLimit=_limit_s,
+                gapRel=_gap_rel,
+                **_extra_opts,
             )
             attempt_start = time.time()
             prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
@@ -1428,7 +1516,7 @@ class KeplerSolver:
             # tripwire below, so worst case remains "keep the previous plan", never
             # a garbage plan shipped.
             if prob.status == pulp.LpStatusNotSolved:  # type: ignore[reportUnknownMemberType]
-                if _highs_duration < 0.9 * SOLVER_TIME_LIMIT_S:
+                if _highs_duration < 0.9 * _limit_s:
                     raise RuntimeError(
                         f"HiGHS returned NotSolved in {_highs_duration:.1f}s "
                         f"(<0.9x budget) — treating as solver malfunction"
@@ -1436,12 +1524,12 @@ class KeplerSolver:
                 logger.warning(
                     "HiGHS found NO incumbent within its %ds budget (%.1fs) — "
                     "retrying with CBC as a safety net",
-                    SOLVER_TIME_LIMIT_S,
+                    _limit_s,
                     _highs_duration,
                 )
                 raise RuntimeError(
                     f"HiGHS no-incumbent timeout ({_highs_duration:.1f}s of "
-                    f"{SOLVER_TIME_LIMIT_S}s) — retrying with CBC"
+                    f"{_limit_s}s) — retrying with CBC"
                 )
         except Exception as highs_exc:
             # Expected on hosts without highspy — INFO, not WARNING.
@@ -1462,15 +1550,15 @@ class KeplerSolver:
                 # 8 threads); on a 1-2 vCPU box it is harmless.
                 solver_cmd = pulp.PULP_CBC_CMD(
                     msg=False,
-                    timeLimit=SOLVER_TIME_LIMIT_S,
-                    gapRel=0.01,
+                    timeLimit=_limit_s,
+                    gapRel=_gap_rel,
                     threads=max(1, os.cpu_count() or 1),
                 )
                 attempt_start = time.time()
                 prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
             except Exception:
                 used_solver = "glpk"
-                solver_cmd = pulp.GLPK_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_S)
+                solver_cmd = pulp.GLPK_CMD(msg=False, timeLimit=_limit_s)
                 attempt_start = time.time()
                 prob.solve(solver_cmd)  # type: ignore[reportUnknownMemberType]
 
@@ -1494,12 +1582,12 @@ class KeplerSolver:
         # incumbent it had — possibly far from optimal — even when the status reads
         # "Optimal" (GLPK notoriously does this). Never let that pass silently: the
         # 2026-07-05 incident shipped zero-water plans for hours this way.
-        if solve_duration >= 0.9 * SOLVER_TIME_LIMIT_S:
+        if solve_duration >= 0.9 * _limit_s:
             logger.warning(
                 "Kepler solve consumed %.1fs of its %ds budget — plan quality may be "
                 "degraded (status: %s). Consider a stronger solver or smaller model.",
                 solve_duration,
-                SOLVER_TIME_LIMIT_S,
+                _limit_s,
                 status,
             )
 
@@ -1515,15 +1603,24 @@ class KeplerSolver:
         # getattr: sol_status is standard PuLP, but test doubles / exotic wrappers
         # may lack it — default to "proven" (old behavior) rather than false-flag.
         _sol_status: int = int(getattr(prob, "sol_status", _LP_SOLUTION_OPTIMAL))  # type: ignore[arg-type]
-        if solve_is_time_boxed(is_optimal, _sol_status, used_solver, solve_duration):  # type: ignore[arg-type]
+        if solve_is_time_boxed(is_optimal, _sol_status, used_solver, solve_duration, _limit_s):  # type: ignore[arg-type]
             floor_violation_kwh: float = 0.0
             for d in water_min_kwh_violation:
                 if (
                     config.load_priority_enabled
                     and d in config.load_priorities
-                    and config.load_priorities[d].dynamic_percentile is None
+                    and (
+                        config.load_priorities[d].dynamic_percentile is None
+                        or config.load_priorities[d].may_skip_day
+                    )
                 ):
-                    continue  # static-WTP heaters may legitimately skip a day
+                    # Static-WTP and may_skip_day heaters may legitimately skip a
+                    # day. MUST mirror the objective's exemption at the reliability
+                    # penalty exactly: 2026-08-26 the tripwire lacked may_skip_day,
+                    # so the spa's correctly-skipped 4 kWh floor in two later day
+                    # buckets read as an 8 kWh comfort violation and five valid
+                    # time-boxed plans were thrown away between 04:25 and 05:35.
+                    continue
                 for i in range(len(sorted_days)):
                     _v: Any = pulp.value(water_min_kwh_violation[d][i])  # type: ignore[arg-type]
                     if _v is not None:
@@ -1562,7 +1659,7 @@ class KeplerSolver:
                 "Kepler hit its %ds budget and returned an UNPROVEN incumbent "
                 "(passed the comfort-floor tripwire). Shipping it labeled '%s'; "
                 "objective may be a few SEK/day off optimal.",
-                SOLVER_TIME_LIMIT_S,
+                _limit_s,
                 status,
             )
 
@@ -1594,7 +1691,7 @@ class KeplerSolver:
             }
             if prob.status == pulp.LpStatusInfeasible:  # type: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
                 raise PlannerError(code=PlannerErrorCode.SOLVER_INFEASIBLE, details=details)
-            elif solve_duration >= 0.95 * SOLVER_TIME_LIMIT_S:
+            elif solve_duration >= 0.95 * _limit_s:
                 # Solvers check the clock between nodes and exit just UNDER the
                 # limit (119.939s of 120) — a >= limit comparison never fires.
                 raise PlannerError(code=PlannerErrorCode.SOLVER_TIMEOUT, details=details)

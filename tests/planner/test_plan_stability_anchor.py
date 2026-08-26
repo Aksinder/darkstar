@@ -337,3 +337,51 @@ def test_anchor_mapping_matches_by_epoch_across_tz_representations():
     anchor_epochs = {t.value for t in anchor_ts}
     matched = [i for i, ts in enumerate(future_idx) if ts.value in anchor_epochs]
     assert matched == [2, 3], matched
+
+
+class TestPreviousScheduleReadPath:
+    """The reader must load the SAME file the writer publishes.
+
+    The reader hardcoded "schedule.json" (repo root) while the writer wrote
+    data/schedule.json — so the mid-block lock and the anchor never fired in
+    production (live dumps: anchor_on_slots null on every heater, always).
+    """
+
+    def test_reads_the_writers_path(self, tmp_path, monkeypatch):
+        import json
+
+        from planner.output.schedule import SCHEDULE_JSON_PATH
+        from planner.pipeline import _load_previous_schedule
+
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / SCHEDULE_JSON_PATH
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps({"schedule": [{"start_time": "2026-08-26T10:00:00+02:00"}]}))
+
+        slots = _load_previous_schedule()
+        assert len(slots) == 1
+        assert slots[0]["start_time"].startswith("2026-08-26")
+
+    def test_missing_file_is_empty_not_error(self, tmp_path, monkeypatch):
+        from planner.pipeline import _load_previous_schedule
+
+        monkeypatch.chdir(tmp_path)
+        assert _load_previous_schedule() == []
+
+    def test_corrupt_file_is_empty_not_error(self, tmp_path, monkeypatch):
+        from planner.output.schedule import SCHEDULE_JSON_PATH
+        from planner.pipeline import _load_previous_schedule
+
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / SCHEDULE_JSON_PATH
+        target.parent.mkdir(parents=True)
+        target.write_text('{"schedule": [truncated')
+        assert _load_previous_schedule() == []
+
+    def test_writer_default_matches_constant(self):
+        import inspect
+
+        from planner.output.schedule import SCHEDULE_JSON_PATH, save_schedule_to_json
+
+        sig = inspect.signature(save_schedule_to_json)
+        assert sig.parameters["output_path"].default == SCHEDULE_JSON_PATH

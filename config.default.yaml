@@ -864,6 +864,19 @@ kepler:
   # on cost, solid on time.) The result is expanded back to the 15-minute grid before
   # it leaves the planner, so the executor and schedule file are unchanged.
   coarse_tail_fine_hours: 0            # 24 recommended; 12 if the box is still tight
+                                       # (2026-08-26 replay of five real failing instances:
+                                       # 12 h fine window took the worst solve from a
+                                       # rejected 240 s time-box to PROVEN optimal, 4x
+                                       # faster — measure with scripts/replay_solver_dump.py)
+
+  # Solver runtime knobs. Absent/0 = built-in defaults (240 s budget, 1 % MIP gap).
+  # highs_options is forwarded verbatim to HiGHS (setOptionValue) — an ops escape
+  # hatch: the 2026-08-26 replay sweep measured heuristic/symmetry/presolve options
+  # as pure noise on this model, so leave it empty unless a new measurement says so.
+  # solver:
+  #   time_limit_s: 240
+  #   gap_rel: 0.01
+  #   highs_options: {}
 
 # =============================================================================
 # Home Assistant Integration
