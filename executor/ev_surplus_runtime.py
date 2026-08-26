@@ -1183,10 +1183,14 @@ class EVSurplusController:
                 and last_a is not None
                 and cmd.set_current_a < last_a
             )
+            # A charger with a wake button recovers on the NEXT tick after a wake
+            # press (a Tesla wakes in ~20 s), so its first retry comes after one
+            # tick instead of two. Chargers without one keep the 120 s base.
+            start_backoff_base = 60.0 if ccfg.wake_entity is not None else 120.0
             if fail is not None:
                 backoff_s = (
                     60.0 if protective
-                    else min(900.0, 120.0 * (2.0 ** (fail[1] - 1)))
+                    else min(900.0, start_backoff_base * (2.0 ** (fail[1] - 1)))
                 )
                 if (now_ts - fail[0]) < backoff_s:
                     continue  # in failure backoff — spare the (Tesla) API
@@ -1207,6 +1211,7 @@ class EVSurplusController:
                 wants_change = (cmd.switch_on and drawing_w < 100.0) or (
                     protective and drawing_w >= 100.0
                 )
+                woke_car = False
                 if ccfg.wake_entity and wants_change and not (shadow or ccfg.shadow):
                     last_wake = self._last_wake_ts.get(cmd.id, float("-inf"))
                     if (now_ts - last_wake) >= 300.0:
@@ -1215,6 +1220,7 @@ class EVSurplusController:
                             await ha.call_service(
                                 "button", "press", ccfg.wake_entity
                             )
+                            woke_car = True
                             logger.info(
                                 "EV surplus: pressed wake button %s for %s",
                                 ccfg.wake_entity, cmd.id,
@@ -1226,13 +1232,27 @@ class EVSurplusController:
                 # The reason is logged HERE because a failed command never reaches
                 # the applied list — until now the servo's intent for a failing car
                 # was invisible, which is what made this outage take an hour to read.
-                logger.exception(
-                    "EV surplus: actuation failed for %s (fail #%d, backoff %.0fs, "
-                    "wanted on=%s a=%s, drawing %.0f W: %s) — continuing",
-                    cmd.id, n,
-                    60.0 if protective else min(900.0, 120.0 * (2.0 ** (n - 1))),
-                    cmd.switch_on, cmd.set_current_a, drawing_w, cmd.reason,
+                next_backoff = (
+                    60.0 if protective
+                    else min(900.0, start_backoff_base * (2.0 ** (n - 1)))
                 )
+                if woke_car and n == 1:
+                    # First failure on a wake-able car is the EXPECTED sleeping-car
+                    # state, already remedied by the wake press — a single WARNING,
+                    # not an ERROR with a traceback, three times a day.
+                    logger.warning(
+                        "EV surplus: %s likely asleep — woke it, retrying in %.0fs "
+                        "(wanted on=%s a=%s, drawing %.0f W: %s)",
+                        cmd.id, next_backoff,
+                        cmd.switch_on, cmd.set_current_a, drawing_w, cmd.reason,
+                    )
+                else:
+                    logger.exception(
+                        "EV surplus: actuation failed for %s (fail #%d, backoff %.0fs, "
+                        "wanted on=%s a=%s, drawing %.0f W: %s) — continuing",
+                        cmd.id, n, next_backoff,
+                        cmd.switch_on, cmd.set_current_a, drawing_w, cmd.reason,
+                    )
                 continue
             self._act_fail.pop(cmd.id, None)
             applied.append({"id": cmd.id, "on": cmd.switch_on, "a": cmd.set_current_a, "why": cmd.reason})
@@ -1253,7 +1273,15 @@ class EVSurplusController:
         if ccfg.switch_entity is not None and self._last_switch.get(ccfg.id) != cmd.switch_on:
             if not shadow:
                 svc = "turn_on" if cmd.switch_on else "turn_off"
-                await ha.call_service("switch", svc, ccfg.switch_entity)
+                # A car with a wake button answers HTTP 500 while asleep, and
+                # in-place retries never help it — the client's default 4-attempt
+                # backoff just hammered the vehicle API for ~7 s per tick before
+                # the wake logic even ran. Fail fast; the run-loop wakes the car
+                # and retries next tick.
+                if ccfg.wake_entity is not None:
+                    await ha.call_service("switch", svc, ccfg.switch_entity, max_retries=0)
+                else:
+                    await ha.call_service("switch", svc, ccfg.switch_entity)
             if not cmd.switch_on:
                 # A stop must ZERO the commanded-amps memory: commanded_on derives
                 # from _last_a, and without this the start kick / min-OFF dwell /
