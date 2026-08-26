@@ -1,3 +1,7 @@
+## dev-20260826.0922 — 2026-08-26 09:23
+
+- Solver: stop discarding valid plans; honest per-slot-hours water accounting
+
 ## dev-20260825.1946 — 2026-08-25 19:48
 
 - Recorder: meter the finished slot, integrate time-weighted, price by slot key
