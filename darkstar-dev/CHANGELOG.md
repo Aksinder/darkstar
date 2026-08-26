@@ -1,3 +1,7 @@
+## dev-20260826.1421 — 2026-08-26 14:23
+
+- EV surplus: treat a sleeping Tesla as expected, not as an outage
+
 ## dev-20260826.0922 — 2026-08-26 09:23
 
 - Solver: stop discarding valid plans; honest per-slot-hours water accounting
