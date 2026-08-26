@@ -333,6 +333,7 @@ class HAClient:
         service: str,
         entity_id: str | None = None,
         data: dict[str, Any] | None = None,
+        max_retries: int = 3,
     ) -> bool:
         """
         Call a Home Assistant service.
@@ -366,7 +367,7 @@ class HAClient:
                 response.raise_for_status()
 
         try:
-            await _retry_with_backoff(_post, max_retries=3, base_delay=1.0)
+            await _retry_with_backoff(_post, max_retries=max_retries, base_delay=1.0)
             return True
         except aiohttp.ClientResponseError as e:
             raise HACallError(

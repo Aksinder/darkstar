@@ -21,11 +21,11 @@ class SleepyHA(FakeHA):
         super().__init__(states)
         self.fail_entity = fail_entity
 
-    async def call_service(self, domain, service, entity_id=None, data=None):
+    async def call_service(self, domain, service, entity_id=None, data=None, **kwargs):
         if entity_id == self.fail_entity:
             self.calls.append((domain, service, entity_id, data))
             raise RuntimeError("500 Internal Server Error: vehicle unavailable")
-        return await super().call_service(domain, service, entity_id, data)
+        return await super().call_service(domain, service, entity_id, data, **kwargs)
 
 
 def _wake_cfg(**over):
@@ -184,3 +184,83 @@ async def test_a_failed_stop_on_an_idle_car_does_not_wake(caplog):
                              "sensor.tesla_power": "0"}))
     await ctrl.run(ha, now_ts=1000.0, shadow=False)
     assert not _wake_presses(ha)
+
+
+# ---------------------------------------------------------------------------
+# The sleeping-car start path, after 2026-08-26: fail fast, wake, retry next
+# tick, and stop paging the owner with tracebacks for an expected state.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_switch_write_on_wakeable_car_does_not_retry_in_place():
+    """The client's 4-attempt HTTP backoff hammered a sleeping vehicle API for
+    ~7 s per tick before the wake logic even ran. With a wake button configured
+    the switch write must fail fast (max_retries=0) — pacing belongs to the
+    run-loop, which wakes the car and retries next tick."""
+
+    class KwargsHA(SleepyHA):
+        def __init__(self, states):
+            super().__init__(states)
+            self.kwargs_seen: list[dict] = []
+
+        async def call_service(self, domain, service, entity_id=None, data=None, **kwargs):
+            if entity_id == self.fail_entity:
+                self.kwargs_seen.append(kwargs)
+            return await super().call_service(domain, service, entity_id, data, **kwargs)
+
+    ctrl, _ = _controller(_wake_cfg())
+    ha = KwargsHA(_surplus_states())
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    assert ha.kwargs_seen, "the switch write must have been attempted"
+    assert all(k.get("max_retries") == 0 for k in ha.kwargs_seen)
+
+
+@pytest.mark.asyncio
+async def test_wakeable_car_retries_after_one_tick_not_two():
+    """A woken Tesla is awake in ~20 s; the first retry must come at the next
+    tick (60 s), not after the 120 s base reserved for wake-less chargers."""
+    ctrl, _ = _controller(_wake_cfg())
+    ha = SleepyHA(_surplus_states())
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    n_calls = len([c for c in ha.calls if c[2] == "switch.tesla"])
+    # 70 s later: inside the old 120 s backoff, past the new 60 s one.
+    await ctrl.run(ha, now_ts=1070.0, shadow=False)
+    assert len([c for c in ha.calls if c[2] == "switch.tesla"]) > n_calls
+
+
+@pytest.mark.asyncio
+async def test_wakeless_charger_keeps_the_120s_backoff():
+    """Without a wake button there is nothing to gain from retrying sooner."""
+    ctrl, _ = _controller(_cfg_dict())
+    ha = SleepyHA(_surplus_states())
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    n_calls = len([c for c in ha.calls if c[2] == "switch.tesla"])
+    await ctrl.run(ha, now_ts=1070.0, shadow=False)
+    assert len([c for c in ha.calls if c[2] == "switch.tesla"]) == n_calls, (
+        "70 s is inside the 120 s backoff for a charger with no wake entity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_sleep_failure_is_warning_not_error(caplog):
+    """Three ERROR tracebacks a day for 'the car was asleep' is alert fatigue.
+    Failure #1 with a successful wake press is the expected state: WARNING,
+    single line. Failure #2 (the wake did not help) stays ERROR."""
+    import logging
+
+    ctrl, _ = _controller(_wake_cfg())
+    ha = SleepyHA(_surplus_states())
+    with caplog.at_level(logging.WARNING, logger="darkstar.ev_surplus"):
+        await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    first = [r for r in caplog.records if "tesla" in r.getMessage()]
+    assert first, "the sleeping-car state must be logged"
+    assert all(r.levelno == logging.WARNING for r in first)
+    assert any("asleep" in r.getMessage() for r in first)
+
+    caplog.clear()
+    # Retry at +70 s fails again (SleepyHA never recovers): now a real ERROR.
+    with caplog.at_level(logging.WARNING, logger="darkstar.ev_surplus"):
+        await ctrl.run(ha, now_ts=1070.0, shadow=False)
+    second = [r for r in caplog.records if "actuation failed" in r.getMessage()]
+    assert second and second[0].levelno == logging.ERROR
