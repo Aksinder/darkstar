@@ -27,7 +27,7 @@ from planner.errors import PlannerError, PlannerErrorCode
 from planner.inputs.data_prep import apply_safety_margins, floored_load_margin, prepare_df
 from planner.inputs.learning import load_learning_overlays
 from planner.inputs.weather import fetch_temperature_forecast
-from planner.output.schedule import save_schedule_to_json
+from planner.output.schedule import SCHEDULE_JSON_PATH, save_schedule_to_json
 from planner.output.soc_target import apply_soc_target_percent
 from planner.preflight import run_preflight
 from planner.solver.adapter import (
@@ -89,6 +89,25 @@ def resolve_vacation_enabled(config_enabled: bool, ha_vacation: bool, entity_wir
     if entity_wired:
         return ha_vacation
     return config_enabled or ha_vacation
+
+
+def _load_previous_schedule() -> list[dict[str, Any]]:
+    """The previously published plan's slots, or [] when unavailable.
+
+    Reads the SAME path the writer publishes (planner/output/schedule.py's
+    SCHEDULE_JSON_PATH). This read used a hardcoded "schedule.json" (repo root)
+    from birth while the writer wrote data/schedule.json, so the mid-block lock
+    and the plan-stability anchor were inert in production — live solver dumps
+    showed force_on_slots/anchor_on_slots null on every heater, always.
+    """
+    try:
+        schedule_path = Path(SCHEDULE_JSON_PATH)
+        if schedule_path.exists():
+            with schedule_path.open() as f:
+                return json.load(f).get("schedule", [])
+    except Exception as e:
+        logger.warning("Failed to load previous schedule for water locking: %s", e)
+    return []
 
 
 def _load_hot_water_states(path: str = "data/hot_water_state.json") -> dict[str, dict]:
@@ -218,26 +237,20 @@ def _calculate_excess_pv_flags(
         duration = (s.end_time - s.start_time).total_seconds() / 3600.0
         slot_hours_list.append(duration)
 
-    avg_slot_hours = sum(slot_hours_list) / len(slot_hours_list) if slot_hours_list else 0.25
-
-    # Minimum water heating per slot (sum across all heaters, min_kwh_per_day spread evenly)
-    min_water_heat_per_slot = 0.0
-    for wh in water_heaters:
-        kwh_per_slot = wh.power_kw * avg_slot_hours
-        if kwh_per_slot > 0:
-            min_water_heat_per_slot += wh.min_kwh_per_day / (24.0 / avg_slot_hours)
-
-    # Minimum EV charging per slot
-    min_ev_per_slot = 0.0
-    for ev in ev_chargers:
-        if ev.plugged_in and ev.max_power_kw > 0:
-            min_ev_per_slot += ev.max_power_kw * avg_slot_hours
+    # Per-slot thresholds: on the mixed coarse-tail grid an averaged slot
+    # length over-reserved fine slots and under-reserved coarse hours (a 1.0 h
+    # tail slot was treated as 0.37 h of EV+water headroom), flipping flags on
+    # exactly the tail slots where surplus decisions matter least but binaries
+    # are created anyway. Uniform grids are unchanged.
+    water_daily_kwh = sum(wh.min_kwh_per_day for wh in water_heaters if wh.power_kw > 0)
+    ev_power_kw = sum(ev.max_power_kw for ev in ev_chargers if ev.plugged_in and ev.max_power_kw > 0)
 
     flags: list[bool] = []
     for t in range(T):
-        pv_kwh = kepler_slots[t].pv_kwh
-        load_kwh = kepler_slots[t].load_kwh
-        excess = pv_kwh - load_kwh - min_water_heat_per_slot - min_ev_per_slot
+        h_t = slot_hours_list[t]
+        min_water_t = water_daily_kwh * h_t / 24.0
+        min_ev_t = ev_power_kw * h_t
+        excess = kepler_slots[t].pv_kwh - kepler_slots[t].load_kwh - min_water_t - min_ev_t
         flags.append(excess > 0)
 
     return flags
@@ -535,17 +548,7 @@ class PlannerPipeline:
             learning_overlays = await load_learning_overlays(active_config.get("learning", {}))
 
         # Rev WH2: Load previous schedule to check for active water heating (Mid-block locking)
-        previous_schedule: list[dict[str, Any]] = []
-        try:
-            import json
-
-            schedule_path = Path("schedule.json")
-            if schedule_path.exists():
-                with schedule_path.open() as f:
-                    data = json.load(f)
-                    previous_schedule = data.get("schedule", [])
-        except Exception as e:
-            logger.warning("Failed to load previous schedule for water locking: %s", e)
+        previous_schedule: list[dict[str, Any]] = _load_previous_schedule()
 
         # Prepare DataFrame (merge prices + forecasts)
         timezone_name = active_config.get("timezone", "Europe/Stockholm")
@@ -941,6 +944,24 @@ class PlannerPipeline:
                     fine_hours,
                 )
                 kepler_input = replace(kepler_input, slots=coarse_slots)
+                # Remap the heater state's slot indices onto the coarse grid.
+                # force_on_slots (mid-block lock) and anchor_on_slots (plan
+                # stability) were computed as FINE future_df indices above; the
+                # solver consumes them against the coarsened slot list. They were
+                # never remapped — invisible while the reader bug kept both
+                # features inert, live the moment that bug was fixed (2026-08-26
+                # review). In the fine head the mapping is identity; a fine index
+                # in a merged tail hour maps to its coarse slot (deduped).
+                fine_to_coarse: dict[int, int] = {}
+                for c_idx, grp in enumerate(coarse_groups):
+                    for f_idx in grp:
+                        fine_to_coarse[f_idx] = c_idx
+                for state_entry in water_heater_states:
+                    for key in ("force_on_slots", "anchor_on_slots"):
+                        v = state_entry.get(key)
+                        if v:
+                            remapped = sorted({fine_to_coarse[i] for i in v if i in fine_to_coarse})
+                            state_entry[key] = remapped or None
             else:
                 coarse_groups = None
 

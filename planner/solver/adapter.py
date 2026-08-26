@@ -1030,6 +1030,20 @@ def config_to_kepler_config(
         curtailment_penalty_sek=float(
             planner_config.get("kepler", {}).get("curtailment_penalty_sek", 0.001)
         ),
+        # kepler.solver: runtime knobs. 0/absent = the solver-module defaults
+        # (240 s, 1 % gap). highs_options is forwarded verbatim to highspy's
+        # setOptionValue — an ops escape hatch, not a tuning surface: the
+        # 2026-08-26 replay sweep on five real failing instances measured
+        # mip_heuristic_effort/mip_detect_symmetry/presolve as pure noise.
+        solver_time_limit_s=float(
+            (planner_config.get("kepler", {}).get("solver") or {}).get("time_limit_s", 0.0) or 0.0
+        ),
+        solver_gap_rel=float(
+            (planner_config.get("kepler", {}).get("solver") or {}).get("gap_rel", 0.0) or 0.0
+        ),
+        solver_highs_options=(
+            (planner_config.get("kepler", {}).get("solver") or {}).get("highs_options") or None
+        ),
         export_threshold_sek_per_kwh=get_val("export_threshold_sek_per_kwh", 0.0),
         # Per-device water heater inputs
         water_heaters=water_inputs,

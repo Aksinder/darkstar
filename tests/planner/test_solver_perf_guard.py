@@ -163,6 +163,65 @@ class TestComfortFloorTripwire:
         assert "time-boxed incumbent" in result.status_msg
 
 
+class TestTripwireMaySkipDayExemption:
+    """The tripwire must mirror the objective's reliability-penalty exemption.
+
+    Live 2026-08-26 04:25-05:35: the spa (dynamic_percentile 30 + may_skip_day)
+    had its floor correctly skipped by the objective in two later day-buckets,
+    but the tripwire counted those 8 kWh as a comfort violation and five valid
+    time-boxed plans were rejected in a row.
+    """
+
+    def _underpowered(self, heater_id: str = "vvb"):
+        heater = WaterHeaterInput(
+            id=heater_id,
+            power_kw=0.5,
+            min_kwh_per_day=6.0,
+            max_hours_between_heating=0.0,
+            min_spacing_hours=0.0,
+            heated_today_kwh=0.0,
+        )
+        return KeplerInput(slots=_quarter_slots(8), initial_soc_kwh=5.0), heater
+
+    def test_may_skip_day_violation_ships(self, monkeypatch):
+        from planner.solver.types import LoadPriority
+
+        input_data, heater = self._underpowered("spa")
+        config = _cfg([heater])
+        config.load_priority_enabled = True
+        config.load_priorities = {
+            "spa": LoadPriority(
+                base_wtp_sek_per_kwh=2.0,
+                dynamic_percentile=30.0,
+                may_skip_day=True,
+            )
+        }
+        monkeypatch.setattr("planner.solver.kepler.solve_is_time_boxed", lambda *a, **k: True)
+        result = KeplerSolver().solve(input_data, config)
+        assert result.is_optimal
+        assert "time-boxed incumbent" in result.status_msg
+
+    def test_dynamic_percentile_without_skip_still_rejected(self, monkeypatch):
+        # Control: a dynamic-percentile heater WITHOUT may_skip_day keeps the
+        # hard floor, so the same violation must still be rejected.
+        from planner.solver.types import LoadPriority
+
+        input_data, heater = self._underpowered("vvb")
+        config = _cfg([heater])
+        config.load_priority_enabled = True
+        config.load_priorities = {
+            "vvb": LoadPriority(
+                base_wtp_sek_per_kwh=2.0,
+                dynamic_percentile=50.0,
+                may_skip_day=False,
+            )
+        }
+        monkeypatch.setattr("planner.solver.kepler.solve_is_time_boxed", lambda *a, **k: True)
+        with pytest.raises(PlannerError) as exc:
+            KeplerSolver().solve(input_data, config)
+        assert exc.value.code == PlannerErrorCode.SOLVER_TIMEOUT
+
+
 class TestSolverFallbackChain:
     """Build #10: HiGHS-first chain with honest malfunction handling."""
 

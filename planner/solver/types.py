@@ -352,6 +352,12 @@ class KeplerConfig:
     # the economic "how much extra to keep" decision continuously. 0 = disabled.
     battery_value_sek_per_kwh: float = 0.0
 
+    # Solver runtime knobs (kepler.solver: block in config.yaml). 0/None = the
+    # module defaults (240 s / 0.01), so old dumps and configs are unchanged.
+    solver_time_limit_s: float = 0.0
+    solver_gap_rel: float = 0.0
+    solver_highs_options: dict[str, float | int | bool | str] | None = None
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         # Rev F39: Validate battery configuration
