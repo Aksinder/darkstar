@@ -148,7 +148,10 @@ async def _apply_ev_owner_levers(
     now_ts = slots[0].start_time.timestamp()
     for c in surplus_cfg.get("chargers", []) or []:
         dep_entity = c.get("departure_entity")
-        tgt_entity = c.get("departure_target_entity")
+        # Trip target: explicit departure_target_entity if wired, else the car's
+        # own charge limit (owner decision 2026-08-27 — number.*_charge_limit is
+        # already the number the household maintains).
+        tgt_entity = c.get("departure_target_entity") or c.get("target_soc_entity")
         if not dep_entity or not tgt_entity:
             continue
         dep_state = await get_ha_entity_state(str(dep_entity))
