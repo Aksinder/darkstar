@@ -1,3 +1,7 @@
+## dev-20260827.2119 — 2026-08-27 21:21
+
+- Vacation: an away house may sell what an occupied one reserves
+
 ## dev-20260827.1344 — 2026-08-27 13:46
 
 - EV servo: never send switch.turn_on to a car that is already drawing
