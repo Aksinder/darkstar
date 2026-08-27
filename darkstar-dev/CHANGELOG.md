@@ -1,3 +1,7 @@
+## dev-20260827.0835 — 2026-08-27 08:37
+
+- EV: trip target defaults to the car's own charge limit; supercharger alert gated on the one-off departure entity only
+
 ## dev-20260827.0754 — 2026-08-27 07:56
 
 - EV: departure always wins, priority select re-weights the planner, daily priority confirmation, supercharger-price alert
