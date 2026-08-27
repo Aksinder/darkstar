@@ -191,6 +191,17 @@ async def lifespan(app: FastAPI):
             run_ev_arrival_loop(publisher_config), name="ev_arrival_loop"
         )
         logger.info("✅ EV come-home arrival loop scheduled")
+
+        # EV priority attendant: a non-auto darkstar_ev_priority select is a
+        # per-situation lever, not standing policy — ask the owner daily whether
+        # to keep it; no answer within the window reverts it to auto.
+        from backend.services.ev_priority_attendant import run_ev_priority_attendant_loop
+
+        asyncio.create_task(  # noqa: RUF006 - lifetime is the app process
+            run_ev_priority_attendant_loop(publisher_config),
+            name="ev_priority_attendant_loop",
+        )
+        logger.info("✅ EV priority attendant scheduled")
     except Exception as e:
         logger.error(f"❌ Failed to start cycle/phase publisher: {e}")
 

@@ -506,3 +506,129 @@ class TestPriceSourceResolution:
             out = await ctl.run(ha, 1000.0, shadow=True, internal_spot_price_sek=None)
         assert out["price_source"] == "default"
         assert any("paid tiers closed" in r.message for r in caplog.records)
+
+
+class TestDepartureTargetFloor:
+    """A ONE-OFF departure raises the guarantee floor to the departure target.
+
+    Live 2026-08-27: departure 07:25 set at 22:53, car stopped at 41 % because
+    the deadline floor targeted floor_soc 40 — correct for the weekday
+    recurrence, useless for an explicit trip. The recurrence keeps the low
+    band (that distinction fixed the old charge-to-90-every-night bug).
+    """
+
+    def _charger(self, **over):
+        base = {
+            "id": "tesla", "priority": 1, "phases": 3,
+            "switch_entity": "switch.tesla", "current_entity": "number.tesla_amps",
+            "power_entity": "sensor.tesla_power", "plug_entity": "binary_sensor.tesla_plug",
+            "soc_entity": "sensor.tesla_soc", "capacity_kwh": 60,
+            "floor_soc": 40,
+            "departure_entity": "input_datetime.tesla_departure",
+            "departure_target_entity": "input_number.tesla_departure_soc",
+            "min_current_a": 5, "max_current_a": 16,
+        }
+        base.update(over)
+        return base
+
+    async def _run(self, ha, cfg_over=None):
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger()], **(cfg_over or {})))
+        ctrl = EVSurplusController(cfg)
+        # No surplus: the only reason to charge is a deadline floor.
+        await ctrl.run(ha, now_ts=1_000_000.0)
+        return ha
+
+    @pytest.mark.asyncio
+    async def test_one_off_departure_forces_toward_target(self):
+        # SoC 41, floor 40 (satisfied) BUT departure in 30 min with target 80:
+        # the floor must retarget to 80 and grid-force despite zero surplus.
+        ha = FakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41",
+                "input_number.tesla_departure_soc": "80",
+            }),
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 + 1800}},
+        )
+        await self._run(ha)
+        on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        assert on_calls, f"expected grid forcing toward the 80% departure target, calls={ha.calls}"
+
+    @pytest.mark.asyncio
+    async def test_satisfied_floor_without_departure_stays_off(self):
+        # Same car, no departure set: floor 40 already met at SoC 41 => no forcing.
+        ha = FakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41",
+                "input_number.tesla_departure_soc": "80",
+            }),
+        )
+        await self._run(ha)
+        on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        assert not on_calls, f"no departure => the 40 floor is met, calls={ha.calls}"
+
+    @pytest.mark.asyncio
+    async def test_recurring_deadline_keeps_the_low_floor(self):
+        # Weekday recurrence active (deadline in ~30 min via recurrence), SoC 41:
+        # floor stays 40 (met) — the recurrence must NOT charge to the trip target.
+        ha = FakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41",
+                "input_number.tesla_departure_soc": "80",
+            }),
+        )
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger(
+            recurring_deadline_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            recurring_deadline_time="23:59",
+        )]))
+        await EVSurplusController(cfg).run(ha, now_ts=1_000_000.0)
+        on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        assert not on_calls, f"recurrence keeps floor 40 (met at 41), calls={ha.calls}"
+
+    @pytest.mark.asyncio
+    async def test_stale_departure_is_inert(self):
+        # A PAST departure timestamp must not raise the floor.
+        ha = FakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41",
+                "input_number.tesla_departure_soc": "80",
+            }),
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 - 3600}},
+        )
+        await self._run(ha)
+        on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        assert not on_calls, f"stale departure must be inert, calls={ha.calls}"
+
+    @pytest.mark.asyncio
+    async def test_departure_later_than_recurrence_still_forces_toward_target(self):
+        # Review round 1: a departure five minutes AFTER the weekday recurrence
+        # lost the min-race and got no target guarantee — silently reproducing
+        # the 2026-08-27 incident. The binding pair is now the one demanding
+        # the higher charge rate, not the earlier one.
+        ha = FakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41",
+                "input_number.tesla_departure_soc": "80",
+            }),
+            # Departure in 6h (39% gap => ~4.4 kW required > 3.45 kW charger min,
+            # so the floor must force); recurrence fires ~5h from now (earlier!).
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 + 6 * 3600}},
+        )
+        import datetime as _dt
+
+        import pytz as _pytz
+        tz = _pytz.timezone("Europe/Stockholm")
+        rec_dt = _dt.datetime.fromtimestamp(1_000_000.0 + 5 * 3600, tz)
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger(
+            recurring_deadline_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            recurring_deadline_time=f"{rec_dt.hour:02d}:{rec_dt.minute:02d}",
+        )]))
+        await EVSurplusController(cfg).run(ha, now_ts=1_000_000.0)
+        on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        # Rate to 80 in 6h (6.5 %/h) beats rate to 40 in 5h (0 — already met):
+        # the departure pair is binding and must force despite losing the min-race.
+        assert on_calls, f"later-than-recurrence departure must still force, calls={ha.calls}"

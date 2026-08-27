@@ -110,6 +110,57 @@ def _load_previous_schedule() -> list[dict[str, Any]]:
     return []
 
 
+async def _apply_ev_owner_levers(
+    kepler_config: Any, active_config: dict[str, Any], kepler_input: Any
+) -> None:
+    """Feed the owner's EV helpers into the MILP's incentive ladders.
+
+    Live driver 2026-08-27: input_select.darkstar_ev_priority=tesla_first and a
+    07:25 departure were both set the evening before, and the planner ignored
+    both — penalty_levels are static config, and the select only ordered the
+    daytime surplus class. The Tesla stood at 41 % at departure while the FMB
+    had bought every cheap night slot up to its 86 % band.
+    """
+    from backend.core.ha_client import get_ha_entity_state, get_ha_sensor_float
+    from planner.ev_priority import apply_departure_target, apply_priority_order
+
+    chargers = getattr(kepler_config, "ev_chargers", None) or []
+    if not chargers:
+        return
+    surplus_cfg = (active_config.get("executor", {}) or {}).get("ev_surplus", {}) or {}
+
+    # --- priority select -> ladder re-weighting -------------------------------
+    prio_entity = surplus_cfg.get("priority_entity")
+    orders: dict[str, Any] = surplus_cfg.get("priority_orders") or {}
+    if prio_entity and orders:
+        state = await get_ha_entity_state(str(prio_entity))
+        mode = str((state or {}).get("state", "auto")).lower()
+        for note in apply_priority_order(chargers, orders.get(mode)):
+            logger.info("%s (select=%s)", note, mode)
+
+    # --- one-off departures -> urgent-band extension --------------------------
+    slots = getattr(kepler_input, "slots", None) or []
+    if not slots:
+        return
+    horizon_hours = (
+        slots[-1].end_time - slots[0].start_time
+    ).total_seconds() / 3600.0
+    now_ts = slots[0].start_time.timestamp()
+    for c in surplus_cfg.get("chargers", []) or []:
+        dep_entity = c.get("departure_entity")
+        tgt_entity = c.get("departure_target_entity")
+        if not dep_entity or not tgt_entity:
+            continue
+        dep_state = await get_ha_entity_state(str(dep_entity))
+        dep_ts = ((dep_state or {}).get("attributes") or {}).get("timestamp")
+        target = await get_ha_sensor_float(str(tgt_entity))
+        hours = (float(dep_ts) - now_ts) / 3600.0 if dep_ts is not None else None
+        for note in apply_departure_target(
+            chargers, str(c.get("id", "")), hours, target, horizon_hours
+        ):
+            logger.info("%s", note)
+
+
 def _load_hot_water_states(path: str = "data/hot_water_state.json") -> dict[str, dict]:
     """The tank estimator's persisted state, or {} when it is not available.
 
@@ -1115,6 +1166,16 @@ class PlannerPipeline:
                 ev_charger_states_with_deadline,
                 load_priority_cfg=active_config.get("load_priority"),
             )
+
+            # Owner EV levers: priority select re-weighting + one-off departure
+            # band. MUST run after this rebuild — the first review round proved a
+            # pre-rebuild application was a silent no-op (the mutated list was
+            # replaced wholesale right here). Entities come from the servo's own
+            # config block; every read is fail-soft, leaving ladders unchanged.
+            try:
+                await _apply_ev_owner_levers(kepler_config, active_config, kepler_input)
+            except Exception:
+                logger.exception("EV owner levers failed — configured ladders unchanged")
 
             # Rev K19: Vacation Mode Anti-Legionella
             # (vacation_enabled resolved above, before the EV build — one source of truth)

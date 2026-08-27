@@ -1127,6 +1127,22 @@ executor:
       #   target_soc_entity  user-settable target % (input_number). soc >= target => stop (cap, never overcharge)
       #   departure_entity   input_datetime (date+time). Behind the curve to hit target by then => grid-backed
       #                      floor that ramps to charger max as the deadline nears; a deadline car overtakes the
+      #   departure_target_entity  input_number (%): the SoC a ONE-OFF departure charges toward.
+      #                      When the user-set departure entity is the active deadline, the guarantee
+      #                      floor retargets from floor_soc to THIS (an explicit trip means "ready for
+      #                      the trip"); the weekday recurrence keeps the low floor_soc band. The
+      #                      planner also lifts the car's urgent penalty band to this target so cheap
+      #                      night slots are booked ahead of the servo's dawn ramp. Unset => old behavior.
+      #   supercharger_price_sek_per_kwh  (ev_surplus level) alert threshold: when a deadline floor
+      #                      grid-forces at a price above this, notify once per plug-in session that
+      #                      supercharging on the road is cheaper. Requires notify_service.
+      #   notify_service     (ev_surplus level) notify service for EV alerts, e.g. notify.notify_robert
+      #   priority_attendant (ev_surplus level) daily confirmation of a non-auto priority select:
+      #                        enabled: true | ask_time: "20:00" | timeout_minutes: 60
+      #                      Asks via an actionable notification; a tap on "Behåll prioriteten" keeps
+      #                      it, silence reverts the select to auto and announces it. The planner also
+      #                      re-weights: non-auto demotes the other car's penalty bands below the
+      #                      preferred car's lowest band, so the preferred car wins contested slots.
       #                      others. No departure => the car only charges from opportunistic surplus toward target.
       #   capacity_kwh       usable battery (sizes the deadline floor)
       #   vacation_target_soc when vacation_entity is on, the target switches to this (e.g. FMB 15 = cap at 15%,

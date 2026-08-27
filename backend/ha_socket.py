@@ -11,6 +11,16 @@ from backend.core.secrets import load_home_assistant_config, load_yaml
 
 logger = logging.getLogger("darkstar.ha_socket")
 
+# Callbacks invoked with the action string of every mobile_app_notification_action
+# event. Registered by services that send actionable notifications (the tap is the
+# only channel the companion app offers back).
+_notification_action_callbacks: list[Any] = []
+
+
+def register_notification_action_callback(cb: Any) -> None:
+    _notification_action_callbacks.append(cb)
+
+
 
 class HAWebSocketClient:
     def __init__(self):
@@ -224,6 +234,21 @@ class HAWebSocketClient:
                         )
                     )
 
+                    # Subscribe to mobile notification action taps. Darkstar's own
+                    # actionable notifications (EV priority attendant) are answered
+                    # by a tap; the companion app surfaces it only as this event.
+                    action_sub_id = self.id_counter
+                    self.id_counter += 1
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "id": action_sub_id,
+                                "type": "subscribe_events",
+                                "event_type": "mobile_app_notification_action",
+                            }
+                        )
+                    )
+
                     # Get initial states (Rev U2)
                     states_id = self.id_counter
                     self.id_counter += 1
@@ -296,6 +321,19 @@ class HAWebSocketClient:
 
                         if data.get("type") == "event":
                             event = data.get("event", {})
+                            if event.get("event_type") == "mobile_app_notification_action":
+                                # A tap on one of Darkstar's actionable notifications.
+                                # Fan out to whoever registered (EV priority attendant);
+                                # unknown actions are simply nobody's.
+                                action = str(event.get("data", {}).get("action", ""))
+                                for cb in list(_notification_action_callbacks):
+                                    try:
+                                        cb(action)
+                                    except Exception:
+                                        logger.exception(
+                                            "notification-action callback failed for %r", action
+                                        )
+                                continue
                             entity_id = event.get("data", {}).get("entity_id")
                             new_state = event.get("data", {}).get("new_state", {})
 

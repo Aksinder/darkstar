@@ -2075,6 +2075,17 @@ class ExecutorEngine:
                                 if self._ev_surplus.cfg.enabled
                                 else None
                             )
+                            # Full import price (spot + VAT/fees/transfer) for the
+                            # supercharger comparison — a pump price is all-in, so
+                            # comparing raw spot against it under-alerts by the
+                            # ~1.3-1.9 SEK/kWh the grid adds (review finding).
+                            _servo_import = (
+                                await self._current_import_price()
+                                if self._ev_surplus.cfg.enabled
+                                and self._ev_surplus.cfg.supercharger_price_sek_per_kwh
+                                is not None
+                                else None
+                            )
                             await self._ev_surplus.run(
                                 self.ha_client,
                                 time.time(),
@@ -2090,6 +2101,7 @@ class ExecutorEngine:
                                     else 0.0
                                 ),
                                 internal_spot_price_sek=_servo_spot,
+                                current_import_price_sek=_servo_import,
                             )
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)

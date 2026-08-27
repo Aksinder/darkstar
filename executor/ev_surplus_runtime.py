@@ -25,6 +25,7 @@ from .ev_surplus import (
     EVSurplusInputs,
     EVSurplusTick,
     WriteGuardConfig,
+    _deadline_required_w,
     battery_fill_slack_kwh,
     battery_reserve_active,
     battery_tier_active,
@@ -89,6 +90,13 @@ class EVSurplusChargerCfg:
     # selection disables demotion — an explicit order is taken literally.
     comfort_soc: float | None = None
     departure_entity: str | None = None  # input_datetime (date+time) -> 'timestamp' attr (epoch)
+    # SoC target for a ONE-OFF departure (input_number, %). When the active deadline
+    # is the user-set departure entity (not the weekday recurrence), the grid-backed
+    # floor charges toward THIS instead of floor_soc: an explicit trip means "have the
+    # car ready", best effort from plug-in time. The recurrence keeps the low
+    # guarantee band — that distinction is what fixed the old price-blind
+    # charge-to-90-every-night bug, and it is preserved. None => floor_soc always.
+    departure_target_entity: str | None = None
     # The guarantee band's upper SoC (what the deadline floor charges toward). Plain config
     # value per owner decision — the current SoC comes from soc_entity, the comfort cap from
     # target_soc_entity; this is the third, distinct number. None => floor uses the cap (legacy).
@@ -155,6 +163,11 @@ class EVSurplusRuntimeConfig:
     # Missing/unknown option (or unreadable entity) => configured per-charger priorities.
     priority_entity: str | None = None  # e.g. input_select.darkstar_ev_priority
     priority_orders: dict[str, list[str]] = field(default_factory=dict)
+    # Owner alert: when a deadline floor grid-forces a car at an import price above
+    # this, home charging costs more than supercharging on the road would — notify
+    # (once per plug-in session) so the owner can choose. None => never.
+    supercharger_price_sek_per_kwh: float | None = None
+    notify_service: str | None = None  # e.g. notify.notify_robert
     # Local timezone for recurring deadlines (wall-clock "07:30" must survive DST — the
     # naive-datetime trap class; never compare naive local against epoch).
     timezone: str = "Europe/Stockholm"
@@ -399,6 +412,7 @@ def parse_ev_surplus_config(
                 target_soc=_f(c.get("target_soc")),
                 comfort_soc=_f(c.get("comfort_soc")),
                 departure_entity=c.get("departure_entity") or None,
+                departure_target_entity=c.get("departure_target_entity") or None,
                 floor_soc=_f(c.get("floor_soc")),
                 recurring_deadline_days=tuple(
                     str(d).lower()[:3]
@@ -468,6 +482,8 @@ def parse_ev_surplus_config(
         remaining_solar_entity=raw.get("remaining_solar_entity") or None,
         vacation_entity=raw.get("vacation_entity") or None,
         priority_entity=raw.get("priority_entity") or None,
+        supercharger_price_sek_per_kwh=_f(raw.get("supercharger_price_sek_per_kwh")),
+        notify_service=raw.get("notify_service") or None,
         priority_orders={
             str(k).lower(): [str(cid) for cid in cast("list[Any]", v)]
             for k, v in cast(
@@ -531,6 +547,9 @@ class EVSurplusController:
         # history. Exponential: 120 s doubling to a 900 s ceiling; any SUCCESSFUL
         # actuation clears it.
         self._act_fail: dict[str, tuple[float, int]] = {}
+        # Chargers already told "home charging beats supercharging is FALSE right
+        # now" this plug-in session; cleared when the car unplugs/leaves.
+        self._suc_notified: set[str] = set()
         self._last_wake_ts: dict[str, float] = {}
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
@@ -803,6 +822,7 @@ class EVSurplusController:
             self._read_f(ha, c.soc_entity, None),
             self._read_f(ha, c.target_soc_entity, None),
             self._read_attr_f(ha, c.departure_entity, "timestamp", None),
+            self._read_f(ha, c.departure_target_entity, None),
         )
         power, power_ts = cast("tuple[float | None, float | None]", res[0])
         if power is None:
@@ -819,12 +839,14 @@ class EVSurplusController:
                 logger.debug("EV surplus: %s away — clearing failure backoff", c.id)
             self._act_fail.pop(c.id, None)
             self._last_wake_ts.pop(c.id, None)
+            self._suc_notified.discard(c.id)
         override = str(res[3])
         soc = cast("float | None", res[4])
         target = cast("float | None", res[5])
         if target is None:
             target = c.target_soc  # config-constant cap when no entity is wired/readable
         dep_ts = cast("float | None", res[6])
+        dep_target = cast("float | None", res[7])
         # Effective deadline = earliest of the one-off departure entity (if in the future)
         # and the recurring weekday deadline. The entity is a per-trip override that can rot
         # (a past date is simply inert); the recurrence never does.
@@ -836,9 +858,43 @@ class EVSurplusController:
         )
         if rec_ts is not None:
             candidates.append(rec_ts)
+        # Two guarantee candidates can coexist: the weekday recurrence toward the
+        # low floor_soc, and a user-set ONE-OFF departure toward its trip target
+        # ("charged for the trip" — live 2026-08-27: departure 07:25 set at 22:53,
+        # car stopped at 41% because the floor was 40). The binding one is whichever
+        # DEMANDS MORE POWER from now (gap/hours) — not whichever comes first: a
+        # departure five minutes AFTER the recurrence, or on Friday with daily
+        # recurrences in between, must still be charged for, and review round one
+        # proved a min-race silently reproduced the incident in exactly those
+        # shapes. The recurrence never charges toward the trip target (that
+        # distinction is the old charge-to-90-every-night bugfix, preserved).
+        floor_soc = c.floor_soc
         deadline_hours: float | None = None
-        if candidates:
-            deadline_hours = (min(candidates) - now_ts) / 3600.0
+        pairs: list[tuple[float, float | None]] = []  # (hours, floor_for_that_deadline)
+        if rec_ts is not None:
+            pairs.append(((rec_ts - now_ts) / 3600.0, c.floor_soc))
+        if dep_ts is not None and dep_ts > now_ts:
+            one_off_floor = (
+                dep_target
+                if dep_target is not None
+                and dep_target > 0.0
+                and (c.floor_soc is None or dep_target > c.floor_soc)
+                else c.floor_soc
+            )
+            pairs.append(((dep_ts - now_ts) / 3600.0, one_off_floor))
+        if pairs:
+            if soc is not None and len(pairs) > 1:
+                # Binding = largest required charge rate (SoC-points per hour).
+                def _rate(p: tuple[float, float | None]) -> float:
+                    hours, fl = p
+                    if fl is None or hours <= 0.0:
+                        return 0.0
+                    return max(0.0, fl - soc) / hours
+
+                deadline_hours, floor_soc = max(pairs, key=_rate)
+            else:
+                # Unknown SoC or a single candidate: earliest deadline, its floor.
+                deadline_hours, floor_soc = min(pairs, key=lambda p: p[0])
         # Vacation = solar-only for EVERY charger: clear any deadline unconditionally so no
         # car is grid-forced while the household is away (a weekday recurrence would otherwise
         # keep force-charging the commuter car all vacation). The target override additionally
@@ -912,7 +968,7 @@ class EVSurplusController:
             current_power_w=power or 0.0, max_current_a=c.max_current_a,
             min_current_a=c.min_current_a, phases=c.phases, voltage_v=c.voltage_v,
             controllable=c.controllable, priority=c.priority, override=override,
-            soc_percent=soc, target_soc_percent=target, floor_soc_percent=c.floor_soc,
+            soc_percent=soc, target_soc_percent=target, floor_soc_percent=floor_soc,
             comfort_soc_percent=c.comfort_soc, phase_map=c.phase_map,
             capacity_kwh=c.capacity_kwh,
             deadline_hours=deadline_hours, charge_efficiency=c.charge_efficiency,
@@ -927,6 +983,7 @@ class EVSurplusController:
         plan_kw: dict[str, float] | None = None,
         plan_battery_charge_kw: float = 0.0,
         internal_spot_price_sek: float | None = None,
+        current_import_price_sek: float | None = None,
     ) -> dict[str, Any]:
         """One control cycle. Returns a summary (for logging / UI).
 
@@ -1125,6 +1182,57 @@ class EVSurplusController:
         )
         tick = EVSurplusTick()
         commands = compute_ev_surplus(inputs, cfg.policy, tick_out=tick)
+
+        # Supercharger-price alert (owner directive 2026-08-27): a deadline floor
+        # grid-forcing a car AT HOME at an all-in import price above the pump
+        # price means home charging is the expensive option — say so, once per
+        # plug-in session, while it is still actionable. Review round one found
+        # three holes, all closed here: (1) the comparison uses the FULL import
+        # price (spot + VAT/fees), the same denomination as a supercharger's
+        # posted price — raw spot under-alerted by the ~1.3-1.9 SEK/kWh the grid
+        # adds; (2) an away car (plugged at a public charger — its plug sensor is
+        # car-side) is skipped: it is not charging at home, and its dedup entry
+        # is cleared every tick, which re-buzzed every cycle; (3) the alert
+        # requires the car to be COMMANDED ON this tick, so a force_off override
+        # or a surplus-covered floor can no longer claim "grid-laddas nu".
+        if (
+            not shadow
+            and cfg.supercharger_price_sek_per_kwh is not None
+            and cfg.notify_service
+            and current_import_price_sek is not None
+            and current_import_price_sek > cfg.supercharger_price_sek_per_kwh
+        ):
+            _on_ids = {cmd.id for cmd in commands if cmd.switch_on}
+            for st in states:
+                if (
+                    st.id in self._suc_notified
+                    or not st.plugged
+                    or not st.at_home
+                    or st.id not in _on_ids
+                ):
+                    continue
+                if _deadline_required_w(st, cfg.policy) <= 0.0:
+                    continue
+                self._suc_notified.add(st.id)
+                try:
+                    await ha.send_notification(
+                        cfg.notify_service,
+                        "Dyr hemmaladdning",
+                        (
+                            f"{st.id} grid-laddas hemma till "
+                            f"{current_import_price_sek:.2f} kr/kWh (inkl. avgifter) "
+                            f"för att hinna till avresan — över supercharger-nivån "
+                            f"({cfg.supercharger_price_sek_per_kwh:.2f} kr/kWh). "
+                            "Överväg att snabbladda på vägen i stället."
+                        ),
+                        data={"tag": f"darkstar_suc_{st.id}"},
+                    )
+                    logger.info(
+                        "EV surplus: supercharger-price alert for %s at %.2f SEK/kWh",
+                        st.id, current_import_price_sek,
+                    )
+                except Exception:
+                    logger.exception("supercharger-price notification failed")
         self._update_ev_priority_cap(
             ev_priority_battery_cap_w(
                 inputs, cfg.policy, tick, max(0.0, plan_battery_charge_kw) * 1000.0
