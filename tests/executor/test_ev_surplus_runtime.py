@@ -755,3 +755,72 @@ class TestSuperchargerAlert:
         ctrl = EVSurplusController(self._cfg(self._charger()))
         await ctrl.run(ha, now_ts=1_000_000.0, current_import_price_sek=2.4)
         assert not ha.notifications
+
+
+class TestNoRedundantTurnOn:
+    """A car that is already drawing must never be sent switch.turn_on.
+
+    Live 2026-08-27 14:13-14:27: the Tesla pulled 11 kW under force_on while the
+    servo sent turn_on every tick — each rejected by the vehicle API, each
+    raising before _last_switch was updated, so the servo never learned the car
+    was on: fail #1..#4, backoff to 480 s, four ERROR tracebacks in 14 minutes.
+    """
+
+    def _charger(self, **over):
+        base = {
+            "id": "tesla", "priority": 1, "phases": 3,
+            "switch_entity": "switch.tesla", "current_entity": "number.tesla_amps",
+            "power_entity": "sensor.tesla_power", "plug_entity": "binary_sensor.tesla_plug",
+            "override_entity": "input_select.tesla_mode",
+            "min_current_a": 5, "max_current_a": 16,
+        }
+        base.update(over)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_drawing_car_is_not_turned_on_again(self):
+        # force_on + the car already pulling 11 kW: no turn_on may be sent.
+        ha = FakeHA(_states(**{
+            "sensor.tesla_power": "11000",
+            "input_select.tesla_mode": "force_on",
+        }))
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger()]))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_on", "switch.tesla", None) not in ha.calls, ha.calls
+
+    @pytest.mark.asyncio
+    async def test_idle_car_is_still_turned_on(self):
+        # Control: a car drawing nothing must still be started normally.
+        ha = FakeHA(_states(**{
+            "sensor.tesla_power": "0",
+            "input_select.tesla_mode": "force_on",
+        }))
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger()]))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_on", "switch.tesla", None) in ha.calls, ha.calls
+
+    @pytest.mark.asyncio
+    async def test_stop_still_actuates_on_a_drawing_car(self):
+        # The skip must be ON-only: a car that must STOP is exactly the one that
+        # IS drawing, so turn_off may never be suppressed.
+        ha = FakeHA(_states(**{
+            "sensor.tesla_power": "11000",
+            "input_select.tesla_mode": "force_off",
+        }))
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger()]))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_off", "switch.tesla", None) in ha.calls, ha.calls
+
+    @pytest.mark.asyncio
+    async def test_adopted_state_persists_so_later_ticks_stay_quiet(self):
+        ha = FakeHA(_states(**{
+            "sensor.tesla_power": "11000",
+            "input_select.tesla_mode": "force_on",
+        }))
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger()]))
+        ctrl = EVSurplusController(cfg)
+        await ctrl.run(ha, now_ts=1000.0)
+        await ctrl.run(ha, now_ts=1060.0)
+        await ctrl.run(ha, now_ts=1120.0)
+        turn_ons = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        assert not turn_ons, f"no tick may re-send turn_on, calls={ha.calls}"
