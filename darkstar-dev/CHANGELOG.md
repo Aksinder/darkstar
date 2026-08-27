@@ -1,3 +1,7 @@
+## dev-20260827.1344 — 2026-08-27 13:46
+
+- EV servo: never send switch.turn_on to a car that is already drawing
+
 ## dev-20260827.0835 — 2026-08-27 08:37
 
 - EV: trip target defaults to the car's own charge limit; supercharger alert gated on the one-off departure entity only
