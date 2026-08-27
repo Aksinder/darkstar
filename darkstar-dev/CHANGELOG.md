@@ -1,3 +1,7 @@
+## dev-20260827.0754 — 2026-08-27 07:56
+
+- EV: departure always wins, priority select re-weights the planner, daily priority confirmation, supercharger-price alert
+
 ## dev-20260826.1421 — 2026-08-26 14:23
 
 - EV surplus: treat a sleeping Tesla as expected, not as an outage
