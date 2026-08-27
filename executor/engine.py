@@ -3440,6 +3440,26 @@ class ExecutorEngine:
         except Exception as e:
             logger.warning("Failed to gather some system state: %s", e)
 
+        # Vacation export floor: an away household reserves nothing for its own
+        # return, so the guard's floor may be lowered while away (owner
+        # 2026-08-27). Read per tick — the planner's own relaxation is
+        # solver-side only, and without this the servo kept blocking export at
+        # the configured floor and the away kWh were planned but never sold
+        # (review-caught before deploy). Fail-soft: any error keeps the
+        # configured floor, and homecoming restores it on the next tick.
+        try:
+            vac_floor = (self._full_config.get("vacation", {}) or {}).get(
+                "export_floor_soc_percent"
+            )
+            if vac_floor is not None:
+                vac_entity = self._full_config.get("input_sensors", {}).get("vacation_mode")
+                if vac_entity:
+                    raw = await self.ha_client.get_state_value(vac_entity)
+                    if str(raw).lower() in ("on", "true", "home"):
+                        state.vacation_export_floor_percent = float(vac_floor)
+        except Exception as e:
+            logger.warning("Vacation export-floor read failed (keeping config floor): %s", e)
+
         return state
 
     def _create_execution_record(
