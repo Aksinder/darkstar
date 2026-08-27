@@ -550,6 +550,9 @@ class EVSurplusController:
         # Chargers already told "home charging beats supercharging is FALSE right
         # now" this plug-in session; cleared when the car unplugs/leaves.
         self._suc_notified: set[str] = set()
+        # Chargers whose one-off departure entity holds a FUTURE timestamp as of
+        # the latest read — the only state the supercharger alert may fire in.
+        self._dep_future: set[str] = set()
         self._last_wake_ts: dict[str, float] = {}
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
@@ -873,12 +876,18 @@ class EVSurplusController:
         pairs: list[tuple[float, float | None]] = []  # (hours, floor_for_that_deadline)
         if rec_ts is not None:
             pairs.append(((rec_ts - now_ts) / 3600.0, c.floor_soc))
-        if dep_ts is not None and dep_ts > now_ts:
+        dep_future = dep_ts is not None and dep_ts > now_ts
+        if dep_future:
+            # Trip target precedence: explicit departure_target_entity if wired,
+            # else the CAR'S OWN charge limit (target_soc_entity — owner decision
+            # 2026-08-27: "we already have number.white_betty_charge_limit"),
+            # else the low floor. A PAST departure is ignored entirely.
+            trip_target = dep_target if dep_target is not None and dep_target > 0.0 else target
             one_off_floor = (
-                dep_target
-                if dep_target is not None
-                and dep_target > 0.0
-                and (c.floor_soc is None or dep_target > c.floor_soc)
+                trip_target
+                if trip_target is not None
+                and trip_target > 0.0
+                and (c.floor_soc is None or trip_target > c.floor_soc)
                 else c.floor_soc
             )
             pairs.append(((dep_ts - now_ts) / 3600.0, one_off_floor))
@@ -959,6 +968,14 @@ class EVSurplusController:
             cmd_ts = self._last_cmd_ts.get(c.id)
             if cmd_ts is not None and power_ts is not None and power_ts < cmd_ts:
                 power = self._last_a[c.id] * c.phases * c.voltage_v
+
+        # The supercharger alert is gated on THIS (owner directive: check only
+        # the one-off departure entity; a historical timestamp disables the
+        # alert entirely — routine weekday-recurrence forcing must never alert).
+        if dep_future:
+            self._dep_future.add(c.id)
+        else:
+            self._dep_future.discard(c.id)
 
         start_inhibited = (
             now_ts - self._last_stop_ts.get(c.id, float("-inf"))
@@ -1206,6 +1223,7 @@ class EVSurplusController:
             for st in states:
                 if (
                     st.id in self._suc_notified
+                    or st.id not in self._dep_future
                     or not st.plugged
                     or not st.at_home
                     or st.id not in _on_ids

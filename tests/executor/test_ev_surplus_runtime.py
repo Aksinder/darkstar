@@ -632,3 +632,126 @@ class TestDepartureTargetFloor:
         # Rate to 80 in 6h (6.5 %/h) beats rate to 40 in 5h (0 — already met):
         # the departure pair is binding and must force despite losing the min-race.
         assert on_calls, f"later-than-recurrence departure must still force, calls={ha.calls}"
+
+    @pytest.mark.asyncio
+    async def test_one_off_falls_back_to_the_cars_charge_limit(self):
+        # Owner decision 2026-08-27: no separate departure-target helper — the
+        # car's own charge limit (number.*_charge_limit) IS the trip target.
+        charger = self._charger()
+        charger.pop("departure_target_entity")
+        charger["target_soc_entity"] = "number.tesla_limit"
+        ha = FakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41",
+                "number.tesla_limit": "80",
+            }),
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 + 1800}},
+        )
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[charger]))
+        await EVSurplusController(cfg).run(ha, now_ts=1_000_000.0)
+        on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        assert on_calls, f"charge limit must serve as the trip target, calls={ha.calls}"
+
+
+class NotifyFakeHA(FakeHA):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.notifications: list[tuple] = []
+
+    async def send_notification(self, service, title, message, data=None):
+        self.notifications.append((service, title, message))
+        return True
+
+
+class TestSuperchargerAlert:
+    """The alert is gated on the ONE-OFF departure entity only (owner directive):
+    a historical or absent timestamp disables it entirely — the routine weekday
+    recurrence must never trigger it."""
+
+    def _charger(self, **over):
+        base = {
+            "id": "tesla", "priority": 1, "phases": 3,
+            "switch_entity": "switch.tesla", "current_entity": "number.tesla_amps",
+            "power_entity": "sensor.tesla_power", "plug_entity": "binary_sensor.tesla_plug",
+            "soc_entity": "sensor.tesla_soc", "capacity_kwh": 60,
+            "floor_soc": 40,
+            "departure_entity": "input_datetime.tesla_departure",
+            "target_soc_entity": "number.tesla_limit",
+            "min_current_a": 5, "max_current_a": 16,
+        }
+        base.update(over)
+        return base
+
+    def _cfg(self, charger):
+        return parse_ev_surplus_config(_cfg_dict(
+            chargers=[charger],
+            supercharger_price_sek_per_kwh=5.5,
+            notify_service="notify.test",
+        ))
+
+    @pytest.mark.asyncio
+    async def test_one_off_forced_expensive_charge_alerts_once(self):
+        ha = NotifyFakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41", "number.tesla_limit": "80",
+            }),
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 + 1800}},
+        )
+        ctrl = EVSurplusController(self._cfg(self._charger()))
+        await ctrl.run(ha, now_ts=1_000_000.0, current_import_price_sek=6.2)
+        assert len(ha.notifications) == 1, ha.notifications
+        # Second tick: same session, no re-buzz.
+        await ctrl.run(ha, now_ts=1_000_060.0, current_import_price_sek=6.2)
+        assert len(ha.notifications) == 1
+
+    @pytest.mark.asyncio
+    async def test_recurrence_forcing_never_alerts(self):
+        # SoC below floor + imminent recurrence => forcing, but NO one-off
+        # departure => the routine morning guarantee must not alert.
+        import datetime as _dt
+
+        import pytz as _pytz
+        tz = _pytz.timezone("Europe/Stockholm")
+        rec_dt = _dt.datetime.fromtimestamp(1_000_000.0 + 1800, tz)
+        ha = NotifyFakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "30", "number.tesla_limit": "80",
+            }),
+        )
+        ctrl = EVSurplusController(self._cfg(self._charger(
+            recurring_deadline_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            recurring_deadline_time=f"{rec_dt.hour:02d}:{rec_dt.minute:02d}",
+        )))
+        await ctrl.run(ha, now_ts=1_000_000.0, current_import_price_sek=6.2)
+        on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
+        assert on_calls, "the recurrence floor must still force"
+        assert not ha.notifications, "recurrence forcing must never alert"
+
+    @pytest.mark.asyncio
+    async def test_past_departure_never_alerts(self):
+        ha = NotifyFakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "30", "number.tesla_limit": "80",
+            }),
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 - 3600}},
+        )
+        ctrl = EVSurplusController(self._cfg(self._charger()))
+        await ctrl.run(ha, now_ts=1_000_000.0, current_import_price_sek=6.2)
+        assert not ha.notifications, "a historical departure must disable the alert"
+
+    @pytest.mark.asyncio
+    async def test_cheap_price_never_alerts(self):
+        ha = NotifyFakeHA(
+            _states(**{
+                "sensor.pv": "0", "sensor.grid": "0",
+                "sensor.tesla_soc": "41", "number.tesla_limit": "80",
+            }),
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 + 1800}},
+        )
+        ctrl = EVSurplusController(self._cfg(self._charger()))
+        await ctrl.run(ha, now_ts=1_000_000.0, current_import_price_sek=2.4)
+        assert not ha.notifications
