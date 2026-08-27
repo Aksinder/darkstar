@@ -1321,7 +1321,7 @@ class EVSurplusController:
                 if (now_ts - fail[0]) < backoff_s:
                     continue  # in failure backoff — spare the (Tesla) API
             try:
-                await self._actuate(ha, ccfg, cmd, now_ts, shadow)
+                await self._actuate(ha, ccfg, cmd, now_ts, shadow, drawing_w=drawing_w)
             except Exception:
                 # One charger's dead entity must not starve the others' actuation,
                 # and a sleeping Tesla must not be hammered every tick.
@@ -1388,12 +1388,41 @@ class EVSurplusController:
                     [(a["id"], a["on"], a["a"]) for a in applied])
         return {"enabled": True, "applied": applied, "price_sek": price, "price_source": price_source}
 
-    async def _actuate(self, ha: Any, ccfg: EVSurplusChargerCfg, cmd: Any, now_ts: float, shadow: bool) -> None:
+    async def _actuate(
+        self,
+        ha: Any,
+        ccfg: EVSurplusChargerCfg,
+        cmd: Any,
+        now_ts: float,
+        shadow: bool,
+        drawing_w: float = 0.0,
+    ) -> None:
         # Per-charger shadow (rollout gate): suppress service calls but keep the full
         # decision path + guard state, so shadow logs show realistic write rates.
         shadow = shadow or ccfg.shadow
         # Per-charger write pacing wins over the global guard.
         guard = ccfg.write_guard or self.cfg.guard
+
+        # A measurable draw IS an on relay: never send turn_on to a car that is
+        # already charging. Owner directive 2026-08-27 — live that day the Tesla
+        # pulled 11 kW under a force_on override while the servo sent turn_on
+        # every tick, each one rejected by the vehicle API (fail #1..#4, backoff
+        # to 480 s). The write raised BEFORE _last_switch was updated below, so
+        # the servo never learned the car was on and retried forever. Adopting
+        # the measurement here closes that loop. A STOP still actuates normally,
+        # because a car that must stop is exactly the one that IS drawing.
+        if (
+            cmd.switch_on
+            and ccfg.switch_entity is not None
+            and drawing_w >= 100.0
+            and self._last_switch.get(ccfg.id) is not True
+        ):
+            logger.info(
+                "EV surplus: %s already drawing %.0f W — skipping redundant "
+                "switch.turn_on, adopting ON",
+                ccfg.id, drawing_w,
+            )
+            self._last_switch[ccfg.id] = True
 
         # Switch: only toggle on change.
         if ccfg.switch_entity is not None and self._last_switch.get(ccfg.id) != cmd.switch_on:
