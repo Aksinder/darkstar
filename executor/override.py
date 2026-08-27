@@ -82,6 +82,13 @@ class SystemState:
     # Manual override toggle
     manual_override_active: bool = False
 
+    # Vacation: an away household reserves nothing for its own return, so the
+    # export floor may be LOWERED while away (owner 2026-08-27). Runtime, not
+    # config: the engine reads input_sensors.vacation_mode every tick, so the
+    # relaxation ends the moment the flag clears — no stale-config class. None
+    # => use the configured floor (today's behaviour).
+    vacation_export_floor_percent: float | None = None
+
 
 @dataclass
 class SlotPlan:

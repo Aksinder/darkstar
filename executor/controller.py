@@ -28,6 +28,22 @@ from .profiles import InverterProfile
 logger = logging.getLogger(__name__)
 
 
+def effective_export_floor_pct(config_floor: float, state: object) -> float:
+    """The export floor in force right now.
+
+    A vacation floor may only ever LOWER it. The guard itself must survive any
+    away-mode relaxation: it exists because SoC can drift below the plan's
+    assumption and Sungrow forced-discharge would otherwise run to BMS cutoff at
+    full power. The vacation value is RUNTIME state (the engine re-reads
+    input_sensors.vacation_mode every tick), so homecoming restores the
+    configured floor on the very next tick — no stale-config class.
+    """
+    vac = getattr(state, "vacation_export_floor_percent", None)
+    if vac is None:
+        return config_floor
+    return min(float(config_floor), float(vac))
+
+
 @dataclass
 class ControllerDecision:
     """The controller's decision on what actions to take.
@@ -137,12 +153,15 @@ class Controller:
             # floor — only the timer stopped it; the plan path had the guard, this
             # path did not). A forced discharge would otherwise run to the quick
             # action's soc_target (default 10) at full power.
-            if round(state.current_soc_percent) <= self.config.export_floor_soc_percent:
+            _floor = effective_export_floor_pct(
+                self.config.export_floor_soc_percent, state
+            )
+            if round(state.current_soc_percent) <= _floor:
                 logger.warning(
                     "Force-export blocked: SoC %.1f%% at/below export floor %.0f%% "
                     "— downgrading override to self_consumption",
                     state.current_soc_percent,
-                    self.config.export_floor_soc_percent,
+                    _floor,
                 )
                 mode_intent = "self_consumption"
             else:
@@ -223,12 +242,15 @@ class Controller:
             # Forced discharge would otherwise run to BMS cutoff at full power.
             # At/below the floor, downgrade to self_consumption (battery serves the
             # house only, never the grid).
-            if round(state.current_soc_percent) <= self.config.export_floor_soc_percent:
+            _floor = effective_export_floor_pct(
+                self.config.export_floor_soc_percent, state
+            )
+            if round(state.current_soc_percent) <= _floor:
                 logger.warning(
                     "Export intent blocked: SoC %.1f%% at/below export floor %.0f%% "
                     "— downgrading to self_consumption",
                     state.current_soc_percent,
-                    self.config.export_floor_soc_percent,
+                    _floor,
                 )
                 mode_intent = "self_consumption"
             else:

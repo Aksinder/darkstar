@@ -658,6 +658,46 @@ battery_value:
   lookahead_hours: 12      # forward price window for the estimate
   scale: 0.75              # fraction of the forward floor price to credit (lower = more willing to trade)
 
+# Vacation strategy: what an AWAY house may sell that an occupied one reserves.
+#
+# Vacation mode itself is unchanged and lives elsewhere — the flag is
+# water_heating.vacation_mode.enabled OR input_sensors.vacation_mode (a wired HA
+# boolean is authoritative in both directions), and it already strips EV charging
+# incentives, caps tanks and defers anti-legionella. What it never touched was the
+# BATTERY side: the safety floor, the terminal energy credit and the export floor
+# are all reserves sized for a household that is about to consume. Away, that
+# household is not there, and PV refills the pack every day.
+#
+# Every key below is OPTIONAL. Absent => today's behaviour exactly. Each one may
+# only ever RELAX its reserve — the code clamps in the relaxing direction only, so
+# a mis-set value cannot make the planner more conservative or strand the house,
+# and the battery's own min_soc_percent is never crossed.
+vacation:
+  # Override s_index.risk_appetite while away (clamped to [configured, 5]). This is
+  # lever when the MINIMUM buffer binds: at risk 3 that reserves 10 % of the pack
+  # (risk 4 => 3 %, risk 5 => 0 %). Note the floor is max(temporal_deficit_reserve,
+  # min_buffer) — on a genuinely deficit-heavy forecast the deficit term dominates
+  # and this changes little; it bites hardest exactly when an away house has almost
+  # no deficit, which is the case it was added for. It also lowers the SoC-target
+  # penalty (risk 3 = 200, 4 = 120, 5 = 60 SEK/kWh), letting economics outweigh
+  # the target.
+  # risk_appetite: 4
+  #
+  # Drop the terminal battery-value credit while away. That credit prices leftover
+  # energy at ~0.75x the cheapest forward IMPORT price — a buy-back an empty house
+  # never makes, so it over-values holding. Only an explicit false disables it.
+  # battery_value_enabled: false
+  #
+  # Lower the export floor while away (lower-only). The normal floor exists so a
+  # returning household is not met by an empty pack; away, that reason is suspended.
+  # BOTH halves honour this: the MILP plans down to it, and the executor's runtime
+  # guard (which exists because SoC can drift below the plan and forced-discharge
+  # would otherwise run to BMS cutoff) is lowered to the same value while away —
+  # without that half the kWh are planned and never sold.
+  # A value below battery.min_soc_percent buys nothing: min_soc is defended at
+  # 1000 SEK/kWh and simply clamps this. Keep it >= min_soc_percent.
+  # export_floor_soc_percent: 14
+
 # S-Index Configuration (Risk & Safety Strategy)
 s_index:
   mode: "probabilistic"            # Options: probabilistic | dynamic

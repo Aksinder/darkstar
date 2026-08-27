@@ -700,6 +700,29 @@ class PlannerPipeline:
             except Exception as e:
                 logger.warning("Failed to extract previous-plan anchor slots: %s", e)
 
+        # Vacation source of truth, resolved BEFORE the strategy block: the safety
+        # floor, the SoC-target penalty, the terminal battery value and the export
+        # floor are all risk parameters sized for an OCCUPIED house, and an away
+        # household should sell what it would otherwise reserve for itself (owner
+        # 2026-08-27: "vid vacation_mode borde vi sälja betydligt mer"). The flag
+        # itself is unchanged: a WIRED HA boolean is authoritative in both
+        # directions (turning it off at home ends vacation even if the config flag
+        # was left true — a stale flag once suppressed comfort heating for half a
+        # day after homecoming); the config flag only matters with no entity.
+        _vac_cfg = water_cfg.get("vacation_mode", {}) or {}
+        _input_sensors_cfg = cast("dict[str, Any]", active_config.get("input_sensors") or {})
+        vacation_enabled = resolve_vacation_enabled(
+            _vac_cfg.get("enabled", False),
+            bool((input_data.get("initial_state") or {}).get("vacation_mode", False)),
+            bool(str(_input_sensors_cfg.get("vacation_mode") or "").strip()),
+        )
+        # Away-mode strategy overrides. Every key is optional; absent => today's
+        # behaviour exactly. Only ever RELAXES reserves — it cannot make the
+        # planner more conservative, so a mis-set value cannot strand the house.
+        _vac_strategy: dict[str, Any] = active_config.get("vacation", {}) or {}
+        if vacation_enabled and _vac_strategy:
+            logger.info("Vacation strategy overrides active: %s", _vac_strategy)
+
         # 3. Strategy (S-Index & Safety Margins)
         s_index_debug: dict[str, Any] = {}
         effective_load_margin = 1.0
@@ -713,6 +736,21 @@ class PlannerPipeline:
             # and dynamic risk factor for target SoC (D2 strategy)
 
             s_index_cfg = active_config.get("s_index", {}) or {}
+            # An away house needs no comfort reserve: a higher risk_appetite lowers
+            # BOTH the temporal-deficit margin and the unconditional minimum buffer
+            # (risk 3 reserves 10% of the pack come what may; risk 5 reserves none),
+            # and it feeds the SoC-target penalty below through the same value.
+            # Clamped to [current, 5]: this may only relax, never tighten.
+            _vac_risk = _vac_strategy.get("risk_appetite") if vacation_enabled else None
+            if _vac_risk is not None:
+                _base_risk = int(s_index_cfg.get("risk_appetite", 3))
+                _eff_risk = max(_base_risk, min(5, int(_vac_risk)))
+                if _eff_risk != _base_risk:
+                    s_index_cfg = {**s_index_cfg, "risk_appetite": _eff_risk}
+                    logger.info(
+                        "Vacation: risk_appetite %d -> %d (smaller safety floor while away)",
+                        _base_risk, _eff_risk,
+                    )
             base_factor = float(s_index_cfg.get("base_factor", 1.05))
 
             # Apply learned base factor
@@ -1079,19 +1117,10 @@ class PlannerPipeline:
             kepler_config.max_charge_power_kw = 0.0
             kepler_config.max_discharge_power_kw = 0.0
 
-        # Vacation source of truth (hoisted above the EV build — both EVs and water need it):
-        # when the HA boolean is WIRED it is authoritative in BOTH directions — turning it
-        # off at home ends vacation even if the config flag was left true (a stale config
-        # flag once suppressed all comfort heating for half a day after homecoming). The
-        # config flag only matters when no entity is configured.
+        # vacation_enabled is resolved ONCE, above the strategy block (the safety
+        # floor and battery-value credit need it too). vacation_cfg stays local
+        # because the anti-legionella schedule below reads its own keys from it.
         vacation_cfg = water_cfg.get("vacation_mode", {})
-        vacation_enabled = vacation_cfg.get("enabled", False)
-        ha_vacation = bool(initial_state.get("vacation_mode", False))
-        _input_sensors_cfg = cast("dict[str, Any]", active_config.get("input_sensors") or {})
-        vacation_entity_wired = bool(str(_input_sensors_cfg.get("vacation_mode") or "").strip())
-        vacation_enabled = resolve_vacation_enabled(
-            vacation_enabled, ha_vacation, vacation_entity_wired
-        )
 
         # Per-device EV state: build EVChargerInput list for Kepler
         has_ev_charger = system_cfg.get("has_ev_charger", False)
@@ -1317,7 +1346,14 @@ class PlannerPipeline:
         # value never exceeds the min forward import price, so it can't trigger grid
         # buying just to inflate the terminal SoC. Existing setups are unchanged.
         bv_cfg: dict[str, Any] = active_config.get("battery_value", {}) or {}
-        if mode == "full" and bv_cfg.get("enabled", False):
+        # The terminal credit prices energy at what the HOUSEHOLD would pay to buy it
+        # back. Away, there is no such buy-back — holding a full pack past the horizon
+        # is worth the export price, not 0.75x the cheapest import. Default: keep the
+        # credit (absent key => today's behaviour).
+        _bv_away_off = vacation_enabled and _vac_strategy.get("battery_value_enabled") is False
+        if _bv_away_off and bv_cfg.get("enabled", False):
+            logger.info("Vacation: battery_value credit disabled (no household buy-back away)")
+        if mode == "full" and bv_cfg.get("enabled", False) and not _bv_away_off:
             import_prices = [s.import_price_sek_kwh for s in kepler_input.slots]
             lookahead_slots = int(float(bv_cfg.get("lookahead_hours", 12)) * 4)
             kepler_config.battery_value_sek_per_kwh = derive_battery_value_sek_per_kwh(
@@ -1331,6 +1367,24 @@ class PlannerPipeline:
                 kepler_config.battery_value_sek_per_kwh,
                 lookahead_slots,
             )
+
+        # Away-mode export floor: the reserve that stops the battery discharging for
+        # export exists so a returning household is not met by an empty pack. Away,
+        # that reason is suspended — and PV keeps refilling every day. Only ever
+        # LOWERED (max with nothing, min with the configured value), so a mis-set
+        # key cannot raise the floor and strand exports.
+        if vacation_enabled and mode == "full":
+            _vac_floor = _vac_strategy.get("export_floor_soc_percent")
+            if _vac_floor is not None and kepler_config.export_floor_soc_percent is not None:
+                _new_floor = min(
+                    float(kepler_config.export_floor_soc_percent), float(_vac_floor)
+                )
+                if _new_floor < kepler_config.export_floor_soc_percent:
+                    logger.info(
+                        "Vacation: export floor %.0f%% -> %.0f%% (away pack may sell deeper)",
+                        kepler_config.export_floor_soc_percent, _new_floor,
+                    )
+                    kepler_config.export_floor_soc_percent = _new_floor
 
         # Dynamic WTP caps: for any priority load configured with a percentile, recompute
         # its base_wtp from the rolling 24 h import-price distribution so the cap tracks the
