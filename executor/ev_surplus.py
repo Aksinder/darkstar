@@ -210,6 +210,16 @@ class EVSurplusInputs:
     # explicit stops BEFORE compute is ever reached.
     phase_currents_a: dict[str, float] = field(default_factory=dict)
     chargers: list[ChargerState] = field(default_factory=lambda: [])
+    # This tick's wall clock, EPOCH SECONDS. Deliberately not a datetime: naive
+    # datetimes crossing a module boundary are a recurring bug class in this
+    # codebase (the container runs LOCAL time while comparators assume UTC), and
+    # an epoch float cannot carry the ambiguity.
+    now_ts: float = 0.0
+    # Forward IMPORT-price curve as (start_ts, end_ts, sek_per_kwh) triples, epoch
+    # seconds, any granularity, need not be sorted or contiguous. Feeds the
+    # deadline floor's front-loading (see _deadline_required_w). Empty = no curve,
+    # which restores the legacy urgency-only ramp exactly.
+    forward_prices: tuple[tuple[float, float, float], ...] = ()
 
 
 @dataclass
@@ -459,7 +469,63 @@ def _soc_at_or_above_target(c: ChargerState) -> bool:
     )
 
 
-def _deadline_required_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
+def _now_is_in_cheapest_slots(
+    energy_kwh: float,
+    max_w: float,
+    now_ts: float,
+    deadline_ts: float,
+    prices: tuple[tuple[float, float, float], ...],
+) -> bool | None:
+    """Is NOW one of the cheapest slots needed to deliver ``energy_kwh`` by the deadline?
+
+    Selects, greedily by price, the least-expensive slots between now and the deadline
+    until their combined FULL-POWER capacity covers the requirement, then reports
+    whether the slot containing ``now_ts`` made the cut.
+
+    Returns ``None`` when the curve cannot answer — no prices, ``now`` outside the
+    series, nothing priced before the deadline, or a charger with no max power. The
+    caller then keeps the legacy urgency ramp, so an unusable curve is inert rather
+    than dangerous.
+
+    Past slots are clipped away, so the slot holding ``now`` is always the EARLIEST
+    survivor; sorting breaks ties by start time, which means an exact price tie always
+    resolves to "buy now" — the safer half of the tie.
+    """
+    if not prices or max_w <= 0.0 or energy_kwh <= 0.0 or deadline_ts <= now_ts:
+        return None
+    # Clip every slot to the [now, deadline] window; a slot straddling either edge
+    # contributes only its overlapping part.
+    window: list[tuple[float, float, float]] = []  # (price, clipped_start, clipped_end)
+    current_idx: int | None = None
+    for start, end, price in prices:
+        lo, hi = max(start, now_ts), min(end, deadline_ts)
+        if hi <= lo:
+            continue
+        if start <= now_ts < end:
+            current_idx = len(window)
+        window.append((price, lo, hi))
+    if current_idx is None:
+        return None
+    hours_needed = energy_kwh / (max_w / 1000.0)
+    # Sort by price, then start time — deterministic, and earlier wins a tie.
+    # Index-keyed (not identity/equality) so duplicate price+span rows cannot alias.
+    accumulated = 0.0
+    for idx in sorted(range(len(window)), key=lambda i: (window[i][0], window[i][1])):
+        if accumulated >= hours_needed:
+            return False  # cheaper slots already cover it; this one is not needed
+        if idx == current_idx:
+            return True
+        accumulated += (window[idx][2] - window[idx][1]) / 3600.0
+    # Every priced slot is needed (the window is too short to be picky) — charge now.
+    return True
+
+
+def _deadline_required_w(
+    c: ChargerState,
+    cfg: EVSurplusConfig,
+    now_ts: float = 0.0,
+    prices: tuple[tuple[float, float, float], ...] = (),
+) -> float:
     """Grid-backed power floor needed to reach the FLOOR SoC by the deadline, else 0.
 
     This is the average plug power required from *now*::
@@ -497,9 +563,35 @@ def _deadline_required_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
         return 0.0
     energy_at_plug_kwh = soc_gap * c.capacity_kwh / max(0.05, c.charge_efficiency)
     required_w = energy_at_plug_kwh * 1000.0 / c.deadline_hours
+    max_w = _charger_max_w(c)
+    # --- Front-loading (owner 2026-08-31) -----------------------------------------
+    # The urgency ramp below defers grid until `required_w` crosses the charger's
+    # minimum, i.e. until time nearly runs out — and then buys at whatever the clock
+    # costs. On the night of 30->31 Aug that meant the Tesla's 40 %-by-07:30 guarantee
+    # crept along at 7 A straight through the morning ramp, paying 2.07 and 2.14
+    # SEK/kWh at 06:30-06:45 while 1.05 sat unused at 05:00.
+    #
+    # When a forward curve is available, buy the whole requirement at FULL power in
+    # the cheapest slots before the deadline instead. Charging fast in a cheap slot
+    # shrinks the SoC gap, so later (dearer) slots size themselves to ~0 naturally.
+    #
+    # Safety property, deliberately one-directional: this branch can only ever
+    # RETURN MORE than the legacy ramp would, never less. A wrong or stale curve can
+    # therefore make charging costlier, but it can never put the deadline at risk —
+    # the urgency ramp underneath is untouched and remains the guarantee.
+    if (
+        prices
+        and now_ts > 0.0
+        and max_w > 0.0
+        and _now_is_in_cheapest_slots(
+            energy_at_plug_kwh, max_w, now_ts, now_ts + c.deadline_hours * 3600.0, prices
+        )
+        is True
+    ):
+        return max_w
     if required_w < _charger_min_on_w(c, cfg):
         return 0.0  # enough time left — wait for cheaper/solar energy instead of forcing grid
-    return min(required_w, _charger_max_w(c))
+    return min(required_w, max_w)
 
 
 @dataclass
@@ -775,7 +867,10 @@ def compute_ev_surplus(
     # Two floor sources per charger: the grid-backed deadline guarantee and the
     # planner's price-placed slot (plan_floor_w, pre-gated by the runtime). Merged
     # with max() — NEVER sum (the same energy need must not be double-counted).
-    deadline_w = {c.id: _deadline_required_w(c, cfg) for c in chargeable}
+    deadline_w = {
+        c.id: _deadline_required_w(c, cfg, inputs.now_ts, inputs.forward_prices)
+        for c in chargeable
+    }
     floor_w = {c.id: max(deadline_w[c.id], c.plan_floor_w) for c in chargeable}
 
     # Deadline cars overtake (sort key 0), then by priority. Used for BOTH surplus

@@ -1001,6 +1001,7 @@ class EVSurplusController:
         plan_battery_charge_kw: float = 0.0,
         internal_spot_price_sek: float | None = None,
         current_import_price_sek: float | None = None,
+        forward_prices: tuple[tuple[float, float, float], ...] | None = None,
     ) -> dict[str, Any]:
         """One control cycle. Returns a summary (for logging / UI).
 
@@ -1196,6 +1197,7 @@ class EVSurplusController:
             battery_reserve_active_prev=self._battery_reserve_prev,
             plan_battery_charge_w=max(0.0, plan_battery_charge_kw) * 1000.0,
             phase_currents_a=phase_currents, chargers=states,
+            now_ts=now_ts, forward_prices=tuple(forward_prices or ()),
         )
         tick = EVSurplusTick()
         commands = compute_ev_surplus(inputs, cfg.policy, tick_out=tick)
@@ -1229,7 +1231,7 @@ class EVSurplusController:
                     or st.id not in _on_ids
                 ):
                     continue
-                if _deadline_required_w(st, cfg.policy) <= 0.0:
+                if _deadline_required_w(st, cfg.policy, now_ts, inputs.forward_prices) <= 0.0:
                     continue
                 self._suc_notified.add(st.id)
                 try:

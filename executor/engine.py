@@ -260,6 +260,7 @@ class ExecutorEngine:
         # Idle-hold: (hour iso, import price) memo — recomputed once per hour.
         self._import_price_cache: tuple[str, float] | None = None
         self._spot_price_cache: tuple[str, float] | None = None
+        self._forward_price_cache: tuple[str, tuple[tuple[float, float, float], ...]] | None = None
         self._price_window_cache: tuple[tuple[str, str, float], list[float]] | None = None
 
         # Idle-hold log de-dup: heater id -> last (hold, reason) logged.
@@ -2086,6 +2087,13 @@ class ExecutorEngine:
                                 is not None
                                 else None
                             )
+                            # Forward curve for the deadline floor's front-loading.
+                            # Same pre-now_ts ordering rationale as the spot fetch.
+                            _servo_curve = (
+                                await self._forward_import_prices()
+                                if self._ev_surplus.cfg.enabled
+                                else ()
+                            )
                             await self._ev_surplus.run(
                                 self.ha_client,
                                 time.time(),
@@ -2102,6 +2110,7 @@ class ExecutorEngine:
                                 ),
                                 internal_spot_price_sek=_servo_spot,
                                 current_import_price_sek=_servo_import,
+                                forward_prices=_servo_curve,
                             )
                         except Exception as ev_exc:
                             logger.warning("EV surplus controller error: %s", ev_exc)
@@ -2572,6 +2581,55 @@ class ExecutorEngine:
         except Exception as e:
             logger.debug("Idle-hold: import price unavailable: %s", e)
         return None
+
+    async def _forward_import_prices(self) -> tuple[tuple[float, float, float], ...]:
+        """Forward IMPORT-price curve as (start_ts, end_ts, sek_per_kwh), epoch seconds.
+
+        Feeds the EV deadline floor's front-loading. Empty on any failure, which the
+        servo treats as "no curve" and falls back to the legacy urgency ramp — so a
+        Nordpool outage degrades to yesterday's behaviour rather than to a wrong plan.
+
+        IMPORT price (spot + VAT/fees/transfer), not raw spot: the decision being made
+        is "which quarter is cheapest to BUY in", and the fixed per-kWh adders shift
+        every slot equally while VAT scales them — ordering by spot alone would rank a
+        negative-spot hour differently from what it actually costs.
+
+        Memoized per 15-min slot: run() calls this every tick.
+        """
+        try:
+            import pytz
+
+            from backend.core.prices import get_nordpool_data
+
+            tz = pytz.timezone(self.config.timezone)
+            now = datetime.now(tz)
+            slot_key = now.replace(
+                minute=(now.minute // 15) * 15, second=0, microsecond=0
+            ).isoformat()
+            cached = self._forward_price_cache
+            if cached is not None and cached[0] == slot_key:
+                return cached[1]
+
+            now_ts = now.timestamp()
+            curve: list[tuple[float, float, float]] = []
+            for p in await get_nordpool_data("config.yaml") or []:
+                start, end, price = (
+                    p.get("start_time"),
+                    p.get("end_time"),
+                    p.get("import_price_sek_kwh"),
+                )
+                if start is None or end is None or price is None:
+                    continue
+                end_ts = end.timestamp()
+                if end_ts <= now_ts:
+                    continue  # already past
+                curve.append((start.timestamp(), end_ts, float(price)))
+            out = tuple(curve)
+            self._forward_price_cache = (slot_key, out)
+            return out
+        except Exception as e:
+            logger.debug("EV surplus: forward price curve unavailable: %s", e)
+            return ()
 
     async def _current_spot_price(self) -> float | None:
         """Raw day-ahead spot (excl. VAT/fees) for the current 15-min slot, or None.
