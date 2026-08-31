@@ -1,3 +1,7 @@
+## dev-20260831.0850 — 2026-08-31 08:51
+
+- feat(executor): front-load the EV deadline guarantee into the cheapest quarters
+
 ## dev-20260827.2119 — 2026-08-27 21:21
 
 - Vacation: an away house may sell what an occupied one reserves
