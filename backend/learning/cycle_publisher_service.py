@@ -483,7 +483,7 @@ async def run_publisher_loop(
         """
         import pytz
 
-        from backend.learning.savings import compute_savings
+        from backend.learning.savings import compute_savings, compute_stored_energy_delta
         from backend.learning.store import LearningStore
 
         learning_cfg: dict[str, Any] = config.get("learning", {}) or {}
@@ -503,7 +503,30 @@ async def run_publisher_loop(
             )
         finally:
             await store.close()
-        sensors = build_savings_sensors(compute_savings(today_rows), compute_savings(d30_rows))
+
+        # Basis fallback for the today window: early in the morning it has discharged
+        # overnight but not yet charged, so it has no inflow of its own to price. Slice
+        # the rows already in hand rather than issuing a second query -- today_rows is a
+        # suffix of d30_rows and midnight_iso is the identical string used as its start
+        # bound, so the two are exact complements by construction. List slicing, not
+        # timestamp arithmetic, keeps this clear of the DST/offset trap documented on
+        # LearningStore.get_observation_rows_between.
+        midnight_iso = midnight.isoformat()
+        prior_rows = [r for r in d30_rows if str(r["slot_start"]) < midnight_iso][-192:]
+        battery_cfg: dict[str, Any] = config.get("battery", {}) or {}
+        eta = float(battery_cfg.get("roundtrip_efficiency_percent", 95.0)) / 100.0
+        today_stored = compute_stored_energy_delta(
+            today_rows, roundtrip_efficiency=eta, basis_rows=prior_rows
+        )
+        d30_stored = compute_stored_energy_delta(
+            d30_rows, roundtrip_efficiency=eta, basis_rows=None
+        )
+        sensors = build_savings_sensors(
+            compute_savings(today_rows),
+            compute_savings(d30_rows),
+            today_stored,
+            d30_stored,
+        )
         if sensors:
             await publish(sensors)
 
