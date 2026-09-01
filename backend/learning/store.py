@@ -72,8 +72,16 @@ class LearningStore:
     ) -> list[dict[str, Any]]:
         """Return SlotObservation rows with slot_start in [start_iso, end_iso) as dicts.
 
-        slot_start is stored as an ISO-8601 string in a consistent local-offset format,
-        so lexicographic comparison equals chronological comparison within one site.
+        slot_start is stored as an ISO-8601 string in a local-offset format, so
+        lexicographic comparison equals chronological comparison only WITHIN ONE
+        UTC-OFFSET REGIME. The live table already carries both +01:00 (200 rows) and
+        +02:00 (15048 rows), so the equality fails across a DST transition: a "+01:00"
+        string sorts before a "+02:00" string that names an EARLIER instant.
+
+        Both compute_savings and compute_stored_energy_delta are order-independent sums
+        over whatever rows come back, so only window MEMBERSHIP is affected here. Any
+        future order-sensitive consumer -- a running stock, a cumsum, a priced ledger --
+        must not rely on this ordering.
         """
         async with self.AsyncSession() as session:
             stmt = (
@@ -96,6 +104,8 @@ class LearningStore:
                     "ev_charging_kwh": row.ev_charging_kwh,  # type: ignore[reportUnknownMemberType]
                     "import_price_sek_kwh": row.import_price_sek_kwh,
                     "export_price_sek_kwh": row.export_price_sek_kwh,
+                    "batt_charge_kwh": row.batt_charge_kwh,
+                    "batt_discharge_kwh": row.batt_discharge_kwh,
                 }
                 for row in result.scalars().all()
             ]
