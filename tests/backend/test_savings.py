@@ -2,10 +2,23 @@
 
 import pytest
 
-from backend.learning.savings import compute_savings
+from backend.learning.savings import compute_savings, compute_stored_energy_delta
 
 
-def _slot(imp=0.0, exp=0.0, pv=0.0, load=0.0, p_imp=2.0, p_exp=0.8, water=0.0, ev=0.0):
+def _slot(
+    imp=0.0,
+    exp=0.0,
+    pv=0.0,
+    load=0.0,
+    p_imp=2.0,
+    p_exp=0.8,
+    water=0.0,
+    ev=0.0,
+    batt_charge=None,
+    batt_discharge=None,
+):
+    # batt_* default to None (NOT 0.0): the factory must never fabricate a measurement,
+    # and the existing assertions below must keep exercising the absent-column path.
     return {
         "import_kwh": imp,
         "export_kwh": exp,
@@ -15,6 +28,8 @@ def _slot(imp=0.0, exp=0.0, pv=0.0, load=0.0, p_imp=2.0, p_exp=0.8, water=0.0, e
         "ev_charging_kwh": ev,
         "import_price_sek_kwh": p_imp,
         "export_price_sek_kwh": p_exp,
+        "batt_charge_kwh": batt_charge,
+        "batt_discharge_kwh": batt_discharge,
     }
 
 
@@ -142,3 +157,169 @@ def test_missing_export_price_treated_as_zero():
     s = compute_savings(rows)
     # Export valued at 0 on both sides => no phantom savings from missing prices.
     assert s.savings_sek == pytest.approx(0.0)
+
+
+# --- compute_savings additivity -------------------------------------------------
+# The property the stored-energy design rests on: compute_savings is a pure per-slot
+# sum, so it is additive over any partition. An earlier design of the inventory term
+# put a window-weighted price INSIDE this function, which would have destroyed it.
+
+
+def test_compute_savings_is_additive_over_any_partition():
+    rows = [
+        _slot(imp=1.0, load=1.0, p_imp=2.0),
+        _slot(exp=2.0, pv=3.0, load=1.0, p_exp=0.8),
+        _slot(imp=0.5, load=2.0, pv=1.5, p_imp=1.4),
+        _slot(exp=1.0, pv=1.0, p_exp=-0.2),
+    ]
+    whole = compute_savings(rows)
+    for cut in range(len(rows) + 1):
+        left = compute_savings(rows[:cut])
+        right = compute_savings(rows[cut:])
+        assert left.savings_sek + right.savings_sek == pytest.approx(
+            whole.savings_sek, abs=1e-9
+        ), f"additivity broken at cut {cut}"
+
+
+# --- compute_stored_energy_delta ------------------------------------------------
+
+
+def test_stored_delta_empty_and_batteryless_rows_are_inert():
+    """No battery telemetry at all => nothing stored, no basis, zero value."""
+    assert compute_stored_energy_delta([]).value_sek == 0.0
+    d = compute_stored_energy_delta([_slot(imp=1.0, load=1.0), _slot(exp=2.0, pv=2.0)])
+    assert d.n_slots == 2
+    assert d.n_battery_slots == 0
+    assert d.battery_coverage == 0.0
+    assert d.net_stored_kwh == 0.0
+    assert d.basis_sek_kwh is None
+    assert d.value_sek == 0.0
+
+
+def test_stored_delta_nulls_are_not_zeros():
+    """A NULL flow column must be skipped, never coalesced to 0.0.
+
+    The live DB's battery NULLs cluster in the recorder's daylight gaps, i.e. exactly
+    when charging happens. Coalescing them to 0.0 would fabricate a phantom debit while
+    priced coverage still read 1.000; battery_coverage is what exposes such a window.
+    """
+    rows = [
+        _slot(pv=4.0, batt_charge=2.0, batt_discharge=0.0),
+        _slot(pv=4.0),  # columns absent entirely
+        _slot(pv=4.0, batt_charge=None, batt_discharge=1.0),  # half-measured
+    ]
+    d = compute_stored_energy_delta(rows, roundtrip_efficiency=1.0)
+    assert d.n_battery_slots == 1
+    assert d.battery_coverage == pytest.approx(1 / 3)
+    # Only the fully-measured slot contributes; the half-measured discharge is NOT
+    # allowed to subtract 1.0 kWh from the stock.
+    assert d.net_stored_kwh == pytest.approx(2.0)
+
+
+def test_stored_delta_efficiency_removes_the_roundtrip_ratchet():
+    """Raw charge-minus-discharge books round-trip loss as stored energy.
+
+    Measured on the live site over 2026-08-04..09-01: raw flow difference +28.49 kWh
+    against a real SoC gain of +9.07 kWh. Applying the efficiency to the charge leg
+    reconciles the two.
+    """
+    rows = [
+        _slot(pv=10.0, batt_charge=10.0, batt_discharge=0.0),
+        _slot(load=10.0, batt_charge=0.0, batt_discharge=9.5),
+    ]
+    raw = compute_stored_energy_delta(rows, roundtrip_efficiency=1.0)
+    adjusted = compute_stored_energy_delta(rows, roundtrip_efficiency=0.95)
+    assert raw.net_stored_kwh == pytest.approx(0.5)  # phantom: pure loss
+    assert adjusted.net_stored_kwh == pytest.approx(0.0)  # a closed round trip
+
+
+def test_stored_delta_nets_within_a_slot_that_both_charged_and_discharged():
+    """216 real slots carry both flows; netting keeps pass-through out of the basis."""
+    d = compute_stored_energy_delta(
+        [_slot(pv=5.0, p_exp=1.0, batt_charge=3.0, batt_discharge=2.0)],
+        roundtrip_efficiency=1.0,
+    )
+    assert d.net_stored_kwh == pytest.approx(1.0)
+    assert d.charge_kwh == pytest.approx(1.0)  # netted inflow, not the raw 3.0
+
+
+def test_stored_delta_prices_pv_at_export_and_grid_at_import():
+    """Grid-charged energy's foregone alternative is not buying it, at the import price."""
+    pv_only = compute_stored_energy_delta(
+        [_slot(pv=5.0, load=0.0, p_imp=2.0, p_exp=0.8, batt_charge=2.0, batt_discharge=0.0)],
+        roundtrip_efficiency=1.0,
+    )
+    assert pv_only.basis_sek_kwh == pytest.approx(0.8)  # displaced an export
+
+    grid_only = compute_stored_energy_delta(
+        [_slot(pv=0.0, load=0.0, p_imp=2.0, p_exp=0.8, batt_charge=2.0, batt_discharge=0.0)],
+        roundtrip_efficiency=1.0,
+    )
+    assert grid_only.basis_sek_kwh == pytest.approx(2.0)  # displaced a purchase
+
+    # Half from a 1 kWh surplus, half from the grid => the blend.
+    mixed = compute_stored_energy_delta(
+        [_slot(pv=1.0, load=0.0, p_imp=2.0, p_exp=0.8, batt_charge=2.0, batt_discharge=0.0)],
+        roundtrip_efficiency=1.0,
+    )
+    assert mixed.basis_sek_kwh == pytest.approx((1.0 * 0.8 + 1.0 * 2.0) / 2.0)
+
+
+def test_stored_delta_negative_export_price_is_not_clamped():
+    """SE3 genuinely goes negative; storing then is a real gain, and it must show."""
+    d = compute_stored_energy_delta(
+        [_slot(pv=5.0, load=0.0, p_exp=-0.5, batt_charge=2.0, batt_discharge=0.0)],
+        roundtrip_efficiency=1.0,
+    )
+    assert d.basis_sek_kwh == pytest.approx(-0.5)
+    assert d.value_sek == pytest.approx(-1.0)
+
+
+def test_stored_delta_unpriced_slot_still_counts_toward_the_stock():
+    """Energy moved whether or not a price was recorded — the stock must not lose it.
+
+    This is the one place the function must NOT copy compute_savings, which skips
+    unpriced slots outright.
+    """
+    d = compute_stored_energy_delta(
+        [
+            _slot(pv=5.0, p_imp=None, p_exp=None, batt_charge=2.0, batt_discharge=0.0),
+            _slot(pv=5.0, p_imp=2.0, p_exp=1.0, batt_charge=1.0, batt_discharge=0.0),
+        ],
+        roundtrip_efficiency=1.0,
+    )
+    assert d.net_stored_kwh == pytest.approx(3.0)  # both slots
+    assert d.charge_kwh == pytest.approx(1.0)  # only the priced one sets the basis
+    assert d.basis_sek_kwh == pytest.approx(1.0)
+
+
+def test_stored_delta_no_inflow_falls_back_to_prior_window_basis():
+    """The dominant degenerate case: an early-morning cut that only discharged.
+
+    Without a fallback the basis is 0/0 exactly when the overnight discharge needs
+    pricing, and the whole term silently reads zero.
+    """
+    overnight = [_slot(load=3.0, batt_charge=0.0, batt_discharge=3.0)]
+    prior = [_slot(pv=6.0, p_exp=0.9, batt_charge=4.0, batt_discharge=0.0)]
+
+    without = compute_stored_energy_delta(overnight, roundtrip_efficiency=1.0)
+    assert without.basis_sek_kwh is None
+    assert without.value_sek == 0.0  # no basis => no fabricated value
+    assert without.net_stored_kwh == pytest.approx(-3.0)  # stock still moved
+
+    with_prior = compute_stored_energy_delta(
+        overnight, roundtrip_efficiency=1.0, basis_rows=prior
+    )
+    assert with_prior.basis_sek_kwh == pytest.approx(0.9)
+    assert with_prior.value_sek == pytest.approx(-2.7)  # the night's draw, priced
+
+
+def test_stored_delta_basis_fallback_does_not_recurse_past_depth_one():
+    """A prior window that itself has no inflow must resolve to None, not recurse."""
+    d = compute_stored_energy_delta(
+        [_slot(load=1.0, batt_charge=0.0, batt_discharge=1.0)],
+        roundtrip_efficiency=1.0,
+        basis_rows=[_slot(load=1.0, batt_charge=0.0, batt_discharge=1.0)],
+    )
+    assert d.basis_sek_kwh is None
+    assert d.value_sek == 0.0

@@ -200,7 +200,13 @@ async def get_energy_range(
                     )
                     * func.coalesce(SlotObservation.import_price_sek_kwh, 0)
                 ),
-                # Self Consumption Savings
+                # Self Consumption Savings.
+                # NOT the same quantity as sensor.darkstar_savings_today/_30d. This is
+                # computed here directly in SQL off slot_observations; those sensors run
+                # through backend/learning/savings.py, which values a no-battery
+                # counterfactual and (on the today sensor) adds the value of energy still
+                # held in the battery at the cut. Expect the two to disagree; they answer
+                # different questions. See backend/learning/savings.py for that contract.
                 func.sum(
                     func.max(
                         0,

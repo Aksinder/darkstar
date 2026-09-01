@@ -87,6 +87,8 @@ def _slug(value: str) -> str:
 def build_savings_sensors(
     today: Any,
     last_30d: Any,
+    today_stored: Any = None,
+    last_30d_stored: Any = None,
 ) -> list[PublishedSensor]:
     """Publish the no-battery counterfactual savings (see backend/learning/savings.py).
 
@@ -95,31 +97,71 @@ def build_savings_sensors(
     in attributes so a dashboard can show actual-vs-baseline, and ``priced_coverage``
     exposes how much of the window could actually be valued — a thin/unpriced window
     is visible instead of masquerading as a result.
+
+    The TODAY sensor's state additionally carries the value of energy still held in the
+    battery at the cut (``StoredEnergyDelta``), because the today window is a partial,
+    non-calendar slice that nothing sums: cutting it mid-charge otherwise reads as pure
+    cost. Measured on 2026-09-01 that moves the day from -5.08 to +2.39 SEK. The raw
+    figure stays available as ``savings_excl_stored_sek`` so the series remains
+    reconstructable across the deploy.
+
+    The 30-DAY sensor's state is deliberately left raw. The same term over 30 days is
+    +2.87 SEK against +323.21 SEK of savings (0.9%) because it self-cancels across days,
+    so adjusting it would add measurement noise to a cumulative figure for no gain. Its
+    delta is still published in attributes when supplied.
     """
     sensors: list[PublishedSensor] = []
-    for object_id, name, summary in (
-        ("darkstar_savings_today", "Darkstar besparing idag", today),
-        ("darkstar_savings_30d", "Darkstar besparing 30 dagar", last_30d),
+    for object_id, name, summary, delta, adjust_state in (
+        ("darkstar_savings_today", "Darkstar besparing idag", today, today_stored, True),
+        (
+            "darkstar_savings_30d",
+            "Darkstar besparing 30 dagar",
+            last_30d,
+            last_30d_stored,
+            False,
+        ),
     ):
         if summary is None:
             continue
+        raw = float(summary.savings_sek)
+        state = raw + float(delta.value_sek) if adjust_state and delta is not None else raw
+        attributes: dict[str, Any] = {
+            "actual_cost_sek": round(float(summary.actual_cost_sek), 2),
+            "baseline_cost_sek": round(float(summary.baseline_cost_sek), 2),
+            "n_slots": int(summary.n_slots),
+            "priced_coverage": round(float(summary.coverage), 3),
+            "baseline": "PV house without battery layer (no arbitrage, "
+            "no stored-solar shifting); load-shift value not included",
+        }
+        if delta is not None:
+            basis = delta.basis_sek_kwh
+            attributes["savings_excl_stored_sek"] = round(raw, 2)
+            attributes["stored_energy_value_sek"] = round(float(delta.value_sek), 2)
+            attributes["net_stored_kwh"] = round(float(delta.net_stored_kwh), 3)
+            # None, not 0.0: a window with no determinable basis must stay
+            # distinguishable from one whose stored energy genuinely cost nothing.
+            attributes["stored_basis_sek_kwh"] = (
+                round(float(basis), 4) if basis is not None else None
+            )
+            attributes["battery_coverage"] = round(float(delta.battery_coverage), 3)
+            if adjust_state:
+                attributes["baseline"] = (
+                    "PV house without battery layer (no arbitrage, no stored-solar "
+                    "shifting); load-shift value not included. State INCLUDES the "
+                    "value of energy still held in the battery at the cut, priced at "
+                    "what it cost to put there; savings_excl_stored_sek is the raw "
+                    "grid-cash figure the 30-day sensor uses"
+                )
         sensors.append(
             PublishedSensor(
                 object_id=object_id,
-                state=f"{round(float(summary.savings_sek), 2)}",
+                state=f"{round(state, 2)}",
                 unit="SEK",
                 device_class="monetary",
                 state_class="measurement",
                 icon="mdi:piggy-bank-outline",
                 friendly_name=name,
-                attributes={
-                    "actual_cost_sek": round(float(summary.actual_cost_sek), 2),
-                    "baseline_cost_sek": round(float(summary.baseline_cost_sek), 2),
-                    "n_slots": int(summary.n_slots),
-                    "priced_coverage": round(float(summary.coverage), 3),
-                    "baseline": "PV house without battery layer (no arbitrage, "
-                    "no stored-solar shifting); load-shift value not included",
-                },
+                attributes=attributes,
             )
         )
     return sensors
