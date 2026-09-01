@@ -3061,3 +3061,172 @@ class TestFinishedSlotBounds:
         start, end = finished_slot_bounds(now)
         assert start == tz.localize(datetime(2026, 8, 25, 23, 45))
         assert end == tz.localize(datetime(2026, 8, 26, 0, 0))
+
+
+class TestEnergyBalanceTripwire:
+    """The recorder flags quarters where energy conservation does not close.
+
+    Identity: (import + pv + discharge) - (export + charge + base_load + water + EV
+    + cyclic). The tripwire is computed BEFORE the balance-rescue, because the rescue
+    assigns load from this same identity and would drive the residual to exactly zero.
+    """
+
+    @pytest.fixture
+    def base_config(self):
+        return {
+            "timezone": "Europe/Stockholm",
+            "learning": {"sqlite_path": ":memory:"},
+            "input_sensors": {
+                "pv_power": "sensor.pv_power",
+                "load_power": "sensor.load_power",
+                "grid_power": "sensor.grid_power",
+                "battery_power": "sensor.battery_power",
+                "battery_soc": "sensor.battery_soc",
+                "total_pv_production": "sensor.total_pv_production",
+                "total_load_consumption": "sensor.total_load_consumption",
+            },
+            "system": {
+                "grid_meter_type": "net",
+                "has_battery": True,
+                "has_water_heater": False,
+                "has_ev_charger": False,
+            },
+            "water_heaters": [],
+            "ev_chargers": [],
+        }
+
+    async def _run(self, config, *, pv_delta, load_delta, grid_kw):
+        """Drive one observation and return (record, warning_calls).
+
+        PV and load energy come from the cumulative counters (the recorder prefers
+        them); grid comes from the power snapshot over the quarter.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            state_store = RecorderStateStore(state_file)
+            state_store.load()
+            now = datetime.now(pytz.timezone("Europe/Stockholm"))
+            prev_time = now - timedelta(minutes=15)
+            state_store._state = {
+                "pv_total": {"value": 100.0, "timestamp": prev_time.isoformat()},
+                "load_total": {"value": 50.0, "timestamp": prev_time.isoformat()},
+            }
+            state_store.save()
+
+            async def mock_kw(entity):
+                return {
+                    "sensor.pv_power": 5.0,
+                    "sensor.load_power": 7.0,
+                    "sensor.grid_power": grid_kw,
+                    "sensor.battery_power": 0.0,
+                }.get(entity, 0.0)
+
+            async def mock_float(entity):
+                return 50.0 if entity == "sensor.battery_soc" else None
+
+            async def mock_entity_state(entity):
+                return {
+                    "sensor.total_pv_production": {
+                        "state": f"{100.0 + pv_delta}",
+                        "attributes": {"unit_of_measurement": "kWh"},
+                        "last_updated": now.isoformat(),
+                    },
+                    "sensor.total_load_consumption": {
+                        "state": f"{50.0 + load_delta}",
+                        "attributes": {"unit_of_measurement": "kWh"},
+                        "last_updated": now.isoformat(),
+                    },
+                }.get(entity)
+
+            with (
+                patch(
+                    "backend.recorder.get_ha_sensor_kw_normalized",
+                    side_effect=mock_kw,
+                ),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=mock_float),
+                patch("backend.recorder.get_ha_entity_state", side_effect=mock_entity_state),
+                patch(
+                    "backend.recorder.get_energy_from_power_history",
+                    new_callable=AsyncMock,
+                    return_value=None,
+                ),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
+                patch("backend.recorder.logger") as mock_logger,
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=config, state_store=state_store
+                    )
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+                    warnings = [str(c) for c in mock_logger.warning.call_args_list]
+                    return record, warnings
+
+    @staticmethod
+    def _flags(record):
+        raw = record.get("quality_flags")
+        return json.loads(raw) if raw else {}
+
+    @pytest.mark.asyncio
+    async def test_balanced_slot_does_not_flag(self, base_config):
+        """import 1.75 + pv 1.25 - load 3.0 == 0: nothing to report."""
+        record, _ = await self._run(
+            base_config.copy(), pv_delta=1.25, load_delta=3.0, grid_kw=7.0
+        )
+        assert "balance_residual_kwh" not in self._flags(record)
+
+    @pytest.mark.asyncio
+    async def test_positive_imbalance_flags_with_the_residual_value(self, base_config):
+        """More energy arrived than left: 1.75 + 1.25 - 1.0 = +2.0 kWh unaccounted."""
+        record, warnings = await self._run(
+            base_config.copy(), pv_delta=1.25, load_delta=1.0, grid_kw=7.0
+        )
+        flags = self._flags(record)
+        assert flags["balance_residual_kwh"] == pytest.approx(2.0, abs=0.01)
+        assert any("energy balance did not close" in w for w in warnings)
+
+    @pytest.mark.asyncio
+    async def test_negative_imbalance_flags_too(self, base_config):
+        """The clamp trap: balance_base_kwh is max(0.0, ...), so a residual taken from
+        it could only ever show one sign. The two largest real imbalances on this site
+        were both negative."""
+        record, _ = await self._run(
+            base_config.copy(), pv_delta=1.25, load_delta=5.0, grid_kw=7.0
+        )
+        flags = self._flags(record)
+        assert flags["balance_residual_kwh"] == pytest.approx(-2.0, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_rescued_slot_abstains_instead_of_reporting_balanced(self, base_config):
+        """The vacuous-flag trap.
+
+        A frozen load counter triggers the balance-rescue, which sets load_kwh from the
+        very identity the tripwire tests — making the residual exactly zero. Such a slot
+        must NOT be recorded as balanced; it is unevaluable, and it says so by carrying
+        load_rescued and no residual. On live data this is 28.6% of all quarters and 90%
+        of quarters above 2.5 kWh PV.
+        """
+        record, _ = await self._run(
+            base_config.copy(), pv_delta=1.25, load_delta=0.0, grid_kw=7.0
+        )
+        flags = self._flags(record)
+        assert "load_rescued" in flags
+        assert "balance_residual_kwh" not in flags
+
+    @pytest.mark.asyncio
+    async def test_tolerance_is_configurable(self, base_config):
+        """A +2.0 kWh residual passes a 3.0 tolerance and trips a 0.5 one."""
+        loose = base_config.copy()
+        loose["recorder"] = {"balance_tolerance_kwh": 3.0}
+        record, _ = await self._run(loose, pv_delta=1.25, load_delta=1.0, grid_kw=7.0)
+        assert "balance_residual_kwh" not in self._flags(record)
+
+        tight = base_config.copy()
+        tight["recorder"] = {"balance_tolerance_kwh": 0.5}
+        record, _ = await self._run(tight, pv_delta=1.25, load_delta=1.0, grid_kw=7.0)
+        assert "balance_residual_kwh" in self._flags(record)
