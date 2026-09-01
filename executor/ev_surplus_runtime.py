@@ -507,6 +507,41 @@ def parse_ev_surplus_config(
     )
 
 
+@dataclass
+class ActuationResult:
+    """What ``_actuate`` ACTUALLY pushed to the device this tick — not what it wanted.
+
+    Before 2026-09-01 ``_actuate`` returned None and the run loop appended
+    ``cmd.set_current_a`` to ``applied`` regardless of whether any service call had
+    been made. ``_actuate`` has six early ``return`` paths, four of them silent, so
+    the summary line
+
+        EV surplus: ... -> [('tesla', True, 16.0)]
+
+    could repeat unchanged for 41 consecutive ticks off a SINGLE write. It did, on the
+    night of 2026-08-31: an HA automation clamped the car to 5 A at 02:20:00 while the
+    servo kept logging 16.0, because ``should_write_current`` saw its own stale intent
+    (|16.0 - 16.0| = 0 < min_step_a) and suppressed every subsequent write. Reading that
+    log as evidence of delivery cost an investigation an hour and produced a wrong
+    root cause. ``a_written`` is the fix: it is None whenever nothing left the process.
+
+    ``suppressed`` names WHY no current write happened, so the four silent returns are
+    visible for the first time:
+    ``guard`` (write-guard pacing / min-step), ``schmitt`` (quantizer dead zone),
+    ``easee_floor`` (sub-6 A refusal), ``no_current_write`` (off, uncontrollable, or no
+    amps in the command).
+
+    ``shadow`` records that service calls were suppressed by shadow mode, which is NOT
+    the same as being suppressed by a guard — shadow deliberately keeps the full decision
+    path so its logs show realistic write rates.
+    """
+
+    a_written: float | None = None
+    switch_written: bool | None = None
+    suppressed: str | None = None
+    shadow: bool = False
+
+
 class EVSurplusController:
     """Stateful runtime: reads HA, computes, actuates through the write-guard."""
 
@@ -694,11 +729,35 @@ class EVSurplusController:
                 fuse_limited=True,
             )
             try:
-                await self._actuate(ha, ccfg, cmd, now_ts, shadow)
+                act = await self._actuate(ha, ccfg, cmd, now_ts, shadow)
             except Exception:
                 logger.exception(
                     "EV surplus: fail-safe stop failed for %s — continuing", ccfg.id
                 )
+            else:
+                # The intent/delivery gap matters MOST here. This path logs
+                # "stopping all chargers" and then trusts _actuate silently — but a
+                # stop no-ops whenever _last_switch already says False, which is
+                # exactly the stale-intent state that let a foreign writer clamp the
+                # Tesla unnoticed on 2026-08-31. A fail-safe that quietly sent
+                # nothing must not read like one that stopped the car.
+                if act.shadow:
+                    logger.warning(
+                        "EV surplus fail-safe: %s NOT stopped — shadow mode "
+                        "(observe-only; no service call was made)", ccfg.id,
+                    )
+                elif act.switch_written is None and act.a_written is None:
+                    logger.warning(
+                        "EV surplus fail-safe: %s — NOTHING WAS SENT (%s). The servo "
+                        "already believed this charger was off; if it is in fact "
+                        "drawing, that belief is stale.",
+                        ccfg.id, act.suppressed or "no write path",
+                    )
+                else:
+                    logger.info(
+                        "EV surplus fail-safe: %s stopped (switch=%s, a=%s)",
+                        ccfg.id, act.switch_written, act.a_written,
+                    )
 
     async def _read_f(self, ha: Any, entity: str | None, default: float | None = None) -> float | None:
         if not entity:
@@ -1323,7 +1382,7 @@ class EVSurplusController:
                 if (now_ts - fail[0]) < backoff_s:
                     continue  # in failure backoff — spare the (Tesla) API
             try:
-                await self._actuate(ha, ccfg, cmd, now_ts, shadow, drawing_w=drawing_w)
+                act = await self._actuate(ha, ccfg, cmd, now_ts, shadow, drawing_w=drawing_w)
             except Exception:
                 # One charger's dead entity must not starve the others' actuation,
                 # and a sleeping Tesla must not be hammered every tick.
@@ -1383,11 +1442,22 @@ class EVSurplusController:
                     )
                 continue
             self._act_fail.pop(cmd.id, None)
-            applied.append({"id": cmd.id, "on": cmd.switch_on, "a": cmd.set_current_a, "why": cmd.reason})
+            # "a" stays the INTENT for backward compatibility; "a_written" is what
+            # actually left the process, and "suppressed" says why it did not.
+            applied.append({
+                "id": cmd.id, "on": cmd.switch_on, "a": cmd.set_current_a,
+                "a_written": act.a_written, "suppressed": act.suppressed,
+                "switch_written": act.switch_written, "why": cmd.reason,
+            })
 
+        # Render a_want -> a_written so a suppressed write can never again read as a
+        # delivered one. "16.0->-" means the servo wanted 16 A and sent nothing.
         logger.info("EV surplus: grid=%.0fW batt=%.0fW soc=%.0f%% price=%.2f(%s) vac=%s -> %s",
                     grid_w, battery_w, soc, price, price_source, vacation,
-                    [(a["id"], a["on"], a["a"]) for a in applied])
+                    [(a["id"], a["on"],
+                      f'{a["a"]}->{"-" if a["a_written"] is None else a["a_written"]}'
+                      + (f' ({a["suppressed"]})' if a["suppressed"] else ""))
+                     for a in applied])
         return {"enabled": True, "applied": applied, "price_sek": price, "price_source": price_source}
 
     async def _actuate(
@@ -1398,7 +1468,7 @@ class EVSurplusController:
         now_ts: float,
         shadow: bool,
         drawing_w: float = 0.0,
-    ) -> None:
+    ) -> ActuationResult:
         # Per-charger shadow (rollout gate): suppress service calls but keep the full
         # decision path + guard state, so shadow logs show realistic write rates.
         shadow = shadow or ccfg.shadow
@@ -1426,7 +1496,9 @@ class EVSurplusController:
             )
             self._last_switch[ccfg.id] = True
 
-        # Switch: only toggle on change.
+        # Switch: only toggle on change. `sw` carries what actually went to the
+        # device (None = no switch write happened this tick).
+        sw: bool | None = None
         if ccfg.switch_entity is not None and self._last_switch.get(ccfg.id) != cmd.switch_on:
             if not shadow:
                 svc = "turn_on" if cmd.switch_on else "turn_off"
@@ -1448,6 +1520,7 @@ class EVSurplusController:
                     self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
             self._last_switch[ccfg.id] = cmd.switch_on
+            sw = cmd.switch_on if not shadow else None
             # Any write invalidates a power reading older than it (trust_commanded_draw).
             self._last_cmd_ts[ccfg.id] = now_ts
 
@@ -1456,9 +1529,10 @@ class EVSurplusController:
         # charging at its last dynamic limit. The write-guard always allows a stop immediately.
         if not cmd.switch_on and ccfg.switch_entity is None and ccfg.easee_device_id:
             prev_a = self._last_a.get(ccfg.id)
-            if should_write_current(
+            wrote_zero = should_write_current(
                 prev_a, self._last_ts.get(ccfg.id), 0.0, now_ts, guard
-            ):
+            )
+            if wrote_zero:
                 if not shadow:
                     await ha.call_service(
                         "easee", "set_charger_dynamic_limit", None,
@@ -1469,7 +1543,12 @@ class EVSurplusController:
                 self._last_a[ccfg.id] = 0.0
                 self._last_ts[ccfg.id] = now_ts
                 self._last_cmd_ts[ccfg.id] = now_ts
-            return
+            return ActuationResult(
+                a_written=(0.0 if wrote_zero else None),
+                switch_written=sw,
+                suppressed=(None if wrote_zero else "guard"),
+                shadow=shadow,
+            )
 
         # Pause a switchless current-entity charger (e.g. a Tesla wired without its
         # switch): write 0 A — otherwise an "off" command silently no-ops and the
@@ -1481,9 +1560,10 @@ class EVSurplusController:
             and ccfg.current_entity
         ):
             prev_a = self._last_a.get(ccfg.id)
-            if should_write_current(
+            wrote_zero = should_write_current(
                 prev_a, self._last_ts.get(ccfg.id), 0.0, now_ts, guard
-            ):
+            )
+            if wrote_zero:
                 if not shadow:
                     await ha.call_service(
                         "number", "set_value", ccfg.current_entity, {"value": 0}
@@ -1493,11 +1573,18 @@ class EVSurplusController:
                 self._last_a[ccfg.id] = 0.0
                 self._last_ts[ccfg.id] = now_ts
                 self._last_cmd_ts[ccfg.id] = now_ts
-            return
+            return ActuationResult(
+                a_written=(0.0 if wrote_zero else None),
+                switch_written=sw,
+                suppressed=(None if wrote_zero else "guard"),
+                shadow=shadow,
+            )
 
         # Current: only when on, controllable, and the write-guard allows it.
         if not (cmd.switch_on and ccfg.controllable and cmd.set_current_a is not None):
-            return
+            return ActuationResult(
+                switch_written=sw, suppressed="no_current_write", shadow=shadow
+            )
         new_a = float(cmd.set_current_a)
         last_a = self._last_a.get(ccfg.id)
         # A fuse-guard reduction is overload relief — it must never be Schmitt-
@@ -1520,11 +1607,11 @@ class EVSurplusController:
             and abs(float(raw) - last_a)
             < self.cfg.policy.schmitt_fraction * max(0.0, self.cfg.policy.current_step_a)
         ):
-            return
+            return ActuationResult(switch_written=sw, suppressed="schmitt", shadow=shadow)
         if not should_write_current(
             last_a, self._last_ts.get(ccfg.id), new_a, now_ts, guard, fuse_relief=fuse_relief
         ):
-            return
+            return ActuationResult(switch_written=sw, suppressed="guard", shadow=shadow)
         # Easee hard floor (owner-confirmed: the FMB stops charging below 6 A) —
         # final backstop after the pure-layer clamp and the parse-time config clamp.
         if ccfg.easee_device_id and 0 < round(new_a) < 6:
@@ -1533,7 +1620,7 @@ class EVSurplusController:
                 new_a,
                 ccfg.id,
             )
-            return
+            return ActuationResult(switch_written=sw, suppressed="easee_floor", shadow=shadow)
         if not shadow:
             if ccfg.current_entity:
                 await ha.call_service("number", "set_value", ccfg.current_entity, {"value": new_a})
@@ -1546,3 +1633,6 @@ class EVSurplusController:
         self._last_a[ccfg.id] = new_a
         self._last_cmd_ts[ccfg.id] = now_ts
         self._last_ts[ccfg.id] = now_ts
+        return ActuationResult(
+            a_written=(None if shadow else new_a), switch_written=sw, shadow=shadow
+        )
