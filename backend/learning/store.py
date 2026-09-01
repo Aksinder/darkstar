@@ -205,8 +205,14 @@ class LearningStore:
         if unplaced_past:
             logger.warning(
                 "store_slot_prices: %d PAST slot(s) had no observation row to hold "
-                "their price (placed=%d, future=%d). Prices for those slots are lost "
-                "to savings/arbitrage until backfill_missing_prices repairs them.",
+                "their price (placed=%d, future=%d). The RECORDER missed those slots; "
+                "the price is dropped because there is no measurement to attach it to. "
+                "backfill_missing_prices canNOT repair this — it fills a missing price "
+                "on a row that EXISTS, and a slot with no row is absent from the "
+                "history range it iterates. Do NOT 'fix' this by making this function "
+                "INSERT: minting zero-energy rows is the 2026-08-08 regression the "
+                "obs_future_minted_rows tripwire exists to catch. Chase the observation "
+                "gap instead (/api/learning/coverage, obs_stale).",
                 unplaced_past,
                 placed,
                 unplaced_future,
