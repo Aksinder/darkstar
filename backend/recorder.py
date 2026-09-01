@@ -629,6 +629,27 @@ async def record_observation_from_current_state(
     load_rescued = False
     balance_total_kwh = pv_kwh + import_kwh - export_kwh + batt_discharge_kwh - batt_charge_kwh
     balance_base_kwh = max(0.0, balance_total_kwh - ev_charging_kwh - water_kwh)
+
+    # Energy-balance tripwire. How far the slot is from closing:
+    #   (import + pv + discharge) - (export + charge + base_load + water + EV + cyclic)
+    # Two things about WHERE and HOW this is computed are load-bearing:
+    #
+    # BEFORE the rescue below, because the rescue ASSIGNS load_kwh = balance_base_kwh,
+    # which drives this residual to exactly zero BY CONSTRUCTION. Measured on the live
+    # DB over 2026-08-04..09-01 against the load_rescued flag itself: 28.6% of all
+    # quarters and 90% of quarters above 2.5 kWh PV are rescued — i.e. a tripwire
+    # placed after the rescue would be blind on precisely the slots most likely broken.
+    #
+    # UNCLAMPED, unlike balance_base_kwh above. A max(0.0, ...) residual could only ever
+    # show one sign, and the two largest real imbalances in that month were NEGATIVE
+    # (-7.2 kWh and -3.7 kWh, both at low PV).
+    #
+    # cyclic_kwh is included here though the normal path's isolation is the only place
+    # it appears; omitting it would leave a term of the identity unaccounted.
+    balance_residual_kwh = balance_total_kwh - (
+        load_kwh + ev_charging_kwh + water_kwh + cyclic_kwh
+    )
+
     # A transient 0-read with a HEALTHY cumulative-counter delta must keep the
     # measured value — the counter is the better instrument. Rescue only when the
     # measurement itself is absent/zero: read invalid WITHOUT a cumulative source,
@@ -722,14 +743,75 @@ async def record_observation_from_current_state(
         "export_price_sek_kwh": export_price,
         "created_at": datetime.now(UTC).isoformat(),
     }
+    # Energy-balance tripwire: does conservation close on this slot?
+    #
+    # ABSTAINS on rescued or invalid-read slots rather than reporting them balanced. A
+    # rescued slot's residual is identically zero because the rescue computed load from
+    # this very identity; calling that "balanced" would be reporting the rescue's own
+    # arithmetic back to us.
+    #
+    # THRESHOLD. The review that raised this proposed +/-0.1 kWh. Measured against
+    # 2772 live quarters (2026-08-04..09-01, rescued slots excluded), +/-0.1 fires on
+    # 40.4% of them -- 27.6 flags/day, which is a log-spammer, not a signal. The
+    # non-rescued night population (pv < 0.05) closes tightly: median residual 0.0001
+    # kWh, only 6% past 0.1. The default below fires on 2.2% (1.5/day), spread across
+    # the day rather than clustered, and catches both signs.
+    #
+    # A PV-proportional allowance was considered and REJECTED on measurement: the
+    # hypothesis was that load_kwh is blind to the AC-coupled Fronius, which would make
+    # the residual scale with PV at roughly the Fronius production share (~0.58). The
+    # measured slope is +0.113 kWh per kWh PV with r = 0.155, and the per-bucket medians
+    # are not monotonic in PV (0.000 / +0.100 / +0.234 / -0.174 / -0.002). PV explains
+    # almost none of the variance, so a flat tolerance is the honest form.
+    #
+    # NOTE: that calibration was run on a residual WITHOUT cyclic_kwh, which is not
+    # persisted and so cannot be reconstructed from the database. If cyclic loads are
+    # configured and material, re-check the live firing rate before trusting the default.
+    recorder_cfg: dict[str, Any] = config.get("recorder", {}) or {}
+    balance_tolerance_kwh = float(recorder_cfg.get("balance_tolerance_kwh", 1.5))
+    balance_tripped = (
+        not load_rescued
+        and not load_read_invalid
+        and abs(balance_residual_kwh) > balance_tolerance_kwh
+    )
+    if balance_tripped:
+        logger.warning(
+            "Recorder: energy balance did not close for %s: residual %+.3f kWh "
+            "(tolerance %.3f) — pv=%.3f import=%.3f export=%.3f charge=%.3f "
+            "discharge=%.3f load=%.3f water=%.3f ev=%.3f cyclic=%.3f",
+            slot_start,
+            balance_residual_kwh,
+            balance_tolerance_kwh,
+            pv_kwh,
+            import_kwh,
+            export_kwh,
+            batt_charge_kwh,
+            batt_discharge_kwh,
+            load_kwh,
+            water_kwh,
+            ev_charging_kwh,
+            cyclic_kwh,
+        )
+
     # Provenance: tag rescued rows AND unrescued-but-invalid reads (the latter so a
-    # later repair/analysis can find them even though eval/train filters exclude them).
-    if load_rescued or load_read_invalid:
+    # later repair/analysis can find them even though eval/train filters exclude them),
+    # plus slots whose energy balance did not close.
+    #
+    # Written ONLY when one of these fires, never on every row. quarantine.py selects
+    # its price-mint population on _NO_PROVENANCE -- quality_flags IS NULL or '{}' --
+    # and treats anything else as claimed by a writer that "must not be relabelled"
+    # (quarantine.py:61-63). Stamping every row would empty that population entirely.
+    if load_rescued or load_read_invalid or balance_tripped:
         flags: dict[str, Any] = {}
         if load_rescued:
             flags["load_rescued"] = "energy_balance"
         if load_read_invalid:
             flags["load_read_invalid"] = True
+        if balance_tripped:
+            # The residual VALUE, not a boolean: a bare flag would bake today's
+            # tolerance into history irreversibly, while the number stays re-derivable
+            # against any later threshold.
+            flags["balance_residual_kwh"] = round(balance_residual_kwh, 3)
         record["quality_flags"] = json.dumps(flags)
 
     logger.info(
