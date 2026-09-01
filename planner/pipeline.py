@@ -751,6 +751,30 @@ class PlannerPipeline:
                         "Vacation: risk_appetite %d -> %d (smaller safety floor while away)",
                         _base_risk, _eff_risk,
                     )
+            # ...but risk_appetite is INERT whenever the cap binds, which is most of the
+            # time. calculate_safety_floor ends with
+            #     floor = min(min_soc + effective_reserve + weather, min_soc + max_buffer)
+            # so once the temporal deficit exceeds max_buffer the second term wins and
+            # neither the risk margin nor min_buffer can move the result. Live proof
+            # 2026-08-31: deficit 25.94 kWh, floor pinned at exactly min_soc + max_buffer
+            # for seven straight hours while the pack sat idle and the house imported.
+            # At risk 5 the arithmetic is unchanged. So the away override ALSO needs the
+            # cap itself — this is the lever that actually frees the reserve.
+            #
+            # Note the inverted direction: a HIGHER risk_appetite relaxes, a LOWER
+            # max_safety_buffer_percent relaxes. Both clamps are relax-only, so a
+            # mis-set value can never reserve MORE than an occupied house would.
+            _vac_cap = _vac_strategy.get("max_safety_buffer_percent") if vacation_enabled else None
+            if _vac_cap is not None:
+                _base_cap = float(s_index_cfg.get("max_safety_buffer_percent", 20.0))
+                _eff_cap = min(_base_cap, max(0.0, float(_vac_cap)))
+                if _eff_cap != _base_cap:
+                    s_index_cfg = {**s_index_cfg, "max_safety_buffer_percent": _eff_cap}
+                    logger.info(
+                        "Vacation: max_safety_buffer_percent %.0f -> %.0f "
+                        "(floor cap = min_soc + this; the lever that actually moves it)",
+                        _base_cap, _eff_cap,
+                    )
             base_factor = float(s_index_cfg.get("base_factor", 1.05))
 
             # Apply learned base factor

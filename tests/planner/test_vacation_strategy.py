@@ -172,3 +172,87 @@ def test_floor_never_below_min_soc(risk: int):
     assert floor >= BATTERY["capacity_kwh"] * BATTERY["min_soc_percent"] / 100.0 - 1e-6, (
         "relaxing the reserve must never dip under the battery's own min_soc"
     )
+
+
+class TestRiskAppetiteIsInertWhenTheCapBinds:
+    """The defect this class documents: the shipped away-override moved a lever that
+    cannot move the floor.
+
+    calculate_safety_floor ends with
+        floor = min(min_soc + max(deficit_reserve, min_buffer) + weather,
+                    min_soc + max_buffer)
+    Once the temporal deficit exceeds max_buffer the RIGHT term wins, and neither the
+    risk margin nor min_buffer appears in it. Live 2026-08-31: deficit 25.94 kWh, floor
+    pinned at exactly min_soc + max_buffer for seven hours while the pack sat idle at
+    27.7 % and the house imported 1.4 kW from the grid all night.
+    """
+
+    @staticmethod
+    def _deficit_heavy(risk: int, cap_pct: float = 20.0) -> float:
+        """Load far above PV, with a look-ahead window that actually HAS data.
+
+        The deficit is summed over the 24 h BEYOND the price horizon, so a bare 24 h
+        frame yields a deficit of zero and the min_buffer term wins instead — which is
+        a different regime entirely. Build 48 h and put the price horizon at the
+        midpoint so the look-ahead lands on real rows.
+        """
+        full = _df(load_kwh=2.0, pv_kwh=0.0, periods=192)
+        priced = full.iloc[:96]
+        floor, _ = calculate_safety_floor(
+            priced,
+            BATTERY,
+            {"risk_appetite": risk, "max_safety_buffer_percent": cap_pct},
+            TZ,
+            full_forecast_df=full,
+            price_horizon_end=priced.index[-1],
+        )
+        return floor
+
+    def test_risk_appetite_cannot_move_the_floor_when_the_cap_binds(self):
+        f3, f5 = self._deficit_heavy(3), self._deficit_heavy(5)
+        assert f3 == pytest.approx(f5), (
+            f"risk 3 gave {f3:.2f} and risk 5 gave {f5:.2f} — if these ever differ the "
+            "cap has stopped binding and this test's premise is gone"
+        )
+
+    def test_the_pinned_floor_is_exactly_min_soc_plus_the_cap(self):
+        # 10 % min_soc + 20 % cap on a 16 kWh pack = 4.80 kWh — the number observed live.
+        assert self._deficit_heavy(3) == pytest.approx(4.80)
+
+    def test_lowering_the_cap_is_what_actually_frees_the_reserve(self):
+        assert self._deficit_heavy(3, cap_pct=10.0) == pytest.approx(3.20)
+        assert self._deficit_heavy(3, cap_pct=0.0) == pytest.approx(1.60)  # == min_soc
+
+    def test_the_cap_can_never_push_below_min_soc(self):
+        # 0 % cap floors at min_soc, never under it — the battery's own limit stands.
+        assert self._deficit_heavy(5, cap_pct=0.0) >= BATTERY["capacity_kwh"] * 0.10 - 1e-9
+
+
+class TestVacationCapOverride:
+    """The fix: the away override must move the cap, not just the risk appetite."""
+
+    @staticmethod
+    def _src() -> str:
+        from pathlib import Path
+
+        import planner.pipeline as mod
+        return Path(mod.__file__).read_text()
+
+    def test_cap_override_is_lower_only_in_source(self):
+        assert "_eff_cap = min(_base_cap, max(0.0, float(_vac_cap)))" in self._src(), (
+            "the cap clamp must be min(base, override) and non-negative — relax-only, "
+            "so a mis-set away value can never reserve MORE than an occupied house"
+        )
+
+    def test_cap_override_is_gated_on_vacation_in_source(self):
+        assert (
+            '_vac_cap = _vac_strategy.get("max_safety_buffer_percent") if vacation_enabled else None'
+            in self._src()
+        ), "the cap override must apply only while away"
+
+    def test_both_levers_are_still_applied(self):
+        src = self._src()
+        assert "_eff_risk = max(_base_risk, min(5, int(_vac_risk)))" in src
+        assert '"max_safety_buffer_percent": _eff_cap' in src, (
+            "the clamped cap must actually reach s_index_cfg"
+        )
