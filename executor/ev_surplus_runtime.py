@@ -48,6 +48,12 @@ class EVSurplusChargerCfg:
     id: str
     switch_entity: str | None = None  # on/off
     current_entity: str | None = None  # number.* set_value path (e.g. Tesla)
+    # Where to READ the device's current limit back from. Defaults to current_entity,
+    # which for a number.* is both the write target and the readback. Only needs setting
+    # where the two differ — the Easee is written through a service and would read back
+    # from a sensor, and its dynamic-limit sensor updates only every ~37 min, so it is
+    # deliberately left unset for now (see readback_entity).
+    current_readback_entity: str | None = None
     easee_device_id: str | None = None  # easee.set_charger_dynamic_limit device (e.g. Easee)
     power_entity: str | None = None
     plug_entity: str | None = None
@@ -163,6 +169,17 @@ class EVSurplusChargerCfg:
     @property
     def controllable(self) -> bool:
         return bool(self.current_entity or self.easee_device_id)
+
+    @property
+    def readback_entity(self) -> str | None:
+        """Entity to read the device's current limit back from, or None for no readback.
+
+        Falls back to current_entity so a number.*-controlled charger gets the readback
+        with no config change at all. A charger written through a service (the Easee)
+        has no readable analogue here and simply gets None — the reconciliation and the
+        foreign-clamp rule then never engage for it, which is today's behaviour.
+        """
+        return self.current_readback_entity or self.current_entity
 
 
 @dataclass
@@ -413,6 +430,7 @@ def parse_ev_surplus_config(
                 id=str(c["id"]),
                 switch_entity=c.get("switch_entity") or None,
                 current_entity=c.get("current_entity") or None,
+                current_readback_entity=c.get("current_readback_entity") or None,
                 easee_device_id=c.get("easee_device_id") or None,
                 power_entity=c.get("power_entity") or None,
                 plug_entity=c.get("plug_entity") or None,
@@ -620,6 +638,14 @@ class EVSurplusController:
         # confirmation, on every stop, and on unplug/away.
         self._subst_since: dict[str, float] = {}
         self._subst_warned: set[str] = set()
+        # Foreign-clamp latch: the device's current limit was found at or below the
+        # charger's floor without Darkstar having put it there. While latched, Darkstar
+        # yields the RAISE (it stops writing increases above the clamp) but keeps the
+        # switch and keeps its right to REDUCE — yielding downward would be a safety
+        # regression on a shared fuse. See _read_charger for the predicate.
+        self._clamp_a: dict[str, float] = {}
+        self._clamp_since: dict[str, float] = {}
+        self._clamp_notified: set[str] = set()
         # EV-priority battery cap for the engine (see ev_priority_battery_cap_w).
         # None = do not touch the battery. Reset to None on every skipped or
         # fail-safe tick, so a stale cap can never outlive the tick that computed it.
@@ -827,6 +853,42 @@ class EVSurplusController:
         raw_rep = state.get("last_reported") or raw_ts
         return value, _epoch(raw_ts), _epoch(raw_rep)
 
+    async def _read_limit_with_ts(
+        self, ha: Any, entity: str | None
+    ) -> tuple[float | None, float | None]:
+        """Read a charger's current-limit register plus its VALUE-CHANGE epoch.
+
+        (None, None) for an absent entity, an unreadable state, or unknown/unavailable.
+        None means NO INFORMATION and must never be coerced to 0.0 — a 0 would be read
+        as "the device is at zero amps", which is the one value that can flip
+        commanded_on and manufacture a stop.
+
+        Uses last_updated, deliberately, not last_reported: the question here is "did the
+        value move AFTER our write", which is what proves a readback reflects the world
+        rather than our own pending command. (last_reported answers a different question
+        — "is the feed alive" — and is what the substitution bound in _read_charger uses
+        for diagnosis.)
+        """
+        if not entity:
+            return None, None
+        state = cast("dict[str, Any] | None", await ha.get_state(entity))
+        if not state:
+            return None, None
+        raw_state = state.get("state")
+        if isinstance(raw_state, str) and raw_state.lower() in ("unknown", "unavailable"):
+            return None, None
+        value = _f(raw_state)
+        if value is None:
+            return None, None
+        raw_ts = state.get("last_updated") or state.get("last_changed")
+        ts: float | None = None
+        if isinstance(raw_ts, str):
+            try:
+                ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = None
+        return value, ts
+
     async def _read_attr_f(
         self, ha: Any, entity: str | None, attr: str, default: float | None = None
     ) -> float | None:
@@ -928,10 +990,13 @@ class EVSurplusController:
             self._read_f(ha, c.target_soc_entity, None),
             self._read_attr_f(ha, c.departure_entity, "timestamp", None),
             self._read_f(ha, c.departure_target_entity, None),
+            # Appended LAST so every existing res[N] index keeps its meaning.
+            self._read_limit_with_ts(ha, c.readback_entity),
         )
         power, power_ts, report_ts = cast(
             "tuple[float | None, float | None, float | None]", res[0]
         )
+        dev_a, dev_ts = cast("tuple[float | None, float | None]", res[8])
         if power is None:
             power = 0.0
         plugged = bool(res[1])
@@ -950,6 +1015,11 @@ class EVSurplusController:
             # not inherit a ttl that started before it left.
             self._subst_since.pop(c.id, None)
             self._subst_warned.discard(c.id)
+            # ...and any foreign-clamp yield. The clamp is a fact about this session at
+            # this charge point; a car that left and came back gets a clean slate.
+            self._clamp_a.pop(c.id, None)
+            self._clamp_since.pop(c.id, None)
+            self._clamp_notified.discard(c.id)
             self._suc_notified.discard(c.id)
         override = str(res[3])
         soc = cast("float | None", res[4])
@@ -1021,6 +1091,60 @@ class EVSurplusController:
             deadline_hours = None
             if c.vacation_target_soc is not None:
                 target = c.vacation_target_soc
+        # --- Device readback: reconcile DOWNWARD, and detect a foreign clamp. ---
+        #
+        # Darkstar writes the current limit but has never read it back, so _last_a has
+        # been what it INTENDED, not what the device holds. Two gates make the readback
+        # safe to believe, and both are load-bearing:
+        #
+        # FRESHNESS. Only a reading whose value moved AFTER our last write proves the
+        # world responded rather than echoing our pending command; the Easee answers its
+        # own write within ~2 s, so an ungated readback would race it.
+        #
+        # KEY. Never create the _last_a key from a readback. This entity is a LIMIT
+        # REGISTER, not a charging indicator: number.white_betty_charge_current reads 16
+        # right now with the cable unplugged and the switch off. Creating the key would
+        # hand commanded_on below a definite value on a process that has never actuated,
+        # and _last_switch would still be absent — and the stop gate treats an absent
+        # key as "changed" (None != False), so that is the one path by which a readback
+        # could fire a real turn_off.
+        #
+        # DIRECTION. Sync only downward, and never write a value <= 0. commanded_on is
+        # exactly `_last_a > 0.0`, so a zero readback is the single value that could flip
+        # it and manufacture a stop. Raising _last_a from a readback is refused too: it
+        # feeds the fuse clamp as ChargerState.commanded_current_a, where T3 established
+        # that the own-draw term must never OVER-state. Downward-only keeps that
+        # invariant by construction.
+        dev_fresh = (
+            dev_a is not None
+            and dev_ts is not None
+            and dev_ts > self._last_cmd_ts.get(c.id, float("-inf"))
+        )
+        if dev_fresh and dev_a is not None and c.id in self._last_a:
+            prev_a = self._last_a[c.id]
+            # A foreign clamp: the device sits at or below this charger's floor without
+            # Darkstar having put it there. The `prev_a > c.min_current_a` term is the
+            # discriminating half and cannot be dropped — Darkstar commands its own
+            # min_current_a routinely (42 times on 2026-08-31 for the Tesla, whose floor
+            # IS 5 A), so the value alone cannot tell the two apart. `<=` cannot be
+            # weakened to `<` either, or the rule misses its actual adversary, which
+            # writes exactly the floor.
+            if prev_a > c.min_current_a >= dev_a:
+                if c.id not in self._clamp_a:
+                    self._clamp_since[c.id] = now_ts
+                self._clamp_a[c.id] = dev_a
+            elif dev_a > c.min_current_a:
+                # The clamp lifted. Resume normal control.
+                if self._clamp_a.pop(c.id, None) is not None:
+                    self._clamp_since.pop(c.id, None)
+                    self._clamp_notified.discard(c.id)
+                    logger.info(
+                        "EV surplus: %s foreign clamp released — device now at %.1f A",
+                        c.id, dev_a,
+                    )
+            if 0.0 < dev_a < prev_a:
+                self._last_a[c.id] = dev_a
+
         # Commanded state: _last_a is authoritative for controllable chargers (every
         # actuated stop zeroes it — see _actuate), the switch memory for binary ones.
         # None (never actuated this process) => the pure layer infers from power.
@@ -1358,6 +1482,36 @@ class EVSurplusController:
         # adds; (2) an away car (plugged at a public charger — its plug sensor is
         # car-side) is skipped: it is not charging at home, and its dedup entry
         # is cleared every tick, which re-buzzed every cycle; (3) the alert
+        # Foreign-clamp alarm — once per episode, and never in shadow (an observe-only
+        # executor writes nothing, so a divergence there is expected, not news).
+        if not shadow and cfg.notify_service:
+            for _ccfg in cfg.chargers:
+                _clamp = self._clamp_a.get(_ccfg.id)
+                if _clamp is None or _ccfg.id in self._clamp_notified:
+                    continue
+                self._clamp_notified.add(_ccfg.id)
+                logger.warning(
+                    "EV surplus: %s FOREIGN CLAMP at %.1f A (floor %.1f) — yielding "
+                    "raises; Darkstar keeps the switch and may still reduce",
+                    _ccfg.id, _clamp, _ccfg.min_current_a,
+                )
+                try:
+                    await ha.send_notification(
+                        cfg.notify_service,
+                        "Laddström klämd utifrån",
+                        (
+                            f"{_ccfg.id}: laddströmmen står på {_clamp:.0f} A, satt av "
+                            f"något annat än Darkstar. Darkstar slåss inte emot — den "
+                            f"höjer inte över {_clamp:.0f} A, men behåller strömbrytaren "
+                            f"och kan fortfarande sänka om säkringen kräver det. "
+                            f"Släpper automatiskt när gränsen höjs igen, vid urkoppling "
+                            f"eller när laddningen stoppas."
+                        ),
+                        data={"tag": f"darkstar_evclamp_{_ccfg.id}"},
+                    )
+                except Exception as exc:
+                    logger.warning("EV surplus: clamp notify failed: %s", exc)
+
         # requires the car to be COMMANDED ON this tick, so a force_off override
         # or a surplus-covered floor can no longer claim "grid-laddas nu".
         if (
@@ -1629,6 +1783,11 @@ class EVSurplusController:
                 # the 2026-08-15 incident restored by the fix meant to prevent it.
                 self._subst_since.pop(ccfg.id, None)
                 self._subst_warned.discard(ccfg.id)
+                # A stop ends the foreign-clamp yield too: the next session starts clean
+                # rather than inheriting a cap from the one before it.
+                self._clamp_a.pop(ccfg.id, None)
+                self._clamp_since.pop(ccfg.id, None)
+                self._clamp_notified.discard(ccfg.id)
             self._last_switch[ccfg.id] = cmd.switch_on
             sw = cmd.switch_on if not shadow else None
             # Any write invalidates a power reading older than it (trust_commanded_draw).
@@ -1658,6 +1817,11 @@ class EVSurplusController:
                 # the 2026-08-15 incident restored by the fix meant to prevent it.
                 self._subst_since.pop(ccfg.id, None)
                 self._subst_warned.discard(ccfg.id)
+                # A stop ends the foreign-clamp yield too: the next session starts clean
+                # rather than inheriting a cap from the one before it.
+                self._clamp_a.pop(ccfg.id, None)
+                self._clamp_since.pop(ccfg.id, None)
+                self._clamp_notified.discard(ccfg.id)
                 self._last_ts[ccfg.id] = now_ts
                 self._last_cmd_ts[ccfg.id] = now_ts
             return ActuationResult(
@@ -1695,6 +1859,11 @@ class EVSurplusController:
                 # the 2026-08-15 incident restored by the fix meant to prevent it.
                 self._subst_since.pop(ccfg.id, None)
                 self._subst_warned.discard(ccfg.id)
+                # A stop ends the foreign-clamp yield too: the next session starts clean
+                # rather than inheriting a cap from the one before it.
+                self._clamp_a.pop(ccfg.id, None)
+                self._clamp_since.pop(ccfg.id, None)
+                self._clamp_notified.discard(ccfg.id)
                 self._last_ts[ccfg.id] = now_ts
                 self._last_cmd_ts[ccfg.id] = now_ts
             return ActuationResult(
@@ -1716,6 +1885,21 @@ class EVSurplusController:
         fuse_relief = bool(getattr(cmd, "fuse_limited", False)) and (
             last_a is None or new_a < last_a
         )
+        # Foreign-clamp yield. Something outside Darkstar has pinned this charger's
+        # limit at or below its floor — on this site a dead-add-on fuse watchdog writes
+        # exactly 5 A (Tesla) and 6 A (Easee). Darkstar does NOT fight it: two
+        # controllers alternately rewriting the same register over a physical 25 A fuse
+        # is worse than charging slowly.
+        #
+        # It yields the RAISE, not the load. Stops have already returned above, and a
+        # fuse-guard reduction is explicitly exempt: yielding the DOWNWARD direction
+        # would turn a courtesy into a safety regression. Darkstar keeps the switch and
+        # keeps its right to reduce.
+        clamp_a = self._clamp_a.get(ccfg.id)
+        if clamp_a is not None and not fuse_relief and new_a > clamp_a:
+            return ActuationResult(
+                switch_written=sw, suppressed="foreign_clamp", shadow=shadow
+            )
         # Schmitt quantizer: a +/-1-step move is only real once the RAW (unsnapped)
         # target has cleared schmitt_fraction of a step away from the written value.
         # Kills midpoint dither and the config-vs-real-voltage churn that a 1 A grid
