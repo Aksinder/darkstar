@@ -541,3 +541,92 @@ class TestCombinedBatteryCap:
         d = self._decision(mode_intent="idle")
         cap(eng, d)
         assert d.max_charge == 800.0
+
+
+class TestOwnDrawIsALowerBound:
+    """T3: the clamp computes cap = own + (budget - meter_phase), which expands to
+    (budget - other_load) - (own - true_draw).
+
+    Every ampere by which ``own`` OVER-states the charger's present draw is an ampere of
+    phantom headroom handed straight to the car. ``own`` must therefore be a LOWER bound
+    — which is why the originally proposed max(sensor, commanded) must never ship: it
+    manufactures an upper bound and makes the guard permissive in exactly the direction
+    that matters for a physical fuse.
+    """
+
+    def test_supercharger_reading_cannot_inflate_the_cap(self):
+        """sensor.white_betty_charger_power reports the SUPERCHARGER's output when the
+        car is away — 167 kW peak over the last 90 days = 242 A/phase. Only the at_home
+        gate kept that out of the cap; the rating clamp closes it properly."""
+        from executor.ev_surplus import _fuse_own_draw_a
+
+        tesla = _tesla(soc_percent=50.0, deadline_hours=None, current_power_w=167000.0)
+        # Raw arithmetic would give 167000/(230*3) = 242 A.
+        assert tesla.current_power_w / (tesla.voltage_v * tesla.phases) > 240.0
+        assert _fuse_own_draw_a(tesla) == tesla.max_current_a
+
+    def test_commanded_current_lowers_but_never_raises_the_estimate(self):
+        from executor.ev_surplus import _fuse_own_draw_a
+
+        # Sensor says 16 A, but we only ever commanded 6 => the car cannot be drawing
+        # more than 6. Take the lower.
+        hi = _tesla(soc_percent=50.0, deadline_hours=None,
+                    current_power_w=16.0 * 230.0 * 3, commanded_current_a=6.0)
+        assert _fuse_own_draw_a(hi) == pytest.approx(6.0)
+
+        # Sensor says 0 (car declined), command says 16 => the LOWER value wins, so the
+        # guard stays conservative. max() here would have invented 16 A of draw.
+        lo = _tesla(soc_percent=50.0, deadline_hours=None,
+                    current_power_w=0.0, commanded_current_a=16.0)
+        assert _fuse_own_draw_a(lo) == pytest.approx(0.0)
+
+    def test_absent_command_behaves_exactly_as_before(self):
+        from executor.ev_surplus import _fuse_own_draw_a
+
+        c = _tesla(soc_percent=50.0, deadline_hours=None, current_power_w=8.0 * 230.0 * 3)
+        assert c.commanded_current_a is None
+        assert _fuse_own_draw_a(c) == pytest.approx(8.0)
+
+
+class TestNoSpuriousShedWhenTheFuseIsFine:
+    """T3: a negative delta is NOT the same question as 'is a phase over budget'.
+
+    delta also goes negative merely because a sibling charger's grant consumed the
+    shared ledger. Only the METER-ONLY condition licenses forcing a reduction — and when
+    no phase is over budget, the meter has already proved the present state fits the
+    fuse, so the clamp may bound growth but must not manufacture a shed.
+    """
+
+    def test_running_charger_is_not_stopped_while_every_phase_fits(self):
+        """The spurious stop. The car draws 11 kW but its sensor reads 0 (a stale poll
+        on the Tesla's 600 s grid), so own = 0 and cap = delta alone. Before the fix
+        that capped a running car below its minimum and emitted a real turn_off."""
+        tesla = _tesla(soc_percent=50.0, deadline_hours=None, current_power_w=0.0,
+                       commanded_on=True)
+        # Meter carries the car's real draw; no phase is over the 23 A budget.
+        cmds = {c.id: c for c in compute_ev_surplus(
+            _inputs([tesla], {"a": 18.2, "b": 17.0, "c": 19.6}), BUDGET
+        )}
+        assert cmds["tesla"].switch_on, "a running car must not be stopped by the clamp"
+
+    def test_over_budget_still_sheds(self):
+        """The safety direction is untouched: a phase genuinely past the budget still
+        forces the reduction, exactly as before."""
+        tesla = _tesla(soc_percent=50.0, deadline_hours=None, current_power_w=0.0,
+                       commanded_on=True)
+        cmds = {c.id: c for c in compute_ev_surplus(
+            _inputs([tesla], {"a": 30.0, "b": 17.0, "c": 19.6}), BUDGET
+        )}
+        assert cmds["tesla"].fuse_limited
+        assert not cmds["tesla"].switch_on
+
+    def test_floor_cannot_start_a_stopped_charger(self):
+        """The floor is gated on _is_on: it may only REDUCE a running charger, never
+        START a stopped one. That gate is what bounds the worst case — without it the
+        clamp could authorise a cold car onto an already-loaded phase."""
+        tesla = _tesla(soc_percent=50.0, deadline_hours=None, current_power_w=0.0,
+                       commanded_on=False)
+        cmds = {c.id: c for c in compute_ev_surplus(
+            _inputs([tesla], {"a": 22.5, "b": 22.5, "c": 22.5}, surplus_w=0.0), BUDGET
+        )}
+        assert not cmds["tesla"].switch_on

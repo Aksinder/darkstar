@@ -179,6 +179,11 @@ class ChargerState:
     # Min-OFF dwell active: this charger was recently stopped and must not restart
     # yet (anti-flap). Deadline floors are exempt — grid-backed forcing punches through.
     start_inhibited: bool = False
+    # Runtime's last COMMANDED per-phase amps — the lever position, not a measurement.
+    # The ampere sibling of commanded_on above. Used ONLY to LOWER the fuse guard's
+    # estimate of this charger's own draw (a car cannot draw more than the limit it was
+    # given), never to raise it. None => unknown, behave exactly as before.
+    commanded_current_a: float | None = None
 
 
 @dataclass
@@ -351,31 +356,63 @@ def _fuse_delta_allowed_a(
     inputs: EVSurplusInputs,
     cfg: EVSurplusConfig,
     alloc: dict[str, float],
-) -> tuple[float | None, tuple[str, ...]]:
-    """Allowed per-phase ampere INCREASE for this charger, or (None, ()) = guard off.
+) -> tuple[float | None, tuple[str, ...], bool]:
+    """Allowed per-phase ampere INCREASE, the phases, and whether a phase is over budget.
 
-    Blind (no/partial readings) => 0.0: hold-or-reduce only. Export-aware via
-    _export_credit_a. Shared by the force_on path and pass 2 — a manual comfort
-    override does not outrank the main fuse when a deadline guarantee does not.
+    Returns (None, (), False) = guard off; (0.0, phases, False) on the blind branch
+    (no/partial readings => hold-or-reduce only). Export-aware via _export_credit_a.
+    Shared by the force_on path and pass 2 — a manual comfort override does not outrank
+    the main fuse when a deadline guarantee does not.
+
+    ``over_budget`` is computed from the METER ALONE, deliberately excluding ``alloc``.
+    A negative ``delta`` is NOT the same question as "is a phase physically overloaded":
+    delta also goes negative merely because a sibling charger's grant consumed the shared
+    ledger, which is a budgeting fact, not an overload. Only the meter-only condition
+    licenses forcing a REDUCTION, and only it needs no attribution term to be trusted.
     """
     if cfg.fuse_budget_a is None:
-        return None, ()
+        return None, (), False
     phases = c.phase_map or tuple(sorted(inputs.phase_currents_a.keys()))
     if not inputs.phase_currents_a or any(
         p not in inputs.phase_currents_a for p in phases
     ):
-        return 0.0, phases
+        return 0.0, phases, False
     credit = _export_credit_a(inputs.grid_w, c.voltage_v)
+    over_budget = any(
+        max(0.0, inputs.phase_currents_a[p] - credit) > cfg.fuse_budget_a for p in phases
+    )
     return min(
         cfg.fuse_budget_a
         - max(0.0, inputs.phase_currents_a[p] - credit)
         - alloc.get(p, 0.0)
         for p in phases
-    ), phases
+    ), phases, over_budget
 
 
 def _charger_max_w(c: ChargerState) -> float:
     return c.max_current_a * c.voltage_v * c.phases
+
+
+def _fuse_own_draw_a(c: ChargerState) -> float:
+    """LOWER bound on this charger's present per-phase draw, for the fuse clamp.
+
+    THE INVARIANT: the clamp computes cap = own + (budget - meter_phase), which expands
+    to (budget - other_load) - (own - true_draw). Every ampere by which ``own``
+    OVER-states the real draw is an ampere of phantom headroom handed to the charger.
+    ``own`` must therefore never over-state. That is why this takes minima, and why
+    max(sensor, commanded) — an UPPER bound — must never be substituted here.
+
+    Two clamps, both previously missing:
+    - ``max_current_a``: sensor.white_betty_charger_power reports the SUPERCHARGER's
+      output when the car is away — 167 kW peak in the last 90 days, i.e. 242 A/phase.
+      Only the at_home gate keeps that out of the cap today.
+    - ``commanded_current_a``: the car cannot draw more than the limit it was given.
+      Stays a valid lower bound even under a foreign write, which can only lower it.
+    """
+    a = c.current_power_w / (c.voltage_v * c.phases)
+    if c.commanded_current_a is not None:
+        a = min(a, c.commanded_current_a)
+    return max(0.0, min(a, c.max_current_a))
 
 
 def _charger_min_on_w(c: ChargerState, cfg: EVSurplusConfig) -> float:
@@ -618,6 +655,11 @@ class EVSurplusTick:
     demand: bool = False
     reserve_active: bool = False
     computed: bool = False
+    # The fuse ledger this tick: per-phase ampere increases GRANTED to the chargers.
+    # Published so the runtime consumes THIS ledger rather than rebuilding its own from
+    # the returned commands — two independent derivations of one meter snapshot is
+    # exactly the double-spend the ev_alloc_a subtraction exists to prevent.
+    fuse_alloc_a: dict[str, float] = field(default_factory=dict[str, float])
 
 
 def ev_priority_battery_cap_w(
@@ -733,17 +775,39 @@ def compute_ev_surplus(
         # force_on at 16 A on the VVB phase was a ~35 A stack).
         amps = c.max_current_a
         fuse_capped = False
-        delta_a, fuse_phases = _fuse_delta_allowed_a(c, inputs, cfg, fuse_alloc_a)
+        delta_a, fuse_phases, over_budget = _fuse_delta_allowed_a(
+            c, inputs, cfg, fuse_alloc_a
+        )
         if delta_a is not None:
-            per_phase_now_a = c.current_power_w / (c.voltage_v * c.phases)
-            cap_a = max(0.0, per_phase_now_a + delta_a)
+            per_phase_now_a = _fuse_own_draw_a(c)
+            if over_budget:
+                # A phase is physically over budget: shed, exactly as before.
+                cap_a = max(0.0, per_phase_now_a + delta_a)
+            else:
+                # The meter has already proved the PRESENT state fits the fuse, so the
+                # clamp's only legitimate job here is to bound GROWTH. It must not
+                # manufacture a shed — still less a stop — out of an attribution term
+                # it cannot trust. _is_on gates the floor so it can only ever REDUCE a
+                # running charger, never START a stopped one.
+                cap_a = per_phase_now_a + delta_a
+                if _is_on(c):
+                    cap_a = max(
+                        cap_a,
+                        min(c.max_current_a, max(c.min_current_a, cfg.min_charge_current_a)),
+                    )
             if cap_a < amps:
                 amps = cap_a
                 fuse_capped = True
             step_f = max(0.0, cfg.current_step_a)
             if fuse_capped and step_f > 0:
                 amps = (amps // step_f) * step_f
-            if amps < c.min_current_a or (not c.controllable and fuse_capped):
+            # Denying a force_on outright is only licensed when a phase is physically
+            # over budget, or when the charger is not already running (then it is a
+            # refusal to START, not a stop). Capping a RUNNING charger below its
+            # minimum on nothing but the attribution term is the spurious stop this
+            # guard must not produce.
+            deny = amps < c.min_current_a or (not c.controllable and fuse_capped)
+            if deny and (over_budget or not _is_on(c)):
                 commands.append(
                     ChargerCommand(c.id, switch_on=False,
                                    set_current_a=0.0 if c.controllable else None,
@@ -752,6 +816,8 @@ def compute_ev_surplus(
                                    fuse_limited=True)
                 )
                 continue
+            if deny:
+                amps = max(amps, min(c.max_current_a, c.min_current_a))
             for p in fuse_phases:
                 fuse_alloc_a[p] = fuse_alloc_a.get(p, 0.0) + max(
                     0.0, amps - per_phase_now_a
@@ -957,10 +1023,28 @@ def compute_ev_surplus(
         # target below min-on falls through to OFF — even for a deadline floor:
         # fuse safety trumps the punch-through). ---
         fuse_capped = False
-        per_phase_now_a = c.current_power_w / (c.voltage_v * c.phases)
-        delta_allowed_a, fuse_phases = _fuse_delta_allowed_a(c, inputs, cfg, fuse_alloc_a)
+        per_phase_now_a = _fuse_own_draw_a(c)
+        delta_allowed_a, fuse_phases, over_budget = _fuse_delta_allowed_a(
+            c, inputs, cfg, fuse_alloc_a
+        )
         if delta_allowed_a is not None:
-            cap_w = max(0.0, per_phase_now_a + delta_allowed_a) * c.voltage_v * c.phases
+            if over_budget:
+                # A phase is physically over budget: shed, byte-for-byte as before.
+                cap_a = max(0.0, per_phase_now_a + delta_allowed_a)
+            else:
+                # No phase is over budget — the meter has already proved the present
+                # state fits the fuse. The clamp may bound GROWTH but must not force a
+                # reduction, and must never turn a running charger off, on the strength
+                # of an own-draw term the sensor cannot be trusted to supply. _is_on
+                # gates the floor: it can only REDUCE a running charger, never START a
+                # stopped one, which is what keeps the worst case bounded.
+                cap_a = per_phase_now_a + delta_allowed_a
+                if _is_on(c):
+                    cap_a = max(
+                        cap_a,
+                        min(c.max_current_a, max(c.min_current_a, cfg.min_charge_current_a)),
+                    )
+            cap_w = cap_a * c.voltage_v * c.phases
             if cap_w < target_w:
                 target_w = cap_w
                 fuse_capped = True
@@ -1036,4 +1120,6 @@ def compute_ev_surplus(
         tick_out.commanded_on_total_w = sum(
             cmd.target_power_w for cmd in commands if cmd.switch_on
         )
+        # The authoritative fuse ledger — see EVSurplusTick.fuse_alloc_a.
+        tick_out.fuse_alloc_a = dict(fuse_alloc_a)
     return commands
