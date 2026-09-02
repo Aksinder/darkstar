@@ -187,3 +187,62 @@ class TestUnknownPrice:
         d, ha = _dispatcher(ExportCurtailmentConfig(enabled=True, restore_limit_w=0))
         await d._apply_export_curtailment(None)
         assert 0.0 not in _export_writes(ha)
+
+
+class TestRejectedRestoreSelfHeals:
+    """The number path is the dangerous half: _set_max_export_power turns the limit MODE
+    SWITCH ON whenever the write reports success, so a value the DEVICE refuses leaves the
+    switch enforcing whatever stale low limit the register still holds. The site then sits
+    curtailed with nothing trying to lift it.
+
+    Not hypothetical: Sungrow SH10RT register 13073 accepts 8500 and 400 but rejects 10000
+    with a pymodbus isError — and 10000 is exactly the restore_limit_w configured live.
+    """
+
+    @staticmethod
+    def _rejecting(written_but_holds: str, restore_w: float):
+        """A device that accepts the service call but whose register keeps its old value."""
+        d, ha = _dispatcher(
+            ExportCurtailmentConfig(enabled=True, restore_limit_w=restore_w),
+            current_limit=written_but_holds,
+        )
+        return d, ha
+
+    @staticmethod
+    def _switch_writes(ha) -> list[bool]:
+        return [
+            c.args[1]
+            for c in ha.set_switch.call_args_list
+            if c.args and c.args[0] == SWITCH_ENTITY
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_restore_falls_back_to_switch_off(self):
+        # The register holds 400 W and refuses 10000: the readback never becomes 10000.
+        d, ha = self._rejecting("400", 10000.0)
+        await d._apply_export_curtailment(0.5)  # price above threshold => restore
+        assert 10000.0 in _export_writes(ha), "it must still attempt the configured restore"
+        # ...and, seeing the register did not take it, must end unlimited rather than
+        # leaving the mode switch enforcing 400 W.
+        assert self._switch_writes(ha)[-1] is False
+
+    @pytest.mark.asyncio
+    async def test_an_accepted_restore_does_not_touch_the_switch_off(self):
+        """The healthy path must be untouched: a device that TAKES the value keeps the
+        limit enforced at it, exactly as before."""
+        d, ha = self._rejecting("400", 8500.0)
+
+        # A device that accepts: the register reads 400 until we write, then 8500.
+        state = {"v": "400"}
+
+        async def _accepting_write(entity, value):
+            if entity == EXPORT_ENTITY:
+                state["v"] = str(value)
+            return True
+
+        ha.set_number = AsyncMock(side_effect=_accepting_write)
+        ha.get_state_value = AsyncMock(side_effect=lambda _e: state["v"])
+
+        await d._apply_export_curtailment(0.5)
+        assert 8500.0 in _export_writes(ha)
+        assert False not in self._switch_writes(ha)
