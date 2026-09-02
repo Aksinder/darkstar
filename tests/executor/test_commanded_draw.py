@@ -207,3 +207,129 @@ async def test_a_trickle_is_not_a_self_start():
     ha = TimedHA(_states(**{"sensor.tesla_power": "300"}), {"sensor.tesla_power": LATER})
     st = await _read(ctrl, ha, cfg, now_ts=_epoch(LATER))
     assert st.commanded_on is False
+
+
+# --- T4: the substitution is bounded in wall-clock time ------------------------------
+#
+# Without a bound it never ends. These sensors poll and write on CHANGE, so when the car
+# declines the value does not move, last_updated never advances past our write, and the
+# fiction stands indefinitely. Measured on sensor.white_betty_charger_power: 0.0 held
+# with a frozen last_updated for 3.6 h while the integration reported every 600 s.
+
+EXPIRED_NOW = _epoch("2026-08-15T10:24:00+00:00")  # CMD_TS + 1016 s, past the 900 s ttl
+
+
+@pytest.mark.asyncio
+async def test_the_incident_survives_the_bound():
+    """The case the mechanism exists for must still be covered.
+
+    ttl >= R + T, where R is the charger's REPORT interval (Tesla 600 s, a hard
+    coordinator grid) and T the 60 s servo tick. At the decisive 12:08:05 tick only 61 s
+    have elapsed, against a 900 s ttl — 839 s of margin, structural rather than lucky.
+    """
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 8.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "0"}), {"sensor.tesla_power": BEFORE})
+    st = await _read(ctrl, ha, cfg, now_ts=_epoch("2026-08-15T10:08:05+00:00"))
+    assert st.current_power_w == pytest.approx(8.0 * 3 * 230.0)
+
+
+@pytest.mark.asyncio
+async def test_substitution_expires_and_the_raw_reading_returns():
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 8.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "0"}), {"sensor.tesla_power": BEFORE})
+    # Inside the window the fiction stands...
+    st = await _read(ctrl, ha, cfg, now_ts=STALE_NOW)
+    assert st.current_power_w == pytest.approx(8.0 * 3 * 230.0)
+    # ...past it the measurement returns, however unwelcome.
+    st = await _read(ctrl, ha, cfg, now_ts=EXPIRED_NOW)
+    assert st.current_power_w == 0.0
+
+
+@pytest.mark.asyncio
+async def test_repeated_writes_do_not_extend_the_episode():
+    """The ttl is anchored to the FIRST unconfirmed command, not the latest.
+
+    _last_cmd_ts is restamped by every write, so anchoring there would let a servo that
+    keeps writing every tick hold the fiction open forever — precisely the failure the
+    bound exists to close.
+    """
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 8.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "0"}), {"sensor.tesla_power": BEFORE})
+    await _read(ctrl, ha, cfg, now_ts=STALE_NOW)  # opens the episode
+    # The servo writes again, 10 minutes in. The anchor must NOT move.
+    ctrl._last_cmd_ts["tesla"] = EXPIRED_NOW - 60.0
+    st = await _read(ctrl, ha, cfg, now_ts=EXPIRED_NOW)
+    assert st.current_power_w == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_stop_then_start_gets_a_fresh_substitution_window():
+    """The silent trap: an anchor cleared only on sensor confirmation never clears.
+
+    A stop zeroes the commanded amps while the sensor's value is ALREADY 0.0, so
+    last_updated never advances past the write. Without an explicit clear on the stop
+    path, the NEXT start begins already expired and gets no protection at all — the
+    2026-08-15 incident restored by the fix meant to prevent it.
+    """
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 8.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "0"}), {"sensor.tesla_power": BEFORE})
+    await _read(ctrl, ha, cfg, now_ts=STALE_NOW)
+    await _read(ctrl, ha, cfg, now_ts=EXPIRED_NOW)  # episode expires
+    assert "tesla" in ctrl._subst_since
+
+    # The stop path clears the anchor (mirrors what _actuate does on switch_on=False).
+    ctrl._subst_since.pop("tesla", None)
+    ctrl._subst_warned.discard("tesla")
+
+    # A new start, well after the old episode would have expired, is protected again.
+    ctrl._last_a["tesla"] = 8.0
+    ctrl._last_cmd_ts["tesla"] = EXPIRED_NOW
+    st = await _read(ctrl, ha, cfg, now_ts=EXPIRED_NOW + 30.0)
+    assert st.current_power_w == pytest.approx(8.0 * 3 * 230.0)
+
+
+@pytest.mark.asyncio
+async def test_catching_up_closes_the_episode():
+    """A confirmed reading ends the episode, so the next command starts a fresh ttl."""
+    ctrl, cfg = _ctrl()
+    ctrl._last_a["tesla"] = 8.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    stale = TimedHA(_states(**{"sensor.tesla_power": "0"}), {"sensor.tesla_power": BEFORE})
+    await _read(ctrl, stale, cfg, now_ts=STALE_NOW)
+    assert "tesla" in ctrl._subst_since
+
+    fresh = TimedHA(_states(**{"sensor.tesla_power": "5200"}), {"sensor.tesla_power": AFTER})
+    st = await _read(ctrl, fresh, cfg, now_ts=FRESH_NOW)
+    assert st.current_power_w == pytest.approx(5200.0)
+    assert "tesla" not in ctrl._subst_since
+
+
+@pytest.mark.asyncio
+async def test_ttl_is_per_charger_and_configurable():
+    """No single global value exists: the Tesla needs >= 660 s (600 s poll grid + 60 s
+    tick) while the Easee's ceiling is its 180 s min_off_s. The interval is empty, so
+    the bound has to be per-charger."""
+    raw = _cfg_dict()
+    for c in raw["ev_surplus"]["chargers"]:
+        if c["id"] == "tesla":
+            c["commanded_draw_ttl_s"] = 120.0
+    ctrl, cfg = _ctrl(**raw["ev_surplus"])
+    assert _tesla_cfg(cfg).commanded_draw_ttl_s == pytest.approx(120.0)
+
+    ctrl._last_a["tesla"] = 8.0
+    ctrl._last_cmd_ts["tesla"] = CMD_TS
+    ha = TimedHA(_states(**{"sensor.tesla_power": "0"}), {"sensor.tesla_power": BEFORE})
+    # 25 s in: inside the shortened ttl.
+    st = await _read(ctrl, ha, cfg, now_ts=STALE_NOW)
+    assert st.current_power_w == pytest.approx(8.0 * 3 * 230.0)
+    # 200 s in: past it, though the 900 s default would still have been substituting.
+    st = await _read(ctrl, ha, cfg, now_ts=CMD_TS + 200.0)
+    assert st.current_power_w == 0.0

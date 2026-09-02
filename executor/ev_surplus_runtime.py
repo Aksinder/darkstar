@@ -73,6 +73,25 @@ class EVSurplusChargerCfg:
     # looks exactly like a cloud. The servo then switches off the load it just created.
     # Only ever substitutes while the reading demonstrably predates our own write.
     trust_commanded_draw: bool = True
+    # ...and for at most this long. Without a bound the substitution never ends: on a
+    # poll-and-write-on-change sensor the value does NOT move when the car declines, so
+    # last_updated never advances past our write. Measured on this exact site,
+    # sensor.white_betty_charger_power held 0.0 with a frozen last_updated for 3.6 h
+    # while the integration reported every 600 s.
+    #
+    # Sized as R + T, where R is the charger's REPORT interval and T the 60 s servo tick:
+    #   Tesla  R = 600 s — tesla_fleet publishes the whole charging cluster on a hard
+    #          grid (every recorded value change lands 600.0 s apart, and last_reported
+    #          keeps beating while the car is asleep and disconnected) => ttl >= 660.
+    #   Easee  R ~ 6 s — event-driven, it pushes the result of our own write
+    #          (2026-08-30 08:28:08 115 W -> 08:28:14 1801 W) => ttl >= 66.
+    # Ceiling is that charger's min_off_s: never believe the fiction for longer than the
+    # lockout it exists to prevent. Tesla [660, 900], Easee [66, 180] — so NO single
+    # global value exists, and this is deliberately per-charger.
+    #
+    # NOT the value-change interval, which is far longer (median ~450 s, max ~8954 s)
+    # and measures something else entirely: how often the car's draw happens to change.
+    commanded_draw_ttl_s: float = 900.0
     priority: int = 0
     min_current_a: float = 6.0
     max_current_a: float = 16.0
@@ -403,6 +422,7 @@ def parse_ev_surplus_config(
                 override_timeout_minutes=float(c.get("override_timeout_minutes", 0.0) or 0.0),
                 wake_entity=c.get("wake_entity") or None,
                 trust_commanded_draw=bool(c.get("trust_commanded_draw", True)),
+                commanded_draw_ttl_s=float(c.get("commanded_draw_ttl_s", 900.0)),
                 priority=int(c.get("priority", 0)),
                 min_current_a=float(c.get("min_current_a", 6.0)),
                 max_current_a=float(c.get("max_current_a", 16.0)),
@@ -593,6 +613,13 @@ class EVSurplusController:
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
         self._last_cmd_ts: dict[str, float] = {}
+        # Epoch of the FIRST command of the current UNCONFIRMED episode — what the
+        # commanded_draw_ttl_s bound is measured from. Deliberately not _last_cmd_ts,
+        # which every write restamps and which would therefore let a servo that keeps
+        # writing every tick extend the fiction indefinitely. Cleared on sensor
+        # confirmation, on every stop, and on unplug/away.
+        self._subst_since: dict[str, float] = {}
+        self._subst_warned: set[str] = set()
         # EV-priority battery cap for the engine (see ev_priority_battery_cap_w).
         # None = do not touch the battery. Reset to None on every skipped or
         # fail-safe tick, so a stale cap can never outlive the tick that computed it.
@@ -768,22 +795,37 @@ class EVSurplusController:
 
     async def _read_power_with_ts(
         self, ha: Any, entity: str | None
-    ) -> tuple[float | None, float | None]:
-        """Read a power sensor plus the epoch of its last update (None if unknown)."""
+    ) -> tuple[float | None, float | None, float | None]:
+        """Read a power sensor plus TWO clocks (either None if unknown).
+
+        They are different questions and the code depends on the difference:
+        - ``power_ts`` (last_updated) — when the VALUE last changed. Proof the world
+          moved. The self-start adoption above keys on this and must keep doing so.
+        - ``report_ts`` (last_reported) — when the integration last SPOKE, whether or
+          not the value moved. Proof the feed is alive. A polled sensor publishing a
+          steady value advances only this one.
+
+        Both fall back to the older field, so a client that supplies neither degrades to
+        exactly the previous behaviour and report_ts is always >= power_ts.
+        """
         if not entity:
-            return None, None
+            return None, None, None
         state = cast("dict[str, Any] | None", await ha.get_state(entity))
         if not state:
-            return None, None
+            return None, None, None
         value = _f(state.get("state"))
-        raw_ts = state.get("last_updated") or state.get("last_changed")
-        ts: float | None = None
-        if isinstance(raw_ts, str):
+
+        def _epoch(raw: Any) -> float | None:
+            if not isinstance(raw, str):
+                return None
             try:
-                ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
             except ValueError:
-                ts = None
-        return value, ts
+                return None
+
+        raw_ts = state.get("last_updated") or state.get("last_changed")
+        raw_rep = state.get("last_reported") or raw_ts
+        return value, _epoch(raw_ts), _epoch(raw_rep)
 
     async def _read_attr_f(
         self, ha: Any, entity: str | None, attr: str, default: float | None = None
@@ -887,7 +929,9 @@ class EVSurplusController:
             self._read_attr_f(ha, c.departure_entity, "timestamp", None),
             self._read_f(ha, c.departure_target_entity, None),
         )
-        power, power_ts = cast("tuple[float | None, float | None]", res[0])
+        power, power_ts, report_ts = cast(
+            "tuple[float | None, float | None, float | None]", res[0]
+        )
         if power is None:
             power = 0.0
         plugged = bool(res[1])
@@ -902,6 +946,10 @@ class EVSurplusController:
                 logger.debug("EV surplus: %s away — clearing failure backoff", c.id)
             self._act_fail.pop(c.id, None)
             self._last_wake_ts.pop(c.id, None)
+            # A departure also ends any substitution episode — the returning car must
+            # not inherit a ttl that started before it left.
+            self._subst_since.pop(c.id, None)
+            self._subst_warned.discard(c.id)
             self._suc_notified.discard(c.id)
         override = str(res[3])
         soc = cast("float | None", res[4])
@@ -1022,12 +1070,45 @@ class EVSurplusController:
         # commanded 8 A at 12:07:04, grid went -5.4 kW -> -0.15 kW, charger power stayed
         # 0.0, switched off at 12:08:05, then locked out by min_off_s for 15 min).
         # Substitute the commanded draw ONLY while the reading provably predates our
-        # write; the moment the sensor catches up, measurement wins again — including
-        # when it reports 0 because the car declined.
+        # write — AND for at most commanded_draw_ttl_s.
+        #
+        # The bound is not belt-and-braces; without it the substitution can never end.
+        # These sensors poll and write on CHANGE, so when the car declines the value
+        # does not move, last_updated never advances past our write, and the fiction
+        # stands forever. Verified on sensor.white_betty_charger_power: 0.0 held with a
+        # frozen last_updated for 3.6 h while the integration reported every 600 s.
+        #
+        # Report freshness is deliberately NOT the exit condition. A report proves the
+        # integration spoke; it does not prove the car answered our command. A refresh
+        # requested right after our write can carry a sample taken before the car
+        # ramped, and cancelling on that would re-open 2026-08-15 systematically rather
+        # than occasionally. So the wall clock bounds it, and last_reported is used only
+        # to DIAGNOSE the expiry in the log below.
         if c.trust_commanded_draw and c.id in self._last_a:
             cmd_ts = self._last_cmd_ts.get(c.id)
-            if cmd_ts is not None and power_ts is not None and power_ts < cmd_ts:
-                power = self._last_a[c.id] * c.phases * c.voltage_v
+            if cmd_ts is not None and power_ts is not None and power_ts >= cmd_ts:
+                # The sensor caught up: measurement wins, and the episode is over.
+                self._subst_since.pop(c.id, None)
+                self._subst_warned.discard(c.id)
+            elif cmd_ts is not None and power_ts is not None and power_ts < cmd_ts:
+                since = self._subst_since.setdefault(c.id, now_ts)
+                elapsed = now_ts - since
+                if elapsed <= c.commanded_draw_ttl_s:
+                    power = self._last_a[c.id] * c.phases * c.voltage_v
+                elif c.id not in self._subst_warned:
+                    self._subst_warned.add(c.id)
+                    _rep_age = None if report_ts is None else now_ts - report_ts
+                    logger.warning(
+                        "EV surplus: %s commanded-draw substitution EXPIRED after "
+                        "%.0fs (ttl %.0fs) — commanded %.1f A, sensor still reads "
+                        "%.0f W (value age %.0fs, report age %s). %s",
+                        c.id, elapsed, c.commanded_draw_ttl_s, self._last_a[c.id],
+                        power, now_ts - power_ts,
+                        "unknown" if _rep_age is None else f"{_rep_age:.0f}s",
+                        "Feed looks alive, so the car declined the command"
+                        if _rep_age is not None and _rep_age <= c.commanded_draw_ttl_s
+                        else "Feed looks DEAD — the integration has stopped reporting",
+                    )
 
         # The supercharger alert is gated on THIS (owner directive: check only
         # the one-off departure entity; a historical timestamp disables the
@@ -1541,6 +1622,13 @@ class EVSurplusController:
                 if self._last_switch.get(ccfg.id) is True:
                     self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
+                # ...and end any substitution episode. Without this the anchor never
+                # clears: a stop zeroes the commanded amps while the sensor's value is
+                # ALREADY 0.0, so last_updated never advances past our write and the
+                # NEXT start would begin already expired, with no protection at all —
+                # the 2026-08-15 incident restored by the fix meant to prevent it.
+                self._subst_since.pop(ccfg.id, None)
+                self._subst_warned.discard(ccfg.id)
             self._last_switch[ccfg.id] = cmd.switch_on
             sw = cmd.switch_on if not shadow else None
             # Any write invalidates a power reading older than it (trust_commanded_draw).
@@ -1563,6 +1651,13 @@ class EVSurplusController:
                 if prev_a is not None and prev_a > 0.0:
                     self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
+                # ...and end any substitution episode. Without this the anchor never
+                # clears: a stop zeroes the commanded amps while the sensor's value is
+                # ALREADY 0.0, so last_updated never advances past our write and the
+                # NEXT start would begin already expired, with no protection at all —
+                # the 2026-08-15 incident restored by the fix meant to prevent it.
+                self._subst_since.pop(ccfg.id, None)
+                self._subst_warned.discard(ccfg.id)
                 self._last_ts[ccfg.id] = now_ts
                 self._last_cmd_ts[ccfg.id] = now_ts
             return ActuationResult(
@@ -1593,6 +1688,13 @@ class EVSurplusController:
                 if prev_a is not None and prev_a > 0.0:
                     self._last_stop_ts[ccfg.id] = now_ts
                 self._last_a[ccfg.id] = 0.0
+                # ...and end any substitution episode. Without this the anchor never
+                # clears: a stop zeroes the commanded amps while the sensor's value is
+                # ALREADY 0.0, so last_updated never advances past our write and the
+                # NEXT start would begin already expired, with no protection at all —
+                # the 2026-08-15 incident restored by the fix meant to prevent it.
+                self._subst_since.pop(ccfg.id, None)
+                self._subst_warned.discard(ccfg.id)
                 self._last_ts[ccfg.id] = now_ts
                 self._last_cmd_ts[ccfg.id] = now_ts
             return ActuationResult(
