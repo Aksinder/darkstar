@@ -263,6 +263,44 @@ def _bucket_profile(
     ]
 
 
+def _is_complete(
+    end: datetime,
+    open_tail: tuple[datetime, datetime] | None,
+    data_end: datetime,
+    merge_gap_minutes: float,
+) -> bool:
+    """Is this cycle finished, or might more of it still arrive?
+
+    Two ways it can be unfinished, and only the first used to be checked:
+
+    1. The hysteresis machine was still ABOVE threshold when the series ran out —
+       ``open_tail``. Obvious, and it was already handled.
+
+    2. The machine had dipped below threshold, but so recently that a sample arriving
+       after this fetch could still MERGE into the segment under the very rule applied
+       a few lines above. That case looked identical to a genuinely finished cycle, and
+       it is what made the published sensor flap.
+
+    Concretely (2026-09-02): these detectors run statelessly from HA history on the
+    publisher's own 300 s loop, so the answer depended on where the fetch boundary
+    happened to land. The washer's tumble phase dips below the 25 W off-threshold for
+    about ten seconds every 20-60 s — 138 dips, 27% of the run's wall clock — so each
+    tick had roughly a one-in-four chance of ending inside a dip and declaring the
+    RUNNING wash finished. cycles_observed alternated 5 and 4, and
+    sensor.darkstar_washer_last_cycle_energy alternated between today's run and a
+    two-day-old fragment, on the publisher's exact 311 s cadence.
+
+    Using merge_gap_minutes as the settle window is not a new constant but the same one
+    already deciding whether two segments are one cycle: if a future sample could merge,
+    the cycle is not yet knowable. It also makes completeness MONOTONIC — once true it
+    stays true as data_end advances — which is what stops the flapping rather than
+    merely narrowing it.
+    """
+    if open_tail is not None and end == open_tail[1]:
+        return False
+    return (data_end - end) >= timedelta(minutes=merge_gap_minutes)
+
+
 # ---------------------------------------------------------------------------
 # Detection from power series
 # ---------------------------------------------------------------------------
@@ -342,7 +380,7 @@ def detect_cycles_from_power(
             round(p * power_scale, 3)
             for p in _bucket_profile(window, start, end, profile_bucket_min)
         ]
-        complete = not (open_tail is not None and end == open_tail[1])
+        complete = _is_complete(end, open_tail, pts[-1].ts, merge_gap_minutes)
         cycles.append(
             DetectedCycle(
                 start=start,
@@ -420,7 +458,7 @@ def detect_cycles_from_runstate(
             energy_kwh = assumed_power_kw * (duration_min / 60.0)
             n_buckets = max(1, round(duration_min / profile_bucket_min))
             profile = [round(assumed_power_kw, 3)] * n_buckets
-        complete = not (open_tail is not None and end == open_tail[1])
+        complete = _is_complete(end, open_tail, pts[-1].ts, merge_gap_minutes)
         cycles.append(
             DetectedCycle(
                 start=start,
@@ -544,7 +582,7 @@ def detect_cycles_from_status(
             name = window[i].status.strip() or "Unknown"
             phase_minutes[name] = round(phase_minutes.get(name, 0.0) + dt_min, 2)
 
-        complete = not (open_tail is not None and end == open_tail[1])
+        complete = _is_complete(end, open_tail, pts[-1].ts, merge_gap_minutes)
         cycles.append(
             DetectedCycle(
                 start=start,

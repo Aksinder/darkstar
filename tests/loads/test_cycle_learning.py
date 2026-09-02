@@ -58,10 +58,66 @@ class TestHaHistoryParsing:
         assert [s.running for s in out] == [True, False]
 
 
+class TestTrailingRunIsNeverCalledComplete:
+    """2026-09-02: sensor.darkstar_washer_last_cycle_energy alternated between today's
+    run and a two-day-old fragment, with cycles_observed flipping 5 <-> 4, on the cycle
+    publisher's exact 311 s cadence.
+
+    These detectors run statelessly from HA history, so completeness of the RUNNING wash
+    was decided by where the fetch boundary happened to land. The washer's tumble phase
+    dips below the 25 W off-threshold for ~10 s every 20-60 s — 138 dips, 27% of the
+    run's wall clock — so roughly one tick in four ended inside a dip, saw the hysteresis
+    machine not running, and declared the in-progress wash finished.
+
+    A cycle is complete only when no future sample could still merge into it.
+    """
+
+    def _running_wash_with_dips(self, tail_minute: int, last_w: float):
+        """A wash still in progress, sampled up to tail_minute."""
+        pts = [(0, 0.0)]
+        m = 1
+        while m < tail_minute:
+            # Tumble: mostly above the 50 W on-threshold, dipping under 25 W briefly.
+            pts.append((m, 2000.0))
+            pts.append((m + 1, 13.0))  # a dip, exactly like the real trace
+            m += 2
+        pts.append((tail_minute, last_w))
+        return _p(pts)
+
+    def test_a_dip_at_the_fetch_boundary_does_not_finish_the_wash(self):
+        """The flap's low half: history happens to end mid-dip."""
+        cycles = detect_cycles_from_power(self._running_wash_with_dips(61, 13.0))
+        assert cycles, "the wash must still be detected"
+        assert not cycles[-1].complete
+
+    def test_a_peak_at_the_fetch_boundary_does_not_finish_it_either(self):
+        """The flap's high half — this side was already correct, and must stay so."""
+        cycles = detect_cycles_from_power(self._running_wash_with_dips(61, 2000.0))
+        assert cycles
+        assert not cycles[-1].complete
+
+    def test_both_boundaries_agree(self):
+        """THE REGRESSION. The two only differ in where the fetch stopped; before the
+        fix one said complete and the other said incomplete, and the published sensor
+        alternated between them every publisher tick."""
+        dip = detect_cycles_from_power(self._running_wash_with_dips(61, 13.0))
+        peak = detect_cycles_from_power(self._running_wash_with_dips(61, 2000.0))
+        assert dip[-1].complete == peak[-1].complete
+
+    def test_it_becomes_complete_once_the_machine_really_stops(self):
+        """And it must still finish: idle past the merge gap resolves it."""
+        pts = [(0, 0.0), (1, 2000.0), (30, 2000.0), (60, 2000.0), (61, 0.0), (95, 0.0)]
+        cycles = detect_cycles_from_power(_p(pts))
+        assert len(cycles) == 1
+        assert cycles[0].complete
+
+
 class TestDetectFromPower:
     def test_single_clean_cycle(self):
         # 60 min at ~2 kW
-        samples = _p([(0, 0), (1, 2000), (30, 2000), (60, 2000), (61, 0)])
+        # The trailing sample at minute 90 is load-bearing: a cycle is only knowably
+        # COMPLETE once no future sample could merge into it (merge_gap_minutes = 20).
+        samples = _p([(0, 0), (1, 2000), (30, 2000), (60, 2000), (61, 0), (90, 0)])
         cycles = detect_cycles_from_power(samples)
         assert len(cycles) == 1
         c = cycles[0]
@@ -229,6 +285,7 @@ class TestDetectFromStatus:
                 (60, "Rinsing", 300),
                 (90, "Drying", 50),
                 (110, "Idle", 0),
+                (140, "Idle", 0),  # past merge_gap_minutes => knowably complete
             ]
         )
         cycles = detect_cycles_from_status(samples)
