@@ -382,13 +382,36 @@ class DeferrableApplianceController:
         for app in cfg.appliances:
             if not app.power_sensor:
                 continue
-            power_raw = await ha.get_state_value(app.power_sensor)
+            # Full state, not just the value: last_changed says when the reading BECAME
+            # this, which is what lets an already-sustained draw arm on the first tick
+            # instead of waiting for a second one 60 s later (see power_since in
+            # update_appliance_power_state).
+            power_state = cast(
+                "dict[str, Any] | None", await ha.get_state(app.power_sensor)
+            )
+            power_raw = (
+                power_state.get("state")
+                if isinstance(power_state, dict)
+                else await ha.get_state_value(app.power_sensor)
+            )
             power_readable = power_raw is not None and str(power_raw) not in (
                 "unknown",
                 "unavailable",
                 "",
             )
             power = _f(power_raw) or 0.0
+            power_since = None
+            if isinstance(power_state, dict):
+                _raw_since = power_state.get("last_changed") or power_state.get(
+                    "last_updated"
+                )
+                if isinstance(_raw_since, str):
+                    try:
+                        power_since = datetime.fromisoformat(
+                            _raw_since.replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        power_since = None
             override = await self._read_on(ha, app.override_entity)
             sw_state = (
                 await ha.get_state(app.switch_entity) if app.switch_entity else None
@@ -428,7 +451,9 @@ class DeferrableApplianceController:
                 )
                 continue
 
-            new_state, event = update_appliance_power_state(prev, power, switch_on, now_ts, app.power)
+            new_state, event = update_appliance_power_state(
+                prev, power, switch_on, now_ts, app.power, power_since=power_since
+            )
             new_state.held_by_us = prev.held_by_us and not switch_on
             # A named hand on the plug outranks our own memory of holding it. Without
             # this, a person switching off a plug Darkstar already held stayed invisible
