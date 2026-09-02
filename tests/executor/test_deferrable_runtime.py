@@ -16,7 +16,7 @@ TZ = pytz.timezone("Europe/Stockholm")
 
 
 class FakeHA:
-    def __init__(self, states, context_user_ids=None):
+    def __init__(self, states, context_user_ids=None, attributes=None):
         self.states = states
         self.published: dict[str, tuple] = {}
         self.notifications: list[tuple] = []
@@ -24,6 +24,10 @@ class FakeHA:
         # entity -> context.user_id, so tests can say WHOSE hand touched a switch.
         # Absent means the device reported its own state (HA sends user_id None).
         self.context_user_ids = context_user_ids or {}
+        # entity -> attribute dict. The learned cycle statistics ride here, not in the
+        # state — sensor.darkstar_<id>_last_cycle_energy's STATE is the previous run
+        # while typical_energy_kwh is the median over complete cycles.
+        self.attributes = attributes or {}
 
     async def get_state_value(self, entity):
         return self.states.get(entity)
@@ -34,7 +38,7 @@ class FakeHA:
             return None
         return {
             "state": self.states.get(entity),
-            "attributes": {},
+            "attributes": self.attributes.get(entity, {}),
             "context": {
                 "id": "test",
                 "parent_id": None,
@@ -852,3 +856,106 @@ class TestPlugOwnershipEndToEnd:
         ha = self._ha(cutter=self.ROBERT)
         await ctrl.run(ha, 1000.0 + 999999.0, self._dt(1000.0 + 999999.0), shadow=False)
         assert not [c for c in ha.calls if c[1] == "turn_on"]
+
+
+class TestCycleEnergyInput:
+    """2026-09-02: the washer ran through the day's three most expensive hours.
+
+    The scorer was fed sensor.darkstar_washer_last_cycle_energy's STATE — literally the
+    previous run — where the code intends the LEARNED median that rides on the same
+    entity as the typical_energy_kwh attribute. The previous run had been correctly
+    deferred, released at 12:07, never resumed by hand, and measured 0.057 kWh of
+    tumbling with no heat phase. That fragment became the next decision's entire cost
+    basis.
+
+    It is an off switch, not a bias: the electricity term scales with kWh while the wait
+    penalty is absolute SEK/hour, so below break-even "run now" wins for EVERY price
+    curve. Nothing warned.
+    """
+
+    ENTITY = "sensor.darkstar_washer_last_cycle_energy"
+
+    def _cfg(self, tmp_path, prices, now, *, wait_cost=0.05):
+        raw = _full_cfg(observe_only=True)
+        raw["deferrable_loads"][0]["wait_cost_sek_per_hour"] = wait_cost
+        cfg = parse_deferrable_runtime_config(raw)
+        cfg.schedule_path = _write_schedule(tmp_path, prices, now)
+        return cfg
+
+    async def _arm(self, tmp_path, cfg, *, state, attrs):
+        """Drive an arm and return the washer's recommended action."""
+        ctrl = DeferrableApplianceController(cfg, state_file=str(tmp_path / "s.json"))
+        now = datetime.now(TZ)
+        ha = FakeHA(
+            {
+                "sensor.tvattmaskin_power": "2000", "switch.tvattmaskin": "on",
+                "input_boolean.washing_machine_override": "off",
+                self.ENTITY: state,
+            },
+            attributes={self.ENTITY: attrs},
+        )
+        t = now.timestamp()
+        await ctrl.run(ha, t, now, shadow=False)
+        await ctrl.run(ha, t + 3.0, now, shadow=False)
+        _st, published = ha.published["sensor.darkstar_washer_state"]
+        return published["recommended_action"], ha
+
+    # A cheap block sits well after the expensive present — deferring is worth ~1 SEK
+    # at a real cycle energy, and worth nothing at a fragment.
+    PRICES = [2.5] * 8 + [1.5] * 24
+
+    @pytest.mark.asyncio
+    async def test_the_incident_a_fragment_state_no_longer_decides(self, tmp_path):
+        """The regression. State 0.1 (the fragment), attribute 0.955 (the median)."""
+        cfg = self._cfg(tmp_path, self.PRICES, datetime.now(TZ))
+        action, _ha = await self._arm(
+            tmp_path, cfg,
+            state="0.1",
+            attrs={"typical_energy_kwh": 0.955, "learned": True, "cycles_observed": 5},
+        )
+        assert action == "defer"
+
+    @pytest.mark.asyncio
+    async def test_the_old_behaviour_would_have_run(self, tmp_path):
+        """Proof the test above discriminates: with only the fragment available, the
+        wait penalty dominates and the machine runs at the peak — exactly what happened.
+        Here the floor catches it and drops the penalty, so it defers anyway; without
+        BOTH fixes this is the failing case."""
+        cfg = self._cfg(tmp_path, self.PRICES, datetime.now(TZ))
+        action, ha = await self._arm(tmp_path, cfg, state="0.1", attrs={})
+        assert action == "defer"  # saved by the plausibility floor, not by the median
+
+    @pytest.mark.asyncio
+    async def test_an_unlearned_median_is_not_trusted(self, tmp_path):
+        """A median over too few cycles carries the same weakness as one raw sample."""
+        cfg = self._cfg(tmp_path, self.PRICES, datetime.now(TZ))
+        action, _ha = await self._arm(
+            tmp_path, cfg,
+            state="1.2",
+            attrs={"typical_energy_kwh": 0.05, "learned": False},
+        )
+        # Falls back to the state's 1.2, which is a real cycle => ordinary deferral.
+        assert action == "defer"
+
+    @pytest.mark.asyncio
+    async def test_no_attributes_falls_back_to_the_state(self, tmp_path):
+        """An appliance whose publisher predates the attribute behaves as before."""
+        cfg = self._cfg(tmp_path, self.PRICES, datetime.now(TZ))
+        action, _ha = await self._arm(tmp_path, cfg, state="1.2", attrs={})
+        assert action == "defer"
+
+    @pytest.mark.asyncio
+    async def test_a_real_cycle_still_respects_the_wait_penalty(self, tmp_path):
+        """The penalty must still work — it exists because a formally-optimal defer to
+        01:30 over a 23:00 start that cost seven öre more is not what anyone means by
+        'run it when power is cheap'. A trivially cheaper block far away must not win."""
+        now = datetime.now(TZ)
+        # Present is 1.00; a block 6 h out is 0.99. One öre/kWh is not worth six hours.
+        prices = [1.0] * 24 + [0.99] * 24
+        cfg = self._cfg(tmp_path, prices, now, wait_cost=0.05)
+        action, _ha = await self._arm(
+            tmp_path, cfg,
+            state="1.2",
+            attrs={"typical_energy_kwh": 1.2, "learned": True, "cycles_observed": 9},
+        )
+        assert action == "run"

@@ -45,6 +45,12 @@ from .deferrable import (
 logger = logging.getLogger("darkstar.deferrable")
 
 _STATE_FILE = "data/deferrable_state.json"
+# Below this, a "cycle" is a fragment (a released-but-never-resumed run, a sensor
+# hiccup), not a wash. Measured break-even on this site was ~0.20 kWh: under it the
+# whole day's achievable electricity spread is worth less than the wait penalty, so
+# "run now" wins regardless of price. Used only to distrust the INPUT, never to
+# substitute a value.
+_MIN_TRUSTWORTHY_CYCLE_KWH = 0.2
 # Append-only per-cycle ledger (one JSON object per line), written on every "done"
 # event so the savings load-shift credit has a durable arm->done record — the
 # state file above only holds CURRENT state and wipes start_ts on completion.
@@ -490,13 +496,26 @@ class DeferrableApplianceController:
                 # Cycle energy turns the price curve into kronor so the wait price is
                 # comparable with it. Learned first, seed second; without either the
                 # penalty stays off rather than scoring a dimensionless number.
-                energy_kwh = _f(
-                    await ha.get_state_value(app.energy_sensor_learned or "")
-                ) or app.seed_energy_kwh
+                energy_kwh, energy_src = await self._cycle_energy_kwh(ha, app)
+                # A too-small energy does not merely bias this scorer, it DISABLES
+                # deferral: the electricity term scales with kWh while the wait penalty
+                # is absolute SEK/hour, so below break-even "run now" wins against every
+                # possible price curve. Rather than let that happen silently, drop the
+                # penalty — which is exactly the documented behaviour when no energy is
+                # known at all (absolute cheapest window), and errs toward deferring.
+                wait_cost = app.wait_cost_sek_per_hour
+                if 0.0 < energy_kwh < _MIN_TRUSTWORTHY_CYCLE_KWH and wait_cost > 0.0:
+                    logger.warning(
+                        "Deferrable: %s cycle energy %.3f kWh (%s) is below the %.2f kWh "
+                        "plausibility floor — dropping the wait penalty for this "
+                        "decision so a fragment cannot silently disable deferral",
+                        app.id, energy_kwh, energy_src, _MIN_TRUSTWORTHY_CYCLE_KWH,
+                    )
+                    wait_cost = 0.0
                 action, window_start = recommend_appliance_action(
                     slots, now_ts, duration_slots, deadline_ts,
                     energy_kwh=energy_kwh,
-                    wait_cost_sek_per_hour=app.wait_cost_sek_per_hour,
+                    wait_cost_sek_per_hour=wait_cost,
                 )
 
             # Fas 3 — plug actuation (only outside observe/shadow, only on a readable
@@ -732,6 +751,39 @@ class DeferrableApplianceController:
             await ha.set_state(f"sensor.{oid}", label, attrs)
         except Exception as exc:
             logger.warning("Deferrable: publish failed for %s: %s", app.id, exc)
+
+    async def _cycle_energy_kwh(
+        self, ha: Any, app: DeferrableApplianceCfg
+    ) -> tuple[float, str]:
+        """This cycle's expected energy in kWh, and where the number came from.
+
+        LEARNED FIRST — and the learned value is the ``typical_energy_kwh`` ATTRIBUTE,
+        a median over complete cycles, not the sensor's STATE. The state is
+        ``last_cycle_energy``: literally the previous run, however unrepresentative.
+        Reading the state here was the 2026-09-02 washer incident. The 2026-08-31 cycle
+        had been correctly deferred, released at 12:07, never resumed by hand, and so
+        measured 0.057 kWh of tumbling with no heat phase. That fragment became the next
+        decision's entire cost basis: 0.1 kWh, which put the whole day's price spread
+        below the wait penalty and ran the machine through the day's three most
+        expensive hours. A median over five cycles cannot be moved like that — which is
+        exactly why the duration input, the same statistic, survived the same event.
+
+        Gated on the ``learned`` flag the publisher sets alongside it, so a median over
+        too few cycles is not trusted either. Falls back to the last cycle, then to the
+        configured seed, so an appliance with no history behaves exactly as before.
+        """
+        entity = app.energy_sensor_learned or ""
+        if entity:
+            state = cast("dict[str, Any] | None", await ha.get_state(entity))
+            if state:
+                attrs = cast("dict[str, Any]", state.get("attributes") or {})
+                typical = _f(attrs.get("typical_energy_kwh"))
+                if typical and attrs.get("learned"):
+                    return typical, "learned median"
+                last = _f(state.get("state"))
+                if last:
+                    return last, "last cycle"
+        return app.seed_energy_kwh, "config seed"
 
     async def _maybe_notify(
         self, ha: Any, app: DeferrableApplianceCfg, event: str | None,
