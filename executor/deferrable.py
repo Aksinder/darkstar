@@ -328,7 +328,16 @@ def update_appliance_power_state(
     above = p >= cfg.on_threshold_w
     below = p < cfg.off_threshold_w
 
-    above_since = prev.above_since if above else None
+    # Schmitt trigger on the ARM clock: enter above ``on_threshold_w``, but only leave
+    # below ``off_threshold_w``. Machines draw in BURSTS while they fill — the
+    # dishwasher's first three minutes on 2026-09-02 oscillated between 3.7 W and 33 W,
+    # crossing 10 W in both directions six times. Clearing above_since on any single
+    # low sample restarted the debounce each time, so the arm landed 4m05s after the
+    # cycle began (06:49:22 -> 06:53:27) — by which point the heater had been running
+    # for 80 seconds and the hold cut a tub of part-heated water instead of a cold one.
+    # Every one of those dips was above off_threshold_w, which is the threshold that
+    # already exists to mean "genuinely idle"; using it here arms on the first burst.
+    above_since = prev.above_since if (above or not below) else None
     if above and above_since is None:
         above_since = now_ts
     below_since = prev.below_since if below else None

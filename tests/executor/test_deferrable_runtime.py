@@ -6,6 +6,11 @@ from datetime import datetime
 import pytest
 import pytz
 
+from executor.deferrable import (
+    AppliancePowerConfig,
+    AppliancePowerState,
+    update_appliance_power_state,
+)
 from executor.deferrable_runtime import (
     DeferrableApplianceController,
     load_forward_slots,
@@ -856,6 +861,70 @@ class TestPlugOwnershipEndToEnd:
         ha = self._ha(cutter=self.ROBERT)
         await ctrl.run(ha, 1000.0 + 999999.0, self._dt(1000.0 + 999999.0), shadow=False)
         assert not [c for c in ha.calls if c[1] == "turn_on"]
+
+
+class TestArmClockSurvivesBursts:
+    """A fill-phase dip must not restart the arm debounce.
+
+    Real trace, sensor.diskmaskin_power 2026-09-02: the cycle began at 06:49:22 and its
+    first three minutes oscillated between 3.7 W and 33 W, crossing the 10 W on-threshold
+    in both directions six times. Clearing above_since on every low sample restarted the
+    3 s debounce each time and the arm landed at 06:53:27 — 4m05s in, and 80 seconds
+    AFTER the heater had come on, so the hold cut part-heated water.
+
+    Every dip was above off_threshold_w (3 W), the threshold that already means
+    "genuinely idle". The arm clock now uses it as the exit condition.
+    """
+
+    TRACE = [
+        (0, 0.63), (1, 3.26), (6, 6.17), (12, 7.43), (27, 7.53), (30, 14.62),
+        (36, 16.75), (43, 12.4), (48, 3.93), (54, 16.73), (60, 8.48), (66, 16.72),
+        (71, 3.73), (77, 11.54), (92, 11.51), (97, 8.81), (102, 3.93), (108, 6.59),
+        (114, 15.58), (126, 16.87), (131, 18.62), (136, 24.95), (142, 32.69),
+    ]
+
+    def _arm_at(self, samples):
+        cfg = AppliancePowerConfig()
+        st = AppliancePowerState()
+        for t, p in samples:
+            st, ev = update_appliance_power_state(
+                st, power_w=p, switch_on=True, now_ts=float(t), cfg=cfg
+            )
+            if ev == "armed":
+                return t
+        return None
+
+    def test_a_bursty_fill_arms_on_the_first_sustained_draw(self):
+        """Sampling every reading, the arm lands at the first burst plus the debounce —
+        t+36s, comfortably before the heater at t+166s."""
+        assert self._arm_at(self.TRACE) == 36
+
+    def test_a_dip_below_the_on_threshold_does_not_restart_the_clock(self):
+        cfg = AppliancePowerConfig()
+        st = AppliancePowerState()
+        st, _ = update_appliance_power_state(
+            st, power_w=16.0, switch_on=True, now_ts=0.0, cfg=cfg
+        )
+        assert st.above_since == 0.0
+        # 8 W: under the 10 W arm threshold but well over the 3 W idle threshold.
+        st, _ = update_appliance_power_state(
+            st, power_w=8.0, switch_on=True, now_ts=1.0, cfg=cfg
+        )
+        assert st.above_since == 0.0, "a fill-phase dip must not restart the debounce"
+
+    def test_a_genuine_idle_reading_still_clears_the_clock(self):
+        """The safety half: below off_threshold_w the machine really has stopped, and
+        the clock must reset or a blip an hour ago could arm a cycle that never began."""
+        cfg = AppliancePowerConfig()
+        st = AppliancePowerState()
+        st, _ = update_appliance_power_state(
+            st, power_w=16.0, switch_on=True, now_ts=0.0, cfg=cfg
+        )
+        st, ev = update_appliance_power_state(
+            st, power_w=0.5, switch_on=True, now_ts=1.0, cfg=cfg
+        )
+        assert st.above_since is None
+        assert ev is None
 
 
 class TestCycleEnergyInput:
