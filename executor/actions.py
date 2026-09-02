@@ -1644,7 +1644,30 @@ class ActionDispatcher:
             cc.restore_limit_w if cc.restore_limit_w > 0 else (self._restore_export_limit_w or 0.0)
         )
         if restore > 0:
-            return await self._set_max_export_power(restore)
+            result = await self._set_max_export_power(restore)
+            # SELF-HEAL A REJECTED RESTORE. The number path is the dangerous half of this
+            # feature: _set_max_export_power turns the limit MODE SWITCH ON whenever the
+            # write reports success, so a value the device refuses leaves the switch
+            # enforcing whatever stale low limit the register still holds — the site stays
+            # curtailed with no further attempt to lift it. That is not hypothetical:
+            # Sungrow SH10RT register 13073 accepts 8500 and 400 but rejects 10000 with a
+            # pymodbus isError, and 10000 is the configured restore value here.
+            #
+            # The readback already tells us. When it says the register did not take the
+            # value, fall back to what "unlimited" means on this device and is known to
+            # work: mode switch OFF, no number write at all. That is exactly the switch
+            # method's restore, so the failure mode of the legacy path now converges on
+            # the safe one instead of latching a clamp.
+            if result is not None and result.verification_success is False:
+                logger.warning(
+                    "Export curtailment: restore to %.0f W was REJECTED by the device "
+                    "(readback %s) — the limit switch would be left enforcing a stale "
+                    "value. Falling back to switch OFF (unlimited).",
+                    restore,
+                    result.verified_value,
+                )
+                return await self._set_export_limit_switch(False)
+            return result
         return None
 
     async def _set_export_limit_switch(self, on: bool) -> ActionResult | None:
