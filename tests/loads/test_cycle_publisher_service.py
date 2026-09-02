@@ -30,6 +30,17 @@ def _status_rows(start: datetime, phases, power_w=2000):
         )
         t = t + timedelta(minutes=minutes)
     rows.append({"state": "Idle", "last_changed": t.isoformat(), "attributes": {"power": 0}})
+    # A second idle row well past the merge gap. A cycle is only knowably COMPLETE once
+    # no future sample could still merge into it (see _is_complete), and real history
+    # always runs on to "now" — a series that stops the instant the machine does is not
+    # a finished cycle, it is one we caught at the boundary.
+    rows.append(
+        {
+            "state": "Idle",
+            "last_changed": (t + timedelta(minutes=30)).isoformat(),
+            "attributes": {"power": 0},
+        }
+    )
     return rows
 
 
