@@ -927,6 +927,64 @@ class TestArmClockSurvivesBursts:
         assert ev is None
 
 
+class TestArmClockUsesTheReadingsOwnAge:
+    """The executor ticks every 60 s while start_debounce_s is 3 s.
+
+    Starting the arm clock at now_ts therefore turns a 3-second debounce into a
+    60-second one: the first tick only sets the clock, and a second tick a minute later
+    is needed to satisfy it. Backdating to the reading's own last_changed lets an
+    already-sustained draw arm on the FIRST tick.
+
+    Bounded to exactly the debounce, deliberately: a power sensor can hold one value for
+    hours, and an unbounded backdate would let a freshly-started process arm instantly on
+    a machine already mid-cycle and open the pause gate on it.
+    """
+
+    def test_a_sustained_draw_arms_on_the_first_tick(self):
+        cfg = AppliancePowerConfig()
+        st = AppliancePowerState()
+        # One tick, seeing 16 W that has read 16 W for the last 45 seconds.
+        st, ev = update_appliance_power_state(
+            st, power_w=16.0, switch_on=True, now_ts=1000.0, cfg=cfg,
+            power_since=955.0,
+        )
+        assert ev == "armed"
+
+    def test_without_the_timestamp_it_still_takes_two_ticks(self):
+        """The fallback path — a client that supplies no timestamp behaves as before."""
+        cfg = AppliancePowerConfig()
+        st = AppliancePowerState()
+        st, ev = update_appliance_power_state(
+            st, power_w=16.0, switch_on=True, now_ts=1000.0, cfg=cfg
+        )
+        assert ev is None
+        st, ev = update_appliance_power_state(
+            st, power_w=16.0, switch_on=True, now_ts=1060.0, cfg=cfg
+        )
+        assert ev == "armed"
+
+    def test_a_reading_that_just_changed_still_waits(self):
+        """The debounce must still reject a blip: a value 1 s old is not sustained."""
+        cfg = AppliancePowerConfig()
+        st = AppliancePowerState()
+        st, ev = update_appliance_power_state(
+            st, power_w=16.0, switch_on=True, now_ts=1000.0, cfg=cfg,
+            power_since=999.0,
+        )
+        assert ev is None
+
+    def test_the_backdate_can_never_exceed_the_debounce(self):
+        """A sensor holding one value for hours must not backdate the clock by hours —
+        that would arm instantly on a machine already mid-cycle after a restart."""
+        cfg = AppliancePowerConfig()
+        st = AppliancePowerState()
+        st, _ev = update_appliance_power_state(
+            st, power_w=16.0, switch_on=True, now_ts=10_000.0, cfg=cfg,
+            power_since=1.0,  # ~3 hours old
+        )
+        assert st.above_since == 10_000.0 - cfg.start_debounce_s
+
+
 class TestCycleEnergyInput:
     """2026-09-02: the washer ran through the day's three most expensive hours.
 

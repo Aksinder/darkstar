@@ -311,6 +311,7 @@ def update_appliance_power_state(
     switch_on: bool,
     now_ts: float,
     cfg: AppliancePowerConfig,
+    power_since: float | None = None,
 ) -> tuple[AppliancePowerState, str | None]:
     """Advance the power-only arm/run/done state machine by one tick.
 
@@ -340,6 +341,21 @@ def update_appliance_power_state(
     above_since = prev.above_since if (above or not below) else None
     if above and above_since is None:
         above_since = now_ts
+        # Start the clock from when the reading actually BECAME this value, not from
+        # when we happened to look. The executor ticks once per 60 s while
+        # start_debounce_s is 3 s, so starting it at now_ts turns a 3-second debounce
+        # into a 60-second one: the first tick only sets the clock and a second tick
+        # 60 s later is needed to satisfy it. Backdating lets an already-sustained draw
+        # arm on the FIRST tick.
+        #
+        # Bounded to exactly the debounce, deliberately. A power sensor can hold one
+        # value for hours, and an unbounded backdate would let a process that has just
+        # started observing arm instantly on a machine already mid-cycle — opening the
+        # pause gate on it. Clamping to start_debounce_s gives the whole benefit (one
+        # tick instead of two) and none of that: the clock can never claim more history
+        # than the debounce needs, so a reading that genuinely just changed still waits.
+        if power_since is not None:
+            above_since = max(power_since, now_ts - cfg.start_debounce_s)
     below_since = prev.below_since if below else None
     if below and below_since is None:
         below_since = now_ts
