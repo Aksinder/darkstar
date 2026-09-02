@@ -26,6 +26,7 @@ from .ev_surplus import (
     EVSurplusTick,
     WriteGuardConfig,
     _deadline_required_w,
+    _fuse_own_draw_a,
     battery_fill_slack_kwh,
     battery_reserve_active,
     battery_tier_active,
@@ -1049,6 +1050,11 @@ class EVSurplusController:
             capacity_kwh=c.capacity_kwh,
             deadline_hours=deadline_hours, charge_efficiency=c.charge_efficiency,
             commanded_on=commanded_on, start_inhibited=start_inhibited,
+            # Lever position, for the fuse guard's LOWER-bound own-draw estimate only
+            # (_fuse_own_draw_a takes a min with it). No shadow gate is needed while it
+            # can only ever make the guard MORE restrictive; one becomes mandatory if a
+            # hold-floor is ever built on it, since _last_a is written even in shadow.
+            commanded_current_a=self._last_a.get(c.id),
         )
 
     async def run(
@@ -1318,25 +1324,14 @@ class EVSurplusController:
             )
         )
         if cfg.fuse_guard_enabled:
-            _alloc: dict[str, float] = {}
-            _by_id = {s2.id: s2 for s2 in states}
-            for _cmd in commands:
-                _st = _by_id.get(_cmd.id)
-                if _st is None or not _cmd.switch_on:
-                    continue
-                _amps = (
-                    float(_cmd.set_current_a)
-                    if _cmd.set_current_a is not None
-                    else _cmd.target_power_w / (_st.voltage_v * _st.phases)
-                )
-                _granted = max(
-                    0.0, _amps - _st.current_power_w / (_st.voltage_v * _st.phases)
-                )
-                if _granted <= 0.0:
-                    continue
-                for _p in _st.phase_map or tuple(phase_currents.keys()):
-                    _alloc[_p] = _alloc.get(_p, 0.0) + _granted
-            self.last_ev_alloc_a = _alloc
+            # Consume the planner's own ledger rather than re-deriving one from the
+            # returned commands. This used to be a second, independent implementation
+            # that recomputed granted = max(0, amps - current_power_w/(V*phases)) with
+            # the RAW sensor, while the clamp inside compute_ev_surplus used its own
+            # estimate. Fixing the estimate in only one of them would leave the EV clamp
+            # and the battery cap disagreeing about how much of a single meter snapshot
+            # had been spent — the exact double-spend the subtraction exists to prevent.
+            self.last_ev_alloc_a = dict(tick.fuse_alloc_a)
         # Track the tier through the SAME helper the pure layer uses (hysteresis memory).
         self._battery_tier_prev = battery_tier_active(inputs, cfg.policy)
         reserve = battery_reserve_active(inputs, cfg.policy)
@@ -1458,6 +1453,33 @@ class EVSurplusController:
                       f'{a["a"]}->{"-" if a["a_written"] is None else a["a_written"]}'
                       + (f' ({a["suppressed"]})' if a["suppressed"] else ""))
                      for a in applied])
+
+        # Fuse-clamp forensics. Without this a successful "off: fuse" is invisible:
+        # cmd.reason is only printed on the actuation-FAILURE path below, and the
+        # summary above carries only (id, on, a). Eight days of box logs contained zero
+        # fuse lines for exactly that reason, so a clamp change had nothing to be
+        # verified against. Emitted only when the clamp actually bound.
+        _capped = [c for c in commands if getattr(c, "fuse_limited", False)]
+        if _capped:
+            _st_by_id = {s.id: s for s in states}
+            for _c in _capped:
+                _s = _st_by_id.get(_c.id)
+                if _s is None:
+                    continue
+                _raw_a = _s.current_power_w / (_s.voltage_v * _s.phases)
+                _own_a = _fuse_own_draw_a(_s)
+                _src = "raw"
+                if _s.commanded_current_a is not None and _own_a < _raw_a - 1e-9:
+                    _src = "clamped-to-command"
+                if _own_a >= _s.max_current_a - 1e-9 < _raw_a:
+                    _src = "clamped-to-rating"
+                logger.info(
+                    "EV fuse clamp: %s on=%s reason=%r own=%.2fA (%s, raw %.2fA) "
+                    "phases=%s alloc=%s",
+                    _c.id, _c.switch_on, _c.reason, _own_a, _src, _raw_a,
+                    {k: round(v, 2) for k, v in phase_currents.items()},
+                    {k: round(v, 2) for k, v in tick.fuse_alloc_a.items()},
+                )
         return {"enabled": True, "applied": applied, "price_sek": price, "price_source": price_source}
 
     async def _actuate(
