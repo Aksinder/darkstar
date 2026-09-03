@@ -181,3 +181,83 @@ def test_switch_on_still_adds_energy_while_heating():
     before = est.stored_kwh
     est.update(dt_minutes=60, heating_kw=3.0, switch_on=True)
     assert est.stored_kwh > before
+
+
+class TestSaturation:
+    """Powered but refusing energy = the thermostat has opened = nothing to fill.
+
+    A LIVE measurement, unlike stored_kwh, which is a model estimate and can be days
+    stale — main_tank sat at minutes_since_anchor 9014 (six days) on 2026-09-03 while
+    physically saturated. The daily floor needs the live answer: on 2026-09-02 the house
+    tank was commanded on through the evening peak drawing 0 W, putting 0.58 kWh in at
+    2.42-2.44 SEK/kWh, because heated_today read 1.409 against a 6.00 floor it could not
+    physically meet.
+    """
+
+    def _est(self):
+        return HotWaterEstimator.from_temperature(_tank(), 60.0, prior_draw_kw=0.2)
+
+    def test_powered_and_idle_becomes_saturated(self):
+        est = self._est()
+        assert not est.is_saturated
+        est.update(dt_minutes=est.saturated_after_min, heating_kw=0.0, switch_on=True)
+        assert est.is_saturated
+        assert est.saturated_minutes == pytest.approx(est.saturated_after_min)
+
+    def test_a_switch_that_is_off_is_never_saturated(self):
+        """THE villavagn CASE, and the whole reason the switch state is required.
+
+        That tank also reads ~0 W every fifteen minutes — but because an HA phase guard
+        cuts its switch, not because it is full. Blocked, not satisfied. Calling it
+        saturated would stop Darkstar heating a cold tank, and nobody would find out
+        until the shower ran cold.
+        """
+        est = self._est()
+        est.update(dt_minutes=600, heating_kw=0.0, switch_on=False)
+        assert not est.is_saturated
+        assert est.saturated_minutes == 0.0
+
+    def test_an_unknown_switch_is_never_saturated(self):
+        """An unwired or unreadable switch must not look like a satisfied thermostat."""
+        est = self._est()
+        est.update(dt_minutes=600, heating_kw=0.0, switch_on=None)
+        assert not est.is_saturated
+
+    def test_drawing_current_clears_it(self):
+        """The tank accepted energy, so it was not full. The floor comes back by itself."""
+        est = self._est()
+        est.update(dt_minutes=600, heating_kw=0.0, switch_on=True)
+        assert est.is_saturated
+        est.update(dt_minutes=1, heating_kw=3.0, switch_on=True)
+        assert not est.is_saturated
+        assert est.saturated_minutes == 0.0
+
+    def test_the_clock_needs_to_be_sustained(self):
+        """One tick is not evidence. The element cycles faster than the sensor polls —
+        reading a single instant is exactly how the 2026-09-03 diagnosis went wrong."""
+        est = self._est()
+        est.update(dt_minutes=est.saturated_after_min - 1, heating_kw=0.0, switch_on=True)
+        assert not est.is_saturated
+
+    def test_a_villavagn_style_trickle_still_counts_as_idle(self):
+        """sensor.villavagn_vvb_power reads ~1.3 W when that tank is saturated, not 0.
+        The threshold is heating_on_w, so a trickle must not read as heating."""
+        est = self._est()
+        est.update(dt_minutes=600, heating_kw=0.0013, switch_on=True)
+        assert est.is_saturated
+
+    def test_saturation_survives_a_restart(self):
+        est = self._est()
+        est.update(dt_minutes=600, heating_kw=0.0, switch_on=True)
+        blob = est.state_dict()
+        assert "saturated_min" in blob
+
+        fresh = self._est()
+        fresh.apply_state(blob)
+        assert fresh.is_saturated
+
+    def test_an_old_state_file_without_the_key_is_not_saturated(self):
+        """Forward/back compat: a state written before this existed must not claim it."""
+        est = self._est()
+        est.apply_state({"stored_kwh": 5.0, "learned_draw_kw": 0.2})
+        assert not est.is_saturated
