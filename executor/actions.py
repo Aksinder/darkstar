@@ -548,6 +548,25 @@ class ActionDispatcher:
         # (bounded downside — min_on still bounds the block).
         self._water_commit_until: dict[str, float] = {}
 
+    def water_claims_supply(self, entity_id: str | None) -> bool:
+        """Has this heater been TOLD to draw, whatever it happens to be drawing now?
+
+        The question a load-group check must ask, and it is deliberately not "is it
+        drawing". On 2026-09-02 the sequence was: tank committed ON at 13:14:03, an HA
+        phase guard cut it at 13:14:39, Darkstar boosted the spa at 13:15:09. At that
+        instant the tank measured 0 W — shed, not idle — so a check against measured
+        power would have waved the boost through and re-created the collision. Its
+        CLAIM on the shared supply had not been withdrawn; only its current had.
+
+        True while we last commanded ON, or while a committed block is still running.
+        """
+        if not entity_id:
+            return False
+        if self._last_water_cmd.get(entity_id) == "on":
+            return True
+        until = self._water_commit_until.get(entity_id)
+        return until is not None and time.time() < until
+
     async def _read_control_pause(self, entity_id: str) -> bool:
         """Read one control-pause entity: True only if it is definitively 'on'.
 

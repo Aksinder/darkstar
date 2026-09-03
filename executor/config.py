@@ -632,6 +632,27 @@ class ControllerConfig:
 
 
 @dataclass
+class LoadGroupConfig:
+    """A set of loads sharing a physical supply, and the ceiling they share.
+
+    The MILP already enforces this at PLANNING time (planner/solver/kepler.py). The
+    executor needs it too, because the real-time surplus boost deliberately overrides
+    the plan — and until now it did so per device, with no idea a sibling existed.
+
+    Live consequence on this site: the villavagn's spa (1.8 kW) and hot-water tank
+    (1.6 kW) share a 10 A sub-fuse and a 2.3 kW group. The planner never books them
+    together — verified, it booked the spa zero times on 2026-09-03 — but the boost put
+    the spa to 40 C on every 60 s tick from measured surplus, an HA phase guard shed the
+    pair, and Darkstar re-asserted the spa within ~22 s while the tank sat out a
+    15-minute dwell. 22 collisions that day. The spa always won, on that asymmetry alone.
+    """
+
+    id: str
+    max_power_kw: float
+    members: list[str] = field(default_factory=lambda: [])
+
+
+@dataclass
 class ExecutorConfig:
     """Main executor configuration."""
 
@@ -647,6 +668,9 @@ class ExecutorConfig:
     water_heater_devices: list[WaterHeaterDeviceConfig] = field(default_factory=lambda: [])
     cyclic_loads: list[CyclicLoadConfig] = field(default_factory=lambda: [])
     load_balancing: LoadBalancingConfig = field(default_factory=LoadBalancingConfig)
+    # Top-level load_groups:, the same list the planner reads. Empty => no grouping,
+    # which is exactly today's behaviour.
+    load_groups: list[LoadGroupConfig] = field(default_factory=lambda: [])
     ev_charger: EVChargerConfig = field(default_factory=EVChargerConfig)  # legacy compat
     ev_chargers: list[EVChargerDeviceConfig] = field(default_factory=lambda: [])
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
@@ -678,6 +702,36 @@ def load_yaml(path: str) -> dict[str, Any]:
     except Exception as e:
         logger.error("Failed to load YAML %s: %s", path, e)
         return {}
+
+
+def _parse_load_groups(config: dict[str, Any]) -> list[LoadGroupConfig]:
+    """Parse the optional TOP-LEVEL ``load_groups:`` list.
+
+    Mirrors planner/solver/adapter.py:_parse_load_groups so the executor and the MILP
+    read one config the same way. A group with no positive cap or fewer than two members
+    is dropped rather than kept as a no-op: a ceiling that constrains nothing reads like
+    a real one when someone is debugging why two loads collided.
+    """
+    raw: Any = config.get("load_groups") or []
+    if not isinstance(raw, list):
+        logger.warning("load_groups is not a list — ignoring")
+        return []
+    groups: list[LoadGroupConfig] = []
+    for entry in cast("list[Any]", raw):
+        if not isinstance(entry, dict):
+            continue
+        e = cast("dict[str, Any]", entry)
+        gid = str(e.get("id") or "").strip()
+        try:
+            cap = float(e.get("max_power_kw") or 0.0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        raw_members = cast("list[Any]", e.get("members") or [])
+        members = [str(m) for m in raw_members if str(m).strip()]
+        if not gid or cap <= 0.0 or len(members) < 2:
+            continue
+        groups.append(LoadGroupConfig(id=gid, max_power_kw=cap, members=members))
+    return groups
 
 
 def _parse_load_balancing_config(
@@ -1309,6 +1363,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         water_heater_devices=water_heater_devices_list,
         cyclic_loads=cyclic_loads,
         load_balancing=load_balancing,
+        load_groups=_parse_load_groups(data),
         ev_charger=ev_charger,
         ev_chargers=ev_chargers_list,
         notifications=notifications,

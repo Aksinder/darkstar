@@ -36,7 +36,7 @@ from backend.core.secrets import load_home_assistant_config
 from backend.loads.service import LoadDisaggregator
 
 from .actions import ActionDispatcher, ActionResult, HAClient
-from .config import load_executor_config, load_yaml
+from .config import LoadGroupConfig, load_executor_config, load_yaml
 from .controller import ControllerDecision, make_decision
 from .cyclic_run import anyone_home, should_run_opportunistically
 from .fuse_shed import should_shed_for_fuse
@@ -3263,6 +3263,58 @@ class ExecutorEngine:
         ceiling = device.temp_max if device.temp_max is not None else intended + 1
         return min(intended + 1, int(ceiling))
 
+    def _group_sibling_claiming_supply(self, device: Any) -> str | None:
+        """Why this device must not boost right now, or None if it may.
+
+        The surplus boost overrides the plan by design — it sees real-time surplus the
+        planner cannot. But it decided per device, so it also overrode the load-group
+        cap the MILP enforces, and nothing downstream noticed: the string "load_group"
+        did not appear anywhere under executor/.
+
+        On this site that produced a fight the spa always won. Both loads sit on the
+        villavagn's 10 A sub-fuse inside a 2.3 kW group; 1.8 + 1.6 = 3.4 kW does not fit.
+        The planner honoured that (it booked the spa zero times on 2026-09-03), but the
+        boost re-commanded the spa on every 60 s tick while the tank sat out a 15-minute
+        dwell — so the tank lost every round, 22 times that day, and its water never got
+        hot. Darkstar cannot even see that phase: the sub-fuse sensor appears nowhere in
+        its config, and its own fuse guard watches the house meter.
+
+        A sibling counts as claiming the supply when it has been TOLD to draw, not when
+        it happens to be drawing — see ActionDispatcher.water_claims_supply.
+
+        Only ever REFUSES a boost. It cannot start anything, cannot raise a target, and
+        with no load_groups configured it returns None on the first line, which is
+        exactly today's behaviour.
+        """
+        groups: list[LoadGroupConfig] = self.config.load_groups
+        # getattr, not self.dispatcher: unit tests build the engine with object.__new__
+        # and set only what they exercise, so the attribute may not exist at all. No
+        # dispatcher means no command memory to consult, and the honest answer is then
+        # "I cannot tell" — which must permit, since this gate may only ever refuse.
+        dispatcher = getattr(self, "dispatcher", None)
+        if not groups or dispatcher is None:
+            return None
+        by_id = {d.id: d for d in self.config.water_heater_devices}
+        my_kw = float(getattr(device, "power_kw", 0.0) or 0.0)
+        for grp in groups:
+            if device.id not in grp.members:
+                continue
+            for member_id in grp.members:
+                if member_id == device.id:
+                    continue
+                sib = by_id.get(member_id)
+                if sib is None:
+                    continue
+                if not dispatcher.water_claims_supply(sib.target_entity):
+                    continue
+                sib_kw = float(getattr(sib, "power_kw", 0.0) or 0.0)
+                if my_kw + sib_kw > grp.max_power_kw:
+                    return (
+                        f"group {grp.id} claimed by {member_id} "
+                        f"({sib_kw:.1f}+{my_kw:.1f} kW > {grp.max_power_kw:.1f} kW cap)"
+                    )
+        return None
+
     def _water_surplus_boost(
         self,
         device: Any,
@@ -3277,6 +3329,12 @@ class ExecutorEngine:
         overrides the plan it has to honour that itself.
         """
         if not getattr(device, "surplus_boost", False) or ctx["vacation"]:
+            return None
+        blocked_by = self._group_sibling_claiming_supply(device)
+        if blocked_by is not None:
+            if self._water_boost_state.get(device.id) != (False, blocked_by):
+                self._water_boost_state[device.id] = (False, blocked_by)
+                logger.info("Water surplus-boost %s: off (%s)", device.id, blocked_by)
             return None
         boost, reason = should_boost_on_surplus(
             power_w=power_w,
