@@ -1,3 +1,7 @@
+## dev-20260903.0930 — 2026-09-03 09:32
+
+- feat(water): strike the daily floor while a tank is powered but refusing energy
+
 ## dev-20260831.0850 — 2026-08-31 08:51
 
 - feat(executor): front-load the EV deadline guarantee into the cheapest quarters
