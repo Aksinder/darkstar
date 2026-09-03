@@ -3063,6 +3063,116 @@ class TestFinishedSlotBounds:
         assert end == tz.localize(datetime(2026, 8, 26, 0, 0))
 
 
+class TestUnmeasuredWhenConfigIsAbsent:
+    """An all-zero row written with no configuration is a fabrication, not a quiet hour.
+
+    2026-09-02/03: run.sh replaced config.yaml with a 27-byte stub after a parse failure,
+    and the recorder wrote 44 consecutive all-zero observations across eleven hours,
+    logging "Could not validate energy values ... Proceeding with raw values" each time.
+    They landed with quality_flags "{}" — indistinguishable from a real quarter in which
+    nothing happened, and from the price-mint rows quarantine.py exists to label.
+
+    The row is still stored, because the PRICE on it is real and feeds price_outlook and
+    the ML lags. It is stored TAGGED.
+    """
+
+    @pytest.fixture
+    def base_config(self):
+        # Deliberately missing system.grid.max_power_kw — the shape a failed load has.
+        return {
+            "timezone": "Europe/Stockholm",
+            "learning": {"sqlite_path": ":memory:"},
+            "input_sensors": {"pv_power": "sensor.pv", "load_power": "sensor.load"},
+            "system": {"grid_meter_type": "net"},
+            "water_heaters": [],
+            "ev_chargers": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_observation_is_tagged(self, base_config):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_store = RecorderStateStore(Path(tmpdir) / "s.json")
+            state_store.load()
+
+            async def zero(_entity):
+                return 0.0
+
+            async def none_f(_entity):
+                return None
+
+            with (
+                patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=zero),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=none_f),
+                patch("backend.recorder.get_ha_entity_state", side_effect=none_f),
+                patch(
+                    "backend.recorder.get_energy_from_power_history",
+                    new_callable=AsyncMock, return_value=None,
+                ),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
+                patch("backend.recorder.logger"),
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=base_config, state_store=state_store
+                    )
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+
+        flags = json.loads(str(record["quality_flags"]))
+        assert flags.get("no_config") is True, (
+            "an observation taken without configuration must say so, or it is "
+            "indistinguishable from a genuinely idle quarter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_configured_observation_is_not_tagged(self, base_config):
+        """The healthy path must stay untouched — no tag on a normal quarter."""
+        cfg = base_config.copy()
+        cfg["system"] = {"grid_meter_type": "net", "grid": {"max_power_kw": 25.0}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_store = RecorderStateStore(Path(tmpdir) / "s.json")
+            state_store.load()
+
+            async def zero(_entity):
+                return 0.0
+
+            async def none_f(_entity):
+                return None
+
+            with (
+                patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=zero),
+                patch("backend.recorder.get_ha_sensor_float", side_effect=none_f),
+                patch("backend.recorder.get_ha_entity_state", side_effect=none_f),
+                patch(
+                    "backend.recorder.get_energy_from_power_history",
+                    new_callable=AsyncMock, return_value=None,
+                ),
+                patch("backend.recorder.get_nordpool_data", return_value=None),
+                patch("backend.recorder.logger"),
+            ):
+                mock_store = MagicMock()
+                mock_store.get_system_state = AsyncMock(return_value=None)
+                mock_store.set_system_state = AsyncMock()
+                mock_store.store_slot_observations = AsyncMock()
+                mock_store.close = AsyncMock()
+                with patch("backend.recorder.LearningStore", return_value=mock_store):
+                    await record_observation_from_current_state(
+                        config=cfg, state_store=state_store
+                    )
+                    df = mock_store.store_slot_observations.call_args[0][0]
+                    record = df.iloc[0].to_dict()
+
+        raw = record.get("quality_flags")
+        flags = json.loads(str(raw)) if raw else {}
+        assert "no_config" not in flags
+
+
 class TestEnergyBalanceTripwire:
     """The recorder flags quarters where energy conservation does not close.
 
