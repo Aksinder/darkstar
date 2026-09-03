@@ -820,12 +820,41 @@ async def record_observation_from_current_state(
         f"EV={ev_charging_kwh:.3f}kWh Bat={battery_kw:.3f}kW"
     )
 
-    # Validate energy values before storage
+    # Validate energy values before storage.
+    #
+    # A ValueError here means system.grid.max_power_kw is absent, and that key is not
+    # optional decoration — its absence means the configuration itself did not load.
+    # Every sensor lookup above then returned nothing and this record is all zeros with
+    # SOC=None, which is a FABRICATION, not a measurement of a quiet quarter.
+    #
+    # Live incident 2026-09-02/03: run.sh overwrote config.yaml with a 27-byte stub
+    # after a parse failure (fixed separately), and the recorder wrote 44 consecutive
+    # all-zero observations across eleven hours while logging this very warning each
+    # time. They landed with quality_flags "{}" — indistinguishable from a real quarter
+    # in which nothing happened, and from the pre-2026-08-08 price-mint rows that
+    # backend/learning/quarantine.py exists to label.
+    #
+    # The row is still stored rather than skipped, on quarantine.py's reasoning: the
+    # PRICE on it is real and is read by price_outlook's 14-day average and by the ML
+    # price lags, so discarding it throws away good data to avoid bad. It is stored
+    # TAGGED, so "never measured" cannot masquerade as "measured 0.0 kWh".
     try:
         max_kwh = get_max_energy_per_slot(config)
         record = validate_energy_values(record, max_kwh)
     except ValueError as e:
-        logger.warning(f"Could not validate energy values: {e}. Proceeding with raw values.")
+        logger.warning(
+            "Could not validate energy values: %s. Configuration looks absent — "
+            "tagging this observation as unmeasured rather than storing zeros as fact.",
+            e,
+        )
+        _flags: dict[str, Any] = {}
+        if record.get("quality_flags"):
+            try:
+                _flags = json.loads(str(record["quality_flags"]))
+            except (ValueError, TypeError):
+                _flags = {}
+        _flags["no_config"] = True
+        record["quality_flags"] = json.dumps(_flags)
 
     # Store
     df = pd.DataFrame([record])
