@@ -1,3 +1,7 @@
+## dev-20260903.1858 — 2026-09-03 19:00
+
+- fix(executor): the surplus boost must respect the load-group cap
+
 ## dev-20260903.0930 — 2026-09-03 09:32
 
 - feat(water): strike the daily floor while a tank is powered but refusing energy
