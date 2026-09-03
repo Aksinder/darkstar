@@ -109,7 +109,20 @@ config_path = Path('/config/darkstar/config.yaml')
 default_config_path = Path('/app/config.default.yaml')
 secrets_path = Path('/config/darkstar/secrets.yaml')
 
-# Load existing files
+# Load existing files.
+#
+# config_unreadable distinguishes the two cases that produce an empty dict, because
+# they call for opposite behaviour and conflating them destroys the user's config:
+#   - the file does not exist  => {} is the correct starting point, write freely
+#   - the file exists but will not parse => {} is a LIE. Anything written from it
+#     replaces a working configuration with a stub.
+#
+# Live incident 2026-09-02/03: a duplicate key made ruamel refuse the file, config
+# became {}, and the Add-on-settings block further down wrote {timezone: ...} over
+# an 82 KB config — twice, once per restart. The user lost every setting and the
+# add-on then ran blind ("Missing required configuration", SOC=None, PV=0.000kWh)
+# recording zero-filled observations into the learning database.
+config_unreadable = False
 try:
     if config_path.exists():
         with open(config_path) as f:
@@ -119,6 +132,7 @@ try:
 except Exception as e:
     print(f"[run.sh] Error loading config.yaml: {e}")
     config = {}
+    config_unreadable = True
 
 # Load defaults for migration (REV F17)
 try:
@@ -278,10 +292,31 @@ if modified_secrets:
         safe_dump_stream(secrets, f)
     print("[run.sh] Updated secrets.yaml")
 
-if modified_config:
-    with open(config_path, 'w') as f:
-        safe_dump_stream(config, f)
-    print("[run.sh] Applied Add-on settings to config.yaml")
+if modified_config and config_unreadable:
+    # NEVER write a config we could not read. Everything above operated on {}, so
+    # this would replace the user's file with a stub built from Add-on options —
+    # and the original is gone the moment we open it 'w'. Refusing costs one failed
+    # start with a message the user can act on; writing costs them every setting.
+    print(
+        "[run.sh] ⚠️  REFUSING to write config.yaml: it exists but could not be "
+        "parsed (see the load error above). Your configuration is UNCHANGED on "
+        "disk. Fix the reported line and restart — the add-on will not start "
+        "correctly until then."
+    )
+elif modified_config:
+    if not isinstance(config, dict) or len(config) < 2:
+        # Belt and braces for the same class of loss without an exception: a parser
+        # that returns something empty-but-valid, or a future edit that drops the
+        # guard above. A real config has dozens of top-level keys.
+        print(
+            f"[run.sh] ⚠️  REFUSING to write config.yaml: in-memory config has "
+            f"{len(config) if isinstance(config, dict) else 'no'} top-level keys, "
+            "which cannot be right. Leaving the file untouched."
+        )
+    else:
+        with open(config_path, 'w') as f:
+            safe_dump_stream(config, f)
+        print("[run.sh] Applied Add-on settings to config.yaml")
 
 # -----------------------------------------------------------------------------
 # FINAL STATUS LOGGING (SSOT: config.yaml)
