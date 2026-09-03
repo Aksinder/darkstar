@@ -164,7 +164,9 @@ async def _apply_ev_owner_levers(
             logger.info("%s", note)
 
 
-def _load_hot_water_states(path: str = "data/hot_water_state.json") -> dict[str, dict]:
+def _load_hot_water_states(
+    path: str = "data/hot_water_state.json",
+) -> dict[str, dict[str, Any]]:
     """The tank estimator's persisted state, or {} when it is not available.
 
     Written every ~300 s by the cycle publisher running in this same process.
@@ -201,6 +203,38 @@ def _apply_water_shortfall_gate(
         raw = cfg_by_id.get(h.id)
         if not raw:
             continue
+
+        # SATURATION STRIKE, ahead of the forecast gate and independent of it.
+        #
+        # A tank that is powered and refusing energy has an open thermostat: there is
+        # nothing to fill, so a daily-kWh promise is not a promise about anything. On
+        # 2026-09-02 the house tank was commanded on right through the evening peak,
+        # drawing 0 W, because heated_today read 1.409 kWh against a 6.00 floor it could
+        # not physically meet — 0.58 kWh went in at 2.42-2.44 SEK/kWh, the day's second
+        # dearest price, with no PV and no export.
+        #
+        # This needs no demand forecast, which is what makes it safe to run where the
+        # shortfall gate below is not: it does not predict a shower, it observes that the
+        # tank is already at temperature. The measurement requires the switch to be
+        # CONFIRMED ON for a sustained period — see HotWaterEstimator.saturated_after_min
+        # for why an unknown switch must never qualify.
+        #
+        # Striking the floor removes the OBLIGATION, not the opportunity: the solver is
+        # still free to heat on a very cheap hour or on surplus, and when the tank really
+        # is full the element simply takes nothing. The floor returns by itself the moment
+        # the tank accepts energy again, because the saturation clock resets.
+        tank_state = cast("dict[str, Any]", states.get(h.id) or {})
+        sat_min = float(tank_state.get("saturated_min", 0.0) or 0.0)
+        sat_after = float(raw.get("saturated_after_min", 10.0))
+        if sat_min >= sat_after > 0 and h.min_kwh_per_day > 0:
+            logger.info(
+                "Water floor %s: STRUCK (%.0f kWh -> 0) — powered but idle for %.0f min, "
+                "thermostat satisfied, nothing to fill. Opportunistic heating unaffected.",
+                h.id, h.min_kwh_per_day, sat_min,
+            )
+            h.min_kwh_per_day = 0.0
+            continue
+
         gate_raw = raw.get("shortfall_gate") or {}
         if not gate_raw.get("enabled", False):
             continue

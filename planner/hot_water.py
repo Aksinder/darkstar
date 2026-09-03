@@ -55,6 +55,19 @@ class HotWaterEstimator:
     heating_on_w: float = 200.0
     full_anchor_after_min: float = 8.0
     comfort_c: float = 40.0
+    # SATURATION: powered but not drawing => the thermostat has opened => the tank cannot
+    # accept energy right now. Distinct from stored_kwh, which is a MODEL estimate and can
+    # be days stale (main_tank sat at minutes_since_anchor 9014 — six days — on
+    # 2026-09-03 while physically saturated). This is a live measurement, and the daily
+    # floor needs it: on 2026-09-02 the house tank was commanded on through the evening
+    # peak, drawing nothing, because heated_today read 1.409 kWh against a 6.00 floor it
+    # could not physically meet.
+    #
+    # Requires the switch to be CONFIRMED ON. That is the whole discrimination: the
+    # villavagn tank also reads ~0 W every fifteen minutes, but because an HA phase guard
+    # cuts its switch — blocked, not full. Treating that as saturated would stop Darkstar
+    # heating a cold tank and nobody would find out until the shower ran cold.
+    saturated_after_min: float = 10.0
 
     # Learned hot-water DRAW — the big down-force the naive integrator lacked (only standing
     # loss decremented before, so the level looked frozen). Draw is unmetered, so it is modelled
@@ -71,6 +84,10 @@ class HotWaterEstimator:
     stored_kwh: float = field(default=-1.0)
     learned_draw_kw: float = field(default=-1.0)
     _heating_run_min: float = field(default=0.0)
+    # Consecutive minutes of "switch confirmed ON and element idle". Reset by any heating,
+    # by the switch going off, and by an unknown switch state — an unwired or unreadable
+    # switch must never look like a satisfied thermostat.
+    _saturated_min: float = field(default=0.0)
     _energy_in_since_anchor_kwh: float = field(default=0.0)
     _minutes_since_anchor: float = field(default=0.0)
 
@@ -160,6 +177,13 @@ class HotWaterEstimator:
         self._minutes_since_anchor += dt_minutes
 
         heating_on = heating_kw * 1000.0 >= self.heating_on_w
+
+        # Saturation clock. Only "switch confirmed ON" counts — see saturated_after_min.
+        if switch_on is True and not heating_on:
+            self._saturated_min += dt_minutes
+        else:
+            self._saturated_min = 0.0
+
         if heating_on:
             self.stored_kwh += heating_kw * dt_h
             self._heating_run_min += dt_minutes
@@ -210,6 +234,21 @@ class HotWaterEstimator:
 
     # -- persistence (so a restart does not reseed every tank to FULL) ------
 
+    @property
+    def saturated_minutes(self) -> float:
+        """Consecutive minutes powered-but-idle. 0 unless the switch is confirmed ON."""
+        return self._saturated_min
+
+    @property
+    def is_saturated(self) -> bool:
+        """The tank is powered and refusing energy: its thermostat has opened.
+
+        A live measurement, unlike stored_kwh. The daily floor may be struck while this
+        holds — there is nothing to fill — and it becomes False again the moment the
+        element draws, the switch opens, or the switch state stops being readable.
+        """
+        return self._saturated_min >= self.saturated_after_min
+
     def state_dict(self) -> dict[str, float]:
         return {
             "stored_kwh": round(self.stored_kwh, 5),
@@ -217,6 +256,7 @@ class HotWaterEstimator:
             "heating_run_min": round(self._heating_run_min, 3),
             "energy_in_since_anchor_kwh": round(self._energy_in_since_anchor_kwh, 5),
             "minutes_since_anchor": round(self._minutes_since_anchor, 3),
+            "saturated_min": round(self._saturated_min, 3),
         }
 
     def apply_state(self, d: dict[str, float]) -> None:
@@ -234,6 +274,8 @@ class HotWaterEstimator:
             self._energy_in_since_anchor_kwh = float(d["energy_in_since_anchor_kwh"])
         if "minutes_since_anchor" in d:
             self._minutes_since_anchor = float(d["minutes_since_anchor"])
+        if "saturated_min" in d:
+            self._saturated_min = max(0.0, float(d["saturated_min"]))
 
 
 def estimate_draw_kwh(
