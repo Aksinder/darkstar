@@ -1,3 +1,7 @@
+## dev-20260905.1700 — 2026-09-05 17:01
+
+- fix(executor): stop colliding with the top of the hour, and say what timed out
+
 ## dev-20260905.1414 — 2026-09-05 14:15
 
 - fix(executor): an expired override must release the selector, not just our view of it
