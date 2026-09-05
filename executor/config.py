@@ -660,6 +660,21 @@ class ExecutorConfig:
     shadow_mode: bool = False  # Log only, don't execute
     interval_seconds: int = 300  # 5 minutes
 
+    # Phase offset from the interval boundary, in seconds. The tick used to fire on the
+    # exact boundary — 10162 of 10166 ticks began on second :00 — which put it in a dead
+    # heat with everything else on this box that is scheduled on whole minutes and whole
+    # hours: HA's hourly statistics compilation, price-sensor refreshes, hourly template
+    # re-renders. The read timeouts clustered accordingly (02:00 x26, 04:00 x18, 01:00
+    # x12, 00:00 x8). Stepping a few seconds off the boundary costs nothing and takes us
+    # out of that thundering herd. Set 0 to restore boundary-aligned ticks.
+    tick_offset_seconds: float = 7.0
+
+    # A tick slower than this logs a WARNING. The old threshold was hardcoded at 1.0 s,
+    # which fired on ~88% of all ticks (median tick 7.1 s, p95 19.3 s) — 10166 warnings
+    # in 8 days is not a signal, it is wallpaper. Every tick still logs its duration and
+    # HTTP split at INFO, so nothing is hidden by raising this.
+    slow_tick_threshold_s: float = 20.0
+
     automation_toggle_entity: str | None = None
     manual_override_entity: str | None = None
 
@@ -1356,6 +1371,8 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         enabled=bool(executor_data.get("enabled", False)),
         shadow_mode=bool(executor_data.get("shadow_mode", False)),
         interval_seconds=int(executor_data.get("interval_seconds", 300)),
+        tick_offset_seconds=float(executor_data.get("tick_offset_seconds", 7.0)),
+        slow_tick_threshold_s=float(executor_data.get("slow_tick_threshold_s", 20.0)),
         automation_toggle_entity=_str_or_none(executor_data.get("automation_toggle_entity")),
         manual_override_entity=_str_or_none(executor_data.get("manual_override_entity")),
         inverter=inverter,

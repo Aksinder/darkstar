@@ -1161,19 +1161,36 @@ class ExecutorEngine:
                 try:
                     tick_start = datetime.now(tz)
                     logger.info("Executing scheduled tick at %s", tick_start.isoformat())
+                    client = getattr(self, "ha_client", None)
+                    if client is not None and hasattr(client, "http_stats_reset"):
+                        client.http_stats_reset()
 
                     # The Core Fix: await the async tick
                     await self._tick()
 
                     tick_duration = (datetime.now(tz) - tick_start).total_seconds()
 
-                    # Rev PERF2: Performance Logging
-                    if tick_duration > 1.0:
+                    # Rev PERF2: Performance Logging — now with ATTRIBUTION. A bare
+                    # duration told us ticks were slow but not why, which is how we spent
+                    # 8 days unable to say whether the cost was HA round-trips or our own
+                    # compute. Every tick reports the split; only genuinely slow ones warn.
+                    calls, http_s = (0, 0.0)
+                    client = getattr(self, "ha_client", None)
+                    if client is not None and hasattr(client, "http_stats"):
+                        calls, http_s = client.http_stats()
+                    detail = "%.2fs (%d HA calls, %.2fs in HTTP, %.2fs compute)" % (
+                        tick_duration,
+                        calls,
+                        http_s,
+                        max(0.0, tick_duration - http_s),
+                    )
+                    threshold = float(getattr(self.config, "slow_tick_threshold_s", 20.0))
+                    if tick_duration > threshold:
                         logger.warning(
-                            "\u26a0\ufe0f SLOW TICK: %.2fs (Threshold: 1.0s)", tick_duration
+                            "\u26a0\ufe0f SLOW TICK: %s (threshold %.0fs)", detail, threshold
                         )
                     else:
-                        logger.info("Tick completed in %.2fs", tick_duration)
+                        logger.info("Tick completed in %s", detail)
                 except Exception as e:
                     logger.exception("Executor tick failed: %s", e)
                     self.status.last_run_status = "error"
@@ -1196,18 +1213,34 @@ class ExecutorEngine:
         logger.info("Executor background loop stopped")
 
     def _compute_next_run(self, now: datetime) -> datetime:
-        """Compute the next execution time based on interval."""
-        # interval = timedelta(seconds=self.config.interval_seconds)
+        """Compute the next execution time: interval boundary PLUS a phase offset.
+
+        The offset is the whole point. Firing on the exact boundary put every tick in a
+        dead heat with everything else on this box that runs on whole minutes and whole
+        hours, and the read timeouts clustered on the hour accordingly. Spacing between
+        ticks is unchanged — only the phase moves — so nothing downstream that reasons
+        about cadence is affected.
+        """
+        interval = self.config.interval_seconds
+        offset = float(getattr(self.config, "tick_offset_seconds", 0.0) or 0.0)
+        # An offset at or beyond one interval is just a later boundary; fold it back so a
+        # mis-set value can never stall the loop or collapse the spacing.
+        offset = max(0.0, offset) % interval
 
         # Align to interval boundaries (e.g., on the 5-minute mark)
         epoch = datetime(2000, 1, 1, tzinfo=now.tzinfo)
         elapsed = (now - epoch).total_seconds()
-        intervals_passed = elapsed // self.config.interval_seconds
-        next_boundary = epoch + timedelta(
-            seconds=(intervals_passed + 1) * self.config.interval_seconds
-        )
+        intervals_passed = elapsed // interval
+        next_boundary = epoch + timedelta(seconds=(intervals_passed + 1) * interval)
+        next_run = next_boundary + timedelta(seconds=offset)
 
-        return next_boundary
+        # The offset can put the CURRENT boundary's slot still ahead of us; take it
+        # rather than idling a whole interval.
+        candidate = next_boundary - timedelta(seconds=interval) + timedelta(seconds=offset)
+        if candidate > now:
+            next_run = candidate
+
+        return next_run
 
     async def _device_control_paused(
         self,

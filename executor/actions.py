@@ -82,6 +82,7 @@ def _is_retryable_error(exception: Exception) -> bool:
 async def _retry_with_backoff(
     operation: Callable[[], Any],
     max_retries: int = 3,
+    what: str = "HA API call",
     base_delay: float = 1.0,
     max_delay: float = 10.0,
     backoff_factor: float = 2.0,
@@ -121,18 +122,25 @@ async def _retry_with_backoff(
 
             # Calculate delay with exponential backoff
             delay = min(base_delay * (backoff_factor**attempt), max_delay)
+            # str(asyncio.TimeoutError()) is the EMPTY STRING, and a timeout carries no
+            # URL either — so the old "%s" produced 265 warnings over 8 days that read
+            # "HA API call failed (attempt 1/4): ." and named neither the entity nor the
+            # kind of failure. Always print the exception TYPE and the target.
+            detail = str(e) or "(no detail)"
             logger.warning(
-                "HA API call failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                "%s failed (attempt %d/%d): %s: %s. Retrying in %.1fs...",
+                what,
                 attempt + 1,
                 max_retries + 1,
-                e,
+                type(e).__name__,
+                detail,
                 delay,
             )
             await asyncio.sleep(delay)
 
     # All retries exhausted
     raise HACallError(
-        message=f"HA API call failed after {max_retries + 1} attempts",
+        message=f"{what} failed after {max_retries + 1} attempts",
         exception_type=type(last_exception).__name__ if last_exception else "Unknown",
     ) from last_exception
 
@@ -221,10 +229,22 @@ class HAClient:
         base_url: str,
         token: str,
         timeout: int = 5,
+        read_timeout: float = 10.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = aiohttp.ClientTimeout(total=timeout)
+        # Reads get a LONGER deadline than writes, and that asymmetry is deliberate.
+        # This box is a 2-vCPU VM: on the hour, HA compiles statistics, price sensors
+        # refresh and hourly templates re-render all at once, and a plain state read can
+        # sit in that queue for well over 5 s. A read that is merely SLOW is still a
+        # correct read, so waiting beats retrying. A WRITE is the opposite — if it has
+        # not landed quickly the world has moved on, so writes keep the tight deadline.
+        self.read_timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=read_timeout)
+        # Per-tick HTTP accounting, so a slow tick can say where the time went instead
+        # of leaving us to guess whether it is the network or our own compute.
+        self._http_calls = 0
+        self._http_seconds = 0.0
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -259,6 +279,15 @@ class HAClient:
         assert self._session is not None
         return self._session
 
+    def http_stats_reset(self) -> None:
+        """Zero the HTTP counters (called at the start of every executor tick)."""
+        self._http_calls = 0
+        self._http_seconds = 0.0
+
+    def http_stats(self) -> tuple[int, float]:
+        """(calls, seconds) spent in HA HTTP since the last reset."""
+        return self._http_calls, self._http_seconds
+
     async def close(self) -> None:
         """Close the aiohttp session."""
         if self._session and not self._session.closed:
@@ -279,14 +308,24 @@ class HAClient:
 
         async def _fetch() -> dict[str, Any]:
             session = await self._get_session()
-            async with session.get(
-                f"{self.base_url}/api/states/{entity_id}",
-            ) as response:
-                response.raise_for_status()
-                return await response.json()
+            started = time.monotonic()
+            try:
+                async with session.get(
+                    f"{self.base_url}/api/states/{entity_id}",
+                    timeout=self.read_timeout,
+                ) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            finally:
+                self._http_calls += 1
+                self._http_seconds += time.monotonic() - started
 
         try:
-            return await _retry_with_backoff(_fetch, max_retries=3, base_delay=1.0)
+            # Three attempts, not four. The deadline doubled, so the retry BUDGET has to
+            # shrink or one wedged entity could eat 37 s of a 60 s tick.
+            return await _retry_with_backoff(
+                _fetch, max_retries=2, base_delay=1.0, what=f"HA read {entity_id}"
+            )
         except HACallError:
             # All retries exhausted, return None for graceful degradation
             return None
@@ -314,14 +353,21 @@ class HAClient:
 
         async def _post() -> None:
             session = await self._get_session()
-            async with session.post(
-                f"{self.base_url}/api/states/{entity_id}",
-                json=body,
-            ) as response:
-                response.raise_for_status()
+            started = time.monotonic()
+            try:
+                async with session.post(
+                    f"{self.base_url}/api/states/{entity_id}",
+                    json=body,
+                ) as response:
+                    response.raise_for_status()
+            finally:
+                self._http_calls += 1
+                self._http_seconds += time.monotonic() - started
 
         try:
-            await _retry_with_backoff(_post, max_retries=2, base_delay=1.0)
+            await _retry_with_backoff(
+                _post, max_retries=2, base_delay=1.0, what=f"HA publish {entity_id}"
+            )
             return True
         except (aiohttp.ClientError, TimeoutError, HACallError) as e:
             logger.warning("Failed to publish state for %s: %s", entity_id, e)
@@ -360,14 +406,24 @@ class HAClient:
 
         async def _post() -> None:
             session = await self._get_session()
-            async with session.post(
-                f"{self.base_url}/api/services/{domain}/{service}",
-                json=payload,
-            ) as response:
-                response.raise_for_status()
+            started = time.monotonic()
+            try:
+                async with session.post(
+                    f"{self.base_url}/api/services/{domain}/{service}",
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+            finally:
+                self._http_calls += 1
+                self._http_seconds += time.monotonic() - started
 
         try:
-            await _retry_with_backoff(_post, max_retries=max_retries, base_delay=1.0)
+            await _retry_with_backoff(
+                _post,
+                max_retries=max_retries,
+                base_delay=1.0,
+                what=f"HA {domain}.{service} on {entity_id or '-'}",
+            )
             return True
         except aiohttp.ClientResponseError as e:
             raise HACallError(
