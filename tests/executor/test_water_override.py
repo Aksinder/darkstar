@@ -19,15 +19,22 @@ from executor.engine import ExecutorEngine
 class FakeHA:
     def __init__(self, value):
         self.value = value
+        self.selects: list[tuple[str, str]] = []
 
     async def get_state_value(self, entity):
         return self.value
+
+    async def set_select_option(self, entity, option):
+        self.selects.append((entity, option))
+        return True
 
 
 def _engine() -> ExecutorEngine:
     """A bare engine: only the override helper and its memo are exercised."""
     eng = ExecutorEngine.__new__(ExecutorEngine)
     eng._override_since = {}
+    # Expiry now also releases the SELECTOR back to auto, rate-limited per heater.
+    eng._override_reset_ts = {}
     eng.ha_client = None
     return eng
 
@@ -126,3 +133,89 @@ class TestExpiry:
         eng._override_since["spa"] = (time.time() - 3601, "force_on")
         assert await _read("auto", dev, eng) == "auto"
         assert "spa" not in eng._override_since
+
+
+class TestExpiryReleasesTheSelector:
+    """The expiry has always worked internally — it just never reached the helper.
+
+    Live 2026-09-05: input_select.darkstar_ev_easee_mode had read force_on since
+    2026-09-04 03:33 and Darkstar logged "expired after 180 min — back to auto" on every
+    60 s tick, for 33 hours. The UI said force_on, the system ran auto, and nothing but
+    that log line distinguished them.
+
+    Worse than cosmetic: the clock is in-memory and starts when the value is first SEEN,
+    so every add-on restart restarts it. Restart more often than the timeout and a
+    forgotten force never expires at all, while the log insists it is counting down.
+    """
+
+    def _live_engine(self, *, shadow=False):
+        eng = _engine()
+        eng.config = SimpleNamespace(shadow_mode=shadow)
+        return eng
+
+    @pytest.mark.asyncio
+    async def test_it_writes_auto_back_to_the_helper(self):
+        eng = self._live_engine()
+        dev = _device(override_timeout_minutes=60.0)
+        eng._override_since["spa"] = (time.time() - 3601, "force_on")
+        ha = FakeHA("force_on")
+        eng.ha_client = ha
+        assert await eng._heater_override(dev) == "auto"
+        assert ha.selects == [("input_select.spa_override", "auto")]
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_write_before_the_timeout(self):
+        eng = self._live_engine()
+        dev = _device(override_timeout_minutes=60.0)
+        eng._override_since["spa"] = (time.time() - 600, "force_on")
+        ha = FakeHA("force_on")
+        eng.ha_client = ha
+        assert await eng._heater_override(dev) == "force_on"
+        assert ha.selects == []
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_never_writes(self):
+        """Observe-only must not touch a user's helper, however stale it looks."""
+        eng = self._live_engine(shadow=True)
+        dev = _device(override_timeout_minutes=60.0)
+        eng._override_since["spa"] = (time.time() - 3601, "force_on")
+        ha = FakeHA("force_on")
+        eng.ha_client = ha
+        assert await eng._heater_override(dev) == "auto"
+        assert ha.selects == []
+
+    @pytest.mark.asyncio
+    async def test_the_write_is_rate_limited_not_once_only(self):
+        """One write per interval, not one per tick — but never give up either.
+
+        A write that silently failed would otherwise latch the override for good, which
+        is the exact failure this exists to prevent. So it retries, slowly.
+        """
+        eng = self._live_engine()
+        dev = _device(override_timeout_minutes=60.0)
+        eng._override_since["spa"] = (time.time() - 3601, "force_on")
+        ha = FakeHA("force_on")
+        eng.ha_client = ha
+
+        for _ in range(5):  # five consecutive ticks
+            assert await eng._heater_override(dev) == "auto"
+        assert len(ha.selects) == 1, "must not write on every tick"
+
+        # ...and once the retry window has passed, it tries again.
+        eng._override_reset_ts["spa"] = time.time() - 601
+        assert await eng._heater_override(dev) == "auto"
+        assert len(ha.selects) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_still_reports_auto(self):
+        """The internal answer must not depend on the helper accepting the write."""
+        eng = self._live_engine()
+        dev = _device(override_timeout_minutes=60.0)
+        eng._override_since["spa"] = (time.time() - 3601, "force_on")
+
+        class Failing(FakeHA):
+            async def set_select_option(self, entity, option):
+                raise RuntimeError("HA said no")
+
+        eng.ha_client = Failing("force_on")
+        assert await eng._heater_override(dev) == "auto"
