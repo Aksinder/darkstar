@@ -1,3 +1,7 @@
+## dev-20260905.1414 — 2026-09-05 14:15
+
+- fix(executor): an expired override must release the selector, not just our view of it
+
 ## dev-20260903.1858 — 2026-09-03 19:00
 
 - fix(executor): the surplus boost must respect the load-group cap
