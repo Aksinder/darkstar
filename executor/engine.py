@@ -67,6 +67,12 @@ from .write_verify import VerifySignal, VerifyState, note_attempt
 
 logger = logging.getLogger(__name__)
 
+# Retry cadence for releasing an expired override selector back to "auto". The happy
+# path needs one write — the next read sees "auto" and clears the clock — so this only
+# governs retries after a failed write, and bounds the log to one line per interval
+# instead of one per tick forever. Mirrors ev_surplus_runtime's constant of the same name.
+_OVERRIDE_RESET_RETRY_S = 600.0
+
 EXECUTOR_VERSION = "1.0.0"
 
 
@@ -271,6 +277,9 @@ class ExecutorEngine:
         self._water_boost_hold_until: dict[str, float] = {}
         # heater id -> (epoch when this override was first seen, which one)
         self._override_since: dict[str, tuple[float, str]] = {}
+        # heater id -> epoch of the last attempt to release its selector back to auto,
+        # so a failed write retries slowly instead of latching the override for good.
+        self._override_reset_ts: dict[str, float] = {}
         self._override_state: dict[str, str] = {}
         # Escalation memory: did our correction actually reach the appliance?
         self._verify_state: dict[str, VerifyState] = {}
@@ -2887,10 +2896,34 @@ class ExecutorEngine:
             since = now
         self._override_since[device.id] = (since, val)
         if (now - since) >= timeout_min * 60.0:
-            logger.info(
-                "Water override %s: %s expired after %.0f min — back to auto",
-                device.id, val, timeout_min,
-            )
+            # Release the SELECTOR too, not just our own view of it. The expiry has
+            # always worked internally, but it never reached the helper — so the UI kept
+            # showing force_on while the system ran on auto, distinguishable only by a
+            # log line that repeated every tick forever. See the EV twin in
+            # ev_surplus_runtime._release_expired_override for the full account; the
+            # in-memory clock also restarts on every add-on restart, so a forgotten
+            # force could outlive its timeout indefinitely while the log claimed to be
+            # counting it down.
+            last = self._override_reset_ts.get(device.id, 0.0)
+            if now - last >= _OVERRIDE_RESET_RETRY_S:
+                self._override_reset_ts[device.id] = now
+                logger.info(
+                    "Water override %s: %s expired after %.0f min — releasing %s to auto",
+                    device.id, val, timeout_min, entity,
+                )
+                # getattr: unit tests build a bare engine with only the fields the
+                # override helper touches, so `config` may not exist. An engine with no
+                # config cannot be trusted to know whether it may write, so treat that
+                # as shadow — the gate may only ever suppress a write, never add one.
+                shadow = bool(getattr(getattr(self, "config", None), "shadow_mode", True))
+                if not shadow:
+                    try:
+                        await self.ha_client.set_select_option(entity, "auto")
+                    except Exception as exc:
+                        logger.warning(
+                            "Water override %s: could not release %s to auto (%s) — "
+                            "will retry", device.id, entity, exc,
+                        )
             return "auto"
         return val
 

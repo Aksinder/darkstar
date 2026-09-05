@@ -38,6 +38,12 @@ from .ev_surplus import (
 
 logger = logging.getLogger("darkstar.ev_surplus")
 
+# How often to re-attempt releasing an expired override selector back to "auto". Slow,
+# because the happy path needs exactly one write: the next read then sees "auto" and the
+# clock clears itself. This cadence only governs RETRIES after a failed write, and it
+# also bounds the log to one line per interval instead of one per 60 s tick forever.
+_OVERRIDE_RESET_RETRY_S = 600.0
+
 _TRUEISH = {"on", "home", "true", "charging", "connected", "plugged", "1"}
 
 
@@ -652,6 +658,12 @@ class EVSurplusController:
         self.last_ev_priority_cap_w: float | None = None
         # charger id -> (epoch when this override was first seen, which one)
         self._override_since: dict[str, tuple[float, str]] = {}
+        # charger id -> epoch of the last "release this selector to auto" attempt, so a
+        # write that fails is retried on a slow cadence instead of latching the override.
+        self._override_reset_ts: dict[str, float] = {}
+        # The global shadow flag for the tick in progress, stashed by run() because the
+        # read helpers below are called from _read_charger, which does not carry it.
+        self._shadow_tick: bool = False
 
     def fuse_battery_cap_w(self, now_ts: float) -> float | None:
         """Battery charge-setpoint cap for the engine, or None when the guard is off.
@@ -952,12 +964,59 @@ class EVSurplusController:
             since = now_ts
         self._override_since[c.id] = (since, val)
         if (now_ts - since) >= timeout_min * 60.0:
-            logger.info(
-                "EV override %s: %s expired after %.0f min — back to auto",
-                c.id, val, timeout_min,
+            await self._release_expired_override(
+                ha, c.override_entity, c.id, val, timeout_min, now_ts,
+                shadow=self._shadow_tick or c.shadow,
             )
             return "auto"
         return val
+
+    async def _release_expired_override(
+        self,
+        ha: Any,
+        entity: str,
+        load_id: str,
+        val: str,
+        timeout_min: float,
+        now_ts: float,
+        *,
+        shadow: bool,
+    ) -> None:
+        """Write the selector back to auto when its override has expired.
+
+        The expiry itself has always worked — it just never reached the HELPER. Darkstar
+        returned "auto" internally and left input_select showing force_on, so the UI said
+        one thing and the system did another, with nothing to tell them apart but a log
+        line repeating every 60 s forever. Live on 2026-09-05: easee_fmb had read
+        force_on since 2026-09-04 03:33 and logged "expired after 180 min" on every tick.
+
+        Worse than cosmetic, because the clock is in-memory and starts when the value is
+        first SEEN: every add-on restart restarts it. Restart more often than the timeout
+        and a forgotten force_on never expires at all — while the log insists it is
+        counting.
+
+        Retried on a slow cadence rather than sent once. A write that silently failed
+        would otherwise leave the override latched for good, which is the failure this
+        exists to prevent. Success needs no bookkeeping: the next read sees "auto" and
+        clears the clock through the ordinary path.
+        """
+        last = self._override_reset_ts.get(load_id, 0.0)
+        if now_ts - last < _OVERRIDE_RESET_RETRY_S:
+            return
+        self._override_reset_ts[load_id] = now_ts
+        logger.info(
+            "EV override %s: %s expired after %.0f min — releasing %s back to auto",
+            load_id, val, timeout_min, entity,
+        )
+        if shadow:
+            return
+        try:
+            await ha.set_select_option(entity, "auto")
+        except Exception as exc:
+            logger.warning(
+                "EV override %s: could not release %s to auto (%s) — will retry",
+                load_id, entity, exc,
+            )
 
     async def _read_priority_order(self, ha: Any) -> list[str] | None:
         """Resolve the manual priority selector to a charger ordering, else None.
@@ -1280,6 +1339,9 @@ class EVSurplusController:
         plan_floor: true consume it, after the soc-gate and continuity hold.
         """
         cfg = self.cfg
+        # Stash for the read helpers below — _read_charger does not carry the flag, and
+        # releasing an expired override writes to a user-facing helper.
+        self._shadow_tick = bool(shadow)
         if not cfg.enabled or not cfg.chargers:
             self.last_ev_priority_cap_w = None
             return {"enabled": False}
