@@ -1,3 +1,7 @@
+## dev-20260906.2007 — 2026-09-06 20:09
+
+- fix(planner): a daily water floor may not exceed what the tank can hold
+
 ## dev-20260906.1958 — 2026-09-06 20:00
 
 - fix(ev): a silent tracker is not a car that drove away
