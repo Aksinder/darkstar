@@ -3,6 +3,7 @@ import contextlib
 import logging
 import math
 import re
+import time as _time
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,12 @@ from backend.core.ev_presence import ev_is_home, haversine_km
 from backend.health import set_load_forecast_status
 
 logger = logging.getLogger("darkstar.core.ha_client")
+
+# Last good EV SoC per charger, and how long it may stand in for a missing reading.
+# Six hours is deliberately shorter than a night: a held value may carry the car across
+# an integration hiccup, but it must never quietly plan a whole night on a stale number.
+_LAST_GOOD_EV_SOC: dict[str, tuple[float, float]] = {}
+_EV_SOC_HOLD_S = 6 * 3600.0
 
 
 def _as_float(value: Any) -> float | None:
@@ -706,18 +713,44 @@ async def get_initial_state(
             soc_sensor = ev.get("soc_sensor", "")
             plug_sensor = ev.get("plug_sensor", "")
 
-            # SoC
+            # SoC. An unreadable sensor used to default to 0%, and 0% is not a neutral
+            # number here: the penalty ladder reads it as "empty", which is precisely the
+            # state that is meant to outbid price. 2026-09-06 21:00 the Tesla integration
+            # dropped every white_betty_* entity to unknown while the spot price stood at
+            # 1.27 SEK/kWh; nothing was force-charged only because the controller happened
+            # to fall out of the surplus list first. That is luck of ordering, not a guard.
+            #
+            # 100% would be no better, only wrong in the other direction — it would sleep
+            # through the night a genuinely empty car needed. So this invents neither:
+            # hold the last good reading while it is still plausible, and otherwise say
+            # "unknown" out loud and let the car sit this cycle out.
             soc_percent = 0.0
+            soc_known = True
             if soc_sensor:
                 ha_soc_val = per_device_results.get(f"ev_soc_{charger_id}")
                 if ha_soc_val is not None:
                     soc_percent = float(ha_soc_val)
+                    _LAST_GOOD_EV_SOC[charger_id] = (soc_percent, _time.time())
                 else:
-                    logger.warning(
-                        "EV %s SoC sensor %s returned no data, defaulting to 0%%",
-                        charger_id,
-                        soc_sensor,
-                    )
+                    held = _LAST_GOOD_EV_SOC.get(charger_id)
+                    age = _time.time() - held[1] if held else None
+                    if held is not None and age is not None and age <= _EV_SOC_HOLD_S:
+                        soc_percent = held[0]
+                        logger.warning(
+                            "EV %s SoC sensor %s returned no data — holding last good "
+                            "%.0f%% (%.0f min old, hold expires at %.0f min)",
+                            charger_id, soc_sensor, soc_percent, age / 60.0,
+                            _EV_SOC_HOLD_S / 60.0,
+                        )
+                    else:
+                        soc_known = False
+                        why = "never read" if age is None else f"{age / 60.0:.0f} min old"
+                        logger.warning(
+                            "EV %s SoC sensor %s returned no data and no recent reading "
+                            "to hold (%s) — SoC UNKNOWN, sitting this cycle out rather "
+                            "than assuming a number",
+                            charger_id, soc_sensor, why,
+                        )
 
             # Plug state
             is_override_charger = ev_plug_override_charger_id == charger_id or (
@@ -819,10 +852,21 @@ async def get_initial_state(
                             ch_reason,
                         )
 
+            # An unknown SoC must not read as a plugged-in car with an empty battery.
+            # plugged_in is the one lever every consumer already honours, so the car is
+            # withheld from planning and actuation for exactly as long as the reading is
+            # missing — and returns by itself the moment the sensor answers again.
+            if not soc_known and plugged_in:
+                logger.warning(
+                    "EV %s: withholding from the plan this cycle — SoC unknown", charger_id
+                )
+                plugged_in = False
+
             ev_charger_states.append(
                 {
                     "id": charger_id,
                     "soc_percent": soc_percent,
+                    "soc_known": soc_known,
                     "plugged_in": plugged_in,
                     "at_home": at_home,
                     "reserve_kwh": ev_reserve,
