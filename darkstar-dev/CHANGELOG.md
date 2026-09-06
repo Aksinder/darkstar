@@ -1,3 +1,7 @@
+## dev-20260906.1414 — 2026-09-06 14:15
+
+- fix(executor): a satisfied thermostat must not hold the load group's budget
+
 ## dev-20260905.1700 — 2026-09-05 17:01
 
 - fix(executor): stop colliding with the top of the hour, and say what timed out
