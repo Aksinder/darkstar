@@ -235,6 +235,55 @@ def _apply_water_shortfall_gate(
             h.min_kwh_per_day = 0.0
             continue
 
+        # PHYSICS CAP. A daily floor may never ask for more energy than the tank can
+        # physically accept, and unlike the saturation strike above this needs neither a
+        # forecast nor the switch to have been turned on first.
+        #
+        # That "first" is the whole point. The strike is real evidence — powered and
+        # refusing energy — but the only way to collect it is to power the tank, so the
+        # floor always buys one block before it learns the block was pointless. On
+        # 2026-09-06 20:50 the house tank latched a 45-minute block at 1.27 SEK/kWh
+        # against heated_today=2.591 of a 6.00 floor, sat there drawing 0 W at 70.6 C and
+        # 93% full, and the strike fired ten minutes later — after the block had already
+        # committed. The block cost nothing (a satisfied thermostat takes nothing), but it
+        # held the relay closed through the evening peak, where any real draw would have
+        # been reheated at peak instead of waiting for the morning.
+        #
+        # 195 L from 10 to 75 C is 14.7 kWh of capacity; at 93% full the tank had roughly
+        # 1.0 kWh of headroom. The floor was asking for six times what it could hold.
+        #
+        # This only ever LOWERS an unmeetable promise to a meetable one; it never raises a
+        # floor and never suppresses opportunistic or surplus heating. If the estimator
+        # were to drift high and shrink the floor wrongly, max_hours_between_heating
+        # remains as an independent backstop that no estimate can talk out of.
+        stored_kwh = tank_state.get("stored_kwh")
+        volume_l = raw.get("volume_litres")
+        if h.min_kwh_per_day > 0 and volume_l and stored_kwh is not None:
+            try:
+                from planner.thermal import WaterTankModel
+
+                model = WaterTankModel(
+                    volume_litres=float(volume_l),
+                    t_cold_c=float(raw.get("t_cold_c", 10.0)),
+                    t_max_c=float(raw.get("t_max_c", 85.0)),
+                    ua_w_per_k=float(raw.get("ua_w_per_k", 2.0)),
+                )
+                headroom = max(0.0, model.capacity_kwh() - float(stored_kwh))
+            except Exception:
+                # Loud, not silent: a swallowed error here would leave the old
+                # unmeetable floor in place and look exactly like nothing happening.
+                logger.exception("Water floor %s: headroom unavailable, floor unchanged", h.id)
+            else:
+                if headroom < h.min_kwh_per_day:
+                    logger.info(
+                        "Water floor %s: CAPPED %.2f -> %.2f kWh — tank holds %.2f of "
+                        "%.2f kWh, only %.2f kWh of headroom left. Opportunistic heating "
+                        "unaffected.",
+                        h.id, h.min_kwh_per_day, headroom,
+                        float(stored_kwh), model.capacity_kwh(), headroom,
+                    )
+                    h.min_kwh_per_day = headroom
+
         gate_raw = raw.get("shortfall_gate") or {}
         if not gate_raw.get("enabled", False):
             continue
