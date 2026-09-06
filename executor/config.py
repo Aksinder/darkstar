@@ -669,6 +669,15 @@ class ExecutorConfig:
     # out of that thundering herd. Set 0 to restore boundary-aligned ticks.
     tick_offset_seconds: float = 7.0
 
+    # How long a load-group member must sit switched-on-but-not-drawing before it stops
+    # holding the group's power budget. 2026-09-06: the villavagn tank latched a 120 min
+    # committed block at 12:39, was drawing 1.16 W by 13:33, and kept the whole 2.3 kW
+    # group to itself until 16:01 — through the cheapest hours of the day (2-8 ore) with
+    # 12 kW on the roof. The spa started heating 4 minutes after it let go. The gate was
+    # right to queue them; it was wrong to let a satisfied thermostat hold the queue.
+    # 600 s matches the planner's saturated_after_min: 10.0. Set 0 to disable the release.
+    group_release_after_s: float = 600.0
+
     # A tick slower than this logs a WARNING. The old threshold was hardcoded at 1.0 s,
     # which fired on ~88% of all ticks (median tick 7.1 s, p95 19.3 s) — 10166 warnings
     # in 8 days is not a signal, it is wallpaper. Every tick still logs its duration and
@@ -1372,6 +1381,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         shadow_mode=bool(executor_data.get("shadow_mode", False)),
         interval_seconds=int(executor_data.get("interval_seconds", 300)),
         tick_offset_seconds=float(executor_data.get("tick_offset_seconds", 7.0)),
+        group_release_after_s=float(executor_data.get("group_release_after_s", 600.0)),
         slow_tick_threshold_s=float(executor_data.get("slow_tick_threshold_s", 20.0)),
         automation_toggle_entity=_str_or_none(executor_data.get("automation_toggle_entity")),
         manual_override_entity=_str_or_none(executor_data.get("manual_override_entity")),

@@ -280,6 +280,9 @@ class ExecutorEngine:
         # heater id -> epoch of the last attempt to release its selector back to auto,
         # so a failed write retries slowly instead of latching the override for good.
         self._override_reset_ts: dict[str, float] = {}
+        # When a load-group member first looked SATURATED — relay closed, drawing
+        # nothing. Absent means "not saturated"; the gate reads it, the tick fills it.
+        self._group_idle_since: dict[str, float] = {}
         self._override_state: dict[str, str] = {}
         # Escalation memory: did our correction actually reach the appliance?
         self._verify_state: dict[str, VerifyState] = {}
@@ -1848,6 +1851,12 @@ class ExecutorEngine:
                                     )
                                     if water_ctx is not None:
                                         heater_w = await self._heater_power_w(device)
+                                        # Update the load-group saturation view while
+                                        # this device's power is already in hand.
+                                        with contextlib.suppress(Exception):
+                                            await self._note_group_saturation(
+                                                device, heater_w, time.time()
+                                            )
                                         # Fuse relief outranks everything below: the
                                         # plan, the boost and the idle-hold all assume
                                         # the main can carry the load.
@@ -3291,6 +3300,88 @@ class ExecutorEngine:
             idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
         )
 
+    def _in_a_load_group(self, device_id: str) -> bool:
+        groups: list[LoadGroupConfig] = (
+            getattr(getattr(self, "config", None), "load_groups", None) or []
+        )
+        return any(device_id in g.members for g in groups)
+
+    async def _note_group_saturation(
+        self, device: Any, power_w: float | None, now_ts: float
+    ) -> None:
+        """Track whether a grouped device is switched on but no longer drawing.
+
+        The distinction this exists to draw, and the ONLY reason it reads the relay:
+
+            SHED     relay OPEN,  ~0 W  -> keeps its claim. The phase guard cut it and
+                                          it resumes the moment the guard lets go.
+            SATURATED relay CLOSED, ~0 W -> releases its claim. The thermostat is
+                                          satisfied; holding the group's budget buys
+                                          nobody anything.
+
+        Both read 0 W, which is why 2026-09-02's gate deliberately judged the COMMAND
+        and not the power. That was right. It was also blind to the second row, and on
+        2026-09-06 the second row cost the spa the cheapest 3.5 hours of the day.
+
+        Fail-safe throughout: anything unreadable, ambiguous, or merely momentary leaves
+        the claim standing. A device only stops holding the budget on positive evidence.
+        """
+        did = getattr(device, "id", None)
+        if not did:
+            return
+        if float(getattr(self.config, "group_release_after_s", 0.0) or 0.0) <= 0.0:
+            self._group_idle_since.pop(did, None)
+            return
+        if not self._in_a_load_group(did):
+            return
+        dispatcher = getattr(self, "dispatcher", None)
+        target = getattr(device, "target_entity", None)
+        # Not claiming anything, so there is nothing to release.
+        if dispatcher is None or not dispatcher.water_claims_supply(target):
+            self._group_idle_since.pop(did, None)
+            return
+        # Cheap tests first. The relay read below is an extra HA round-trip, and a tick
+        # is already 100% HTTP-bound — so only pay for it once the power says it might
+        # matter.
+        if power_w is None:
+            self._group_idle_since.pop(did, None)
+            return
+        scale = float(getattr(device, "power_scale", 1.0) or 1.0)
+        idle_w = float(getattr(device, "idle_power_w", 100.0) or 100.0)
+        if abs(power_w * scale) >= idle_w:
+            # Drawing. Any real draw resets the clock outright — a tank that starts
+            # re-heating must get its budget back on the very next tick, not after a
+            # second dwell.
+            self._group_idle_since.pop(did, None)
+            return
+        # A relay we cannot read as a plain switch tells us nothing about shed-vs-
+        # satisfied, and guessing here would re-create the collision the gate prevents.
+        if not target or not str(target).startswith("switch."):
+            self._group_idle_since.pop(did, None)
+            return
+        relay = None
+        if self.ha_client is not None:
+            with contextlib.suppress(Exception):
+                relay = await self.ha_client.get_state_value(target)
+        if str(relay).strip().lower() != "on":
+            # Open, unknown or unreadable. SHED until proven otherwise.
+            self._group_idle_since.pop(did, None)
+            return
+        if did not in self._group_idle_since:
+            self._group_idle_since[did] = now_ts
+
+    def _group_member_released(self, device_id: str, now_ts: float) -> bool:
+        """Has this member been saturated long enough to stop holding the budget?"""
+        after = float(getattr(self.config, "group_release_after_s", 0.0) or 0.0)
+        if after <= 0.0:
+            return False
+        # getattr: unit tests build the engine with object.__new__ and set only what
+        # they exercise. No memory means no evidence of saturation, which must read as
+        # "still claiming" — this helper may only ever RELEASE a claim.
+        seen: dict[str, float] = getattr(self, "_group_idle_since", None) or {}
+        since = seen.get(device_id)
+        return since is not None and (now_ts - since) >= after
+
     async def _force_heater_heat_mode(
         self, device: Any, intended: int, off_temp: int
     ) -> Any | None:
@@ -3372,6 +3463,11 @@ class ExecutorEngine:
                 if sib is None:
                     continue
                 if not dispatcher.water_claims_supply(sib.target_entity):
+                    continue
+                # Commanded on, relay closed, drawing nothing for long enough: the
+                # thermostat is satisfied and will not use what it is holding. It keeps
+                # running — nothing here touches it — it just stops standing in the way.
+                if self._group_member_released(member_id, time.time()):
                     continue
                 sib_kw = float(getattr(sib, "power_kw", 0.0) or 0.0)
                 if my_kw + sib_kw > grp.max_power_kw:
