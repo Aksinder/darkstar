@@ -106,20 +106,19 @@ class TestGatherSensorReads:
 
 @pytest.mark.asyncio
 async def test_ev_soc_fallback_logging_no_crash(tmp_path):
-    """Verify that EV SoC fallback logging with '0%%' does not crash due to formatting.
+    """The unreadable-SoC warning must format without raising.
 
-    This is a regression test for the ValueError: incomplete format bug where
-    the logging statement in get_initial_state() contained an unescaped percent sign.
-
-    The fix: Escape the percent sign as '0%%' so Python's logging percent-formatting
-    interprets it as a literal '%' character.
-
-    Scenario: Logging EV SoC fallback
-    WHEN EV SoC sensor returns no data
-    THEN the system logs a warning with the literal "0%" without crashing
+    Regression test for a ValueError: incomplete format, where this logging statement
+    carried an unescaped percent sign. The guard is the point, not the wording: the
+    message changed on 2026-09-06 when an unreadable SoC stopped being reported as 0%
+    (see tests/test_ev_soc_unknown.py), so this asserts that whatever warning is emitted
+    actually renders with its arguments.
     """
 
-    from backend.core.ha_client import get_initial_state
+    from backend.core.ha_client import _LAST_GOOD_EV_SOC, get_initial_state
+
+    # A hold left by another test would carry a SoC into this one and hide the branch.
+    _LAST_GOOD_EV_SOC.clear()
 
     # Config with EV charger enabled but sensor returns no data
     test_config = {
@@ -156,13 +155,20 @@ async def test_ev_soc_fallback_logging_no_crash(tmp_path):
         # This should NOT raise ValueError: incomplete format
         result = await get_initial_state(config_path)
 
-        # Verify the warning was logged with 0%%
-        ev_soc_warnings = [call for call in warning_calls if "defaulting to" in call[0]]
-        assert len(ev_soc_warnings) == 1
-        assert "0%%" in ev_soc_warnings[0][0]  # Format string has escaped %%
+        # A warning about the unreadable sensor is emitted...
+        soc_warnings = [c for c in warning_calls if "SoC" in c[0]]
+        assert soc_warnings, f"no SoC warning among {[c[0] for c in warning_calls]}"
 
-        # Verify result has default EV SoC of 0
+        # ...and every warning renders against its own arguments. This is the actual
+        # regression guard: a stray single % raises ValueError here, not in the test.
+        for msg, args in warning_calls:
+            msg % args
+
+        # With no earlier good reading to hold, the aggregate stays 0.0 — but the car is
+        # withheld from the plan rather than offered as an empty battery.
         assert result["ev_soc_percent"] == 0.0
+        assert result["ev_charger_states"][0]["soc_known"] is False
+        assert result["ev_charger_states"][0]["plugged_in"] is False
 
 
 @pytest.mark.asyncio
