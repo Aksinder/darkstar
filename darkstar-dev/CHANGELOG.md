@@ -1,3 +1,7 @@
+## dev-20260906.1928 — 2026-09-06 19:30
+
+- fix(ev): an unreadable SoC is not an empty battery
+
 ## dev-20260906.1414 — 2026-09-06 14:15
 
 - fix(executor): a satisfied thermostat must not hold the load group's budget
