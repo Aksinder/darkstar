@@ -36,10 +36,11 @@ class TestTheHoldWindow:
         assert soc == 64.0
         assert time.time() - ts < 5
 
-    def test_the_hold_is_shorter_than_a_night(self):
-        """A held value may carry the car across an integration hiccup. It must never
-        quietly plan a whole night on a stale number."""
-        assert 0 < hac._EV_SOC_HOLD_S <= 8 * 3600
+    def test_the_hold_outlasts_a_charging_window(self):
+        """It was 6 h, and that had the risks backwards: a hold expiring at 02:49 drops
+        the car out of the plan mid-window, hours before a 07:30 departure. The stale
+        number it guarded against barely moves — a parked car's SoC not at all."""
+        assert 12 * 3600 <= hac._EV_SOC_HOLD_S <= 36 * 3600
 
     def test_a_fresh_hold_is_usable(self):
         hac._LAST_GOOD_EV_SOC["tesla"] = (27.0, time.time() - 600)

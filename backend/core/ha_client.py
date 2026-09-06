@@ -27,10 +27,26 @@ from backend.health import set_load_forecast_status
 logger = logging.getLogger("darkstar.core.ha_client")
 
 # Last good EV SoC per charger, and how long it may stand in for a missing reading.
-# Six hours is deliberately shorter than a night: a held value may carry the car across
-# an integration hiccup, but it must never quietly plan a whole night on a stale number.
+#
+# This was 6 h — "shorter than a night", so a hold could not plan a whole night on a
+# stale number. That reasoning had the risks backwards. A hold that expires at 02:49 does
+# not produce a cautious plan; it drops the car out of the plan in the middle of the
+# cheapest window, hours before a 07:30 departure. Meanwhile the number it was protecting
+# against barely moves: a parked car's SoC does not change at all, and a charging car's
+# only rises, bounded by its own charge limit.
+#
+# 24 h keeps the cliff outside any single charging window while still refusing to plan on
+# a reading old enough that the car has probably been driven since.
 _LAST_GOOD_EV_SOC: dict[str, tuple[float, float]] = {}
-_EV_SOC_HOLD_S = 6 * 3600.0
+_EV_SOC_HOLD_S = 24 * 3600.0
+
+# Last readable presence per charger, same shape and the same reasoning as the SoC hold:
+# a tracker that stopped answering has not told us the car left. 24 h, because the risk it
+# guards (planning on a stale location) is far smaller than the risk it removes (dropping
+# a car that is sitting on the drive, plugged in, with a morning deadline).
+_LAST_GOOD_EV_HOME: dict[str, tuple[bool, float]] = {}
+_EV_HOME_HOLD_S = 24 * 3600.0
+_UNREADABLE_STATES = ("", "unknown", "unavailable", "none")
 
 
 def _as_float(value: Any) -> float | None:
@@ -811,6 +827,31 @@ async def get_initial_state(
                 ov_obj = per_device_results.get(f"ev_override_{charger_id}")
                 if isinstance(ov_obj, dict):
                     override = str(cast("dict[str, Any]", ov_obj).get("state", "")) or OVERRIDE_AUTO
+                # An unreadable tracker is not a car that drove away. 2026-09-06 20:49
+                # the Tesla integration dropped every white_betty_* entity to unknown; the
+                # zone check read "" and returned away, and the car — parked, plugged in,
+                # 11% SoC, departure 07:30 — was silently excluded from the plan. The
+                # grace window did not help: it is measured from last_changed, which the
+                # flip to unknown had just reset.
+                #
+                # So presence is held exactly like the SoC above: a readable state is
+                # remembered, an unreadable one keeps the last one. Only a tracker that
+                # positively says the car is elsewhere may exclude it.
+                if str(zone_state or "").strip().lower() not in _UNREADABLE_STATES:
+                    _LAST_GOOD_EV_HOME[charger_id] = (at_home, _time.time())
+                elif not at_home:
+                    held_home = _LAST_GOOD_EV_HOME.get(charger_id)
+                    if held_home is not None:
+                        age = _time.time() - held_home[1]
+                        if age <= _EV_HOME_HOLD_S and held_home[0]:
+                            at_home = True
+                            reason = f"tracker unreadable, holding home ({age / 60.0:.0f} min)"
+                            logger.warning(
+                                "EV %s: presence tracker unreadable — holding last known "
+                                "HOME (%.0f min old) rather than treating silence as away",
+                                charger_id, age / 60.0,
+                            )
+
                 if override == OVERRIDE_FORCE_OFF:
                     at_home = False  # force off also blocks charging now
                     reason = "override:force_off"
