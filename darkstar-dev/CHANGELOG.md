@@ -1,3 +1,7 @@
+## dev-20260906.1958 — 2026-09-06 20:00
+
+- fix(ev): a silent tracker is not a car that drove away
+
 ## dev-20260906.1928 — 2026-09-06 19:30
 
 - fix(ev): an unreadable SoC is not an empty battery
