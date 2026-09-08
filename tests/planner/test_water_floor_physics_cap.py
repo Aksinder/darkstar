@@ -12,6 +12,15 @@ kWh of headroom. The floor was asking for six times what the tank could physical
 
 This cap needs no forecast and no switch-on. It only ever lowers an unmeetable promise to
 a meetable one.
+
+UNITS, and why every assertion here is about the EFFECTIVE booking rather than the field.
+min_kwh_per_day is a GROSS day target — kepler computes day_min = max(0, min_kwh_per_day -
+heated_today) itself (kepler.py ~1037). The first version of this cap wrote the headroom
+straight into that field, and headroom is already net of the day's heating, so the day's
+progress was subtracted twice. On the incident's own numbers (floor 6.00, heated 2.591,
+headroom 1.00) day_min came out 0 — and because the WTP credit is gated on the same
+`day_min_kwh > 0` (~1120), the tank lost its willingness to pay along with its floor.
+These tests assert min_kwh_per_day - heated_today, which is what the solver actually books.
 """
 
 from __future__ import annotations
@@ -41,16 +50,24 @@ CAPACITY = WaterTankModel(
 ).capacity_kwh()
 
 
+HEATED_TODAY = 2.591  # the incident's own figure
+
+
 def _heater(min_kwh=6.0):
     return SimpleNamespace(id="main_tank", min_kwh_per_day=min_kwh, power_kw=3.4)
 
 
-def _run(heater, state, cfg=None):
+def _run(heater, state, cfg=None, heated=HEATED_TODAY):
     with patch("planner.pipeline._load_hot_water_states", return_value={"main_tank": state}):
         _apply_water_shortfall_gate(
-            [heater], [cfg or TANK_CFG], [], NOW, {"main_tank": 2.591}
+            [heater], [cfg or TANK_CFG], [], NOW, {"main_tank": heated}
         )
     return heater
+
+
+def booked(heater, heated=HEATED_TODAY):
+    """What kepler will actually require today: day_min = max(0, gross - heated)."""
+    return max(0.0, heater.min_kwh_per_day - heated)
 
 
 class TestTheCap:
@@ -58,8 +75,11 @@ class TestTheCap:
         """THE case: 93% full, 6 kWh promised, ~1 kWh of room."""
         stored = CAPACITY * 0.932
         h = _run(_heater(), {"stored_kwh": stored, "saturated_min": 0.0})
-        assert h.min_kwh_per_day == pytest.approx(CAPACITY - stored, abs=1e-6)
-        assert h.min_kwh_per_day < 1.5
+        headroom = CAPACITY - stored
+        assert booked(h) == pytest.approx(headroom, abs=1e-6)
+        assert booked(h) < 1.5
+        # ...and the field itself carries the day's progress, or kepler subtracts it twice.
+        assert h.min_kwh_per_day == pytest.approx(headroom + HEATED_TODAY, abs=1e-6)
 
     def test_an_empty_tank_keeps_its_whole_floor(self):
         h = _run(_heater(), {"stored_kwh": 0.0, "saturated_min": 0.0})
@@ -72,7 +92,7 @@ class TestTheCap:
 
     def test_a_completely_full_tank_goes_to_zero(self):
         h = _run(_heater(), {"stored_kwh": CAPACITY, "saturated_min": 0.0})
-        assert h.min_kwh_per_day == pytest.approx(0.0)
+        assert booked(h) == pytest.approx(0.0)
 
     def test_it_never_raises_a_floor(self):
         """Headroom of 12 kWh against a 2 kWh floor must leave 2, not 12."""
@@ -81,7 +101,7 @@ class TestTheCap:
 
     def test_an_overfull_estimate_cannot_go_negative(self):
         h = _run(_heater(), {"stored_kwh": CAPACITY * 2, "saturated_min": 0.0})
-        assert h.min_kwh_per_day == 0.0
+        assert booked(h) == 0.0
 
 
 class TestItDoesNotGuess:
@@ -98,9 +118,10 @@ class TestItDoesNotGuess:
         assert h.min_kwh_per_day == 6.0
 
     def test_an_unusable_tank_geometry_keeps_the_floor(self):
-        cfg = dict(TANK_CFG, t_max_c=10, t_cold_c=10)  # zero span
+        cfg = dict(TANK_CFG, t_max_c=10, t_cold_c=10)  # zero span = a typo, not a full tank
         h = _run(_heater(), {"stored_kwh": 0.0, "saturated_min": 0.0}, cfg)
-        assert h.min_kwh_per_day == pytest.approx(0.0) or h.min_kwh_per_day == 6.0
+        assert h.min_kwh_per_day == 6.0
+        assert booked(h) == pytest.approx(6.0 - HEATED_TODAY)
 
     def test_a_zero_floor_is_left_alone(self):
         h = _run(_heater(min_kwh=0.0), {"stored_kwh": 0.0, "saturated_min": 0.0})
@@ -113,3 +134,33 @@ class TestItYieldsToTheStrike:
         cap at all would mean the strike had not fired."""
         h = _run(_heater(), {"stored_kwh": CAPACITY * 0.5, "saturated_min": 30.0})
         assert h.min_kwh_per_day == 0.0
+
+
+class TestTheDoubleCountRegression:
+    """The bug this file shipped with on 2026-09-06, pinned so it cannot come back."""
+
+    def test_a_binding_cap_does_not_delete_the_floor_on_a_tank_heated_today(self):
+        stored = CAPACITY * 0.932            # ~1.0 kWh of headroom
+        h = _run(_heater(), {"stored_kwh": stored, "saturated_min": 0.0})
+        assert booked(h) > 0.0, "floor survived to the solver"
+
+    def test_a_binding_cap_does_not_delete_the_wtp_credit(self):
+        """kepler gates the WTP credit on `day_min_kwh > 0` (kepler.py ~1120), so a floor
+        that rounds to zero silently removes the tank's willingness to pay as well."""
+        stored = CAPACITY * 0.932
+        h = _run(_heater(), {"stored_kwh": stored, "saturated_min": 0.0})
+        assert booked(h) > 0.0
+
+    def test_the_old_form_would_have_booked_nothing(self):
+        """Documents the arithmetic: writing headroom raw gives max(0, 1.0 - 2.591) = 0."""
+        stored = CAPACITY * 0.932
+        headroom = CAPACITY - stored
+        assert max(0.0, headroom - HEATED_TODAY) == 0.0
+
+    def test_with_nothing_heated_today_the_field_is_the_headroom(self):
+        """The two forms agree exactly when the day's progress is zero — which is why the
+        bug was invisible on a tank that had not run yet."""
+        stored = CAPACITY * 0.932
+        h = _run(_heater(), {"stored_kwh": stored, "saturated_min": 0.0}, heated=0.0)
+        assert h.min_kwh_per_day == pytest.approx(CAPACITY - stored, abs=1e-6)
+        assert booked(h, 0.0) == pytest.approx(CAPACITY - stored, abs=1e-6)

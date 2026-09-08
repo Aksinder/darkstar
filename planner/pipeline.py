@@ -181,6 +181,26 @@ def _load_hot_water_states(
         return {}
 
 
+def slots_for_hours(slots: list[Any], hours: float, *, fallback_slot_min: float = 15.0) -> int:
+    """How many slots span ``hours`` on THIS grid, and never fewer than one.
+
+    Both price windows in the pipeline used to assume a 15-minute slot — one by
+    hardcoding ``int(hours * 4)``, the other by counting slots off the COARSENED list
+    where a slot is no longer 15 minutes. Either way a window configured in hours
+    silently became a window in slots, and its real length drifted with
+    ``coarse_tail_fine_hours`` without a word in the log. Derive it instead.
+
+    Returns a count clamped to the series length, so a 48 h ask against a 36 h horizon
+    yields the horizon rather than reading past the end.
+    """
+    if not slots:
+        return 1
+    slot_min = (slots[0].end_time - slots[0].start_time).total_seconds() / 60.0
+    if slot_min <= 0:
+        slot_min = fallback_slot_min
+    return max(1, min(len(slots), round(hours * 60.0 / slot_min)))
+
+
 def _apply_water_shortfall_gate(
     heaters: list[Any],
     heaters_cfg: list[dict[str, Any]],
@@ -253,9 +273,29 @@ def _apply_water_shortfall_gate(
         # 1.0 kWh of headroom. The floor was asking for six times what it could hold.
         #
         # This only ever LOWERS an unmeetable promise to a meetable one; it never raises a
-        # floor and never suppresses opportunistic or surplus heating. If the estimator
-        # were to drift high and shrink the floor wrongly, max_hours_between_heating
-        # remains as an independent backstop that no estimate can talk out of.
+        # floor and never suppresses opportunistic or surplus heating.
+        #
+        # UNITS. min_kwh_per_day is a GROSS day target: kepler subtracts the day's progress
+        # itself (day_min = max(0, min_kwh_per_day - heated_today), kepler.py ~1037). The
+        # headroom below is a REMAINING quantity — already net of everything heated today —
+        # so writing it raw double-subtracts. Shipped that way on 2026-09-06 and it was
+        # worse than a wrong number: on the incident's own figures (floor 6.00,
+        # heated_today 2.591, headroom 1.00) day_min came out max(0, 1.00 - 2.591) = 0, and
+        # because kepler gates the WTP credit on the same `day_min_kwh > 0` (~1120) the
+        # tank lost its willingness to pay along with its floor. Add the day's progress
+        # back, then clamp: the effective booking is exactly the headroom, and the day i>0
+        # reuse stays inside [0, configured].
+        #
+        # NO BACKSTOP. The comment here used to claim max_hours_between_heating catches an
+        # estimator that drifts high. It does not — adapter.py parses it onto the heater
+        # and kepler never reads it; gap_violation_penalty is hardcoded 0.0 and enters the
+        # objective as a no-op ("Deprecated in K16"). It was retired deliberately and must
+        # not be revived: at main_tank's 6 h it would force ~4 hourly ON blocks a day,
+        # ~13.6 kWh against a 6 kWh floor, holding switch.vvb closed through the evening
+        # peak — the very incident this cap was written for. So the tanks' guarantee now
+        # rests on the estimator's stored_kwh alone. This correction only ever RAISES the
+        # effective floor, which shrinks that exposure; nothing that lowers a floor further
+        # should ship until a real backstop exists.
         stored_kwh = tank_state.get("stored_kwh")
         volume_l = raw.get("volume_litres")
         if h.min_kwh_per_day > 0 and volume_l and stored_kwh is not None:
@@ -268,21 +308,32 @@ def _apply_water_shortfall_gate(
                     t_max_c=float(raw.get("t_max_c", 85.0)),
                     ua_w_per_k=float(raw.get("ua_w_per_k", 2.0)),
                 )
-                headroom = max(0.0, model.capacity_kwh() - float(stored_kwh))
+                capacity = model.capacity_kwh()
+                if capacity <= 0.0:
+                    # A tank that reports no usable span is a typo (t_max <= t_cold), not
+                    # a full tank. Reading it as "holds nothing, so promise nothing" would
+                    # let one bad character silently delete the floor. Keep the floor.
+                    raise ValueError(
+                        f"unusable tank geometry: capacity {capacity:.3f} kWh"
+                    )
+                headroom = max(0.0, capacity - float(stored_kwh))
             except Exception:
                 # Loud, not silent: a swallowed error here would leave the old
                 # unmeetable floor in place and look exactly like nothing happening.
                 logger.exception("Water floor %s: headroom unavailable, floor unchanged", h.id)
+                # falls through with h.min_kwh_per_day untouched
             else:
-                if headroom < h.min_kwh_per_day:
+                heated = float(heated_today_by_id.get(h.id, 0.0) or 0.0)
+                gross = min(h.min_kwh_per_day, headroom + heated)
+                if gross < h.min_kwh_per_day:
                     logger.info(
-                        "Water floor %s: CAPPED %.2f -> %.2f kWh — tank holds %.2f of "
-                        "%.2f kWh, only %.2f kWh of headroom left. Opportunistic heating "
-                        "unaffected.",
-                        h.id, h.min_kwh_per_day, headroom,
-                        float(stored_kwh), model.capacity_kwh(), headroom,
+                        "Water floor %s: CAPPED %.2f -> %.2f kWh gross (%.2f headroom + "
+                        "%.2f already heated today) — tank holds %.2f of %.2f kWh. "
+                        "Opportunistic heating unaffected.",
+                        h.id, h.min_kwh_per_day, gross, headroom, heated,
+                        float(stored_kwh), capacity,
                     )
-                    h.min_kwh_per_day = headroom
+                    h.min_kwh_per_day = gross
 
         gate_raw = raw.get("shortfall_gate") or {}
         if not gate_raw.get("enabled", False):
@@ -1461,8 +1512,21 @@ class PlannerPipeline:
         if _bv_away_off and bv_cfg.get("enabled", False):
             logger.info("Vacation: battery_value credit disabled (no household buy-back away)")
         if mode == "full" and bv_cfg.get("enabled", False) and not _bv_away_off:
-            import_prices = [s.import_price_sek_kwh for s in kepler_input.slots]
-            lookahead_slots = int(float(bv_cfg.get("lookahead_hours", 12)) * 4)
+            # Sample the FINE list. kepler_input.slots was reassigned to the coarsened
+            # grid above, where a "slot" is no longer 15 minutes — so both the price
+            # distribution and the slots-per-hour arithmetic below would silently change
+            # meaning with coarse_tail_fine_hours. fine_slots is the uncoarsened series
+            # and is identical to it when coarsening is off.
+            import_prices = [s.import_price_sek_kwh for s in fine_slots]
+            _bv_min = (
+                (fine_slots[0].end_time - fine_slots[0].start_time).total_seconds() / 60.0
+                if fine_slots
+                else 15.0
+            )
+            _bv_hours = float(bv_cfg.get("lookahead_hours", 12))
+            # 4 slots/hour was hardcoded. Derive it, so a grid that is not 15-minute
+            # cannot turn a 12 h look-ahead into 3 h without saying anything.
+            lookahead_slots = slots_for_hours(fine_slots, _bv_hours)
             kepler_config.battery_value_sek_per_kwh = derive_battery_value_sek_per_kwh(
                 import_prices,
                 lookahead_slots=lookahead_slots,
@@ -1470,9 +1534,12 @@ class PlannerPipeline:
                 wear_cost_sek_per_kwh=kepler_config.wear_cost_sek_per_kwh,
             )
             logger.info(
-                "Battery value (Improvement B): %.4f SEK/kWh (window %d slots)",
+                "Battery value (Improvement B): %.4f SEK/kWh (window %.1f h = %d slots "
+                "of %.0f min)",
                 kepler_config.battery_value_sek_per_kwh,
+                _bv_hours,
                 lookahead_slots,
+                _bv_min,
             )
 
         # Away-mode export floor: the reserve that stops the battery discharging for
@@ -1501,11 +1568,15 @@ class PlannerPipeline:
         if (
             kepler_config.load_priority_enabled
             and kepler_config.load_priorities
-            and kepler_input.slots
+            and fine_slots
         ):
-            dyn_prices = [s.import_price_sek_kwh for s in kepler_input.slots]
+            # FINE list, same reason as the battery-value window above: on the coarsened
+            # grid a "24 h window" is a slot COUNT whose hours drift with the tail, so the
+            # percentile silently becomes a mixed-resolution one weighted toward the near
+            # term. Zero delta while coarse_tail_fine_hours covers the whole window.
+            dyn_prices = [s.import_price_sek_kwh for s in fine_slots]
             slot_min = (
-                kepler_input.slots[0].end_time - kepler_input.slots[0].start_time
+                fine_slots[0].end_time - fine_slots[0].start_time
             ).total_seconds() / 60.0
             window_24h = min(
                 len(dyn_prices), max(1, round(24 * 60 / slot_min)) if slot_min > 0 else 96
@@ -1526,11 +1597,20 @@ class PlannerPipeline:
                 if _cap is not None:
                     _lp.base_wtp_sek_per_kwh = _cap
                     logger.info(
-                        "Dynamic WTP cap: load %s -> %.3f SEK/kWh (P%.0f of next %d slots)",
+                        "Dynamic WTP cap: load %s -> %.3f SEK/kWh (P%.0f of %.1f h = "
+                        "%d slots of %.0f min)%s",
                         _lid,
                         _cap,
                         _lp.dynamic_percentile,
+                        _win * slot_min / 60.0,
                         _win,
+                        slot_min,
+                        (
+                            " CLIPPED from %.1f h" % _lp.dynamic_window_hours
+                            if _lp.dynamic_window_hours is not None
+                            and _win * slot_min / 60.0 < _lp.dynamic_window_hours - 0.01
+                            else ""
+                        ),
                     )
 
         run_preflight(input_data, active_config)
