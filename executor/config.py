@@ -369,6 +369,23 @@ class WaterHeaterDeviceConfig:
     # it tracks the market rather than a level tuned in one season. Wins over the
     # absolute value above when set. See price_percentile() in executor/water_hold.py.
     idle_hold_max_price_percentile: float | None = None
+    # Surplus-boost ceiling, taken as a percentile of the EXPORT series.
+    #
+    # The boost gate compares the EXPORT price (spare PV costs the revenue foregone,
+    # not import), but its ceiling was the idle-hold's percentile of the IMPORT series.
+    # Export runs about a krona below import here, so the ceiling cleared almost
+    # everything: measured against this site's real 48 h window on 2026-09-08, the
+    # spa's P30 import ceiling of 2.01 SEK/kWh let 98.1% of hours through, and P40 and
+    # up let 100% through. The gate could not say no even in the most expensive hour.
+    #
+    # Because export = spot + premium + grid_benefit - fee is affine with slope 1 in
+    # spot, a percentile of the export series admits almost exactly that percentage of
+    # hours — so this number reads directly as "boost in the cheapest N% of the window".
+    # Verified against the same series: P20 -> 20.4%, P30 -> 30.1%, P40 -> 39.8%.
+    #
+    # None => keep the old import-derived ceiling, so nothing changes for a site that
+    # does not set it.
+    surplus_boost_max_price_percentile: float | None = None
     # How long a window that percentile spans. Future-first, backfilled from today's
     # passed hours when the forward series is shorter (Nordpool publishes only today
     # and tomorrow, so ~48 h is the hard ceiling). A comfort load that can wait out a
@@ -1079,6 +1096,9 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 ),
                 idle_hold_max_price_percentile=_float_or_none(
                     heater.get("idle_hold_max_price_percentile")
+                ),
+                surplus_boost_max_price_percentile=_float_or_none(
+                    heater.get("surplus_boost_max_price_percentile")
                 ),
                 idle_hold_price_window_hours=float(
                     heater.get("idle_hold_price_window_hours")
