@@ -1,3 +1,7 @@
+## dev-20260908.2037 — 2026-09-08 20:39
+
+- fix(executor): the surplus boost measured its ceiling against the wrong price series
+
 ## dev-20260908.1826 — 2026-09-08 18:28
 
 - fix(planner): the water floor cap double-counted the day's heating, and cited a backstop that does not exist
