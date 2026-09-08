@@ -1,3 +1,7 @@
+## dev-20260908.1826 — 2026-09-08 18:28
+
+- fix(planner): the water floor cap double-counted the day's heating, and cited a backstop that does not exist
+
 ## dev-20260906.2007 — 2026-09-06 20:09
 
 - fix(planner): a daily water floor may not exceed what the tank can hold
