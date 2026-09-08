@@ -2788,6 +2788,29 @@ class ExecutorEngine:
             logger.debug("Price window unavailable: %s", e)
         return []
 
+    def _heater_surplus_ceiling(self, device: Any, ctx: dict[str, Any]) -> float | None:
+        """The BOOST-side ceiling, measured against the series it is compared with.
+
+        should_boost_on_surplus prefers the EXPORT price — spare PV costs the revenue
+        foregone, not import — but its ceiling used to come from _heater_price_ceiling,
+        a percentile of the IMPORT window. Export runs about a krona below import here,
+        so the ceiling cleared nearly everything: on this site's real 48 h window the
+        spa's P30 import ceiling of 2.01 SEK/kWh admitted 98.1% of hours, and P40 and
+        above admitted 100%. The gate could not refuse even the most expensive hour.
+
+        Unset => fall through to the old ceiling, so a site that has not chosen a
+        surplus percentile sees exactly today's behaviour.
+        """
+        pct = getattr(device, "surplus_boost_max_price_percentile", None)
+        if pct is None:
+            return self._heater_price_ceiling(device, ctx)
+        cap = price_percentile(ctx.get("export_price_window") or [], float(pct))
+        if cap is not None:
+            return cap
+        # An unreadable export series must not silently REMOVE the ceiling — fall back
+        # to the absolute value, which fails closed on an unknown price.
+        return getattr(device, "idle_hold_max_price_sek_per_kwh", None)
+
     def _heater_price_ceiling(self, device: Any, ctx: dict[str, Any]) -> float | None:
         """This heater's effective price ceiling: percentile of the window, else absolute."""
         pct = getattr(device, "idle_hold_max_price_percentile", None)
@@ -2867,6 +2890,7 @@ class ExecutorEngine:
             float(getattr(d, "idle_hold_price_window_hours", 24.0))
             for d in self.config.water_heater_devices
             if getattr(d, "idle_hold_max_price_percentile", None) is not None
+            or getattr(d, "surplus_boost_max_price_percentile", None) is not None
         ]
         window_hours += [
             float(c.price_window_hours)
@@ -2877,13 +2901,19 @@ class ExecutorEngine:
                 or c.presence_max_price_percentile is not None
             )
         ]
-        # The pumps' gates compare an EXPORT price under surplus, so they need the
-        # export series to take a percentile of; comparing it against import
-        # percentiles would clear almost any ceiling. The tanks keep the import
-        # series they have always used.
+        # Gates that compare an EXPORT price under surplus need the export series to
+        # take a percentile of; comparing it against import percentiles clears almost
+        # any ceiling. That is true of the pumps' opportunistic gates and — since the
+        # 2026-09-08 audit — of the tanks' surplus BOOST too. The tanks' idle-hold keeps
+        # the import series it has always used: it commands no heat, only skips an
+        # off-write, so a mis-denominated ceiling there is cheap. The boost is where the
+        # energy actually gets bought.
         needs_export_window = any(
             c.enabled and c.surplus_run and c.max_price_percentile is not None
             for c in self.config.cyclic_loads
+        ) or any(
+            getattr(d, "surplus_boost_max_price_percentile", None) is not None
+            for d in self.config.water_heater_devices
         )
         return {
             "price_window": (
@@ -3505,7 +3535,7 @@ class ExecutorEngine:
             import_price_sek_kwh=ctx["import_price"],
             export_price_sek_kwh=ctx["export_price"],
             heater_power_w=float(getattr(device, "power_kw", 0.0) or 0.0) * 1000.0,
-            max_price_sek_kwh=self._heater_price_ceiling(device, ctx),
+            max_price_sek_kwh=self._heater_surplus_ceiling(device, ctx),
             heated_today_kwh=heated_today_kwh,
             absorb_cap_kwh_per_day=getattr(device, "absorb_cap_kwh_per_day", None),
         )
