@@ -1,3 +1,7 @@
+## dev-20260910.0530 — 2026-09-10 05:32
+
+- fix(planner): a control-paused tank must not be planned, and must keep saying it is paused
+
 ## dev-20260908.2037 — 2026-09-08 20:39
 
 - fix(executor): the surplus boost measured its ceiling against the wrong price series
