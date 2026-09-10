@@ -73,6 +73,12 @@ logger = logging.getLogger(__name__)
 # instead of one per tick forever. Mirrors ev_surplus_runtime's constant of the same name.
 _OVERRIDE_RESET_RETRY_S = 600.0
 
+# How often to REPEAT the "this device is control-paused" line while it stays paused.
+# The line used to fire once per episode, which is fine for a pause measured in hours and
+# useless for one measured in days: by the time anyone asks why a tank is cold, the only
+# evidence has scrolled away. Hourly is quiet enough to ignore and frequent enough to find.
+_CONTROL_PAUSE_RELOG_S = 3600.0
+
 EXECUTOR_VERSION = "1.0.0"
 
 
@@ -248,7 +254,11 @@ class ExecutorEngine:
         # Control-pause (rent-out hands-off): keys of devices/sinks whose pause we
         # have already logged this episode, so the INFO line fires ONCE per pause
         # (not every tick). Cleared per key when the device becomes unpaused again.
-        self._control_pause_logged: set[str] = set()
+        # log_key -> when we last SAID this device is paused. Not a one-shot set: a
+        # pause can outlive the memory of it. The villavagn tank sat control-paused for
+        # three days on 2026-09-09 having logged exactly once, so a cold tank read as a
+        # planner mystery instead of "somebody paused it". Repeats hourly while paused.
+        self._control_pause_logged: dict[str, float] = {}
 
         # Override notification deduplication (Issue 3 fix)
         self._last_override_type: str | None = None
@@ -1264,14 +1274,19 @@ class ExecutorEngine:
             return False
         paused_via = await self.dispatcher.control_pause_entity(entities, cache)
         if paused_via is not None:
-            if log_key not in self._control_pause_logged:
-                self._control_pause_logged.add(log_key)
+            now = time.time()
+            last = self._control_pause_logged.get(log_key)
+            if last is None or (now - last) >= _CONTROL_PAUSE_RELOG_S:
+                self._control_pause_logged[log_key] = now
                 logger.info(
-                    "%s control paused via %s - leaving manual", log_name, paused_via
+                    "%s control paused via %s - leaving manual%s",
+                    log_name,
+                    paused_via,
+                    "" if last is None else f" (still paused after {(now - last) / 3600.0:.0f} h)",
                 )
             return True
-        # Episode ended: allow a future pause on this device to log again.
-        self._control_pause_logged.discard(log_key)
+        # Episode ended: allow a future pause on this device to log again immediately.
+        self._control_pause_logged.pop(log_key, None)
         return False
 
     async def _apply_water_temp_gated(

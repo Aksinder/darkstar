@@ -646,6 +646,60 @@ async def get_initial_state(
         water_heater_states = []
         water_heated_today_kwh = 0.0
 
+    # CONTROL PAUSE, surfaced to the PLANNER. The executor has always honoured these
+    # helpers by skipping actuation, but the planner never saw them — so a paused tank
+    # was still scheduled, and planned water heat goes straight into kepler's node
+    # balance (kepler.py ~576). A device that cannot draw was therefore reserving PV or
+    # grid import in the plan's arithmetic: on a sunny day the solver could decline to
+    # charge the battery because it expected the tank to soak the surplus, and export it
+    # instead. 2026-09-09: the villavagn tank sat paused for three days, cold, with its
+    # 3 kWh reliability floor booked every replan and never once actuated.
+    #
+    # FAIL-SAFE DIRECTION IS THE SAME AS THE EXECUTOR'S and must stay that way: an
+    # unreadable helper reads as NOT paused. Inverting it here would let one HA hiccup
+    # silently drop a tank out of the plan, which is worse than the phantom load.
+    _wh_cfg_list = cast("list[Any]", config.get("water_heaters", []) or [])
+    for wh_any in _wh_cfg_list:
+        if not isinstance(wh_any, dict):
+            continue
+        wh_d = cast("dict[str, Any]", wh_any)
+        hid = str(wh_d.get("id", ""))
+        if not hid:
+            continue
+        paused_via: str | None = None
+        for ent_any in cast("list[Any]", wh_d.get("control_pause_entities", []) or []):
+            ent = str(ent_any or "")
+            if not ent:
+                continue
+            try:
+                raw_p = await get_ha_entity_state(ent)
+            except Exception as exc:
+                logger.warning(
+                    "control_pause read failed for %s (%s) - treating as NOT paused", ent, exc
+                )
+                continue
+            if raw_p and str(raw_p.get("state", "")).strip().lower() == "on":
+                paused_via = ent
+                break
+        if paused_via is None:
+            continue
+        for st_e in water_heater_states:
+            if st_e.get("id") == hid:
+                st_e["control_paused"] = True
+                st_e["control_paused_via"] = paused_via
+                break
+        else:
+            # No heated-today entry for this tank (it has not run) — it still needs to
+            # reach the adapter, or the filter cannot see that it is paused.
+            water_heater_states.append(
+                {
+                    "id": hid,
+                    "heated_today_kwh": 0.0,
+                    "control_paused": True,
+                    "control_paused_via": paused_via,
+                }
+            )
+
     # Cyclic loads: when did each last run? The pre-scheduler's max-gap rule is
     # anchored here, so a filter that last ran at 16:11 is not left idle until
     # tomorrow's cheap hours just because the first planned hour lies beyond the

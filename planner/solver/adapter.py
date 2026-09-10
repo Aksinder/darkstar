@@ -149,6 +149,49 @@ def build_water_heater_inputs(
         if wh.get("enabled", True) and float(wh.get("power_kw", 0.0)) > 0
     ]
 
+    # CONTROL-PAUSED devices leave the plan entirely, exactly like a disabled one.
+    #
+    # The executor has always skipped actuation for them, but the planner did not know,
+    # so a paused tank was still scheduled — and planned water heat enters kepler's node
+    # balance (kepler.py ~576). A device that cannot draw was reserving PV or grid import
+    # in the plan's arithmetic: on a sunny day the solver could decline to charge the
+    # battery because it expected the tank to soak the surplus, and export instead. Its
+    # daily floor was booked every replan and never actuated, its plan-stability anchor
+    # churned over slots nothing would ever run, and savings/loadshift counted energy
+    # that never moved.
+    #
+    # The pause flag arrives fail-safe from get_initial_state: unreadable => NOT paused.
+    # Keep it that way. Dropping a tank from the plan on a transient HA glitch would be
+    # worse than the phantom load this removes.
+    _paused_ids = {
+        str(s.get("id"))
+        for s in (water_heater_states or [])
+        if s.get("id") and s.get("control_paused")
+    }
+    if _paused_ids:
+        kept: list[dict[str, Any]] = []
+        for wh in enabled_wh:
+            hid = str(wh.get("id", ""))
+            if hid in _paused_ids:
+                via = next(
+                    (
+                        s.get("control_paused_via")
+                        for s in (water_heater_states or [])
+                        if s.get("id") == hid
+                    ),
+                    None,
+                )
+                logger.info(
+                    "Water heater %s EXCLUDED from the plan — control-paused%s. Its daily "
+                    "floor and any planned block are suspended while the pause stands; "
+                    "the executor was already leaving it alone.",
+                    hid,
+                    f" via {via}" if via else "",
+                )
+                continue
+            kept.append(wh)
+        enabled_wh = kept
+
     if not enabled_wh:
         return []
 

@@ -1123,6 +1123,13 @@ class PlannerPipeline:
                 "force_on_slots": force_on_slots_by_heater.get(heater_id),
                 "anchor_on_slots": anchor_on_slots_by_heater.get(heater_id),
             }
+            # Carry the control-pause flag through from initial_state so the adapter can
+            # drop a hands-off device instead of booking energy it will never draw.
+            for _raw in ha_water_states_raw:
+                if _raw.get("id") == heater_id and _raw.get("control_paused"):
+                    state_entry["control_paused"] = True
+                    state_entry["control_paused_via"] = _raw.get("control_paused_via")
+                    break
             state_entry.update(water_absorption_by_id.get(heater_id, {}))
             water_heater_states.append(state_entry)
 
