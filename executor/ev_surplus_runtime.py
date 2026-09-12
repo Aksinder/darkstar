@@ -43,6 +43,15 @@ logger = logging.getLogger("darkstar.ev_surplus")
 # clock clears itself. This cadence only governs RETRIES after a failed write, and it
 # also bounds the log to one line per interval instead of one per 60 s tick forever.
 _OVERRIDE_RESET_RETRY_S = 600.0
+# A foreign clamp that never moves again is presumed STALE, not present. The latch
+# suppresses raises, and the release predicate needs the device value to rise — which
+# only Darkstar or the adversary can do, and Darkstar has stopped writing. Without an
+# expiry the latch is self-sustaining: one spurious detection pins a charger at its
+# floor for the rest of the session (measured 2026-09-12, the Tesla held 5 A from 09:39
+# with ~3 kW of surplus exporting past it). Expiring lets normal control write once
+# more; a live adversary rewrites the register and re-latches within a tick, so the cost
+# of being wrong is one write per hour, not a fight.
+_CLAMP_STALE_AFTER_S = 3600.0
 
 _TRUEISH = {"on", "home", "true", "charging", "connected", "plugged", "1"}
 
@@ -594,6 +603,12 @@ class EVSurplusController:
         self.cfg = cfg
         # Per-charger write-guard memory.
         self._last_a: dict[str, float] = {}
+        # The last current value Darkstar actually PUT ON THE REGISTER. Distinct from
+        # _last_a, which is intent plus every later reconciliation: a downward readback
+        # sync writes it, and so does the reality-adoption path (power / (phases*volts)).
+        # Only this dict can answer "did we put that value there?", which is exactly the
+        # question the foreign-clamp discriminator asks.
+        self._written_a: dict[str, float] = {}
         self._last_ts: dict[str, float] = {}
         self._last_switch: dict[str, bool] = {}
         self._last_stop_ts: dict[str, float] = {}  # min-OFF dwell anchors
@@ -1074,9 +1089,12 @@ class EVSurplusController:
             # not inherit a ttl that started before it left.
             self._subst_since.pop(c.id, None)
             self._subst_warned.discard(c.id)
-            # ...and any foreign-clamp yield. The clamp is a fact about this session at
-            # this charge point; a car that left and came back gets a clean slate.
+            # ...and any foreign-clamp yield, with the authorship record that feeds its
+            # discriminator. The clamp is a fact about this session at this charge
+            # point; a car that left and came back gets a clean slate. Keeping a stale
+            # written value re-latched the clamp on the very next read.
             self._clamp_a.pop(c.id, None)
+            self._written_a.pop(c.id, None)
             self._clamp_since.pop(c.id, None)
             self._clamp_notified.discard(c.id)
             self._suc_notified.discard(c.id)
@@ -1180,15 +1198,33 @@ class EVSurplusController:
             and dev_ts > self._last_cmd_ts.get(c.id, float("-inf"))
         )
         if dev_fresh and dev_a is not None and c.id in self._last_a:
-            prev_a = self._last_a[c.id]
+            # The discriminator compares against what we WROTE, never against _last_a.
+            # _last_a is intent-plus-reconciliation, and two of its writers manufacture
+            # values we never commanded: the downward readback sync, and the
+            # reality-adoption path below, which divides a power reading by
+            # phases*voltage. On 2026-09-12 that second one read 4000 W off a Tesla that
+            # had started itself and produced a 5.8 A comparand against a 5 A floor —
+            # a value no command could ever hold, since 5 A IS the floor. It cleared
+            # the `> min_current_a` term by 0.8 A and latched the clamp onto
+            # Darkstar's own leftover 5 A from the previous afternoon. Absent from
+            # _written_a (never actuated this process) means no proof, no detection.
+            written_a = self._written_a.get(c.id)
             # A foreign clamp: the device sits at or below this charger's floor without
-            # Darkstar having put it there. The `prev_a > c.min_current_a` term is the
+            # Darkstar having put it there. The `written_a > c.min_current_a` term is the
             # discriminating half and cannot be dropped — Darkstar commands its own
             # min_current_a routinely (42 times on 2026-08-31 for the Tesla, whose floor
             # IS 5 A), so the value alone cannot tell the two apart. `<=` cannot be
             # weakened to `<` either, or the rule misses its actual adversary, which
             # writes exactly the floor.
-            if prev_a > c.min_current_a >= dev_a:
+            #
+            # Reading it off _written_a also makes the ECHO case impossible by
+            # construction, with no second guard to keep in sync: if the device holds
+            # exactly what we wrote, then `dev_a <= floor` forces `written_a <= floor`,
+            # and the first term fails. That matters because a freshness stamp is NOT
+            # proof the world moved — an `unavailable -> 5` bounce at 02:39 (the Tesla
+            # integration reconnecting) republishes a day-old value with a brand-new
+            # last_updated, which is how the 2026-09-12 episode got past the gate.
+            if written_a is not None and written_a > c.min_current_a >= dev_a:
                 if c.id not in self._clamp_a:
                     self._clamp_since[c.id] = now_ts
                 self._clamp_a[c.id] = dev_a
@@ -1201,8 +1237,30 @@ class EVSurplusController:
                         "EV surplus: %s foreign clamp released — device now at %.1f A",
                         c.id, dev_a,
                     )
-            if 0.0 < dev_a < prev_a:
+            # Downward reconciliation stays anchored on _last_a: its job is to pull
+            # INTENT down to what the device holds, which is a different question from
+            # who authored that value.
+            if 0.0 < dev_a < self._last_a[c.id]:
                 self._last_a[c.id] = dev_a
+
+        # STALE-CLAMP EXPIRY (see _CLAMP_STALE_AFTER_S). Deliberately outside the
+        # dev_fresh gate: the stuck case IS a register that never moves again, so its
+        # last_updated stays frozen and no fresh reading ever arrives to release it.
+        clamped_since = self._clamp_since.get(c.id)
+        if (
+            clamped_since is not None
+            and c.id in self._clamp_a
+            and (now_ts - clamped_since) > _CLAMP_STALE_AFTER_S
+        ):
+            expired_a = self._clamp_a.pop(c.id)
+            self._clamp_since.pop(c.id, None)
+            self._clamp_notified.discard(c.id)
+            logger.warning(
+                "EV surplus: %s foreign clamp at %.1f A expired after %.0f min — "
+                "resuming normal control; a clamp that is still live will re-latch on "
+                "its next write",
+                c.id, expired_a, (now_ts - clamped_since) / 60.0,
+            )
 
         # Commanded state: _last_a is authoritative for controllable chargers (every
         # actuated stop zeroes it — see _actuate), the switch memory for binary ones.
@@ -1846,8 +1904,10 @@ class EVSurplusController:
                 self._subst_since.pop(ccfg.id, None)
                 self._subst_warned.discard(ccfg.id)
                 # A stop ends the foreign-clamp yield too: the next session starts clean
-                # rather than inheriting a cap from the one before it.
+                # rather than inheriting a cap from the one before it — authorship
+                # included, since no live write survives to compare a readback against.
                 self._clamp_a.pop(ccfg.id, None)
+                self._written_a.pop(ccfg.id, None)
                 self._clamp_since.pop(ccfg.id, None)
                 self._clamp_notified.discard(ccfg.id)
             self._last_switch[ccfg.id] = cmd.switch_on
@@ -1880,8 +1940,10 @@ class EVSurplusController:
                 self._subst_since.pop(ccfg.id, None)
                 self._subst_warned.discard(ccfg.id)
                 # A stop ends the foreign-clamp yield too: the next session starts clean
-                # rather than inheriting a cap from the one before it.
+                # rather than inheriting a cap from the one before it — authorship
+                # included, since no live write survives to compare a readback against.
                 self._clamp_a.pop(ccfg.id, None)
+                self._written_a.pop(ccfg.id, None)
                 self._clamp_since.pop(ccfg.id, None)
                 self._clamp_notified.discard(ccfg.id)
                 self._last_ts[ccfg.id] = now_ts
@@ -1922,8 +1984,10 @@ class EVSurplusController:
                 self._subst_since.pop(ccfg.id, None)
                 self._subst_warned.discard(ccfg.id)
                 # A stop ends the foreign-clamp yield too: the next session starts clean
-                # rather than inheriting a cap from the one before it.
+                # rather than inheriting a cap from the one before it — authorship
+                # included, since no live write survives to compare a readback against.
                 self._clamp_a.pop(ccfg.id, None)
+                self._written_a.pop(ccfg.id, None)
                 self._clamp_since.pop(ccfg.id, None)
                 self._clamp_notified.discard(ccfg.id)
                 self._last_ts[ccfg.id] = now_ts
@@ -2001,6 +2065,10 @@ class EVSurplusController:
                     {"device_id": ccfg.easee_device_id, "current": round(new_a), "time_to_live": 0},
                 )
         self._last_a[ccfg.id] = new_a
+        # The register's author of record — the only value the clamp discriminator may
+        # compare against. Set on the shadow path too, so an observe-only executor keeps
+        # reporting the same intent it would have written.
+        self._written_a[ccfg.id] = new_a
         self._last_cmd_ts[ccfg.id] = now_ts
         self._last_ts[ccfg.id] = now_ts
         return ActuationResult(
