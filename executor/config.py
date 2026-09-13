@@ -646,6 +646,19 @@ class ControllerConfig:
     # controller downgrades an export intent to self_consumption at/below this.
     # Mirrors config export.export_floor_soc_percent.
     export_floor_soc_percent: float = 20.0
+    # Battery->grid intent threshold (kW). Export mode fires only when the plan's
+    # battery-to-grid flow, min(discharge_kw, export_kw), reaches this. Below it the
+    # slot runs self_consumption: PV surplus still exports on its own, and the small
+    # planned discharge serves the house. Live 2026-09-12: seven 9.5 kW forced
+    # discharges to the SoC floor in one morning (~2.8 kWh sold at 0.43-0.65 against
+    # 1.26-1.53 to buy back), each fired by a slot whose planned battery export was
+    # a fraction of that. Mirrors config export.export_min_battery_kw.
+    export_min_battery_kw: float = 1.0
+    # Runtime export price floor (SEK/kWh). An export intent whose slot export price
+    # sits below this is downgraded to self_consumption, loudly. None = off. An
+    # unpriced slot passes (fail-open toward the plan; C3 stands down the same way).
+    # Mirrors config export.min_export_price_sek_kwh.
+    min_export_price_sek_kwh: float | None = None
 
 
 @dataclass
@@ -1281,6 +1294,12 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
             return val
         return default
 
+    # The ROOT export block — the same floor the planner enforces in-model, plus the
+    # executor-side export guards. Typed once here so every .get below is known.
+    export_data: dict[str, Any] = (
+        data.get("export", {}) if isinstance(data.get("export"), dict) else {}
+    )
+    raw_min_export_price = export_data.get("min_export_price_sek_kwh")
     controller = ControllerConfig(
         battery_capacity_kwh=float(
             str(
@@ -1320,13 +1339,14 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         charge_efficiency=float(
             str(ctrl_data.get("charge_efficiency", ControllerConfig.charge_efficiency))
         ),
-        # From the ROOT export block — the same floor the planner enforces in-model.
         export_floor_soc_percent=float(
-            str(
-                (data.get("export", {}) if isinstance(data.get("export"), dict) else {}).get(
-                    "export_floor_soc_percent", ControllerConfig.export_floor_soc_percent
-                )
-            )
+            str(export_data.get("export_floor_soc_percent", ControllerConfig.export_floor_soc_percent))
+        ),
+        export_min_battery_kw=float(
+            str(export_data.get("export_min_battery_kw", ControllerConfig.export_min_battery_kw))
+        ),
+        min_export_price_sek_kwh=(
+            None if raw_min_export_price is None else float(str(raw_min_export_price))
         ),
     )
 

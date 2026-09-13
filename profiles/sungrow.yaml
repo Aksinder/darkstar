@@ -83,8 +83,12 @@ modes:
         value: "Forced mode"
       - entity: "forced_charge_discharge_cmd"
         value: "Forced discharge"
+      # The PLANNED discharge rate, not max_discharge. With max here, any slot that
+      # earned export mode dumped the pack at 9.5 kW to the SoC floor no matter how
+      # little battery->grid the plan actually priced (2026-09-12, seven bursts in a
+      # morning). max_discharge_power below stays at max so house load is covered.
       - entity: "forced_charge_discharge_power"
-        value: "{{max_discharge}}"
+        value: "{{export_discharge_w}}"
       - entity: "max_discharge_power"
         value: "{{discharge_value}}"
       # Deliberate grid export wants NO feed-in limit: mode switch OFF (unlimited).
