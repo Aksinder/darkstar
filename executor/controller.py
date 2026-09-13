@@ -74,6 +74,11 @@ class ControllerDecision:
 
     export_power_w: float = 0.0  # Planned grid export power in Watts
     export_with_load_w: float = 0.0  # Export power + house load (for Fronius export mode)
+    # Battery discharge power to COMMAND in export mode (W): the plan's discharge_kw,
+    # rounded and clamped — not max_discharge. A profile that renders this into its
+    # forced-discharge register sells what the plan priced, not everything the pack
+    # can push. Override force_export keeps max (a manual export is "all of it").
+    export_discharge_w: float = 0.0
     export_price_sek_kwh: float | None = None  # Effective export price; None = unknown (C3 stands down)
 
     # User's configured max limits (for templates like {{max_charge}})
@@ -212,6 +217,7 @@ class Controller:
             discharge_value=discharge_value,
             export_power_w=0.0,
             export_with_load_w=0.0,
+            export_discharge_w=(max_discharge if mode_intent == "export" else 0.0),
             soc_target=soc_target,
             water_temp=water_temp,
             max_charge=max_charge,
@@ -234,7 +240,13 @@ class Controller:
         # PV surplus vs battery export distinction:
         # - Battery export: discharge_kw > 0 (battery actively discharging to grid)
         # - PV surplus: discharge_kw == 0, charge_kw > 0 (excess PV exports while charging)
-        if slot.export_kw > 0 and slot.discharge_kw > 0:
+        # Battery->grid is the SMALLER of the two flows: export_kw counts PV surplus
+        # too, and discharge_kw counts what the battery gives the house. Only their
+        # overlap is battery energy sold. Export mode used to fire on `both > 0` and
+        # then command max_discharge regardless — a 0.3 kW planned discharge in a
+        # sunny slot became a 9.5 kW dump to the SoC floor (2026-09-12, seven times).
+        battery_to_grid_kw = min(slot.export_kw, slot.discharge_kw)
+        if battery_to_grid_kw > 0 and battery_to_grid_kw >= self.config.export_min_battery_kw:
             # Battery discharge to grid - use export mode.
             # R1 runtime SoC-floor guard (arbitrage gate): the export floor exists
             # only inside the MILP — between replans the plan is stale and the real
@@ -245,6 +257,7 @@ class Controller:
             _floor = effective_export_floor_pct(
                 self.config.export_floor_soc_percent, state
             )
+            _price_floor = self.config.min_export_price_sek_kwh
             if round(state.current_soc_percent) <= _floor:
                 logger.warning(
                     "Export intent blocked: SoC %.1f%% at/below export floor %.0f%% "
@@ -253,8 +266,34 @@ class Controller:
                     _floor,
                 )
                 mode_intent = "self_consumption"
+            elif (
+                _price_floor is not None
+                and slot.export_price_sek_kwh is not None
+                and slot.export_price_sek_kwh < _price_floor
+            ):
+                # Runtime price sanity floor. The MILP priced the sale; this is the
+                # backstop for the plan it should never have produced. Unpriced
+                # slots pass — a missing price is not evidence of a bad one.
+                logger.warning(
+                    "Export intent blocked: export price %.2f SEK/kWh below floor "
+                    "%.2f — downgrading to self_consumption (planned battery->grid "
+                    "%.2f kW)",
+                    slot.export_price_sek_kwh, _price_floor, battery_to_grid_kw,
+                )
+                mode_intent = "self_consumption"
             else:
                 mode_intent = "export"
+        elif slot.export_kw > 0 and slot.discharge_kw > 0:
+            # Both flows planned but the overlap is below export_min_battery_kw: the
+            # battery is serving the house while PV surplus exports on its own.
+            # self_consumption does exactly that. NOT idle — idle blocks discharge and
+            # would starve the load the plan meant the battery to cover.
+            logger.info(
+                "Export intent skipped: planned battery->grid %.2f kW below "
+                "export_min_battery_kw %.2f — self_consumption",
+                battery_to_grid_kw, self.config.export_min_battery_kw,
+            )
+            mode_intent = "self_consumption"
         elif (
             slot.charge_kw > 0
             and slot.export_kw == 0
@@ -325,6 +364,17 @@ class Controller:
         else:
             export_with_load_w = 0.0
 
+        # Battery discharge to COMMAND in export mode: the plan's rate, rounded to
+        # the profile step and clamped to the pack's max. Zero outside export mode so
+        # a stale value can never leak into a self_consumption write.
+        export_discharge_w = 0.0
+        if mode_intent == "export":
+            step = self.profile.behavior.round_step_w if self.profile else self.config.round_step_w
+            raw_discharge_w = slot.discharge_kw * 1000.0
+            export_discharge_w = min(
+                self.config.max_discharge_w, max(step, round(raw_discharge_w / step) * step)
+            )
+
         # SoC target from plan
         soc_target = slot.soc_target
 
@@ -356,6 +406,7 @@ class Controller:
             discharge_value=discharge_value,
             export_power_w=export_power_w,
             export_with_load_w=export_with_load_w,
+            export_discharge_w=export_discharge_w,
             export_price_sek_kwh=slot.export_price_sek_kwh,
             soc_target=soc_target,
             water_temp=water_temp,

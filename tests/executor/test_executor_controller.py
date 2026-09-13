@@ -948,3 +948,64 @@ class TestPerDeviceWaterTemps:
             WaterHeaterDeviceConfig(id="x", target_entity="switch.x", temp_off=0)
         ]
         assert c._determine_water_temps(SlotPlan())["x"] == 0
+
+
+class TestExportMagnitude:
+    """2026-09-12: seven 9.5 kW forced discharges to the SoC floor in one morning.
+    Export mode fired on `export_kw > 0 and discharge_kw > 0` and then commanded
+    max_discharge regardless of how much battery->grid the plan actually priced."""
+
+    @pytest.fixture
+    def controller(self):
+        return Controller(ControllerConfig(), InverterConfig())
+
+    def test_small_planned_battery_export_runs_self_consumption(self, controller):
+        """0.3 kW of planned discharge in a sunny slot is house cover, not a sale."""
+        slot = SlotPlan(export_kw=5.0, discharge_kw=0.3)
+        state = SystemState(current_soc_percent=50.0)
+        d = controller._follow_plan(slot, state)
+        assert d.mode_intent == "self_consumption"
+        assert d.export_discharge_w == 0.0
+
+    def test_export_commands_the_planned_discharge_not_max(self, controller):
+        slot = SlotPlan(export_kw=5.0, discharge_kw=3.0)
+        state = SystemState(current_soc_percent=50.0)
+        d = controller._follow_plan(slot, state)
+        assert d.mode_intent == "export"
+        assert d.export_discharge_w == pytest.approx(3000.0)
+        assert d.export_discharge_w < ControllerConfig().max_discharge_w  # W, not the A-unit max
+
+    def test_export_discharge_is_clamped_to_the_pack_max(self, controller):
+        slot = SlotPlan(export_kw=12.0, discharge_kw=12.0)
+        state = SystemState(current_soc_percent=50.0)
+        d = controller._follow_plan(slot, state)
+        assert d.mode_intent == "export"
+        assert d.export_discharge_w == pytest.approx(ControllerConfig().max_discharge_w)
+
+    def test_threshold_is_the_overlap_not_either_flow(self, controller):
+        """Big PV export + tiny discharge, or big discharge + tiny export: neither sells."""
+        state = SystemState(current_soc_percent=50.0)
+        assert controller._follow_plan(
+            SlotPlan(export_kw=8.0, discharge_kw=0.5), state).mode_intent == "self_consumption"
+        assert controller._follow_plan(
+            SlotPlan(export_kw=0.5, discharge_kw=8.0), state).mode_intent == "self_consumption"
+
+    def test_export_below_price_floor_downgrades(self):
+        c = Controller(ControllerConfig(min_export_price_sek_kwh=1.0), InverterConfig())
+        state = SystemState(current_soc_percent=50.0)
+        cheap = SlotPlan(export_kw=5.0, discharge_kw=5.0, export_price_sek_kwh=0.55)
+        assert c._follow_plan(cheap, state).mode_intent == "self_consumption"
+        dear = SlotPlan(export_kw=5.0, discharge_kw=5.0, export_price_sek_kwh=2.25)
+        assert c._follow_plan(dear, state).mode_intent == "export"
+
+    def test_unpriced_slot_passes_the_price_floor(self):
+        """A missing price is not evidence of a bad one (fail-open toward the plan)."""
+        c = Controller(ControllerConfig(min_export_price_sek_kwh=1.0), InverterConfig())
+        state = SystemState(current_soc_percent=50.0)
+        slot = SlotPlan(export_kw=5.0, discharge_kw=5.0, export_price_sek_kwh=None)
+        assert c._follow_plan(slot, state).mode_intent == "export"
+
+    def test_price_floor_off_by_default(self):
+        cfg = ControllerConfig()
+        assert cfg.min_export_price_sek_kwh is None
+        assert cfg.export_min_battery_kw == 1.0

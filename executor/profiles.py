@@ -25,6 +25,7 @@ VALID_TEMPLATES = frozenset(
         "soc_target",
         "export_power_w",
         "export_with_load_w",
+        "export_discharge_w",
         "max_charge",
         "max_discharge",
     ]
