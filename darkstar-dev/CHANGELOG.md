@@ -1,3 +1,7 @@
+## dev-20260913.1843 — 2026-09-13 18:45
+
+- fix(executor): export mode sells what the plan priced, not the whole pack
+
 ## dev-20260910.0530 — 2026-09-10 05:32
 
 - fix(planner): a control-paused tank must not be planned, and must keep saying it is paused
