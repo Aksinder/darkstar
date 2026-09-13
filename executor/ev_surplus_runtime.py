@@ -348,6 +348,25 @@ def _plan_gate_soc(planner_entry: dict | None, charger_id: str) -> float | None:
     return v
 
 
+def _parse_auto_order(raw: Any) -> str:
+    """Validate policy.auto_order; an unknown value falls back LOUDLY to legacy.
+
+    Silent fallback would leave a typo ("soc-gap") running the old order for weeks
+    with nothing in the log — the same dead-config class as the deprecated
+    max_hours_between_heating.
+    """
+    if raw is None:
+        return "priority"
+    value = str(raw).strip().lower()
+    if value in ("priority", "soc_gap"):
+        return value
+    logger.warning(
+        "EV surplus: unknown policy.auto_order %r — using 'priority' (valid: "
+        "priority, soc_gap)", raw,
+    )
+    return "priority"
+
+
 def parse_ev_surplus_config(
     executor_data: dict[str, Any],
     timezone: str | None = None,
@@ -387,6 +406,7 @@ def parse_ev_surplus_config(
         ),
         gain=float(pol.get("gain", 0.5)),
         deadband_w=float(pol.get("deadband_w", 250.0)),
+        auto_order=_parse_auto_order(pol.get("auto_order")),
         # NOTE: must match the pure-layer default (1.0) — a diverging parse default
         # here silently reintroduces the coarse 2 A grid on sites without the key.
         current_step_a=float(pol.get("current_step_a", 1.0)),
@@ -1588,6 +1608,7 @@ class EVSurplusController:
             plan_battery_charge_w=max(0.0, plan_battery_charge_kw) * 1000.0,
             phase_currents_a=phase_currents, chargers=states,
             now_ts=now_ts, forward_prices=tuple(forward_prices or ()),
+            manual_order=bool(priority_order),
         )
         tick = EVSurplusTick()
         commands = compute_ev_surplus(inputs, cfg.policy, tick_out=tick)

@@ -715,6 +715,11 @@ s_index:
 export:
   enable_export: true              # Master switch for grid export (if false, planner enforces 0 export)
   export_floor_soc_percent: 20     # Min SoC % required to allow grid export (planner constraint)
+  export_min_battery_kw: 1.0       # Executor: export mode only when planned battery->grid flow
+                                   # (min of discharge_kw, export_kw) reaches this; below it the slot
+                                   # runs self_consumption (PV surplus still exports by itself)
+  # min_export_price_sek_kwh: 1.0  # Executor: refuse forced discharge to grid when the slot's export
+                                   # price is below this (SEK/kWh). Unset = off. Unpriced slots pass.
 
 # Manual Planning Defaults
 manual_planning:
@@ -1118,6 +1123,8 @@ executor:
       cheap_grid_allowance_w: 3680      # max grid import to give the cars when cheap
       gain: 0.5                         # control damping (0-1)
       deadband_w: 250                   # hold within this power error (anti-jitter)
+      auto_order: priority              # surplus-class order in 'auto': priority (legacy) | soc_gap
+                                        # (car furthest from its target first; floors/deadlines unaffected)
       current_step_a: 2.0               # snap commanded amps to this grid (chunky steps)
       start_hysteresis: 0.15            # extra headroom (frac of min) an OFF charger needs to start
       battery_assist:
