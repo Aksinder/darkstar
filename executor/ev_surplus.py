@@ -86,6 +86,15 @@ class EVSurplusConfig:
     # has no write threshold on this register — only exact-match dedup — so an
     # unhysteresised cap would write the inverter every tick it drifts.
     ev_priority_cap_hysteresis_w: float = 200.0
+    # How the SURPLUS class is ordered when no manual selector order is active.
+    #   "priority" — configured priority, comfort-demotion first (legacy).
+    #   "soc_gap"  — distance to target (target - soc) first, priority as tie-break.
+    # Live 2026-09-13 14:45: FMB at 85 % (prio 0, comfort 86) sat one point under its
+    # comfort line and took the surplus; the Tesla at 40 % — three-phase, 3.45 kW just
+    # to START — got the 3.0 kW left over and never switched on. Priority is blind to
+    # SoC; a one-bit comfort threshold is the only SoC the legacy order ever sees. The
+    # floor class (deadlines, plan floors) is untouched: "avresa vinner alltid".
+    auto_order: str = "priority"
     # Slack the forecast must show BEYOND the battery's remaining need. It absorbs the
     # house load (which eats the same PV) and forecast error, because remaining_solar
     # is gross production, not what actually reaches the battery. Too small and the
@@ -208,6 +217,10 @@ class EVSurplusInputs:
     # cars take surplus first as always (owner 2026-08-13: "inte prioritera
     # batteriet över FMB, bara om vi ser vinst i att sälja").
     plan_battery_charge_w: float = 0.0
+    # True when the runtime remapped priorities from the owner's selector. The owner's
+    # literal order beats every soft rule — comfort-demotion is already switched off
+    # by the runtime in that case, and soc_gap ordering must stand down the same way.
+    manual_order: bool = False
     # Grid phase current magnitudes in AMPERE, keyed by phase name (e.g. {"a": 12.3, ...}).
     # This is the MAIN-FUSE current (direction-blind |A| — export blows fuses too).
     # Empty dict = no fresh readings; the pure fuse clamp then allows NO increases
@@ -947,7 +960,7 @@ def compute_ev_surplus(
     # without a deadline sort behind every deadline floor (urgency inf), then priority.
     # Within the SURPLUS class, comfort-demotion ranks before priority: a car at/above
     # its comfort_soc yields to every non-demoted car, then keeps charging on what's left.
-    def _order_key(x: ChargerState) -> tuple[int, float, int, int, str]:
+    def _order_key(x: ChargerState) -> tuple[int, float, int, float, int, str]:
         has_floor = floor_w[x.id] > 0.0
         # Urgency comes from the DEADLINE SOURCE only: a plan-only floor (deadline_w
         # == 0 — e.g. the FMB above its floor_soc with a cheap night slot) must not
@@ -965,7 +978,23 @@ def compute_ev_surplus(
             and x.soc_percent is not None
             and x.soc_percent >= x.comfort_soc_percent
         )
-        return (0 if has_floor else 1, urgency, demoted, x.priority, x.id)
+        # SoC-gap ordering (auto_order == "soc_gap"): within the surplus class the car
+        # FURTHEST from its target ranks first; configured priority only breaks ties.
+        # Negated so the plain ascending sort puts the biggest gap first. A car whose
+        # SoC is unknown gets 0 — behind every car with a known gap — because a
+        # guess about an unreadable car must not outrank a measured one. Demotion
+        # still sorts ahead of it: a car at its comfort line yields regardless.
+        # Inert for floors (the floor class has its own key) and under a manual order.
+        soc_gap = 0.0
+        if (
+            cfg.auto_order == "soc_gap"
+            and not inputs.manual_order
+            and not has_floor
+            and x.soc_percent is not None
+        ):
+            target = x.target_soc_percent if x.target_soc_percent is not None else 100.0
+            soc_gap = -max(0.0, target - x.soc_percent)
+        return (0 if has_floor else 1, urgency, demoted, soc_gap, x.priority, x.id)
 
     order = sorted(chargeable, key=_order_key)
 

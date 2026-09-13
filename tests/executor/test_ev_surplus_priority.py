@@ -561,3 +561,97 @@ class TestBatteryYieldGate:
         cfg = EVSurplusConfig(enabled=True)  # battery_yield_soc 0.0
         cmds = compute_ev_surplus(self._inputs(soc=12.0), cfg)
         assert cmds[0].switch_on  # legacy: inflow is headroom at any SoC
+
+
+class TestSocGapAutoOrder:
+    """policy.auto_order: soc_gap — the surplus class ranks by distance to target.
+
+    Live 2026-09-13 14:45: FMB 85 % (prio 0, comfort 86) one point under its comfort
+    line took the surplus; the Tesla at 40 % needs 3.45 kW just to start (5 A x 3 ph)
+    and got the 3.0 kW left over — never on. Priority is blind to SoC.
+    """
+
+    @staticmethod
+    def _inputs(tesla, fmb, surplus_w=4000.0, **over):
+        base = dict(
+            pv_w=surplus_w + 2000.0, grid_w=-surplus_w, battery_w=0.0,
+            battery_soc_percent=95.0, import_price_sek=1.0, remaining_solar_kwh=0.0,
+            chargers=[fmb, tesla],
+        )
+        base.update(over)
+        return EVSurplusInputs(**base)
+
+    def test_legacy_order_is_the_default(self):
+        assert EVSurplusConfig().auto_order == "priority"
+
+    def test_soc_gap_puts_the_furthest_car_first(self):
+        """Tesla 40->90 (gap 50) beats FMB 85->100 (gap 15) despite FMB prio 0."""
+        tesla = _tesla(soc_percent=40.0, target_soc_percent=90.0, priority=1)
+        fmb = _fmb(soc_percent=85.0, target_soc_percent=100.0, floor_soc_percent=50.0, priority=0)
+        cmds = {c.id: c for c in compute_ev_surplus(
+            self._inputs(tesla, fmb), EVSurplusConfig(enabled=True, auto_order="soc_gap"))}
+        assert cmds["tesla"].switch_on
+        assert not cmds["easee_fmb"].switch_on  # 0.55 kW left < FMB 6 A min-on
+
+    def test_same_fleet_under_legacy_order_fills_fmb(self):
+        """Control: the identical tick under the legacy order goes the other way."""
+        tesla = _tesla(soc_percent=40.0, target_soc_percent=90.0, priority=1)
+        fmb = _fmb(soc_percent=85.0, target_soc_percent=100.0, floor_soc_percent=50.0, priority=0)
+        cmds = {c.id: c for c in compute_ev_surplus(
+            self._inputs(tesla, fmb), EVSurplusConfig(enabled=True))}
+        assert cmds["easee_fmb"].switch_on
+        assert not cmds["tesla"].switch_on
+
+    def test_manual_selector_order_disables_soc_gap(self):
+        """The owner's literal order beats every soft rule (runtime sets manual_order)."""
+        tesla = _tesla(soc_percent=40.0, target_soc_percent=90.0, priority=1)
+        fmb = _fmb(soc_percent=85.0, target_soc_percent=100.0, floor_soc_percent=50.0, priority=0)
+        cmds = {c.id: c for c in compute_ev_surplus(
+            self._inputs(tesla, fmb, manual_order=True),
+            EVSurplusConfig(enabled=True, auto_order="soc_gap"))}
+        assert cmds["easee_fmb"].switch_on
+        assert not cmds["tesla"].switch_on
+
+    def test_deadline_floor_still_outranks_any_gap(self):
+        """'avresa vinner alltid': the floor class has its own key, gap never enters it."""
+        tesla = _tesla(soc_percent=40.0, target_soc_percent=90.0, priority=1, deadline_hours=None)
+        fmb = _fmb(soc_percent=50.0, target_soc_percent=86.0, priority=0, deadline_hours=1.0)
+        cmds = compute_ev_surplus(
+            self._inputs(tesla, fmb, surplus_w=0.0, pv_w=0.0),
+            EVSurplusConfig(enabled=True, auto_order="soc_gap"))
+        on = [c.id for c in cmds if c.switch_on]
+        assert on and on[0] == "easee_fmb"
+
+    def test_unknown_soc_sorts_behind_every_measured_car(self):
+        tesla = _tesla(soc_percent=None, target_soc_percent=90.0, priority=0)
+        fmb = _fmb(soc_percent=85.0, target_soc_percent=100.0, floor_soc_percent=50.0, priority=1)
+        cmds = {c.id: c for c in compute_ev_surplus(
+            self._inputs(tesla, fmb), EVSurplusConfig(enabled=True, auto_order="soc_gap"))}
+        assert cmds["easee_fmb"].switch_on
+        assert not cmds["tesla"].switch_on
+
+    def test_comfort_demotion_still_ranks_ahead_of_gap(self):
+        """A car at its comfort line yields even with the bigger gap."""
+        tesla = _tesla(soc_percent=85.0, target_soc_percent=100.0, comfort_soc_percent=80.0,
+                       priority=0)  # gap 15, demoted
+        fmb = _fmb(soc_percent=90.0, target_soc_percent=100.0, floor_soc_percent=50.0,
+                   priority=1)  # gap 10, not demoted
+        cmds = compute_ev_surplus(
+            self._inputs(tesla, fmb, surplus_w=12000.0),
+            EVSurplusConfig(enabled=True, auto_order="soc_gap"))
+        on = [c.id for c in cmds if c.switch_on]
+        assert on and on[0] == "easee_fmb"
+
+    def test_parse_auto_order(self):
+        raw = _cfg_dict()
+        raw["ev_surplus"]["policy"]["auto_order"] = "SoC_Gap"
+        cfg = parse_ev_surplus_config(raw)
+        assert cfg is not None and cfg.policy.auto_order == "soc_gap"
+
+    def test_parse_auto_order_unknown_falls_back_loudly(self, caplog):
+        raw = _cfg_dict()
+        raw["ev_surplus"]["policy"]["auto_order"] = "soc-gap"
+        with caplog.at_level("WARNING"):
+            cfg = parse_ev_surplus_config(raw)
+        assert cfg is not None and cfg.policy.auto_order == "priority"
+        assert "unknown policy.auto_order" in caplog.text
