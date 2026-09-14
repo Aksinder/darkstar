@@ -67,6 +67,11 @@ from .write_verify import VerifySignal, VerifyState, note_attempt
 
 logger = logging.getLogger(__name__)
 
+# The EV charge-failure notifier ignores zero-power ticks while the freshest EV power
+# report is older than this (see _ev_power_reading_stale). Matches the Tesla Fleet
+# poll cadence with margin.
+_EV_POWER_STALE_S = 600.0
+
 # Retry cadence for releasing an expired override selector back to "auto". The happy
 # path needs one write — the next read sees "auto" and clears the clock — so this only
 # governs retries after a failed write, and bounds the log to one line per interval
@@ -319,6 +324,7 @@ class ExecutorEngine:
 
         # REV F76 Phase 5: Fail-safe error tracking (Issue 1 fix)
         self._ev_power_fetch_failed = False
+        self._ev_stale_logged = False
 
         # EV charge failure detection
         self._ev_zero_power_ticks: int = 0
@@ -1626,6 +1632,7 @@ class ExecutorEngine:
                     and not self._ev_power_fetch_failed
                     and self._ev_plan_actuation_possible()
                     and not self._ev_plan_intentionally_suppressed()
+                    and not self._ev_power_reading_stale()
                 ):
                     self._ev_zero_power_ticks += 1
                 elif actual_ev_charging:
@@ -4009,6 +4016,36 @@ class ExecutorEngine:
                     cap,
                 )
                 setattr(decision, field_name, cap)
+
+    def _ev_power_reading_stale(self) -> bool:
+        """True when no charger's power sensor has reported within _EV_POWER_STALE_S.
+
+        A zero from a sensor that has not spoken is ignorance, not a failure. The
+        Tesla Fleet integration reports every ~10 min while the car is awake; on
+        2026-09-13 and 2026-09-14 the car started itself at the top of a block and
+        the notifier counted five zero-ticks off a reading from before the block,
+        alarming while 5-11 kW was flowing. Chargers whose age is unknown are ignored;
+        with no known age at all this returns False so the notifier keeps working on
+        sites without the surplus servo.
+        """
+        ages = cast(
+            "dict[str, float | None]",
+            getattr(self._ev_surplus, "last_power_report_age_s", None) or {},
+        )
+        known = [a for a in ages.values() if a is not None]
+        if not known:
+            return False
+        stale = min(known) > _EV_POWER_STALE_S
+        if stale and not self._ev_stale_logged:
+            self._ev_stale_logged = True
+            logger.info(
+                "EV charge-failure detector paused: freshest EV power report is %.0f s "
+                "old (> %.0f s) — a silent sensor is not a failed charge",
+                min(known), _EV_POWER_STALE_S,
+            )
+        elif not stale:
+            self._ev_stale_logged = False
+        return stale
 
     def _ev_plan_intentionally_suppressed(self) -> bool:
         """True when the servo DELIBERATELY isn't executing the planned EV slots.
