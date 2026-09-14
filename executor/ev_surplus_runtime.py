@@ -52,6 +52,16 @@ _OVERRIDE_RESET_RETRY_S = 600.0
 # more; a live adversary rewrites the register and re-latches within a tick, so the cost
 # of being wrong is one write per hour, not a fight.
 _CLAMP_STALE_AFTER_S = 3600.0
+# Hold horizon for the plug / home reads when their entity cannot answer. An
+# integration that went dark has not said the cable is out or the car left — the
+# 2026-09-10 outage turned "unknown" into "unplugged" and idled a 33 % car all night.
+_EV_READ_HOLD_S = 24 * 3600.0
+_UNREADABLE = {"", "unknown", "unavailable", "none"}
+# Before sending switch.turn_on, a power reading older than this is re-fetched
+# (homeassistant.update_entity) so a car that started itself is adopted instead of
+# commanded. The Tesla Fleet integration polls every ~10 min while awake and not at
+# all while asleep, so a 9-minute-old zero is ignorance, not evidence.
+_START_VERIFY_STALE_S = 120.0
 
 _TRUEISH = {"on", "home", "true", "charging", "connected", "plugged", "1"}
 
@@ -629,6 +639,15 @@ class EVSurplusController:
         # Only this dict can answer "did we put that value there?", which is exactly the
         # question the foreign-clamp discriminator asks.
         self._written_a: dict[str, float] = {}
+        # Last readable plug / home answers, for the unreadable-entity hold.
+        self._last_good_plug: dict[str, tuple[bool, float]] = {}
+        self._last_good_home: dict[str, tuple[bool, float]] = {}
+        self._hold_warned: set[str] = set()
+        # When each charger's power sensor last REPORTED (last_reported), and its age
+        # at the last tick — the engine's charge-failure notifier reads the latter so
+        # it does not count zero-ticks from a sensor that has not spoken.
+        self._power_report_ts: dict[str, float | None] = {}
+        self.last_power_report_age_s: dict[str, float | None] = {}
         self._last_ts: dict[str, float] = {}
         self._last_switch: dict[str, bool] = {}
         self._last_stop_ts: dict[str, float] = {}  # min-OFF dwell anchors
@@ -972,6 +991,50 @@ class EVSurplusController:
             return resolved
         return str(v).lower() in {s.lower() for s in states}
 
+    async def _read_on_held(
+        self,
+        ha: Any,
+        entity: str | None,
+        states: tuple[str, ...],
+        default: bool,
+        *,
+        key: str,
+        memory: dict[str, tuple[bool, float]],
+        now_ts: float,
+        what: str,
+    ) -> bool:
+        """``_read_on`` with a last-good hold for an UNREADABLE configured entity.
+
+        Unreadable means the entity is missing or reports unknown/unavailable. The
+        last readable answer is held for _EV_READ_HOLD_S — whichever it was, so a car
+        last seen unplugged/away is not invented into the fleet either. With nothing
+        to hold, False (the phantom-car direction), loudly.
+        """
+        if not entity:
+            return default
+        v = await ha.get_state_value(entity)
+        if v is not None and str(v).strip().lower() not in _UNREADABLE:
+            val = str(v).lower() in {x.lower() for x in states}
+            memory[key] = (val, now_ts)
+            self._hold_warned.discard(f"{key}:{what}")
+            return val
+        held = memory.get(key)
+        age = None if held is None else now_ts - held[1]
+        if held is not None and age is not None and age <= _EV_READ_HOLD_S:
+            if f"{key}:{what}" not in self._hold_warned:
+                self._hold_warned.add(f"{key}:{what}")
+                logger.warning(
+                    "EV surplus: %s %s unreadable (%r) — holding last good %s "
+                    "(%.0f min old, hold expires at %.0f min)",
+                    key, entity, v, held[0], age / 60.0, _EV_READ_HOLD_S / 60.0,
+                )
+            return held[0]
+        logger.warning(
+            "EV surplus: %s %s unreadable (%r) and nothing to hold (%s) -> False",
+            key, entity, v, "never read" if age is None else f"{age / 60.0:.0f} min old",
+        )
+        return False
+
     async def _read_override(self, ha: Any, c: EVSurplusChargerCfg, now_ts: float) -> str:
         """This charger's manual override, with auto-expiry.
 
@@ -1074,11 +1137,14 @@ class EVSurplusController:
         # gather over mixed return types collapses to a union list; narrow each back explicitly.
         res = await asyncio.gather(
             self._read_power_with_ts(ha, c.power_entity),
-            self._read_on(
+            self._read_on_held(
                 ha, c.plug_entity, ("on", "true", "plugged", "connected"), True,
-                unreadable_default=False,
+                key=c.id, memory=self._last_good_plug, now_ts=now_ts, what="plug",
             ),
-            self._read_on(ha, c.home_entity, c.home_states, True, unreadable_default=False),
+            self._read_on_held(
+                ha, c.home_entity, c.home_states, True,
+                key=c.id, memory=self._last_good_home, now_ts=now_ts, what="home",
+            ),
             self._read_override(ha, c, now_ts),
             self._read_f(ha, c.soc_entity, None),
             self._read_f(ha, c.target_soc_entity, None),
@@ -1091,6 +1157,8 @@ class EVSurplusController:
             "tuple[float | None, float | None, float | None]", res[0]
         )
         dev_a, dev_ts = cast("tuple[float | None, float | None]", res[8])
+        self._power_report_ts[c.id] = report_ts
+        self.last_power_report_age_s[c.id] = None if report_ts is None else now_ts - report_ts
         if power is None:
             power = 0.0
         plugged = bool(res[1])
@@ -1755,6 +1823,16 @@ class EVSurplusController:
             try:
                 act = await self._actuate(ha, ccfg, cmd, now_ts, shadow, drawing_w=drawing_w)
             except Exception:
+                # A rejected START may mean "already charging" (the vehicle API
+                # answers 500 to charge_start on a charging car) rather than "asleep".
+                # One fresh read tells them apart; a drawing car is adopted and the
+                # failure is not counted, so no backoff and no false failure alarm.
+                if cmd.switch_on and drawing_w < 100.0 and ccfg.power_entity:
+                    fresh = await self._verify_drawing(ha, ccfg)
+                    if fresh is not None and fresh >= 100.0:
+                        self._adopt_on(ccfg, fresh, "HA rejected the start but the car is charging")
+                        self._act_fail.pop(cmd.id, None)
+                        continue
                 # One charger's dead entity must not starve the others' actuation,
                 # and a sleeping Tesla must not be hammered every tick.
                 n = (fail[1] + 1) if fail is not None else 1
@@ -1858,6 +1936,40 @@ class EVSurplusController:
                 )
         return {"enabled": True, "applied": applied, "price_sek": price, "price_source": price_source}
 
+    async def _verify_drawing(self, ha: Any, ccfg: EVSurplusChargerCfg) -> float | None:
+        """Ask the integration for a FRESH power reading and return it (W), or None.
+
+        homeassistant.update_entity makes a polled sensor poll now. The Tesla Fleet
+        integration does not wake a sleeping car for it, so this is safe to call before
+        every start; it only costs one request. A car that started itself is then seen
+        within seconds instead of at the next 10-minute poll — the gap that produced
+        three rejected turn_on calls, a backoff to 480 s and a false "EV charge
+        failure" on 2026-09-13 and again on 2026-09-14.
+        """
+        if not ccfg.power_entity:
+            return None
+        try:
+            await ha.call_service(
+                "homeassistant", "update_entity", ccfg.power_entity, max_retries=0
+            )
+        except Exception as exc:
+            logger.debug("EV surplus: update_entity %s failed: %s", ccfg.power_entity, exc)
+        try:
+            power, _ts, _rep = await self._read_power_with_ts(ha, ccfg.power_entity)
+        except Exception as exc:
+            logger.debug("EV surplus: re-read %s failed: %s", ccfg.power_entity, exc)
+            return None
+        return power
+
+    def _adopt_on(self, ccfg: EVSurplusChargerCfg, power_w: float, why: str) -> None:
+        """The car is drawing: remember it as ON and sync the amp memory to reality."""
+        logger.info(
+            "EV surplus: %s is drawing %.0f W — %s, adopting ON", ccfg.id, power_w, why
+        )
+        self._last_switch[ccfg.id] = True
+        if ccfg.id in self._last_a:
+            self._last_a[ccfg.id] = power_w / (ccfg.phases * ccfg.voltage_v)
+
     async def _actuate(
         self,
         ha: Any,
@@ -1893,6 +2005,27 @@ class EVSurplusController:
                 ccfg.id, drawing_w,
             )
             self._last_switch[ccfg.id] = True
+        elif (
+            cmd.switch_on
+            and ccfg.switch_entity is not None
+            and self._last_switch.get(ccfg.id) is not True
+            and not shadow
+        ):
+            # VERIFY BEFORE COMMAND. A zero from a sensor that has not reported for
+            # _START_VERIFY_STALE_S is not evidence the car is off: the Tesla Fleet
+            # integration polls every ~10 min, so a car that started itself minutes
+            # ago still reads 0.0 here. Re-fetch once; a drawing car is adopted and
+            # never sent a turn_on it would reject.
+            rep_ts = self._power_report_ts.get(ccfg.id)
+            rep_age = None if rep_ts is None else now_ts - rep_ts
+            if rep_age is None or rep_age > _START_VERIFY_STALE_S:
+                fresh = await self._verify_drawing(ha, ccfg)
+                if fresh is not None and fresh >= 100.0:
+                    self._adopt_on(
+                        ccfg, fresh,
+                        "found charging on a fresh read before turn_on "
+                        f"(sensor was {'unread' if rep_age is None else f'{rep_age:.0f} s old'})",
+                    )
 
         # Switch: only toggle on change. `sw` carries what actually went to the
         # device (None = no switch write happened this tick).

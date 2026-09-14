@@ -46,6 +46,13 @@ _EV_SOC_HOLD_S = 24 * 3600.0
 # a car that is sitting on the drive, plugged in, with a morning deadline).
 _LAST_GOOD_EV_HOME: dict[str, tuple[bool, float]] = {}
 _EV_HOME_HOLD_S = 24 * 3600.0
+# Plug sensor, same disease as the two above. 2026-09-10 20:42 the Tesla Fleet
+# integration went dark; binary_sensor.white_betty_charge_cable read "unknown", the
+# bool coercion made that "unplugged", and a car sitting in its cable at 33 % got
+# nothing for eleven hours. Hold the last READABLE answer; only a sensor that
+# positively says "off" unplugs the car.
+_LAST_GOOD_EV_PLUG: dict[str, tuple[bool, float]] = {}
+_EV_PLUG_HOLD_S = 24 * 3600.0
 _UNREADABLE_STATES = ("", "unknown", "unavailable", "none")
 
 
@@ -336,6 +343,26 @@ def integrate_power_history_kwh(
         if seg_end > seg_start:
             total_kwh += kw * (seg_end - seg_start).total_seconds() / 3600.0
     return total_kwh
+
+
+_TRUE_STATES = {"on", "true", "yes", "1", "armed_away", "armed_home", "armed_night"}
+
+
+async def get_ha_bool_or_none(entity_id: str) -> bool | None:
+    """Tri-state read: True/False for a readable entity, None when it cannot answer.
+
+    ``get_ha_bool`` folds "unknown"/"unavailable"/missing into False, which is the
+    right default for a vacation flag and the wrong one for a plug sensor — an
+    integration that stopped talking has not said the cable is out. Callers that
+    hold a last-good value need to see the difference.
+    """
+    state = await get_ha_entity_state(entity_id)
+    if not state:
+        return None
+    raw = str(state.get("state", "")).strip().lower()
+    if raw in _UNREADABLE_STATES:
+        return None
+    return raw in _TRUE_STATES
 
 
 async def get_ha_bool(entity_id: str) -> bool:
@@ -753,7 +780,8 @@ async def get_initial_state(
             )
             if plug_sensor and not (ev_plugged_in_override is not None and is_override_charger):
                 key = f"ev_plug_{charger_id}"
-                per_device_reads.append((key, lambda e=plug_sensor: get_ha_bool(e)))
+                # Tri-state on purpose: the hold below must see "could not read".
+                per_device_reads.append((key, lambda e=plug_sensor: get_ha_bool_or_none(e)))
 
             # Home-zone presence (e.g. device_tracker for the car). When configured we
             # read its state so the EV can be excluded from the plan while away — the
@@ -832,7 +860,36 @@ async def get_initial_state(
                     "EV %s: using plug state override=%s", charger_id, ev_plugged_in_override
                 )
             elif plug_sensor:
-                plugged_in = bool(per_device_results.get(f"ev_plug_{charger_id}", False))
+                raw_plug = per_device_results.get(f"ev_plug_{charger_id}")
+                if isinstance(raw_plug, bool):
+                    plugged_in = raw_plug
+                    _LAST_GOOD_EV_PLUG[charger_id] = (plugged_in, _time.time())
+                else:
+                    # Unreadable. Hold the last readable answer, whichever it was —
+                    # a car last seen UNPLUGGED is not dragged into the plan either.
+                    held_plug = _LAST_GOOD_EV_PLUG.get(charger_id)
+                    plug_age = _time.time() - held_plug[1] if held_plug else None
+                    if (
+                        held_plug is not None
+                        and plug_age is not None
+                        and plug_age <= _EV_PLUG_HOLD_S
+                    ):
+                        plugged_in = held_plug[0]
+                        logger.warning(
+                            "EV %s plug sensor %s unreadable — holding last good "
+                            "%s (%.0f min old, hold expires at %.0f min)",
+                            charger_id, plug_sensor,
+                            "plugged" if plugged_in else "unplugged",
+                            plug_age / 60.0, _EV_PLUG_HOLD_S / 60.0,
+                        )
+                    else:
+                        plugged_in = False
+                        logger.warning(
+                            "EV %s plug sensor %s unreadable and nothing recent to "
+                            "hold (%s) — treating as unplugged",
+                            charger_id, plug_sensor,
+                            "never read" if plug_age is None else f"{plug_age / 60.0:.0f} min old",
+                        )
             else:
                 # No plug sensor → assume plugged in (let enabled flag be the control)
                 plugged_in = True
