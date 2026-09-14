@@ -41,10 +41,35 @@ __all__ = [
 
 @dataclass
 class WindowSlot:
-    """One forward price slot (from the planner schedule) for window scheduling."""
+    """One forward price slot (from the planner schedule) for window scheduling.
+
+    ``export_kw`` / ``export_price_sek_kwh`` carry the plan's own view of surplus: a
+    slot the planner expects to EXPORT is one where an appliance would not import at
+    all — it would eat energy that was about to be sold, at the export price. Both are
+    optional; absent, a slot prices at import exactly as before.
+    """
 
     start_ts: float  # epoch seconds at the slot start
     import_price_sek_kwh: float
+    export_price_sek_kwh: float | None = None
+    export_kw: float = 0.0  # planned grid export in this slot (surplus the house sheds)
+
+    def effective_price(self, appliance_kw: float) -> float:
+        """What one kWh costs an appliance drawing ``appliance_kw`` in this slot.
+
+        The share of the draw the planned export covers is priced at the export price
+        (foregone sale), the rest at import. Live 2026-09-14: the dishwasher was
+        started at 07:05 into the day's cheapest IMPORT window (2.65 SEK/kWh) while the
+        12:00 window on planned surplus cost 1.68 — the scorer only knew import prices,
+        so a morning dip beat free-ish midday sun every sunny day. Never prices above
+        import: an export price that exceeds import is treated as "no surplus benefit".
+        """
+        imp = self.import_price_sek_kwh
+        exp = self.export_price_sek_kwh
+        if appliance_kw <= 0.0 or self.export_kw <= 0.0 or exp is None or exp >= imp:
+            return imp
+        frac = min(1.0, self.export_kw / appliance_kw)
+        return frac * exp + (1.0 - frac) * imp
 
 
 def cheapest_window_start(
@@ -55,8 +80,13 @@ def cheapest_window_start(
     *,
     energy_kwh: float = 0.0,
     wait_cost_sek_per_hour: float = 0.0,
+    appliance_kw: float = 0.0,
 ) -> float | None:
     """Start ts of the best contiguous ``duration_slots`` block.
+
+    ``appliance_kw`` (the cycle's average draw) lets each slot price the run at what
+    it actually costs there — see WindowSlot.effective_price. 0 = import prices only,
+    the historical behaviour.
 
     Considers only blocks that start at/after the current slot and finish at/before
     ``deadline_ts``. Returns the winning block's start ts, or ``None`` if the run can't
@@ -100,7 +130,7 @@ def cheapest_window_start(
             continue
         if deadline_ts is not None and end_ts > deadline_ts:
             continue
-        price_sum = sum(s.import_price_sek_kwh for s in block)
+        price_sum = sum(s.effective_price(appliance_kw) for s in block)
         if penalise:
             # Kronor, comparable across candidates: electricity + the cost of waiting.
             # Delay is clamped at zero so a block already in progress is not credited
@@ -123,6 +153,7 @@ def recommend_appliance_action(
     *,
     energy_kwh: float = 0.0,
     wait_cost_sek_per_hour: float = 0.0,
+    appliance_kw: float = 0.0,
 ) -> tuple[str, float | None]:
     """Forecast-aware recommendation for an armed cycle.
 
@@ -133,6 +164,7 @@ def recommend_appliance_action(
     start = cheapest_window_start(
         slots, now_ts, duration_slots, deadline_ts,
         energy_kwh=energy_kwh, wait_cost_sek_per_hour=wait_cost_sek_per_hour,
+        appliance_kw=appliance_kw,
     )
     if start is None:
         return ("run", None)  # cannot fit before deadline -> run now

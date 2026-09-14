@@ -228,7 +228,13 @@ def load_forward_slots(schedule_path: str, now_ts: float, tz_name: str) -> list[
             price = _f(s.get("import_price_sek_kwh"))
             if price is None:
                 continue
-            out.append(WindowSlot(start_ts=start.timestamp(), import_price_sek_kwh=price))
+            # Surplus view (optional): the plan's export in this slot and its price.
+            # Missing => the slot prices at import, exactly as before.
+            out.append(WindowSlot(
+                start_ts=start.timestamp(), import_price_sek_kwh=price,
+                export_price_sek_kwh=_f(s.get("export_price_sek_kwh")),
+                export_kw=max(0.0, _f(s.get("export_kw")) or 0.0),
+            ))
         out.sort(key=lambda w: w.start_ts)
         # Keep current + future (drop deep past).
         return [w for w in out if w.start_ts >= now_ts - 7200.0]
@@ -537,10 +543,18 @@ class DeferrableApplianceController:
                         app.id, energy_kwh, energy_src, _MIN_TRUSTWORTHY_CYCLE_KWH,
                     )
                     wait_cost = 0.0
+                # The cycle's average draw lets surplus slots price at the export
+                # price (WindowSlot.effective_price). Unknown energy => 0 => import
+                # only, the legacy scorer.
+                appliance_kw = (
+                    energy_kwh / (duration_min / 60.0)
+                    if energy_kwh > 0.0 and duration_min > 0.0 else 0.0
+                )
                 action, window_start = recommend_appliance_action(
                     slots, now_ts, duration_slots, deadline_ts,
                     energy_kwh=energy_kwh,
                     wait_cost_sek_per_hour=wait_cost,
+                    appliance_kw=appliance_kw,
                 )
 
             # Fas 3 — plug actuation (only outside observe/shadow, only on a readable
