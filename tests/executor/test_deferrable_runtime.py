@@ -1086,3 +1086,33 @@ class TestCycleEnergyInput:
             attrs={"typical_energy_kwh": 1.2, "learned": True, "cycles_observed": 9},
         )
         assert action == "run"
+
+
+class TestSurplusFieldsAreLoaded:
+    def test_loader_carries_export_view(self, tmp_path):
+        import json as _json
+        from datetime import timedelta
+
+        from executor.deferrable_runtime import load_forward_slots
+
+        now = datetime.now(TZ).replace(microsecond=0)
+        slots = []
+        for i in range(3):
+            start = now + timedelta(minutes=15 * i)
+            slots.append({
+                "start_time": start.isoformat(), "import_price_sek_kwh": 2.0,
+                "export_price_sek_kwh": 1.1, "export_kw": 2.5 if i == 1 else 0.0,
+            })
+        path = tmp_path / "schedule.json"
+        path.write_text(_json.dumps({"schedule": slots}), encoding="utf-8")
+        out = load_forward_slots(str(path), now.timestamp(), "Europe/Stockholm")
+        assert [w.export_kw for w in out] == [0.0, 2.5, 0.0]
+        assert all(w.export_price_sek_kwh == 1.1 for w in out)
+
+    def test_loader_without_export_fields_is_legacy(self, tmp_path):
+        from executor.deferrable_runtime import load_forward_slots
+
+        now = datetime.now(TZ)
+        path = _write_schedule(tmp_path, [0.5, 0.6], now)
+        out = load_forward_slots(path, now.timestamp(), "Europe/Stockholm")
+        assert all(w.export_kw == 0.0 and w.export_price_sek_kwh is None for w in out)
