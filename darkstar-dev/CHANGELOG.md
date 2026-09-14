@@ -1,3 +1,7 @@
+## dev-20260914.1304 — 2026-09-14 13:06
+
+- fix(executor): the surplus boost ceiling is the heater's willingness-to-pay
+
 ## dev-20260914.0531 — 2026-09-14 05:33
 
 - feat(deferrable): price surplus slots at the export price when scoring windows
