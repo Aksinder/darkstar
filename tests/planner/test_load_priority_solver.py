@@ -502,3 +502,52 @@ class TestEvWtpFold:
     def test_no_priority_cfg_keeps_legacy_values(self):
         out = build_ev_charger_inputs([_charger("important")])  # load_priority_cfg=None
         assert [b.value_sek for b in out[0].incentive_buckets] == [0.5, 0.2]
+
+
+class TestMaySkipDayHeaterIsNotStarvedByBlockStart:
+    """Live 2026-09-14: the spa (dynamic P30 WTP ~2.0, may_skip_day) got no planned block
+    for 48 h and sat at 26 C while 10 kW of PV exported at 1.77 SEK/kWh. With no
+    reliability floor, its only reason to heat is the WTP credit — (2.0 - 1.27) x 4 kWh
+    ~ 2.9 SEK here — and the flat 3.0 SEK comfort-L3 block-start penalty ate all of it.
+    """
+
+    @staticmethod
+    def _day():
+        base = datetime(2026, 9, 14, 10, 0)
+        out = []
+        for i in range(24):
+            s = base + timedelta(minutes=30 * i)
+            if i < 12:  # midday: 10 kW surplus, import 2.93, export 1.77
+                out.append(KeplerInputSlot(s, s + timedelta(minutes=30), 0.2, 5.0, 2.93, 1.77))
+            else:  # evening/night, no PV
+                imp = 2.40 if i < 18 else 1.72
+                out.append(KeplerInputSlot(s, s + timedelta(minutes=30), 0.2, 0.0, imp, 0.66))
+        return out
+
+    def _solve(self, lp):
+        wh = WaterHeaterInput(id="spa", power_kw=1.8, min_kwh_per_day=4.0,
+                              max_hours_between_heating=0.0, min_spacing_hours=0.0)
+        return KeplerSolver().solve(
+            KeplerInput(self._day(), 0.0),
+            _wcfg(
+                [wh], load_priority_enabled=True, load_priorities={"spa": lp},
+                water_reliability_penalty_sek=15.0, water_block_start_penalty_sek=3.0,
+                water_block_penalty_sek=2.0, max_block_hours=2.0,
+                export_threshold_sek_per_kwh=0.5,
+            ),
+        )
+
+    def test_the_spa_heats_in_the_surplus(self):
+        r = self._solve(LoadPriority(base_wtp_sek_per_kwh=2.0, dynamic_percentile=30.0,
+                                     may_skip_day=True))
+        assert r.is_optimal
+        assert _heated(r, "spa") >= 3.5
+        hot = [i for i, s in enumerate(r.slots) if s.water_heater_results.get("spa", 0.0) > 0]
+        assert hot and max(hot) < 12  # all of it on surplus, none bought at night
+
+    def test_a_worthless_load_still_skips(self):
+        """The waiver removes a flat tax, not the price test: WTP below every cost => 0."""
+        r = self._solve(LoadPriority(base_wtp_sek_per_kwh=0.5, dynamic_percentile=30.0,
+                                     may_skip_day=True))
+        assert r.is_optimal
+        assert _heated(r, "spa") == pytest.approx(0.0)

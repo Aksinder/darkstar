@@ -1383,12 +1383,22 @@ class KeplerSolver:
                     # turning "heats when energy is cheap/surplus" into "never heats".
                     # Waive it for those heaters — their WTP threshold already gates
                     # starts. Dynamic-percentile heaters keep it (consolidation within
-                    # the cheap band is exactly what the penalty is for).
+                    # the cheap band is exactly what the penalty is for) — UNLESS they
+                    # may skip a day. A may_skip_day heater has no reliability floor to
+                    # force the need in, so its whole reason to heat is the WTP credit,
+                    # and a flat 3 SEK start outweighs that credit whenever the margin
+                    # is under ~0.75 SEK/kWh on a 4 kWh need. Live 2026-09-14: the spa
+                    # (P30 WTP 2.0, may_skip_day) got no planned block for 48 h, then
+                    # sat at 26 C while 10 kW exported at 1.77 — the same solver with
+                    # the start waived heats 3.6 kWh in those surplus slots.
                     for d in water_start
                     if not (
                         config.load_priority_enabled
                         and d in config.load_priorities
-                        and config.load_priorities[d].dynamic_percentile is None
+                        and (
+                            config.load_priorities[d].dynamic_percentile is None
+                            or config.load_priorities[d].may_skip_day
+                        )
                     )
                     for t in range(T)
                 )
