@@ -1,3 +1,7 @@
+## dev-20260914.0531 — 2026-09-14 05:33
+
+- feat(deferrable): price surplus slots at the export price when scoring windows
+
 ## dev-20260913.1843 — 2026-09-13 18:45
 
 - fix(executor): export mode sells what the plan priced, not the whole pack
