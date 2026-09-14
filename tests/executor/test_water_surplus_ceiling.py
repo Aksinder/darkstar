@@ -165,3 +165,64 @@ class TestParsing:
         """A blank YAML value must not become a ceiling of 0 that blocks every boost."""
         by_id = self._load(tmp_path, {"surplus_boost_max_price_percentile": None})
         assert by_id["spa"].surplus_boost_max_price_percentile is None
+
+
+class TestWtpIsTheBoostCeiling:
+    """Live 2026-09-14 14:50: "Water surplus-boost spa: off (price 1.77 > 1.25)" all
+    afternoon while 10 kW exported. The P40-of-export ceiling sat under tonight's cheap
+    hours so no midday hour could pass — yet every kWh sold at 1.77 was worth ~2.0 to
+    the spa. A heater with a WTP boosts when export < WTP."""
+
+    def test_wtp_supersedes_a_configured_percentile(self):
+        dev = _device(surplus_boost_max_price_percentile=40.0)
+        ctx = {**CTX, "wtp_by_device": {"spa": 2.0}}
+        assert _engine()._heater_surplus_ceiling(dev, ctx) == 2.0
+
+    def test_todays_export_price_now_passes(self):
+        dev = _device(surplus_boost_max_price_percentile=40.0)
+        ctx = {**CTX, "wtp_by_device": {"spa": 1.99}}
+        assert 1.77 <= _engine()._heater_surplus_ceiling(dev, ctx)
+
+    def test_no_wtp_keeps_the_percentile_path(self):
+        dev = _device(surplus_boost_max_price_percentile=40.0)
+        eng = _engine()
+        assert eng._heater_surplus_ceiling(dev, {**CTX, "wtp_by_device": {}}) == \
+            eng._heater_surplus_ceiling(dev, CTX)
+
+    @pytest.mark.asyncio
+    async def test_wtp_resolution_static_and_dynamic(self):
+        from planner.solver.adapter import dynamic_wtp_from_prices
+
+        eng = _engine()
+        eng.config = SimpleNamespace(water_heater_devices=[
+            SimpleNamespace(id="spa"), SimpleNamespace(id="main_tank"),
+            SimpleNamespace(id="no_prio"),
+        ])
+        eng._full_config = {"load_priority": {
+            "enabled": True,
+            "tiers": {"comfort": {"base_wtp_sek_per_kwh": 0.4},
+                      "important": {"base_wtp_sek_per_kwh": 2.5}},
+            "loads": {
+                "spa": {"tier": "comfort", "wtp_percentile": 30, "wtp_window_hours": 48},
+                "main_tank": {"tier": "important", "rank": 0},
+            },
+        }}
+        asked: list[float] = []
+
+        async def fake_window(hours=24.0, field="import_price_sek_kwh"):
+            asked.append(hours)
+            return IMPORT_W
+
+        eng._price_window = fake_window
+        out = await eng._water_wtp_by_device()
+        assert out["spa"] == pytest.approx(dynamic_wtp_from_prices(IMPORT_W, 30.0, len(IMPORT_W)))
+        assert out["main_tank"] == pytest.approx(2.5)
+        assert "no_prio" not in out
+        assert asked == [48.0]
+
+    @pytest.mark.asyncio
+    async def test_disabled_priority_is_empty(self):
+        eng = _engine()
+        eng.config = SimpleNamespace(water_heater_devices=[SimpleNamespace(id="spa")])
+        eng._full_config = {"load_priority": {"enabled": False}}
+        assert await eng._water_wtp_by_device() == {}

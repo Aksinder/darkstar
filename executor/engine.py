@@ -2810,8 +2810,57 @@ class ExecutorEngine:
             logger.debug("Price window unavailable: %s", e)
         return []
 
+    async def _water_wtp_by_device(self) -> dict[str, float]:
+        """Each priority-bearing heater's willingness-to-pay right now, SEK/kWh.
+
+        Resolved through the planner's own config path (build_load_priorities) and, for a
+        dynamic-percentile load, the same percentile rule (dynamic_wtp_from_prices) over
+        the executor's rolling import window. The executor's window backfills already-
+        passed hours when the forward series is short, so the number can differ from the
+        planner's forward-only one by a few öre; it is a ceiling, not a bid.
+
+        Empty when load_priority is off or unreadable — the boost then falls back to its
+        percentile ceiling exactly as before.
+        """
+        full = cast("dict[str, Any]", getattr(self, "_full_config", None) or {})
+        try:
+            from planner.solver.adapter import (
+                build_load_priorities,
+                dynamic_wtp_from_prices,
+            )
+
+            enabled, prios = build_load_priorities(full)
+        except Exception as exc:  # a bad block must never break the water tick
+            logger.debug("Water WTP: load_priority unreadable: %s", exc)
+            return {}
+        if not enabled:
+            return {}
+        out: dict[str, float] = {}
+        for dev in self.config.water_heater_devices:
+            lp = prios.get(dev.id)
+            if lp is None:
+                continue
+            wtp: float | None
+            if lp.dynamic_percentile is None:
+                wtp = lp.base_wtp_sek_per_kwh + lp.rank_epsilon_sek_per_kwh
+            else:
+                window = await self._price_window(float(lp.dynamic_window_hours or 24.0))
+                wtp = dynamic_wtp_from_prices(window, lp.dynamic_percentile, len(window))
+            if wtp is not None and wtp > 0.0:
+                out[dev.id] = float(wtp)
+        return out
+
     def _heater_surplus_ceiling(self, device: Any, ctx: dict[str, Any]) -> float | None:
         """The BOOST-side ceiling, measured against the series it is compared with.
+
+        A heater with a willingness-to-pay uses THAT, and nothing else. Spare PV costs
+        the export revenue foregone; the heater is worth its WTP; boost when the first is
+        below the second. Live 2026-09-14 14:50 the spa was refused all afternoon
+        ("price 1.77 > 1.25") while 10 kW exported: its P40-of-export ceiling sat under
+        tonight's cheap hours, so no midday hour could pass, though every kWh sold at 1.77
+        was worth ~2.0 to the spa. The daily absorb cap still bounds how much it takes.
+        A configured surplus_boost_max_price_percentile is superseded for such heaters
+        and says so once.
 
         should_boost_on_surplus prefers the EXPORT price — spare PV costs the revenue
         foregone, not import — but its ceiling used to come from _heater_price_ceiling,
@@ -2824,6 +2873,20 @@ class ExecutorEngine:
         surplus percentile sees exactly today's behaviour.
         """
         pct = getattr(device, "surplus_boost_max_price_percentile", None)
+        dev_id = getattr(device, "id", None)
+        wtp = cast("dict[str, float]", ctx.get("wtp_by_device") or {}).get(str(dev_id))
+        if wtp is not None:
+            if pct is not None:
+                logged = cast("set[str]", self.__dict__.setdefault("_surplus_wtp_logged", set()))
+                if str(dev_id) not in logged:
+                    logged.add(str(dev_id))
+                    logger.info(
+                        "Water surplus-boost %s: ceiling is the heater's WTP %.2f SEK/kWh; "
+                        "surplus_boost_max_price_percentile=%s is superseded for heaters "
+                        "with a load_priority entry",
+                        dev_id, wtp, pct,
+                    )
+            return wtp
         if pct is None:
             return self._heater_price_ceiling(device, ctx)
         cap = price_percentile(ctx.get("export_price_window") or [], float(pct))
@@ -2949,6 +3012,12 @@ class ExecutorEngine:
                 )
                 if window_hours and needs_export_window
                 else []
+            ),
+            # Only the boost reads it; skip the work on sites that never boost.
+            "wtp_by_device": (
+                await self._water_wtp_by_device()
+                if any(getattr(d, "surplus_boost", False) for d in self.config.water_heater_devices)
+                else {}
             ),
             "phase_currents": phase_currents,
             "fuse_budget_a": fuse_budget,
