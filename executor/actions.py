@@ -29,6 +29,19 @@ from .profiles import InverterProfile, ModeAction
 logger = logging.getLogger(__name__)
 
 
+# A state that says the device is not answering. HA still ACCEPTS a service call
+# for such an entity and returns 200, so a write against one of these is a
+# confident lie: 2026-09-18..20 the Sungrow modbus link was down for 50 hours and
+# every tick logged "6/6 actions successful" while nothing reached the inverter —
+# and fired a notification a minute on the way past.
+_UNREADABLE_STATES = frozenset({"", "unknown", "unavailable", "none"})
+
+
+def _is_unreadable(state: Any) -> bool:
+    """True when a state read means "the device did not answer"."""
+    return state is None or str(state).strip().lower() in _UNREADABLE_STATES
+
+
 class HACallError(Exception):
     """Home Assistant API call error with detailed context."""
 
@@ -582,6 +595,10 @@ class ActionDispatcher:
         # before the first clamp when export_curtailment.restore_limit_w is left at 0 (auto).
         self._restore_export_limit_w: float | None = None
         self._curtail_unknown_warn_ts: float = -1e12  # rate-limits the unknown-price warning
+        # Control entities currently reading unavailable/unknown. Membership is what
+        # makes the "device unreachable" notice one-shot per outage instead of one per
+        # tick, and it is also what triggers the recovery notice on the way back.
+        self._unreachable_entities: set[str] = set()
         # Manual-ON respect for switch-type water targets: what WE last commanded per
         # entity (so a human's ON is distinguishable from our own), and until when a
         # detected manual ON is honored as an implicit boost. In-memory: an add-on
@@ -900,6 +917,30 @@ class ActionDispatcher:
 
         previous_value = await self.ha.get_state_value(entity_id)
 
+        # The device is not answering: skip the write rather than issue one that
+        # cannot land. An unavailable entity never matches the target, so without
+        # this the executor rewrites (and re-notifies) every tick for as long as the
+        # outage lasts, while reporting every one of them as a success.
+        # Shadow mode is exempt: it writes nothing anyway, and its job is to report
+        # the intent it WOULD have had — reporting "skipped, unreachable" instead
+        # would hide the decision under the device's health.
+        if _is_unreadable(previous_value) and not self.shadow_mode:
+            await self._note_unreachable(action.entity, entity_id, previous_value)
+            return ActionResult(
+                action_type=action.entity,
+                success=False,
+                message=f"{entity_id} unreachable ({previous_value}) — write skipped",
+                previous_value=previous_value,
+                new_value=resolved_value,
+                entity_id=entity_id,
+                skipped=True,
+                requested_mode=mode_intent,
+                applied_mode=mode_intent,
+                duration_ms=int((time.time() - start_time) * 1000),
+            )
+        if not self.shadow_mode:
+            await self._note_reachable(action.entity, entity_id)
+
         if self._values_match(previous_value, resolved_value):
             return ActionResult(
                 action_type=action.entity,
@@ -945,8 +986,19 @@ class ActionDispatcher:
 
         duration_ms = int((time.time() - start_time) * 1000)
 
-        if success:
+        # Notify on a VERIFIED change only. "HA accepted the call" is not evidence the
+        # device did anything — the same 50-hour outage produced ~3000 cheerful
+        # notifications. verification_success is None when the read-back could not be
+        # made at all, which is no evidence either; both stay silent and say so in the
+        # log. The cost is a missed notification when a device is genuinely slower to
+        # report than our read-back, which is the quieter failure of the two.
+        if success and verification_success:
             await self._maybe_notify(action.entity, f"Set {action.entity} to {resolved_value}")
+        elif success:
+            logger.info(
+                "%s: wrote %s but read back %r — not notifying (verified=%s)",
+                entity_id, resolved_value, verified_value, verification_success,
+            )
 
         return ActionResult(
             action_type=action.entity,
@@ -2107,6 +2159,55 @@ class ActionDispatcher:
             await self._send_notification(
                 f"{target} följer inte Darkstars kommando.\n{detail}",
                 title="⚠️ Darkstar: skrivning gick inte igenom",
+            )
+
+    async def _note_unreachable(self, action_entity: str, entity_id: str, state: Any) -> None:
+        """First tick of an outage: log loudly and tell a human once."""
+        if entity_id in self._unreachable_entities:
+            return
+        self._unreachable_entities.add(entity_id)
+        logger.warning(
+            "Control entity %s (%s) reads %r — skipping writes until it answers again. "
+            "Darkstar has no control over this device meanwhile; the inverter keeps "
+            "whatever mode it was last given.",
+            entity_id, action_entity, state,
+        )
+        await self.notify_unreachable(
+            f"{action_entity} ({entity_id})",
+            f"läser {state} — Darkstar kan inte styra enheten och hoppar över "
+            f"skrivningar tills den svarar igen.",
+        )
+
+    async def _note_reachable(self, action_entity: str, entity_id: str) -> None:
+        """The entity answers again: clear the latch and say so, once."""
+        if entity_id not in self._unreachable_entities:
+            return
+        self._unreachable_entities.discard(entity_id)
+        logger.info("Control entity %s (%s) answers again — resuming writes",
+                    entity_id, action_entity)
+        await self.notify_unreachable(
+            f"{action_entity} ({entity_id})", "svarar igen — styrning återupptagen.",
+            recovered=True,
+        )
+
+    async def notify_unreachable(
+        self, target: str, detail: str, recovered: bool = False
+    ) -> None:
+        """Device-unreachable notice, once per outage and once on recovery.
+
+        Shares the on_write_unverified flag with notify_unverified: both answer the
+        same question — did the command reach the hardware — and an owner who wants
+        one wants the other.
+        """
+        if not self.config.notifications.on_write_unverified:
+            return
+        if recovered:
+            await self._send_notification(
+                f"{target}: {detail}", title="Darkstar: enheten svarar igen"
+            )
+        else:
+            await self._send_notification(
+                f"{target} {detail}", title="⚠️ Darkstar: enheten svarar inte"
             )
 
     async def notify_override(self, override_type: str, reason: str) -> None:
