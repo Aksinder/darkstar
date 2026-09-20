@@ -1,3 +1,7 @@
+## dev-20260920.2154 — 2026-09-20 21:56
+
+- fix(executor): never write to a device that is not answering, and notify only on a verified change
+
 ## dev-20260914.1304 — 2026-09-14 13:06
 
 - fix(executor): the surplus boost ceiling is the heater's willingness-to-pay
