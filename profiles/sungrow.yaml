@@ -61,6 +61,16 @@ entities:
     description: "Forced mode charge/discharge power cap (Watts)"
     required: true
 
+  # Read-only: the inverter's own system state (mkaiser template over register
+  # 13000). The executor reads it before every mode and applies nothing while it
+  # is in one of behavior.fault_states — see the fault gate note below.
+  inverter_state:
+    default_entity: "sensor.sungrow_inverter_state"
+    domain: "sensor"
+    category: "system"
+    description: "Inverter system state (Running / Fault / Standby ...)"
+    required: false
+
 modes:
   charge:
     description: "Grid charge — Force charge battery from AC grid"
@@ -133,6 +143,10 @@ behavior:
   round_step_w: 100.0
   write_threshold_w: 100.0
   mode_settling_ms: 100
+  # inverter_state values that mean "not operating". Exact strings as the
+  # sungrow_inverter_state template renders them; case-insensitive.
+  fault_states:
+    - "Fault"
 
 # ============================================================
 # IMPORTANT NOTES (from mkaiser/Sungrow-SHx-Inverter-Modbus-Home-Assistant)
@@ -158,7 +172,18 @@ behavior:
 #    is completely ignored regardless of its current value. The battery
 #    charges from excess PV and discharges to meet home load demand.
 #
-# 5. MAX DISCHARGE POWER CAP:
+# 5. FAULT GATE (2026-09-24):
+#    A faulted SH10RT still answers every Modbus read and accepts every write —
+#    it just does nothing with them. For a week (2026-09-16 17:31 -> 09-23 20:31)
+#    the executor logged "5/5 actions successful" per tick against an inverter
+#    whose system state said Fault: no charge, no discharge, no PV from its own
+#    strings. The unreachable guard cannot see this (the entities are available),
+#    so the executor reads inverter_state first and refuses to apply ANY mode
+#    while it is in fault_states — one notification on entry, one on recovery.
+#    An unreadable state sensor leaves the gate open (that is the link being
+#    down, which the per-entity guard already handles).
+#
+# 6. MAX DISCHARGE POWER CAP:
 #    max_charge_power and max_discharge_power act as caps on battery power
 #    in BOTH Self-consumption and Forced modes. Set these high (user config max)
 #    when you want full power availability.
