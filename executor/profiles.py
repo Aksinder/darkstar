@@ -16,7 +16,13 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-VALID_DOMAINS = frozenset(["select", "number", "switch", "input_number"])
+# "sensor" is read-only: a profile may DECLARE one (the inverter's own state, read by
+# the executor's fault gate) but a mode action can never write to it.
+VALID_DOMAINS = frozenset(["select", "number", "switch", "input_number", "sensor"])
+READ_ONLY_DOMAINS = frozenset(["sensor"])
+# The entity key the fault gate reads. Optional: a profile that declares it, plus
+# behavior.fault_states, gets an executor that refuses to command a faulted inverter.
+INVERTER_STATE_KEY = "inverter_state"
 VALID_CATEGORIES = frozenset(["system", "battery"])
 VALID_TEMPLATES = frozenset(
     [
@@ -80,6 +86,11 @@ class ProfileBehavior:
     write_threshold_w: float = 100.0
     mode_settling_ms: int = 100
     requires_mode_settling: bool = False
+    # States of the ``inverter_state`` entity that mean "this inverter is not
+    # operating" (Sungrow system-state register 0x0100 renders as "Fault"). While
+    # the entity reads one of these, the executor applies no mode at all and says
+    # so once. Empty (the default) disables the gate. Compared case-insensitively.
+    fault_states: list[str] = field(default_factory=list[str])
 
 
 @dataclass
@@ -182,11 +193,21 @@ class InverterProfile:
             if entity_def.category not in VALID_CATEGORIES:
                 errors.append(f"Entity '{key}' has invalid category: {entity_def.category}")
 
+        if self.behavior.fault_states and INVERTER_STATE_KEY not in self.entities:
+            errors.append(
+                f"behavior.fault_states is set but entity '{INVERTER_STATE_KEY}' is not "
+                "declared — the fault gate has nothing to read"
+            )
+
         for mode_key, mode_def in self.modes.items():
             for action in mode_def.actions:
                 if action.entity not in self.entities:
                     errors.append(
                         f"Mode '{mode_key}': action references unknown entity '{action.entity}'"
+                    )
+                elif self.entities[action.entity].domain in READ_ONLY_DOMAINS:
+                    errors.append(
+                        f"Mode '{mode_key}': action writes to read-only entity '{action.entity}'"
                     )
 
                 if isinstance(action.value, str) and action.value.startswith("{{"):
@@ -320,6 +341,7 @@ def parse_profile(data: dict[str, Any]) -> InverterProfile:
         modes[key] = _parse_mode_definition(mode_data)
 
     behavior_data = data.get("behavior", {})
+    fault_states_raw: list[object] = list(behavior_data.get("fault_states") or [])
     behavior = ProfileBehavior(
         control_unit=behavior_data.get("control_unit", "A"),
         min_charge_a=behavior_data.get("min_charge_a", 1.0),
@@ -329,6 +351,7 @@ def parse_profile(data: dict[str, Any]) -> InverterProfile:
         grid_charge_round_step_w=behavior_data.get("grid_charge_round_step_w"),
         write_threshold_w=behavior_data.get("write_threshold_w", 100.0),
         mode_settling_ms=behavior_data.get("mode_settling_ms", 100),
+        fault_states=[str(st) for st in fault_states_raw],
     )
 
     return InverterProfile(

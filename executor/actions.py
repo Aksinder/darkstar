@@ -16,15 +16,15 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
 
 from .config import ExcessPVSinkSpec, ExecutorConfig
 from .controller import ControllerDecision
-from .profiles import InverterProfile, ModeAction
+from .profiles import INVERTER_STATE_KEY, InverterProfile, ModeAction
 
 logger = logging.getLogger(__name__)
 
@@ -599,6 +599,10 @@ class ActionDispatcher:
         # makes the "device unreachable" notice one-shot per outage instead of one per
         # tick, and it is also what triggers the recovery notice on the way back.
         self._unreachable_entities: set[str] = set()
+        # The inverter_state value we last saw in behavior.fault_states, or None while
+        # the inverter runs. Set on the first faulted tick (one notice), cleared on the
+        # first healthy one (one notice) — the fault gate's memory across ticks.
+        self._inverter_fault_state: str | None = None
         # Manual-ON respect for switch-type water targets: what WE last commanded per
         # entity (so a human's ON is distinguishable from our own), and until when a
         # detected manual ON is honored as an implicit boost. In-memory: an add-on
@@ -834,6 +838,10 @@ class ActionDispatcher:
                     message=f"Profile error: {e}",
                 )
             ]
+
+        gate = await self._inverter_fault_gate(mode_intent)
+        if gate is not None:
+            return [gate]
 
         logger.info(
             "Executing mode '%s' (%s) for profile '%s'",
@@ -2159,6 +2167,97 @@ class ActionDispatcher:
             await self._send_notification(
                 f"{target} följer inte Darkstars kommando.\n{detail}",
                 title="⚠️ Darkstar: skrivning gick inte igenom",
+            )
+
+    async def _inverter_fault_gate(self, mode_intent: str) -> ActionResult | None:
+        """Refuse to command an inverter that reports it is not operating.
+
+        The Sungrow answered every register read and accepted every write for a
+        week (2026-09-16 17:31 -> 09-23 20:31) while its system-state register said
+        Fault: no charge, no discharge, no PV from its own strings. Readbacks
+        matched, so every tick logged "5/5 actions successful" and the fuse guard
+        capped charge power on a battery that could not charge. A device that
+        answers "Fault" is not unreachable — the per-entity guard never fires — so
+        this is a separate check, ahead of the whole mode.
+
+        Only a profile that declares both an ``inverter_state`` entity and
+        ``behavior.fault_states`` gets the gate. An unreadable state sensor is
+        ignorance, not a fault: the gate stays open and the per-entity guard covers
+        the link being down. Shadow mode is exempt for the same reason as there —
+        its job is to report the intent. Returns the single skipped result that
+        stands in for the mode, or None to let the mode run.
+        """
+        if self.shadow_mode or not self.profile:
+            return None
+        # getattr + isinstance: engine tests stand in a MagicMock for the profile,
+        # and a MagicMock must never close the gate.
+        raw: object = getattr(self.profile.behavior, "fault_states", None)
+        if not isinstance(raw, list | tuple | set) or not raw:
+            return None
+        fault_states = {str(st).strip().lower() for st in cast("Iterable[object]", raw)}
+        if INVERTER_STATE_KEY not in self.profile.entities:
+            return None
+        entity_id = self._resolve_entity_id(INVERTER_STATE_KEY)
+        if not entity_id:
+            return None
+
+        state = await self.ha.get_state_value(entity_id)
+        if _is_unreadable(state):
+            return None
+        state_text = str(state).strip()
+
+        if state_text.lower() not in fault_states:
+            if self._inverter_fault_state is not None:
+                was = self._inverter_fault_state
+                self._inverter_fault_state = None
+                logger.info(
+                    "Inverter %s reads %r again (was %r) — resuming mode control",
+                    entity_id, state_text, was,
+                )
+                await self.notify_inverter_fault(entity_id, state_text, recovered=True)
+            return None
+
+        if self._inverter_fault_state is None:
+            self._inverter_fault_state = state_text
+            logger.warning(
+                "Inverter %s reports %r — applying no mode until it runs again. Every "
+                "control entity still answers, so nothing else will flag this; the "
+                "battery neither charges nor discharges while it lasts.",
+                entity_id, state_text,
+            )
+            await self.notify_inverter_fault(entity_id, state_text)
+        return ActionResult(
+            action_type=INVERTER_STATE_KEY,
+            success=False,
+            message=f"{entity_id} reports {state_text} — mode '{mode_intent}' not applied",
+            previous_value=state,
+            entity_id=entity_id,
+            skipped=True,
+            requested_mode=mode_intent,
+            applied_mode=mode_intent,
+        )
+
+    async def notify_inverter_fault(
+        self, entity_id: str, state: str, recovered: bool = False
+    ) -> None:
+        """Inverter-fault notice, once on entry and once on recovery.
+
+        Gated on on_write_unverified like the unreachable notice: all three answer
+        the same question — is the hardware doing what it was told.
+        """
+        if not self.config.notifications.on_write_unverified:
+            return
+        if recovered:
+            await self._send_notification(
+                f"{entity_id} läser '{state}' — styrning återupptagen.",
+                title="Darkstar: växelriktaren kör igen",
+            )
+        else:
+            await self._send_notification(
+                f"{entity_id} läser '{state}'. Darkstar skickar inga batterikommandon "
+                "förrän växelriktaren kör igen — läs av felkoden på displayen eller i "
+                "iSolarCloud.",
+                title="⚠️ Darkstar: växelriktaren rapporterar fel",
             )
 
     async def _note_unreachable(self, action_entity: str, entity_id: str, state: Any) -> None:

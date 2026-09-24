@@ -50,7 +50,7 @@ The entity registry defines ALL Home Assistant entities your inverter profile us
 | Property | Type | Description |
 |----------|------|-------------|
 | `default_entity` | string | Default HA entity ID (what most users will have) |
-| `domain` | string | HA domain: `select`, `number`, `switch`, or `input_number` |
+| `domain` | string | HA domain: `select`, `number`, `switch`, `input_number` — or `sensor` for a read-only entity (see below) |
 | `category` | string | Settings tab: `system` or `battery` |
 | `description` | string | Human-readable text shown in Settings UI |
 | `required` | bool | Whether Darkstar requires this entity to function |
@@ -63,6 +63,7 @@ The entity registry defines ALL Home Assistant entities your inverter profile us
 | `number` | `number.set_value` | Numeric sliders |
 | `input_number` | `input_number.set_value` | HA input_number helpers |
 | `switch` | `switch.turn_on/off` | On/off toggles |
+| `sensor` | *(none — read-only)* | The inverter's own state, read by the fault gate. A mode action may not write to it; validation rejects that. |
 
 ### Valid Categories
 
@@ -243,7 +244,39 @@ behavior:
   write_threshold_w: 100.0       # Min delta before writing new value
   mode_settling_ms: 100          # Default delay after mode changes
   requires_mode_settling: false  # Whether mode changes need settling
+  fault_states: []               # Optional fault gate, see below
 ```
+
+### Fault Gate (optional)
+
+Some inverters keep answering every read and accepting every write while they
+are not operating at all — a Sungrow SH10RT in `Fault` did exactly that for a
+week: readbacks matched, the executor logged every mode as successful, and the
+battery neither charged nor discharged. An unavailable-entity check cannot see
+this, because nothing is unavailable.
+
+Declare a read-only `inverter_state` entity plus the states that mean "not
+operating", and the executor reads it before every mode:
+
+```yaml
+entities:
+  inverter_state:
+    default_entity: "sensor.sungrow_inverter_state"
+    domain: "sensor"
+    category: "system"
+    description: "Inverter system state"
+    required: false
+
+behavior:
+  fault_states: ["Fault"]        # compared case-insensitively
+```
+
+While the entity reads one of `fault_states`, no mode actions are written and
+one notification is sent; when it leaves them, control resumes with one more
+notification. An `unavailable`/`unknown` state leaves the gate open — that is the
+link being down, which the per-entity unreachable guard already handles. Users
+map their own entity id through `executor.inverter.custom_entities.inverter_state`
+like any other profile entity. Shadow mode ignores the gate and reports intent.
 
 ---
 
