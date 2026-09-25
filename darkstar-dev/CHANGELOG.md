@@ -1,3 +1,7 @@
+## dev-20260925.2018 — 2026-09-25 20:19
+
+- build: pin sqlalchemy <2.1 — 2.1 dropped greenlet and the asyncio extension cannot import
+
 ## dev-20260924.1822 — 2026-09-24 18:24
 
 - feat(executor): refuse to command an inverter that reports a fault
