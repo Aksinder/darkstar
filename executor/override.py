@@ -113,6 +113,12 @@ class SlotPlan:
     sinks: dict[str, bool] = field(default_factory=lambda: {})
     # None = price unknown (missing field / stale schedule); consumers fail closed.
     export_price_sek_kwh: float | None = None
+    # Set by the ENGINE, never read from the schedule: a car is drawing power this
+    # tick, planned or not. The controller turns any discharge-capable mode into
+    # idle for it — discharge_kw=0 on its own blocks nothing, because the commanded
+    # discharge limit is always the pack maximum and only the mode decides whether
+    # the battery may feed the house (and therefore the car).
+    ev_isolation: bool = False
 
 
 class OverrideEvaluator:

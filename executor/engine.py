@@ -23,7 +23,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -66,6 +66,19 @@ from .water_hold import (
 from .write_verify import VerifySignal, VerifyState, note_attempt
 
 logger = logging.getLogger(__name__)
+
+
+def isolate_slot_for_ev(slot: SlotPlan) -> SlotPlan:
+    """The slot the controller sees while a car is actually drawing power.
+
+    replace(), not a hand-copied constructor: the old rebuild listed nine fields
+    and silently dropped the rest — ev_charger_plans, water_heater_plans,
+    water_heating_boost, sinks — so for as long as a car charged, every water
+    heater read as "planned off" and was commanded off. ev_isolation=True is the
+    part that blocks the battery (see Controller._follow_plan); discharge_kw=0.0
+    stays for the execution record and the A-profile discharge paths.
+    """
+    return replace(slot, discharge_kw=0.0, ev_isolation=True)
 
 # The EV charge-failure notifier ignores zero-power ticks while the freshest EV power
 # report is older than this (see _ev_power_reading_stale). Matches the Tesla Fleet
@@ -1605,19 +1618,10 @@ class ExecutorEngine:
                         )
                     self._ev_detected_last_tick = True
 
-                # Force zero discharge to prevent battery → EV energy flow
-                slot = SlotPlan(
-                    charge_kw=slot.charge_kw,
-                    discharge_kw=0.0,  # Block discharge
-                    export_kw=slot.export_kw,
-                    load_kw=slot.load_kw,
-                    pv_kw=slot.pv_kw,
-                    water_kw=slot.water_kw,
-                    ev_charging_kw=slot.ev_charging_kw,  # REV F76: Preserve EV data
-                    soc_target=slot.soc_target,
-                    soc_projected=slot.soc_projected,
-                    export_price_sek_kwh=slot.export_price_sek_kwh,
-                )
+                # Block battery → EV flow. ev_isolation is what actually does it
+                # (Controller._follow_plan forces idle); discharge_kw=0 is kept for
+                # the execution record and the A-profile paths.
+                slot = isolate_slot_for_ev(slot)
 
                 # EV charge failure detection: track ticks with zero actual power.
                 # Gated on an actuation path existing: with EV value ladders configured the
@@ -2135,9 +2139,10 @@ class ExecutorEngine:
 
                     # Real-time EV surplus controller (variable charge current, default OFF).
                     # Isolated so a transient HA read can never break the main actuation.
-                    # S3 bridge: pass ORIGINAL_slot's per-charger plan — the isolation
-                    # rebuild strips ev_charger_plans exactly when a car is actually
-                    # charging, which is precisely when the bridge must keep working.
+                    # S3 bridge: pass ORIGINAL_slot — the plan's own view of the
+                    # slot, before EV isolation zeroes discharge_kw. (The rebuild
+                    # used to strip ev_charger_plans too; it no longer does, but
+                    # the bridge wants the plan, not the isolated copy.)
                     if self._ev_surplus is not None and self.ha_client is not None:
                         try:
                             # Resolve the price BEFORE stamping now_ts: a slow fetch
