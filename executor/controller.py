@@ -338,6 +338,20 @@ class Controller:
             # Above SoC target - use self_consumption
             mode_intent = "self_consumption"
 
+        if slot.ev_isolation and mode_intent in ("self_consumption", "export"):
+            # A car is drawing power right now — planned or not. discharge_kw=0
+            # alone changes nothing here: _calculate_discharge_limit always commands
+            # the pack maximum, so in self_consumption the inverter feeds the car
+            # from the battery at up to max_discharge_w. 2026-09-25 05:02-05:15 the
+            # Tesla started outside the plan and took ~2 kWh that way until the SoC
+            # floor forced idle; the night before, the same. Only the mode blocks
+            # the flow. A grid charge is left alone: Forced charge cannot discharge.
+            logger.info(
+                "EV source isolation: %s -> idle (car drawing power, no EV slot in plan)",
+                mode_intent,
+            )
+            mode_intent = "idle"
+
         # Calculate charge/discharge values
         charge_value, write_charge = self._calculate_charge_limit(slot, state)
         discharge_value, write_discharge = self._calculate_discharge_limit(slot, state)
@@ -535,6 +549,8 @@ class Controller:
             parts.append(f"Export {slot.export_kw:.1f}kW")
         if slot.water_kw > 0:
             parts.append(f"Water {slot.water_kw:.1f}kW")
+        if slot.ev_isolation:
+            parts.append("EV isolation")
 
         if not parts:
             parts.append("Hold/Idle")
