@@ -28,6 +28,16 @@ from executor.controller import ControllerDecision
 from executor.profiles import EntityDefinition, InverterProfile, ModeAction, ModeDefinition
 
 
+@pytest.fixture(autouse=True)
+def _fast_readback(monkeypatch):
+    """Read-back verification re-reads for up to 2 s when a value has not settled.
+    These tests feed it values that never settle on purpose; don't wait for real."""
+    import executor.actions as actions_mod
+
+    monkeypatch.setattr(actions_mod, "VERIFY_MAX_WAIT_MS", 3)
+    monkeypatch.setattr(actions_mod, "VERIFY_POLL_INTERVAL_MS", 1)
+
+
 def _profile():
     profile = MagicMock(spec=InverterProfile)
     profile.modes = {
