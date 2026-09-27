@@ -1,3 +1,7 @@
+## dev-20260927.1826 — 2026-09-27 18:27
+
+- build: pin every dependency exactly, to the versions of the last green build
+
 ## dev-20260925.2018 — 2026-09-25 20:19
 
 - build: pin sqlalchemy <2.1 — 2.1 dropped greenlet and the asyncio extension cannot import
