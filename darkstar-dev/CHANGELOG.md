@@ -1,3 +1,7 @@
+## dev-20260928.2110 — 2026-09-28 21:12
+
+- fix(ev): the last-good plug, presence and SoC readings survive a restart
+
 ## dev-20260927.1826 — 2026-09-27 18:27
 
 - build: pin every dependency exactly, to the versions of the last green build
