@@ -53,6 +53,54 @@ _EV_HOME_HOLD_S = 24 * 3600.0
 # positively says "off" unplugs the car.
 _LAST_GOOD_EV_PLUG: dict[str, tuple[bool, float]] = {}
 _EV_PLUG_HOLD_S = 24 * 3600.0
+
+# The three holds above are backed by disk (backend/core/ev_hold_store.py) once the
+# application has enabled it, so an add-on restart during a blackout of the car's
+# entities does not turn a plugged-in car into "never read -> unplugged".
+_HOLD_NAMESPACE = "planner"
+
+
+def restore_ev_holds() -> None:
+    """Refill the hold dicts from disk. Called once at startup, after the store is
+    enabled. A reading already in memory wins if it is newer than the persisted one."""
+    from backend.core import ev_hold_store
+
+    persisted = ev_hold_store.load(_HOLD_NAMESPACE)
+    targets: tuple[tuple[str, dict[str, Any], type], ...] = (
+        ("soc", cast("dict[str, Any]", _LAST_GOOD_EV_SOC), float),
+        ("home", cast("dict[str, Any]", _LAST_GOOD_EV_HOME), bool),
+        ("plug", cast("dict[str, Any]", _LAST_GOOD_EV_PLUG), bool),
+    )
+    restored = 0
+    for kind, memory, want in targets:
+        for key, (value, ts) in persisted.get(kind, {}).items():
+            if want is bool and not isinstance(value, bool):
+                continue
+            if want is float and (isinstance(value, bool) or not isinstance(value, int | float)):
+                continue
+            held = memory.get(key)
+            if held is None or held[1] < ts:
+                memory[key] = (want(value), ts)
+                restored += 1
+    if restored:
+        logger.info("EV holds: restored %d last-good reading(s) from disk", restored)
+
+
+def _persist_ev_holds() -> None:
+    """Hand the current holds to the store (throttled there; a no-op when it is off)."""
+    from backend.core import ev_hold_store
+
+    if not ev_hold_store.is_enabled():
+        return
+    ev_hold_store.save(
+        _HOLD_NAMESPACE,
+        {
+            "soc": dict(_LAST_GOOD_EV_SOC),
+            "home": dict(_LAST_GOOD_EV_HOME),
+            "plug": dict(_LAST_GOOD_EV_PLUG),
+        },
+        _time.time(),
+    )
 _UNREADABLE_STATES = ("", "unknown", "unavailable", "none")
 
 
@@ -829,6 +877,7 @@ async def get_initial_state(
                 if ha_soc_val is not None:
                     soc_percent = float(ha_soc_val)
                     _LAST_GOOD_EV_SOC[charger_id] = (soc_percent, _time.time())
+                    _persist_ev_holds()
                 else:
                     held = _LAST_GOOD_EV_SOC.get(charger_id)
                     age = _time.time() - held[1] if held else None
@@ -864,6 +913,7 @@ async def get_initial_state(
                 if isinstance(raw_plug, bool):
                     plugged_in = raw_plug
                     _LAST_GOOD_EV_PLUG[charger_id] = (plugged_in, _time.time())
+                    _persist_ev_holds()
                 else:
                     # Unreadable. Hold the last readable answer, whichever it was —
                     # a car last seen UNPLUGGED is not dragged into the plan either.
@@ -950,6 +1000,7 @@ async def get_initial_state(
                 # positively says the car is elsewhere may exclude it.
                 if str(zone_state or "").strip().lower() not in _UNREADABLE_STATES:
                     _LAST_GOOD_EV_HOME[charger_id] = (at_home, _time.time())
+                    _persist_ev_holds()
                 elif not at_home:
                     held_home = _LAST_GOOD_EV_HOME.get(charger_id)
                     if held_home is not None:

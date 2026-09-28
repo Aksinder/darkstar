@@ -95,6 +95,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Error during startup check: {e}")
 
+    # EV last-good readings survive a restart. Enabled BEFORE the executor is built:
+    # the surplus servo restores its holds in its constructor.
+    try:
+        from backend.core import ev_hold_store
+        from backend.core.ha_client import restore_ev_holds
+
+        ev_hold_store.enable(os.getenv("DARKSTAR_EV_HOLDS_PATH", "data/ev_holds.json"))
+        restore_ev_holds()
+    except Exception as e:
+        logger.error(f"❌ EV hold store could not be enabled: {e}")
+
     loop = asyncio.get_running_loop()
     ws_manager.set_loop(loop)
 
@@ -209,6 +220,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("👋 Darkstar ASGI Server Shutting Down...")
+
+    # The hold store is process-global; a lifespan that ended must not leave it
+    # writing on behalf of whatever runs next in the same process.
+    try:
+        from backend.core import ev_hold_store
+
+        ev_hold_store.disable()
+    except Exception as e:
+        logger.error(f"Failed to disable the EV hold store: {e}")
 
     # Close LearningStore
     if hasattr(app.state, "learning_store") and app.state.learning_store:

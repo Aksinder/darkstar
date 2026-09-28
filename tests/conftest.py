@@ -48,6 +48,23 @@ def setup_test_env():
 
 
 @pytest.fixture(autouse=True)
+def _ev_holds_stay_in_memory(tmp_path, monkeypatch):
+    """The EV hold store is process-global and writes to disk once enabled.
+
+    Anything that runs the real application startup (the API tests do) enables
+    it; without this, the file it wrote and the readings in it would follow every
+    later test around — a servo built afterwards would "remember" a plug it never
+    saw. Point it at this test's tmp dir and switch it off on both sides.
+    """
+    from backend.core import ev_hold_store
+
+    monkeypatch.setenv("DARKSTAR_EV_HOLDS_PATH", str(tmp_path / "ev_holds.json"))
+    ev_hold_store.disable()
+    yield
+    ev_hold_store.disable()
+
+
+@pytest.fixture(autouse=True)
 def _reset_nordpool_fail_memo():
     """The negative-fetch memo is a module global; a test that exercises a failed
     fetch must not silence get_nordpool_data for every later test."""

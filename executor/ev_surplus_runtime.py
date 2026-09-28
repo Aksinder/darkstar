@@ -56,6 +56,8 @@ _CLAMP_STALE_AFTER_S = 3600.0
 # integration that went dark has not said the cable is out or the car left — the
 # 2026-09-10 outage turned "unknown" into "unplugged" and idled a 33 % car all night.
 _EV_READ_HOLD_S = 24 * 3600.0
+# Namespace of this controller's holds in backend/core/ev_hold_store.py.
+_HOLD_NAMESPACE = "servo"
 _UNREADABLE = {"", "unknown", "unavailable", "none"}
 # Before sending switch.turn_on, a power reading older than this is re-fetched
 # (homeassistant.update_entity) so a car that started itself is adopted instead of
@@ -643,6 +645,11 @@ class EVSurplusController:
         self._last_good_plug: dict[str, tuple[bool, float]] = {}
         self._last_good_home: dict[str, tuple[bool, float]] = {}
         self._hold_warned: set[str] = set()
+        # ...and their copy on disk: without it an add-on restart during a blackout
+        # of the car's entities reads "nothing to hold (never read) -> False", the car
+        # drops out of the fleet, no start is ever commanded and so the wake button —
+        # pressed only after a FAILED start — is never pressed (2026-09-28, 19 %).
+        self._restore_holds()
         # When each charger's power sensor last REPORTED (last_reported), and its age
         # at the last tick — the engine's charge-failure notifier reads the latter so
         # it does not count zero-ticks from a sensor that has not spoken.
@@ -991,6 +998,34 @@ class EVSurplusController:
             return resolved
         return str(v).lower() in {s.lower() for s in states}
 
+    def _restore_holds(self) -> None:
+        """Refill the plug/home holds from disk (a no-op while the store is off)."""
+        from backend.core import ev_hold_store
+
+        persisted = ev_hold_store.load(_HOLD_NAMESPACE)
+        restored = 0
+        for kind, memory in (("plug", self._last_good_plug), ("home", self._last_good_home)):
+            for key, (value, ts) in persisted.get(kind, {}).items():
+                if isinstance(value, bool):
+                    memory[key] = (value, ts)
+                    restored += 1
+        if restored:
+            logger.info("EV surplus: restored %d last-good plug/home reading(s) from disk", restored)
+
+    def _persist_holds(self, now_ts: float) -> None:
+        from backend.core import ev_hold_store
+
+        if not ev_hold_store.is_enabled():
+            return
+        ev_hold_store.save(
+            _HOLD_NAMESPACE,
+            {
+                "plug": cast("dict[str, tuple[Any, float]]", dict(self._last_good_plug)),
+                "home": cast("dict[str, tuple[Any, float]]", dict(self._last_good_home)),
+            },
+            now_ts,
+        )
+
     async def _read_on_held(
         self,
         ha: Any,
@@ -1017,6 +1052,7 @@ class EVSurplusController:
             val = str(v).lower() in {x.lower() for x in states}
             memory[key] = (val, now_ts)
             self._hold_warned.discard(f"{key}:{what}")
+            self._persist_holds(now_ts)
             return val
         held = memory.get(key)
         age = None if held is None else now_ts - held[1]
