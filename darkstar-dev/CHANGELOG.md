@@ -1,3 +1,7 @@
+## dev-20260929.1506 — 2026-09-29 15:08
+
+- feat(ev): wake a car we cannot see when a deadline is coming
+
 ## dev-20260928.2110 — 2026-09-28 21:12
 
 - fix(ev): the last-good plug, presence and SoC readings survive a restart
