@@ -334,6 +334,12 @@ class ExecutorEngine:
 
         # REV F76 Phase 5: Smart logging state tracking (Issue 4 fix)
         self._ev_detected_last_tick = False
+        # Why the battery changed what it was doing — one line per change of mind,
+        # next to config.yaml where it can be read from outside the house.
+        from .decision_journal import DecisionJournal
+
+        _journal_dir = str(self._full_config.get("config_dir") or "/config/darkstar")
+        self._journal = DecisionJournal(Path(_journal_dir) / "decision_journal.jsonl")
 
         # REV F76 Phase 5: Fail-safe error tracking (Issue 1 fix)
         self._ev_power_fetch_failed = False
@@ -1682,6 +1688,7 @@ class ExecutorEngine:
             )
 
             self.status.last_action = decision.reason
+            self._journal_decision(decision, slot, slot_start, state, now)
 
             # Control EV Charger Switch (per-device)
             if self._has_ev_charger and self.config.ev_chargers:
@@ -2358,6 +2365,98 @@ class ExecutorEngine:
                 pass  # Silently fail if WebSocket not available
 
         return result
+
+    def _journal_decision(
+        self,
+        decision: Any,
+        slot: SlotPlan | None,
+        slot_start: str | None,
+        state: Any,
+        now: datetime,
+    ) -> None:
+        """Offer this tick's decision to the journal. Never raises, never blocks a tick."""
+        journal = getattr(self, "_journal", None)
+        if journal is None:
+            return
+        try:
+            planned_at, ahead = self._plan_context(now)
+            journal.observe({
+                "ts": now.isoformat(timespec="seconds"),
+                "mode": getattr(decision, "mode_intent", None),
+                "source": getattr(decision, "source", None),
+                "reason": getattr(decision, "reason", None),
+                "soc": getattr(state, "current_soc_percent", None),
+                "slot_start": slot_start,
+                "planned_at": planned_at,
+                "ev_isolation": bool(getattr(slot, "ev_isolation", False)) or None,
+                "slot": None if slot is None else {
+                    "charge_kw": slot.charge_kw,
+                    "discharge_kw": slot.discharge_kw,
+                    "export_kw": slot.export_kw,
+                    "ev_kw": slot.ev_charging_kw,
+                    "water_kw": slot.water_kw,
+                    "pv_kw": slot.pv_kw,
+                    "load_kw": slot.load_kw,
+                    "soc_target": slot.soc_target,
+                    "soc_projected": slot.soc_projected,
+                    "export_price": slot.export_price_sek_kwh,
+                },
+                "ahead": ahead,
+            })
+        except Exception as e:
+            logger.debug("Decision journal: %s", e)
+
+    def _plan_context(
+        self, now: datetime, slots_ahead: int = 8
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """(planned_at of the schedule on disk, the battery's next ``slots_ahead`` slots).
+
+        Cached on the file's mtime and size: the schedule changes every fifteen
+        minutes, a tick happens every one.
+        """
+        path = Path(self.config.schedule_path)
+        try:
+            st = path.stat()
+        except OSError:
+            return None, []
+        key = (st.st_mtime_ns, st.st_size)
+        cached = cast("tuple[Any, str | None, list[dict[str, Any]]] | None",
+                      getattr(self, "_plan_context_cache", None))
+        if cached is None or cached[0] != key:
+            try:
+                with path.open(encoding="utf-8") as f:
+                    payload = cast("dict[str, Any]", json.load(f))
+            except (OSError, ValueError):
+                return None, []
+            meta = cast("dict[str, Any]", payload.get("meta") or {})
+            planned_at = meta.get("planned_at")
+            schedule = cast("list[dict[str, Any]]", payload.get("schedule") or [])
+            cached = (key, None if planned_at is None else str(planned_at), schedule)
+            self._plan_context_cache = cached
+        tz = pytz.timezone(self.config.timezone)
+        ahead: list[dict[str, Any]] = []
+        for slot_data in cached[2]:
+            start_str = slot_data.get("start_time")
+            if not start_str:
+                continue
+            try:
+                start = datetime.fromisoformat(str(start_str).replace("Z", "+00:00"))
+                start = tz.localize(start) if start.tzinfo is None else start.astimezone(tz)
+            except ValueError:
+                continue
+            if start + timedelta(minutes=15) <= now:
+                continue
+            ahead.append({
+                "start": start.strftime("%H:%M"),
+                "charge_kw": slot_data.get("battery_charge_kw"),
+                "discharge_kw": slot_data.get("battery_discharge_kw"),
+                "soc_target": slot_data.get("soc_target_percent", slot_data.get("soc_target")),
+                "ev_kw": slot_data.get("ev_charging_kw"),
+                "import_price": slot_data.get("import_price_sek_kwh"),
+            })
+            if len(ahead) >= slots_ahead:
+                break
+        return cached[1], ahead
 
     def _load_current_slot(self, now: datetime) -> tuple[SlotPlan | None, str | None]:
         """
