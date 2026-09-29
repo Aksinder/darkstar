@@ -58,6 +58,15 @@ _CLAMP_STALE_AFTER_S = 3600.0
 _EV_READ_HOLD_S = 24 * 3600.0
 # Namespace of this controller's holds in backend/core/ev_hold_store.py.
 _HOLD_NAMESPACE = "servo"
+
+# Waking a car we cannot SEE. The wake button used to be pressed only after a failed
+# start — so a car whose entities went blank (the Tesla Fleet integration reports
+# everything `unknown` after a Home Assistant restart until the car next comes
+# online) was woken at the moment charging was already due, if at all. With a
+# deadline coming, that is too late to find out the car is unreachable.
+_BLIND_WAKE_AFTER_S = 3600.0        # unreadable this long before a wake is spent on it
+_BLIND_WAKE_WINDOW_H = 12.0         # ...and only with a deadline this close
+_BLIND_WAKE_COOLDOWN_S = 3 * 3600.0  # at most four presses inside the window
 _UNREADABLE = {"", "unknown", "unavailable", "none"}
 # Before sending switch.turn_on, a power reading older than this is re-fetched
 # (homeassistant.update_entity) so a car that started itself is adopted instead of
@@ -695,6 +704,10 @@ class EVSurplusController:
         # the latest read — the only state the supercharger alert may fire in.
         self._dep_future: set[str] = set()
         self._last_wake_ts: dict[str, float] = {}
+        # When each car's SoC first went unreadable, and when a wake was last spent
+        # on that (see _wake_blind_cars).
+        self._blind_since: dict[str, float] = {}
+        self._last_blind_wake_ts: dict[str, float] = {}
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
         self._last_cmd_ts: dict[str, float] = {}
@@ -997,6 +1010,60 @@ class EVSurplusController:
                 logger.warning("EV surplus: %s configured but unreadable -> %s", entity, resolved)
             return resolved
         return str(v).lower() in {s.lower() for s in states}
+
+    async def _wake_blind_cars(
+        self, ha: Any, states: list[ChargerState], now_ts: float, shadow: bool
+    ) -> None:
+        """Press the wake button of a car we cannot see, when a deadline is coming.
+
+        2026-09-28: Home Assistant restarted at 21:04 with the Tesla asleep and at
+        13 %, departure 07:30. Every entity read `unknown` and stayed that way; the
+        only thing that would ever have woken the car was a start command failing at
+        02:00. One wake press an hour into the blackout fills the entities in again,
+        and everything downstream — the plan, the SoC gates, the holds on disk —
+        works from a real reading instead of a remembered one.
+
+        Deliberately narrow: a wake button must be configured, the car must be
+        (held as) plugged in and at home, its SoC unreadable for an hour, and a
+        deadline inside twelve. Vacation clears the deadline and so the wake too.
+        """
+        by_id = {c.id: c for c in self.cfg.chargers}
+        for st in states:
+            c = by_id.get(st.id)
+            if c is None or c.soc_entity is None:
+                continue
+            if st.soc_percent is not None:
+                self._blind_since.pop(st.id, None)
+                continue
+            since = self._blind_since.setdefault(st.id, now_ts)
+            if c.wake_entity is None or shadow or c.shadow:
+                continue
+            if not st.plugged or not st.at_home:
+                continue
+            hours = st.deadline_hours
+            if hours is None or hours <= 0.0 or hours > _BLIND_WAKE_WINDOW_H:
+                continue
+            if (now_ts - since) < _BLIND_WAKE_AFTER_S:
+                continue
+            last = self._last_blind_wake_ts.get(st.id, float("-inf"))
+            if (now_ts - last) < _BLIND_WAKE_COOLDOWN_S:
+                continue
+            # Share the failed-start path's cooldown so the two never double-press.
+            if (now_ts - self._last_wake_ts.get(st.id, float("-inf"))) < 300.0:
+                continue
+            self._last_blind_wake_ts[st.id] = now_ts
+            self._last_wake_ts[st.id] = now_ts
+            try:
+                await ha.call_service("button", "press", c.wake_entity)
+                logger.warning(
+                    "EV surplus: %s has been unreadable for %.0f min with a deadline in "
+                    "%.1f h — pressed %s to get a real reading",
+                    st.id, (now_ts - since) / 60.0, hours, c.wake_entity,
+                )
+            except Exception as e:
+                logger.warning(
+                    "EV surplus: wake press for unreadable %s failed: %s", st.id, e
+                )
 
     def _restore_holds(self) -> None:
         """Refill the plug/home holds from disk (a no-op while the store is off)."""
@@ -1643,6 +1710,7 @@ class EVSurplusController:
                 *(self._read_charger(ha, c, now_ts, vacation) for c in cfg.chargers)
             )
         )
+        await self._wake_blind_cars(ha, states, now_ts, shadow)
         # S3 plan floors: gate + continuity hold, then attach to the states.
         # Vacation gates the WHOLE attach (mirroring the unconditional deadline
         # clear): plan slots computed pre-vacation must not grid-force an away
