@@ -169,32 +169,26 @@ async def select_theme(payload: ThemeSelectRequest) -> dict[str, Any]:
     if payload.accent_index is not None and not (0 <= payload.accent_index <= 15):
         raise HTTPException(status_code=400, detail="accent_index must be between 0 and 15")
 
-    from ruamel.yaml import YAML
+    from backend.config_migration import (
+        ConfigUnreadableError,
+        ConfigWriteError,
+        update_config,
+    )
 
-    yaml_handler = YAML()
-    yaml_handler.preserve_quotes = True  # type: ignore
-    config_path = Path("config.yaml")
+    def _apply(config: Any) -> None:
+        ui_section = config.setdefault("ui", {})
+        ui_section["theme"] = payload.theme
+        if payload.accent_index is not None:
+            ui_section["theme_accent_index"] = payload.accent_index
 
+    # A theme click must never be able to replace the config: an unreadable file
+    # used to be treated as {} and written back as just the ui section.
     try:
-        if config_path.exists():
-            with config_path.open(encoding="utf-8") as handle:
-                loaded = yaml_handler.load(handle)  # pyright: ignore [reportUnknownMemberType, reportUnknownVariableType]
-                config: dict[str, Any] = (
-                    cast("dict[str, Any]", loaded) if isinstance(loaded, dict) else {}
-                )
-        else:
-            config = {}
-    except Exception as exc:
-        logger.error("Failed to load config.yaml for theme update: %s", exc)
-        config = {}
-
-    ui_section = config.setdefault("ui", {})
-    ui_section["theme"] = payload.theme
-    if payload.accent_index is not None:
-        ui_section["theme_accent_index"] = payload.accent_index
-
-    with config_path.open("w", encoding="utf-8") as handle:
-        yaml_handler.dump(config, handle)  # pyright: ignore [reportUnknownMemberType]
+        update_config(Path("config.yaml"), _apply)
+    except ConfigUnreadableError as exc:
+        raise HTTPException(status_code=409, detail=f"Theme not saved: {exc}") from exc
+    except ConfigWriteError as exc:
+        raise HTTPException(status_code=500, detail=f"Theme not saved: {exc}") from exc
 
     return {
         "status": "success",

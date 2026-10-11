@@ -7,6 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from ruamel.yaml import YAML
 
+from backend.config_migration import (
+    ConfigUnreadableError,
+    ConfigWriteError,
+    update_config,
+)
+
 if TYPE_CHECKING:
     from executor import ExecutorEngine
 
@@ -92,6 +98,20 @@ async def get_status(executor: ExecutorDep) -> dict[str, Any]:
     return executor.get_status()
 
 
+def _save_config(mutator: Any) -> Any:
+    """Apply a small change to config.yaml through the locked atomic writer.
+
+    A config that cannot be read is answered with 409 and left untouched — never
+    replaced by whatever the handler could build from nothing.
+    """
+    try:
+        return update_config(Path("config.yaml"), mutator)
+    except ConfigUnreadableError as e:
+        raise HTTPException(409, f"Config not saved: {e}") from e
+    except ConfigWriteError as e:
+        raise HTTPException(500, f"Config not saved: {e}") from e
+
+
 @router.post(
     "/api/executor/toggle",
     summary="Toggle Executor",
@@ -99,24 +119,15 @@ async def get_status(executor: ExecutorDep) -> dict[str, Any]:
 )
 async def toggle_executor(payload: ToggleRequest) -> dict[str, Any]:
     """Enable or disable the executor."""
-    yaml_handler = YAML()
-    yaml_handler.preserve_quotes = True
 
-    config_path = Path("config.yaml")
-    try:
-        with config_path.open(encoding="utf-8") as f:
-            config = cast("dict[str, Any]", yaml_handler.load(f) or {})  # type: ignore
-    except Exception:
-        config = {}
+    def _apply(config: Any) -> None:
+        section = config.setdefault("executor", {})
+        if payload.enabled is not None:
+            section["enabled"] = payload.enabled
+        if payload.shadow_mode is not None:
+            section["shadow_mode"] = payload.shadow_mode
 
-    executor_cfg = config.setdefault("executor", {})
-    if payload.enabled is not None:
-        executor_cfg["enabled"] = payload.enabled
-    if payload.shadow_mode is not None:
-        executor_cfg["shadow_mode"] = payload.shadow_mode
-
-    with config_path.open("w", encoding="utf-8") as f:
-        yaml_handler.dump(config, f)  # type: ignore
+    executor_cfg = cast("dict[str, Any]", _save_config(_apply).get("executor", {}))
 
     # Reload executor
     executor = get_executor_instance()
@@ -367,16 +378,9 @@ async def get_executor_config() -> dict[str, Any]:
 )
 async def update_executor_config(request: Request) -> dict[str, str]:
     """Update executor entity configuration."""
-    yaml_handler = YAML()
-    yaml_handler.preserve_quotes = True
-
     payload = await request.json()
-    config_path = Path("config.yaml")
 
-    try:
-        with config_path.open(encoding="utf-8") as f:
-            config = cast("dict[str, Any]", yaml_handler.load(f) or {})  # type: ignore
-
+    def _apply(config: Any) -> None:
         if "executor" not in config:
             config["executor"] = {}
 
@@ -411,8 +415,8 @@ async def update_executor_config(request: Request) -> dict[str, str]:
             for key, value in payload["water_heater"].items():
                 executor_cfg["water_heater"][key] = value
 
-        with config_path.open("w", encoding="utf-8") as f:
-            yaml_handler.dump(config, f)  # type: ignore
+    try:
+        _save_config(_apply)
 
         # Reload executor config
         executor = get_executor_instance()
@@ -421,6 +425,8 @@ async def update_executor_config(request: Request) -> dict[str, str]:
 
         return {"status": "success", "message": "Configuration updated"}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Failed to update executor config")
         raise HTTPException(500, str(e)) from e
@@ -477,29 +483,29 @@ async def get_notifications() -> dict[str, Any]:
 )
 async def update_notifications(request: Request) -> dict[str, str]:
     """Update notification settings."""
-    yaml_handler = YAML()
-    yaml_handler.preserve_quotes = True
-
     payload = await request.json()
-    config_path = Path("config.yaml")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Expected a JSON object")
+    updates = cast("dict[str, Any]", payload)
+    from executor.actions import is_notify_service
+
+    # Only the keys this section actually has. The service name becomes an HA
+    # service call made with the add-on's token, so it is held to notify.*:
+    # otherwise this endpoint plus /notifications/test is "call any service".
+    for key, value in updates.items():
+        if key == "service":
+            if value not in ("", None) and not is_notify_service(value):
+                raise HTTPException(400, "service must be a notify.* service")
+        elif not (key.startswith("on_") and isinstance(value, bool)):
+            raise HTTPException(400, f"Unknown notification setting: {key}")
+
+    def _apply(config: Any) -> None:
+        section = config.setdefault("executor", {}).setdefault("notifications", {})
+        for key, value in updates.items():
+            section[key] = value
 
     try:
-        with config_path.open(encoding="utf-8") as f:
-            config = cast("dict[str, Any]", yaml_handler.load(f))  # type: ignore
-
-        if "executor" not in config:
-            config["executor"] = {}
-
-        executor_cfg = cast("dict[str, Any]", config["executor"])
-        if "notifications" not in executor_cfg:
-            executor_cfg["notifications"] = {}
-
-        notify_cfg = cast("dict[str, Any]", executor_cfg["notifications"])
-        for key, value in payload.items():
-            notify_cfg[key] = value
-
-        with config_path.open("w", encoding="utf-8") as f:
-            yaml_handler.dump(config, f)  # type: ignore
+        _save_config(_apply)
 
         # Reload executor config
         executor = get_executor_instance()
@@ -508,6 +514,8 @@ async def update_notifications(request: Request) -> dict[str, str]:
 
         return {"status": "success"}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Failed to update notifications")
         raise HTTPException(500, str(e)) from e

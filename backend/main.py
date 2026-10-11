@@ -9,6 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import socketio
 from fastapi import FastAPI, HTTPException, Request
@@ -301,7 +302,7 @@ def validate_path(base_dir: Path, requested_path: str) -> Path:
         raise HTTPException(status_code=404, detail="Not found") from None
 
 
-def create_app() -> socketio.ASGIApp:
+def create_app() -> Any:
     """Factory to create the ASGI app."""
 
     # 1. Create FastAPI App
@@ -445,9 +446,20 @@ def create_app() -> socketio.ASGIApp:
     # This intercepts /socket.io requests and passes others to FastAPI
     socket_app = socketio.ASGIApp(ws_manager.sio, other_asgi_app=app)
 
-    return socket_app
+    # 7. Under the Supervisor, only Home Assistant may reach the API (see lan_gate).
+    from backend.middleware.lan_gate import LanGate, gate_enabled
+
+    try:
+        from backend.core.secrets import load_yaml as _load_yaml
+
+        gate_on = gate_enabled(_load_yaml("config.yaml"))
+    except Exception:
+        gate_on = gate_enabled(None)
+    if gate_on:
+        logger.info("LAN gate active: API reachable from Home Assistant only")
+    return LanGate(socket_app, enabled=gate_on)
 
 
 # The entry point for uvicorn
 # Usage: uvicorn backend.main:app
-app: socketio.ASGIApp = create_app()
+app: Any = create_app()

@@ -381,9 +381,8 @@ class TestEngineSinkBranch:
 class TestEngineBoostBranch:
     async def test_boost_skips_paused_device(self, temp_schedule, temp_db):
         engine = _build_engine(temp_schedule, temp_db, paused_on={MASTER})
-        # Stub the notification coroutine the low-SoC boost-guard may fire (unawaited
-        # by design in engine code) so it does not leak a RuntimeWarning here.
-        engine.dispatcher._send_notification = MagicMock()
+        # Stub the notification the low-SoC boost-guard may fire.
+        engine.dispatcher._send_notification = AsyncMock()
         # Activate manual water boost so the boost branch runs this tick.
         engine._water_boost_until = datetime.now(TZ) + timedelta(minutes=30)
         _write_plan_schedule(temp_schedule)

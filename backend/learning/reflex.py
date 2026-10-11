@@ -489,8 +489,12 @@ class AuroraReflex:
                 await self.store.update_reflex_state(change["param"], float(change["new"]))
 
             def _write_config():
-                with self.config_path.open("w", encoding="utf-8") as f:
-                    self.yaml.dump(data, f)  # type: ignore[reportUnknownMemberType]
+                from backend.config_migration import write_config
+
+                if not write_config(
+                    Path(self.config_path), data, self.yaml, strict_validation=False
+                ):
+                    raise RuntimeError("config write aborted")
 
             await asyncio.to_thread(_write_config)
             logger.info("Config saved.")

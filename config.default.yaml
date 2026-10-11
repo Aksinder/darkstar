@@ -9,6 +9,13 @@
 config_version: 2                     # Config format version (for migration tracking)
 timezone: "Europe/Stockholm"          # IANA timezone for all schedule calculations
 
+# API access
+# As a Home Assistant add-on, Darkstar answers only Home Assistant itself (the
+# sidebar panel and HA's own REST calls). The API has no login, so direct access
+# to port 5000 from other devices on the network is refused unless enabled here.
+api:
+  allow_lan: false                    # true = allow direct LAN access to port 5000 (restart to apply)
+
 # System Parameters
 system:
   system_id: prod

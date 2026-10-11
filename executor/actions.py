@@ -224,6 +224,20 @@ class ActionResult:
     applied_mode: str | None = None  # The actual mode whose entities were applied
 
 
+def is_notify_service(service: object) -> bool:
+    """True for ``notify.<name>`` (and ``persistent_notification.create``).
+
+    The configured notification "service" is called with the add-on's HA token.
+    Left unrestricted it could name a script, shell_command or rest_command.
+    """
+    if not isinstance(service, str):
+        return False
+    domain, _, name = service.strip().partition(".")
+    if not name or not all(c.isalnum() or c == "_" for c in name):
+        return False
+    return domain == "notify" or service.strip() == "persistent_notification.create"
+
+
 class HAClient:
     """
     Async Home Assistant API client for executing actions.
@@ -580,6 +594,9 @@ class HAClient:
             return False
 
         domain, svc_name = parts
+        if not is_notify_service(service):
+            logger.error("Refusing notification via non-notify service: %s", service)
+            return False
         payload: dict[str, Any] = {
             "title": title,
             "message": message,

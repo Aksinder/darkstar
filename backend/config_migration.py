@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import shutil
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -968,11 +969,59 @@ def create_timestamped_backup(path: Path, max_backups: int = 30) -> Path | None:
         return None
 
 
+# One lock for every in-process writer of config.yaml. Each of them is a
+# read-modify-write; without it two saves interleave and the later one silently
+# drops the earlier one's change (or reads a file the other is replacing).
+CONFIG_WRITE_LOCK = threading.RLock()
+
+
+class ConfigUnreadableError(RuntimeError):
+    """config.yaml could not be loaded, so it must not be written either."""
+
+
+class ConfigWriteError(RuntimeError):
+    """The atomic writer refused or failed the write."""
+
+
 def write_config(
     path: Path, config: Any, yaml_instance: Any, strict_validation: bool = True
 ) -> bool:
     """Public wrapper for the shared config writer."""
-    return _write_config(path, config, yaml_instance, strict_validation=strict_validation)
+    with CONFIG_WRITE_LOCK:
+        return _write_config(path, config, yaml_instance, strict_validation=strict_validation)
+
+
+def update_config(path: Path, mutator: Callable[[Any], None]) -> dict[str, Any]:
+    """Load config.yaml, apply ``mutator`` in place, write it back atomically.
+
+    The one way for a small setting change (executor toggle, theme, notification
+    flags) to reach the file. Those endpoints used to open the file with "w"
+    themselves, and two of them fell back to ``config = {}`` when the read failed
+    — then wrote that. A read that collided with another save turned a 93 kB
+    config into ``executor:\n  enabled: false`` (27 bytes).
+
+    Raises ConfigUnreadableError rather than writing anything when the file does
+    not load as a non-empty mapping, and ConfigWriteError when the writer aborts.
+    Returns the updated document.
+    """
+    if YAML is None:
+        raise ConfigWriteError("ruamel.yaml is not installed")
+    yaml_handler = YAML()
+    yaml_handler.preserve_quotes = True
+    yaml_handler.width = 4096  # same as /api/config/save: never wrap long entity IDs
+    with CONFIG_WRITE_LOCK:
+        try:
+            with Path(path).open(encoding="utf-8") as f:
+                config: Any = yaml_handler.load(f)  # type: ignore[no-untyped-call]
+        except Exception as e:
+            raise ConfigUnreadableError(f"{path} could not be read: {e}") from e
+        if not isinstance(config, dict) or not config:
+            raise ConfigUnreadableError(f"{path} is empty or not a mapping")
+        document = cast("dict[str, Any]", config)
+        mutator(document)
+        if not _write_config(Path(path), document, yaml_handler, strict_validation=False):
+            raise ConfigWriteError(f"write to {path} was aborted")
+        return document
 
 
 def _write_config(
