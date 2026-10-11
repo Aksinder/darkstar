@@ -1,3 +1,7 @@
+## dev-20261011.2158 — 2026-10-11 22:00
+
+- fix(executor): PV-forecast branches hold at the SoC floor
+
 ## dev-20261011.1744 — 2026-10-11 17:46
 
 - fix: audit batch 4 — boost respects fuse and groups, outage rows, pinned actions
