@@ -1,3 +1,7 @@
+## dev-20261011.1726 — 2026-10-11 17:27
+
+- fix: audit batch 3 — EV switch memory, stale-plan alarm, upstream ports
+
 ## dev-20261011.1244 — 2026-10-11 12:46
 
 - fix: audit batch 2 — HA-only API, locked config writes, EV SoC hold
