@@ -60,6 +60,12 @@ class RecorderStateStore:
     def __init__(self, state_file: Path | str = "data/recorder_state.json"):
         self.state_file = Path(state_file)
         self._state: dict[str, Any] = {}
+        # Readings staged by an open transaction (see begin/commit); None = no
+        # transaction, every get_delta persists immediately (the historical mode).
+        self._pending: dict[str, Any] | None = None
+        # Deltas of the current cycle that spanned more than one slot, by state key:
+        # {"kwh": everything the counter moved, "seconds": the span it moved over}.
+        self.multi_slot_deltas: dict[str, dict[str, float]] = {}
         self._ensure_directory()
 
     def _ensure_directory(self) -> None:
@@ -93,6 +99,36 @@ class RecorderStateStore:
         except OSError as e:
             logger.error(f"Failed to save state file: {e}")
 
+    def begin(self) -> None:
+        """Open a transaction: readings taken from here on are staged, not persisted.
+
+        The recorder takes every counter delta early and writes the row last. When
+        the write (or anything in between) raised, the retry three seconds later
+        used to find the state already advanced, read 0.0 for every counter and
+        store an all-zero row over a slot that had real energy in it. Staging the
+        readings until ``commit`` makes the retry recompute the same deltas.
+        """
+        self._pending = {}
+        self.multi_slot_deltas = {}
+
+    def commit(self) -> None:
+        """Persist the readings staged since ``begin`` (the row is safely stored)."""
+        if self._pending is not None:
+            self._state.update(self._pending)
+            self._pending = None
+            self.save()
+
+    def rollback(self) -> None:
+        """Drop the readings staged since ``begin`` (the row was not stored)."""
+        self._pending = None
+
+    def _put(self, key: str, entry: dict[str, Any]) -> None:
+        if self._pending is not None:
+            self._pending[key] = entry
+        else:
+            self._state[key] = entry
+            self.save()
+
     def get_delta(
         self,
         key: str,
@@ -101,13 +137,29 @@ class RecorderStateStore:
         sensor_timestamp: datetime | None = None,
         target_seconds: float = 900.0,
     ) -> tuple[float | None, bool]:
-        """Calculate delta between current and previous meter reading.
+        """Energy to book for the slot that just ended, from a cumulative counter.
 
         When *sensor_timestamp* (the HA ``last_updated`` time) is supplied,
         the raw delta is scaled proportionally so that it represents exactly
         *target_seconds* of energy (default 900 s = 15 min).  This corrects
         the sawtooth artifact caused by sensor-update and recorder cycles
         running at different frequencies.
+
+        The scaled figure is an ESTIMATE, so it is reconciled against the counter:
+        the state remembers ``booked``, the counter level already credited to
+        rows, and that level is held between the reading itself (energy the
+        counter has shown is never left unbooked) and the reading plus what it
+        has plausibly accrued since its own last update (the estimate never runs
+        further ahead than that). Without this the scaling leaked: HA only moves
+        ``last_updated`` when the value changes, so a 0.1 kWh counter that ticks
+        once after 40 quiet minutes had its tick scaled by 15/40 although the
+        quiet slots had booked nothing (measured 2026-10 on the live Sungrow
+        counters, which are polled every 10 minutes: -1.4 % on battery discharge
+        over a week, and 0.28-0.75 of the true energy on a trickle).
+
+        A delta that spans more than one slot (the recorder was down, or earlier
+        cycles failed) is not booked whole into this row: the row gets its
+        time-proportional share and ``multi_slot_deltas`` reports the full span.
 
         Args:
             key: Unique identifier for this meter (e.g., 'total_pv_production')
@@ -119,9 +171,9 @@ class RecorderStateStore:
         Returns:
             Tuple of (delta_value, is_valid):
             - delta_value: Energy delta in kWh, or None if no previous state
-            - is_valid: False if meter reset detected (negative delta)
+            - is_valid: False if the counter went backwards (negative delta)
         """
-        previous = self._state.get(key, {})
+        previous = (self._pending or {}).get(key) or self._state.get(key, {})
         previous_value = previous.get("value")
         previous_sensor_ts_str = previous.get("sensor_timestamp")
 
@@ -136,32 +188,62 @@ class RecorderStateStore:
         # No previous state - can't calculate delta
         if previous_value is None:
             logger.debug(f"No previous state for {key}, storing initial value")
-            self._state[key] = new_entry
-            self.save()
+            self._put(key, new_entry)
             return None, True
 
         # Calculate delta
         try:
             delta = current_value - float(previous_value)
+            booked_level = float(previous.get("booked", previous_value))
         except (TypeError, ValueError):
             logger.warning(f"Invalid previous value for {key}: {previous_value}")
-            self._state[key] = new_entry
-            self.save()
+            self._put(key, new_entry)
             return None, True
 
-        # Check for meter reset (negative delta)
+        # The counter went backwards. A genuine reset (replaced meter, daily
+        # counter rolling over) and a counter that is not monotonic get the same
+        # treatment: rebase to the new reading and let the caller fall back. The
+        # live load counter is the second kind — a template over several inverter
+        # counters that DECLINES for hours while AC-coupled PV charges the battery
+        # (2026-10: 83 of 671 quarters, never rebounding to the old level), so
+        # holding the high-water mark would silence it for the rest of the day.
         if delta < 0:
+            is_reset = current_value < 0.5 * float(previous_value)
             logger.warning(
-                f"Meter reset detected for {key}: {previous_value} -> {current_value} "
-                f"(delta={delta:.3f} kWh). Using fallback."
+                f"{'Meter reset' if is_reset else 'Counter went backwards'} for {key}: "
+                f"{previous_value} -> {current_value} (delta={delta:.3f} kWh). Using fallback."
             )
-            self._state[key] = new_entry
-            self.save()
+            self._put(key, new_entry)
             return None, False
+
+        # -- delta spanning more than one slot ----------------------------------
+        # Everything the counter moved since the last STORED row arrives at once.
+        # The slots in between have no rows to put it in (and minting rows here
+        # would fake coverage), while booking hours of energy into one quarter
+        # hands savings and the load forecast a 12x outlier — or a 0.0, when
+        # validation finds it above the per-slot limit. So this row gets the share
+        # a uniform spread assigns to it, never more than was measured, and the
+        # caller flags it with the whole span so a repair can place the rest.
+        span_seconds = 0.0
+        with contextlib.suppress(TypeError, ValueError):  # unknown span: a normal cycle
+            span_seconds = (
+                timestamp - datetime.fromisoformat(str(previous.get("timestamp")))
+            ).total_seconds()
+        if span_seconds > 1.5 * target_seconds:
+            unbooked = max(0.0, current_value - booked_level)
+            if unbooked > 0:
+                self.multi_slot_deltas[key] = {
+                    "kwh": round(unbooked, 3),
+                    "seconds": round(span_seconds),
+                }
+            self._put(key, new_entry)
+            return unbooked * target_seconds / span_seconds, True
 
         # -- time-proportional scaling ----------------------------------------
         # Without this, deltas alternate between ~10 min and ~20 min of real
         # production when sensors update every 10 min but we record every 15.
+        estimate = delta
+        accrued = 0.0  # what the counter has plausibly gained since ITS last update
         if delta > 0 and sensor_timestamp is not None and previous_sensor_ts_str is not None:
             try:
                 prev_sensor_ts = datetime.fromisoformat(previous_sensor_ts_str)
@@ -169,19 +251,24 @@ class RecorderStateStore:
                 # Only scale within a sane window (5 min - 60 min).
                 # Outside that range (restarts, long gaps) raw delta is safer.
                 if 300 <= actual_seconds <= 3600:
-                    scaled_delta = delta * (target_seconds / actual_seconds)
+                    estimate = delta * (target_seconds / actual_seconds)
+                    lag_seconds = (timestamp - sensor_timestamp).total_seconds()
+                    accrued = delta * min(max(lag_seconds, 0.0), actual_seconds) / actual_seconds
                     logger.debug(
                         f"{key}: scaled {delta:.3f} kWh over {actual_seconds:.0f}s "
-                        f"to {scaled_delta:.3f} kWh over {target_seconds:.0f}s"
+                        f"to {estimate:.3f} kWh over {target_seconds:.0f}s"
                     )
-                    delta = scaled_delta
             except (ValueError, TypeError):
-                pass  # keep raw delta on parse errors
+                estimate, accrued = delta, 0.0  # keep raw delta on parse errors
 
-        self._state[key] = new_entry
-        self.save()
+        # Reconcile the estimate with the counter (see the docstring).
+        new_level = min(max(booked_level + estimate, current_value), current_value + accrued)
+        booked = max(0.0, new_level - booked_level)
+        if booked_level + booked != current_value:
+            new_entry["booked"] = booked_level + booked
+        self._put(key, new_entry)
 
-        return delta, True
+        return booked, True
 
     def get_last_timestamp(self, key: str) -> datetime | None:
         """Get the timestamp of the last reading for a given key."""
@@ -211,7 +298,33 @@ async def record_observation_from_current_state(
     disaggregator: LoadDisaggregator | None = None,
     state_store: RecorderStateStore | None = None,
 ):
-    """Capture current system state and store as an observation."""
+    """Capture current system state and store as an observation.
+
+    The counter readings are committed to the state store only once the cycle has
+    finished: a cycle that raises leaves the state where it was, so the caller's
+    retry measures the same slot again instead of reading 0.0 from every counter.
+    """
+    # Initialize state store for cumulative energy tracking
+    if state_store is None:
+        state_store = RecorderStateStore()
+        state_store.load()
+
+    state_store.begin()
+    try:
+        await _record_observation(config, disaggregator, state_store)
+    except BaseException:
+        state_store.rollback()
+        raise
+    # Also reached when the cycle deliberately stored nothing (SoC unknown): the
+    # readings are still consumed there, exactly as before.
+    state_store.commit()
+
+
+async def _record_observation(
+    config: dict[str, Any] | None,
+    disaggregator: LoadDisaggregator | None,
+    state_store: RecorderStateStore,
+) -> None:
     if not config:
         config = _load_config()
     db_path = config.get("learning", {}).get("sqlite_path", "data/planner_learning.db")
@@ -220,11 +333,6 @@ async def record_observation_from_current_state(
 
     # Initialize store (in-place initialization is acceptable for the standalone script)
     store = LearningStore(db_path, tz)
-
-    # Initialize state store for cumulative energy tracking
-    if state_store is None:
-        state_store = RecorderStateStore()
-        state_store.load()
 
     # Identify the just-FINISHED slot. The recorder wakes a few seconds after each
     # quarter boundary; the only slot with complete data is the one that just
@@ -824,8 +932,22 @@ async def record_observation_from_current_state(
     # its price-mint population on _NO_PROVENANCE -- quality_flags IS NULL or '{}' --
     # and treats anything else as claimed by a writer that "must not be relabelled"
     # (quarantine.py:61-63). Stamping every row would empty that population entirely.
-    if load_rescued or load_read_invalid or balance_tripped or grid_unmeasured or soc_stale:
+    # Counters whose delta covered more than this slot (recorder gap): the energy
+    # columns hold this slot's uniform share; the flag keeps the whole span.
+    _multi_slot: Any = getattr(state_store, "multi_slot_deltas", None)
+    multi_slot: dict[str, Any] = dict(_multi_slot) if isinstance(_multi_slot, dict) else {}
+
+    if (
+        load_rescued
+        or load_read_invalid
+        or balance_tripped
+        or grid_unmeasured
+        or soc_stale
+        or multi_slot
+    ):
         flags: dict[str, Any] = {}
+        if multi_slot:
+            flags["multi_slot_delta"] = multi_slot
         if grid_unmeasured:
             flags["grid_unmeasured"] = True
         if soc_stale:

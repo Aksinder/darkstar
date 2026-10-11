@@ -153,10 +153,11 @@ class TestSlotDistribution:
             states[i] = _state(f"{float(states[i]['state']) + jump:.4f}", times[i])
         profile = await _run_get_load_profile(states)
 
-        assert sum(profile) - sum(baseline_profile) == pytest.approx(jump / 7, rel=1e-3)
+        # The history holds 6 days, so every slot is averaged over 6 (not a fixed 7).
+        assert sum(profile) - sum(baseline_profile) == pytest.approx(jump / 6, rel=1e-3)
         # 23:50-00:00 is 10 of the 15 minutes -> slot 95; 00:00-00:05 -> slot 0.
-        assert profile[95] - baseline_profile[95] == pytest.approx(jump * 10 / 15 / 7, rel=1e-3)
-        assert profile[0] - baseline_profile[0] == pytest.approx(jump * 5 / 15 / 7, rel=1e-3)
+        assert profile[95] - baseline_profile[95] == pytest.approx(jump * 10 / 15 / 6, rel=1e-3)
+        assert profile[0] - baseline_profile[0] == pytest.approx(jump * 5 / 15 / 6, rel=1e-3)
         for slot in range(1, 95):
             assert profile[slot] == pytest.approx(baseline_profile[slot], abs=1e-6)
 
@@ -181,12 +182,15 @@ class TestSlotDistribution:
         with patch("backend.core.ha_client.datetime", _DstNow):
             profile = await _run_get_load_profile(states)
 
-        per_min = energy / minutes / 7
-        assert sum(profile) == pytest.approx(energy / 7, rel=1e-6)
+        # Only 135 minutes of history exist. Slots 8-11 were each seen for 30 min
+        # (two wall-clock passes) and are averaged over those two; slots 7 and 12
+        # were seen for less than one full quarter and are not scaled up.
+        per_min = energy / minutes
         assert profile[7] == pytest.approx(10 * per_min, rel=1e-6)
         for slot in range(8, 12):
-            assert profile[slot] == pytest.approx(30 * per_min, rel=1e-6)
+            assert profile[slot] == pytest.approx(30 * per_min / 2, rel=1e-6)
         assert profile[12] == pytest.approx(5 * per_min, rel=1e-6)
+        assert sum(profile) == pytest.approx((10 + 4 * 15 + 5) * per_min, rel=1e-6)
 
     @pytest.mark.asyncio
     async def test_long_gap_spanning_days_is_spread_evenly(self):
@@ -195,6 +199,45 @@ class TestSlotDistribution:
         start = _fresh_start()
         states = [_state("100.0", start), _state("148.0", start + timedelta(days=2))]
         profile = await _run_get_load_profile(states)
-        assert sum(profile) == pytest.approx(48.0 / 7, rel=1e-6)
+        # 48 kWh over the two days that exist is 24 kWh/day — not 48 / 7.
+        assert sum(profile) == pytest.approx(48.0 / 2, rel=1e-6)
         for slot in range(96):
-            assert profile[slot] == pytest.approx(48.0 / 96 / 7, rel=1e-6)
+            assert profile[slot] == pytest.approx(48.0 / 96 / 2, rel=1e-6)
+
+
+class TestDaysThatContributed:
+    """Each slot is averaged over the days of history that actually exist for it.
+
+    The profile used to be divided by a fixed 7. With less than a week of history
+    for the counter (new install, renamed entity, recorder purge) the whole load
+    profile came out too low by days_present / 7.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("days", [1, 3, 6])
+    async def test_daily_total_does_not_depend_on_how_many_days_exist(self, days):
+        profile = await _run_get_load_profile(_clean_lifetime_states(days=days, daily_kwh=10.0))
+        # The last sample closes the history 15 minutes short of a whole day.
+        assert sum(profile) == pytest.approx(10.0, rel=0.02)
+
+    @pytest.mark.asyncio
+    async def test_slots_with_different_coverage_use_their_own_day_count(self):
+        """2.5 days at a constant 0.1 kWh per quarter: the slots seen three times
+        and the slots seen twice must both come out at 0.1."""
+        start = _fresh_start()
+        states = [
+            _state(f"{1000.0 + 0.1 * i:.4f}", start + timedelta(minutes=15 * i))
+            for i in range(int(2.5 * 96) + 1)
+        ]
+        profile = await _run_get_load_profile(states)
+        for slot in range(96):
+            assert profile[slot] == pytest.approx(0.1, rel=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_a_slot_seen_for_minutes_is_not_scaled_up_to_a_quarter(self):
+        """Ten minutes of history must not be extrapolated: 0.5 kWh stays 0.5 kWh."""
+        start = STOCKHOLM.localize(datetime(2026, 9, 18, 10, 2)).astimezone(pytz.UTC)
+        states = [_state("100.0", start), _state("100.5", start + timedelta(minutes=10))]
+        profile = await _run_get_load_profile(states)
+        assert profile[40] == pytest.approx(0.5, rel=1e-6)
+        assert sum(profile) == pytest.approx(0.5, rel=1e-6)

@@ -1279,6 +1279,8 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
 
         # Energy per local time-of-day slot, summed over the 7-day window
         slot_sums = [0.0] * 96
+        # Seconds of history behind each slot's sum (same spreading as the energy).
+        slot_seconds = [0.0] * 96
         prev_state = None
         prev_time = None
         cached_unit: str | None = None
@@ -1313,6 +1315,17 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
                     time_diff = current_time - prev_time
                     minutes_diff = time_diff.total_seconds() / 60
 
+                    if minutes_diff > 0:
+                        _distribute_interval_energy(
+                            slot_seconds,
+                            prev_time,
+                            current_time,
+                            time_diff.total_seconds(),
+                            local_tz,
+                            window_start=start_time,
+                            window_end=end_time,
+                        )
+
                     if minutes_diff > 0 and energy_delta > 0:
                         _distribute_interval_energy(
                             slot_sums,
@@ -1331,8 +1344,16 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
                 print(f"Warning: Skipping invalid state data for {entity_id}: {e}")
                 continue
 
-        # Create average daily profile from the 7 days of data (divide by 7 days)
-        daily_profile = [slot_sum / 7.0 for slot_sum in slot_sums]
+        # Average daily profile: each slot is divided by the number of days that
+        # actually contributed to it. Dividing by a fixed 7 understated the whole
+        # profile whenever Home Assistant held less than a week of history for the
+        # counter (new install, renamed entity, recorder purge): three days of data
+        # came out at 3/7 of the real consumption. Never by less than one day — a
+        # slot seen for a few minutes is not extrapolated up to a full quarter.
+        daily_profile = [
+            slot_sum / max(1.0, seconds / _SLOT_SECONDS)
+            for slot_sum, seconds in zip(slot_sums, slot_seconds, strict=True)
+        ]
 
         # Validate and clean the profile
         total_daily = sum(daily_profile)
