@@ -9,7 +9,23 @@
 #
 # These are the versions of the last green build (run 36184847057, 2026-09-25),
 # identical in the CI job and in the amd64 and aarch64 images — i.e. what is
-# actually running. To upgrade: bump the pin, run the suite, build.
+# actually running.
+#
+# This file is the INPUT. What CI and the images install is requirements.lock:
+# the full resolution of these pins - transitive dependencies included, which
+# used to float at every build - with a sha256 for every wheel and sdist, valid
+# for CPython 3.12 on linux/amd64, linux/aarch64 and macOS. It is installed with
+# `pip install --require-hashes`, so nothing unlisted or altered gets in.
+#
+# How to update a dependency:
+#   1. bump (or add/remove) the pin here or in requirements-dev.txt
+#   2. scripts/lock_requirements.sh          # needs uv; rewrites the *.lock files
+#   3. run the suite, commit the .txt and .lock files together, build
+# Step 2 only moves what the new pin forces. To move a transitive dependency:
+#   scripts/lock_requirements.sh --upgrade-package <name>   (or --upgrade for all)
+# The gate job runs scripts/check_requirements_lock.py and fails if step 2 was
+# skipped. Local install:
+#   uv pip install --require-hashes -r requirements.lock -r requirements-dev.lock
 aiohttp==3.14.3
 aiosqlite==0.22.1
 alembic==1.20.0

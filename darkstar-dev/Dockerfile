@@ -2,7 +2,12 @@
 # Built for multi-arch (amd64, arm64)
 # Build context is repo root
 
-FROM python:3.12-slim
+# Base image pinned by digest (multi-arch index: amd64 + arm64), so a rebuild of
+# the tag cannot change Python, pip or Debian under an unattended build.
+# This is python 3.12.15 / Debian trixie / pip 25.0.1, resolved 2026-10-11.
+# The pin also freezes base-image security updates: refresh it deliberately with
+#   docker buildx imagetools inspect python:3.12-slim   (take the top-level Digest)
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,6 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     make \
     # Node.js 22.x from NodeSource (frontend engines require >=20.19; node:sqlite needs 22)
+    # NOT pinned: the setup script and the nodejs 22.x package it selects float, as
+    # do the apt packages above. Node only builds the frontend bundle, whose npm
+    # inputs are locked by pnpm-lock.yaml; pinning Node itself means a different
+    # install method (official tarball + checksum), which is a separate change.
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -31,12 +40,19 @@ WORKDIR /app
 
 # Install pnpm and build frontend. Pin pnpm@9 to match lockfileVersion 9.0
 # (pnpm 10 changes frozen-lockfile/approve-builds behaviour and breaks the build).
+# pnpm@9 is a major-version range, not an exact pin: it floats within 9.x.
 COPY frontend/package.json frontend/pnpm-lock.yaml ./frontend/
 RUN npm install -g pnpm@9 && cd frontend && pnpm install --frozen-lockfile
 
-# Install Python dependencies
-COPY requirements.txt ./
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Install Python dependencies from the hashed locks: every wheel/sdist is checked
+# against requirements.lock, and anything not listed there is an error.
+# Two steps because suncalc ships no wheel: the first installs the hashed build
+# backend (setuptools), the second builds suncalc against it (--no-build-isolation)
+# instead of letting pip download an unpinned setuptools.
+# To change a dependency see the header of requirements.txt.
+COPY requirements-build.lock requirements.lock ./
+RUN pip3 install --no-cache-dir --require-hashes -r requirements-build.lock \
+    && pip3 install --no-cache-dir --require-hashes --no-build-isolation -r requirements.lock
 
 # Copy application code (except frontend)
 COPY backend/ ./backend/

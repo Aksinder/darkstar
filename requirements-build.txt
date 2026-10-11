@@ -1,0 +1,8 @@
+# Build backend for dependencies that ship no wheel. Today that is exactly one:
+# suncalc 0.1.3 (pulled in by open-meteo-solar-forecast) is sdist-only, so pip has
+# to run its setup.py in every build. Left to itself pip fetches the newest
+# setuptools for that, unpinned and unhashed. Instead the images and CI install
+# this lock first and then install requirements.lock with --no-build-isolation,
+# so the build runs against exactly this setuptools.
+# Regenerate requirements-build.lock with scripts/lock_requirements.sh.
+setuptools==84.0.0

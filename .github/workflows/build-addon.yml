@@ -34,8 +34,18 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+          cache-dependency-path: requirements*.lock
+      # Offline: compares the pins in requirements*.txt with the locks. Fails when
+      # a pin was edited without scripts/lock_requirements.sh; never asks PyPI, so
+      # a new upstream release cannot fail it.
+      - name: Locks match requirements
+        run: python scripts/check_requirements_lock.py
+      # Hash-enforced, same two steps as the Dockerfiles (setuptools first, because
+      # suncalc ships no wheel and is built against the pinned backend).
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
+        run: |
+          pip install --require-hashes -r requirements-build.lock
+          pip install --require-hashes --no-build-isolation -r requirements.lock -r requirements-dev.lock
       - name: Ruff
         run: ruff check backend/ planner/ ml/ executor/ --output-format=github
       - name: Core test suite
