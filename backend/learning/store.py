@@ -127,6 +127,7 @@ class LearningStore:
                     "export_price_sek_kwh": row.export_price_sek_kwh,
                     "batt_charge_kwh": row.batt_charge_kwh,
                     "batt_discharge_kwh": row.batt_discharge_kwh,
+                    "quality_flags": row.quality_flags,  # type: ignore[reportUnknownMemberType]
                 }
                 for row in result.scalars().all()
             ]
