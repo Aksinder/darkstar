@@ -85,6 +85,12 @@ class StoredEnergyDelta:
         return self.n_battery_slots / self.n_slots if self.n_slots else 0.0
 
 
+def _grid_unmeasured(row: Mapping[str, Any]) -> bool:
+    """True for a row the recorder wrote while the grid meter was unreadable."""
+    flags = row.get("quality_flags")
+    return isinstance(flags, str) and '"grid_unmeasured": true' in flags
+
+
 def compute_savings(rows: Sequence[Mapping[str, Any]]) -> SavingsSummary:
     """Compute the no-battery counterfactual over observation rows.
 
@@ -101,6 +107,8 @@ def compute_savings(rows: Sequence[Mapping[str, Any]]) -> SavingsSummary:
         import_price = row.get("import_price_sek_kwh")
         if import_price is None:
             continue
+        if _grid_unmeasured(row):
+            continue  # zero import here means "not read", not "bought nothing"
         p_imp = float(import_price)
         p_exp = float(row.get("export_price_sek_kwh") or 0.0)
         imp = float(row.get("import_kwh") or 0.0)

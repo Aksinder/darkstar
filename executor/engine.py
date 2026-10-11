@@ -1829,6 +1829,25 @@ class ExecutorEngine:
                         boost_active = self._water_boost_active()
 
                         if boost_active and self.config.water_heater_devices:
+                            # A human asking for hot water still must not overload
+                            # the main fuse or a shared sub-feed. Boost used to turn
+                            # EVERY heater on at once, ahead of the fuse shed and the
+                            # load groups (spa + villavagn tank: 3.4 kW in a 2.3 kW
+                            # group, 14 A on a 10 A-guarded phase).
+                            boost_ctx: dict[str, Any] | None = None
+                            if any(
+                                getattr(d, "fuse_shed", False)
+                                for d in self.config.water_heater_devices
+                            ):
+                                try:
+                                    boost_ctx = await self._water_energy_ctx(
+                                        state, slot.export_price_sek_kwh if slot else None
+                                    )
+                                except Exception as ctx_exc:
+                                    logger.warning(
+                                        "Water boost: fuse context unreadable (%s)", ctx_exc
+                                    )
+                            group_used_kw: dict[str, float] = {}
                             for device in self.config.water_heater_devices:
                                 # Exception-isolated per device, like the sink rungs:
                                 # one tank's failure must not abort its siblings, the
@@ -1845,8 +1864,28 @@ class ExecutorEngine:
                                         pause_cache,
                                     ):
                                         continue
+                                    # "Boost" and "off" are per device: the spa's
+                                    # bridge runs 20-40, so the global 70 is out of
+                                    # its range (and the global 40 is its maximum).
+                                    boost_temp = (
+                                        device.temp_boost
+                                        if device.temp_boost is not None
+                                        else self.config.water_heater.temp_boost
+                                    )
+                                    boost_off = (
+                                        device.temp_off
+                                        if device.temp_off is not None
+                                        else self.config.water_heater.temp_off
+                                    )
+                                    blocked = self._boost_blocked(
+                                        device, boost_ctx, group_used_kw
+                                    )
+                                    if blocked:
+                                        logger.warning(
+                                            "Water boost skipped for %s: %s", device.id, blocked
+                                        )
                                     water_result = await self.dispatcher.set_water_temp(
-                                        self.config.water_heater.temp_boost,
+                                        int(boost_off if blocked else boost_temp),
                                         device.target_entity,
                                         bypass_dwell=True,
                                     )
@@ -3671,6 +3710,43 @@ class ExecutorEngine:
             power_w=power_w,
             idle_power_w=float(getattr(device, "idle_power_w", 100.0)),
         )
+
+    def _boost_blocked(
+        self,
+        device: Any,
+        ctx: dict[str, Any] | None,
+        group_used_kw: dict[str, float],
+    ) -> str | None:
+        """Why a manual boost must leave this heater off, or None to boost it.
+
+        Fuse first (same test as the planned path), then the shared-feed groups:
+        members are admitted in config order until the group's ceiling is reached.
+        ``group_used_kw`` accumulates across the devices of one tick.
+        """
+        if ctx is not None and getattr(device, "fuse_shed", False):
+            shed, why = should_shed_for_fuse(
+                phase_currents_a=ctx["phase_currents"],
+                budget_a=ctx["fuse_budget_a"],
+                heater_phases=getattr(device, "phase_map", ()),
+                grid_w=ctx["grid_w"] or 0.0,
+            )
+            if shed:
+                return f"fuse — {why}"
+        groups: list[LoadGroupConfig] = (
+            getattr(getattr(self, "config", None), "load_groups", None) or []
+        )
+        power_kw = float(getattr(device, "power_kw", 0.0) or 0.0)
+        mine = [g for g in groups if device.id in g.members]
+        for grp in mine:
+            used = group_used_kw.get(grp.id, 0.0)
+            if used + power_kw > float(grp.max_power_kw) + 1e-6:
+                return (
+                    f"group {grp.id}: {used:.1f} kW already boosted, "
+                    f"+{power_kw:.1f} kW exceeds {grp.max_power_kw:.1f} kW"
+                )
+        for grp in mine:
+            group_used_kw[grp.id] = group_used_kw.get(grp.id, 0.0) + power_kw
+        return None
 
     def _in_a_load_group(self, device_id: str) -> bool:
         groups: list[LoadGroupConfig] = (

@@ -399,6 +399,8 @@ async def record_observation_from_current_state(
     import_kw: float = 0.0
     export_kw: float = 0.0
     grid_net_kw: float = 0.0
+    grid_unmeasured = False
+    soc_stale = False
 
     if meter_type == "dual":
         import_kw = power_results.get("grid_import_power") or 0.0
@@ -521,6 +523,12 @@ async def record_observation_from_current_state(
             # Fallback to net power calculation
             import_kwh = import_kw * 0.25
             export_kwh = export_kw * 0.25
+            if power_results.get("grid_power") is None:
+                # No counters AND no power reading: the zeros above are not a
+                # measurement of anything. An inverter-integration outage used
+                # to land as "consumed 4 kWh of water and EV, bought nothing",
+                # which savings booked as pure profit (~65 SEK in one evening).
+                grid_unmeasured = True
 
     # Calculate EV charging energy using power history API
     ev_charging_kwh = 0.0
@@ -659,7 +667,9 @@ async def record_observation_from_current_state(
     # or a ~zero energy result (frozen counter delta / zero snapshot).
     if (
         (load_read_invalid and not used_cumulative_load) or load_kwh <= 0.001
-    ) and balance_base_kwh > 0.02:
+    ) and balance_base_kwh > 0.02 and not grid_unmeasured:
+        # (Not when the grid is unmeasured: the balance would then be pv - water -
+        # EV with import and export both invented as zero — fabricated load.)
         logger.info(
             "Recorder: load balance-rescued to %.3f kWh (sensor said %.3f, read_invalid=%s)",
             balance_base_kwh,
@@ -681,6 +691,7 @@ async def record_observation_from_current_state(
         if cached_soc and soc_entity:
             try:
                 soc_percent = float(cached_soc)
+                soc_stale = True
                 logger.warning(
                     f"Battery SoC sensor ({soc_entity}) unavailable. "
                     f"Using last known value: {soc_percent:.1f}%"
@@ -810,8 +821,12 @@ async def record_observation_from_current_state(
     # its price-mint population on _NO_PROVENANCE -- quality_flags IS NULL or '{}' --
     # and treats anything else as claimed by a writer that "must not be relabelled"
     # (quarantine.py:61-63). Stamping every row would empty that population entirely.
-    if load_rescued or load_read_invalid or balance_tripped:
+    if load_rescued or load_read_invalid or balance_tripped or grid_unmeasured or soc_stale:
         flags: dict[str, Any] = {}
+        if grid_unmeasured:
+            flags["grid_unmeasured"] = True
+        if soc_stale:
+            flags["soc_stale"] = True
         if load_rescued:
             flags["load_rescued"] = "energy_balance"
         if load_read_invalid:
