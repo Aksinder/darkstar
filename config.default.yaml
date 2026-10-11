@@ -228,6 +228,32 @@ water_heaters:
       margin_from_hour_weekday: 18   # The reserve applies from this local hour...
       margin_from_hour_weekend: 14   # ...earlier at weekends, when showers start earlier.
       max_horizon_hours: 16          # Never bet on a cheap window further out than this.
+    floor_deferral:                  # Near the END of a day-bucket (see defer_up_to_hours),
+                                     # let what is still owed wait for the next bucket instead
+                                     # of buying it in whatever hours are left. Needs a tracked
+                                     # tank (type: thermal + volume_litres) with a wired switch.
+                                     # ALL of these must hold, re-checked every replan:
+                                     #  - the bucket ends within max_window_hours
+                                     #  - nothing before the boundary is cheap (min_price_ratio)
+                                     #  - the tank was MEASURED full (relay on, element idle)
+                                     #    no more than max_full_age_hours ago
+                                     #  - projected to the boundary with the learned draw and
+                                     #    standing loss it still holds reserve_showers above
+                                     #    comfort_c
+                                     # Only ever lowers the FIRST bucket; later buckets keep
+                                     # their whole floor. Any unknown input keeps the floor.
+      enabled: false                 # Default off — opt in per tank.
+      reserve_showers: 2.0           # What must be left at the boundary (a shower = shower_litres
+                                     # at comfort_c, ~2.1 kWh). The learned draw is a mean rate
+                                     # and cannot see a shower; this is the margin for the ones
+                                     # it missed.
+      shower_litres: 60
+      comfort_c: 40
+      max_window_hours: 6            # Only the last N hours of a bucket qualify.
+      max_full_age_hours: 8          # How old the last measured-full may be.
+      max_state_age_min: 20          # Estimator state file older than this = dead publisher.
+      min_price_ratio: 1.25          # Cheapest slot before the boundary must cost at least this
+                                     # multiple of an hour of heating after it.
     max_hours_between_heating: 8     # Max comfort gap between heating cycles
     water_min_spacing_hours: 4       # Minimum gap between heating starts
     sensor: ''                       # Home Assistant entity for power reading
