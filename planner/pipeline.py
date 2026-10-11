@@ -45,6 +45,7 @@ from planner.strategy.s_index import (
     derive_battery_value_sek_per_kwh,
 )
 from planner.vacation_state import load_last_anti_legionella, save_last_anti_legionella
+from planner.water_floor_deferral import DeferralConfig, decide_floor_deferral
 from planner.water_shortfall import (
     ShortfallConfig,
     dynamic_floor_kwh,
@@ -181,6 +182,20 @@ def _load_hot_water_states(
         return {}
 
 
+def _hot_water_state_age_min(path: str = "data/hot_water_state.json") -> float | None:
+    """Minutes since the estimator last persisted its state, or None when unknown.
+
+    The state file carries no timestamp of its own, so its mtime is the only evidence
+    that the publisher is still running. The floor deferral refuses to act on a state
+    whose age it cannot establish: a dead publisher leaves "measured full N minutes
+    ago" frozen at whatever it last wrote, and that must not read as a full tank.
+    """
+    try:
+        return max(0.0, (datetime.now().timestamp() - Path(path).stat().st_mtime) / 60.0)
+    except Exception:
+        return None
+
+
 def slots_for_hours(slots: list[Any], hours: float, *, fallback_slot_min: float = 15.0) -> int:
     """How many slots span ``hours`` on THIS grid, and never fewer than one.
 
@@ -207,6 +222,7 @@ def _apply_water_shortfall_gate(
     slots: list[Any],
     now_local: Any,
     heated_today_by_id: dict[str, float],
+    defer_hours: float = 0.0,
 ) -> None:
     """Relax each gated tank's daily floor to its forecast shortfall, in place.
 
@@ -334,6 +350,64 @@ def _apply_water_shortfall_gate(
                         float(stored_kwh), capacity,
                     )
                     h.min_kwh_per_day = gross
+
+        # FLOOR DEFERRAL (opt-in per tank, default off). What is still owed in the
+        # first day-bucket may wait for the next one when the bucket is about to end,
+        # nothing before its boundary is cheap, and the tank was recently MEASURED
+        # full and still holds a shower reserve at the boundary. Lowers bucket 0
+        # only; every guard and its reason is in planner/water_floor_deferral.py.
+        deferral_cfg = DeferralConfig.from_heater(raw)
+        if deferral_cfg.enabled and h.min_kwh_per_day > 0:
+            heated_d = float(heated_today_by_id.get(h.id, 0.0) or 0.0)
+            residual = max(0.0, h.min_kwh_per_day - heated_d)
+            capacity_d: float | None = None
+            loss_fn: Any = None
+            volume_d = raw.get("volume_litres")
+            try:
+                from planner.thermal import WaterTankModel
+
+                tank_d = WaterTankModel(
+                    volume_litres=float(volume_d or 0.0),
+                    t_cold_c=float(raw.get("t_cold_c", 10.0)),
+                    t_max_c=float(raw.get("t_max_c", 85.0)),
+                    ua_w_per_k=float(raw.get("ua_w_per_k", 2.0)),
+                )
+                capacity_d = tank_d.capacity_kwh()
+
+                def _loss(stored: float, hours: float, _t: Any = tank_d) -> float:
+                    temp = _t.t_cold_c + stored * 1000.0 / _t.heat_capacity_wh_per_k
+                    return _t.standby_loss_kwh(temp, hours)
+
+                loss_fn = _loss
+            except Exception:
+                logger.exception("Water floor %s: deferral tank model unavailable", h.id)
+                capacity_d = None
+            sat_age = tank_state.get("min_since_saturated")
+            decision = decide_floor_deferral(
+                cfg=deferral_cfg,
+                slots=slots,
+                now_local=now_local,
+                defer_hours=defer_hours,
+                heater_kw=float(h.power_kw),
+                residual_kwh=residual,
+                stored_kwh=tank_state.get("stored_kwh"),
+                capacity_kwh=capacity_d,
+                volume_litres=float(volume_d) if volume_d else None,
+                learned_draw_kw=tank_state.get("learned_draw_kw"),
+                min_since_saturated=float(sat_age) if sat_age is not None else None,
+                state_age_min=_hot_water_state_age_min(),
+                standby_loss_kwh_fn=loss_fn,
+            )
+            if decision.defer:
+                logger.info(
+                    "Water floor %s: DEFERRED %.2f kWh to the next day-bucket (%s). "
+                    "Later buckets and opportunistic heating unaffected.",
+                    h.id, residual, decision.reason,
+                )
+                # GROSS, like min_kwh_per_day: kepler subtracts heated_today itself.
+                h.first_bucket_min_kwh = min(heated_d, h.min_kwh_per_day)
+            elif residual > 0:
+                logger.info("Water floor %s: not deferred (%s)", h.id, decision.reason)
 
         gate_raw = raw.get("shortfall_gate") or {}
         if not gate_raw.get("enabled", False):
@@ -1274,6 +1348,7 @@ class PlannerPipeline:
             kepler_input.slots,
             now_slot,
             water_heated_today_by_id,
+            defer_hours=float(kepler_config.defer_up_to_hours or 0.0),
         )
 
         # Rev O1: Disable water heating in Kepler if no water heater (task 3.4)

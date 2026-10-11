@@ -1032,13 +1032,18 @@ class KeplerSolver:
                 # Constraint 1: Per-device, per-day daily minimum (task 2.4)
                 for i, day in enumerate(sorted_days):
                     day_slot_indices: list[int] = slots_by_day[day]
+                    bucket_floor: float = heater.min_kwh_per_day
                     if i == 0:
+                        # Floor deferral: the pipeline may hand bucket 0 a lower gross
+                        # target. Clamped so it can only lower, never raise.
+                        if heater.first_bucket_min_kwh is not None:
+                            bucket_floor = min(
+                                bucket_floor, max(0.0, heater.first_bucket_min_kwh)
+                            )
                         # First day: deduct per-device heated-today progress
-                        day_min_kwh: float = max(
-                            0.0, heater.min_kwh_per_day - heater.heated_today_kwh
-                        )
+                        day_min_kwh: float = max(0.0, bucket_floor - heater.heated_today_kwh)
                     else:
-                        day_min_kwh = heater.min_kwh_per_day
+                        day_min_kwh = bucket_floor
 
                     if day_min_kwh > 0:
                         prob += (  # type: ignore[operator]

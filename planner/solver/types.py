@@ -79,6 +79,13 @@ class WaterHeaterInput:
     # otherwise charge the NEW day with the OLD day's absorption (over-tight cap for
     # one cycle). None => legacy behavior (always subtract).
     absorbed_bucket_date: str | None = None
+    # GROSS floor for the FIRST day-bucket only (same units as min_kwh_per_day: kepler
+    # still subtracts heated_today_kwh). None => min_kwh_per_day applies, as always.
+    # Set by the pipeline's floor deferral (planner/water_floor_deferral.py) when a
+    # small end-of-bucket residual may wait for the next bucket. Clamped to
+    # [0, min_kwh_per_day] in the solver, so it can only ever LOWER bucket 0 and can
+    # never touch a later bucket.
+    first_bucket_min_kwh: float | None = None
 
 
 @dataclass

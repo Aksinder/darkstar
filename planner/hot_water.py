@@ -88,6 +88,16 @@ class HotWaterEstimator:
     # by the switch going off, and by an unknown switch state — an unwired or unreadable
     # switch must never look like a satisfied thermostat.
     _saturated_min: float = field(default=0.0)
+    # Minutes since the tank was last MEASURED saturated (see is_saturated), or -1 when
+    # that has never been observed. 0 while it is saturated right now.
+    #
+    # stored_kwh cannot play this role. It re-pins to FULL whenever a heating run of
+    # full_anchor_after_min ends — including a run the PLAN ended by opening the relay on
+    # a tank that was still drawing full power — so "the model says full" and "the
+    # thermostat said full" are different facts. Anything that wants to lean on the tank
+    # being full (the floor deferral in planner/water_floor_deferral.py) needs the
+    # second one, and needs to know how old it is.
+    _min_since_saturated: float = field(default=-1.0)
     _energy_in_since_anchor_kwh: float = field(default=0.0)
     _minutes_since_anchor: float = field(default=0.0)
 
@@ -183,6 +193,10 @@ class HotWaterEstimator:
             self._saturated_min += dt_minutes
         else:
             self._saturated_min = 0.0
+        if self._saturated_min >= self.saturated_after_min > 0:
+            self._min_since_saturated = 0.0
+        elif self._min_since_saturated >= 0.0:
+            self._min_since_saturated += dt_minutes
 
         if heating_on:
             self.stored_kwh += heating_kw * dt_h
@@ -249,6 +263,11 @@ class HotWaterEstimator:
         """
         return self._saturated_min >= self.saturated_after_min
 
+    @property
+    def minutes_since_saturated(self) -> float | None:
+        """Age of the last measured saturation, in minutes. None if never observed."""
+        return self._min_since_saturated if self._min_since_saturated >= 0.0 else None
+
     def state_dict(self) -> dict[str, float]:
         return {
             "stored_kwh": round(self.stored_kwh, 5),
@@ -257,6 +276,7 @@ class HotWaterEstimator:
             "energy_in_since_anchor_kwh": round(self._energy_in_since_anchor_kwh, 5),
             "minutes_since_anchor": round(self._minutes_since_anchor, 3),
             "saturated_min": round(self._saturated_min, 3),
+            "min_since_saturated": round(self._min_since_saturated, 3),
         }
 
     def apply_state(self, d: dict[str, float]) -> None:
@@ -276,6 +296,9 @@ class HotWaterEstimator:
             self._minutes_since_anchor = float(d["minutes_since_anchor"])
         if "saturated_min" in d:
             self._saturated_min = max(0.0, float(d["saturated_min"]))
+        if "min_since_saturated" in d:
+            v = float(d["min_since_saturated"])
+            self._min_since_saturated = v if v >= 0.0 else -1.0
 
 
 def estimate_draw_kwh(
