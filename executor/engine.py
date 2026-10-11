@@ -4056,6 +4056,16 @@ class ExecutorEngine:
         """Gather current system state from Home Assistant."""
         state = SystemState()
 
+        # The planner's floor, for the controller's PV-surplus hold guard. It was
+        # never filled in: the dataclass default (10) happened to match most
+        # configs. Fail-soft — a malformed value keeps the default.
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            state.min_soc_percent = float(
+                (self._full_config.get("battery", {}) or {}).get(
+                    "min_soc_percent", state.min_soc_percent
+                )
+            )
+
         if not self.ha_client:
             return state
 
