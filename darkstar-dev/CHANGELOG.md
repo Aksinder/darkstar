@@ -1,3 +1,7 @@
+## dev-20261011.1244 — 2026-10-11 12:46
+
+- fix: audit batch 2 — HA-only API, locked config writes, EV SoC hold
+
 ## dev-20261011.0708 — 2026-10-11 07:10
 
 - fix: audit safety batch — DST replan crash, executor survival, real heartbeat
