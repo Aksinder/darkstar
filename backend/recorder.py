@@ -29,6 +29,9 @@ from backend.validation import get_max_energy_per_slot, validate_energy_values
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("recorder")
 
+# Past days fetched from Nordpool per price-repair run.
+_BACKFILL_MAX_DAYS_PER_RUN = 10
+
 # The price series seen on the previous recorder wake (see the price lookup).
 _previous_price_series: list[dict[str, Any]] = []
 
@@ -918,51 +921,51 @@ async def backfill_missing_prices():
             return
 
         logger.info("[recorder] Backfilling missing prices...")
-        price_data = await get_nordpool_data()
-        if not price_data:
-            logger.error("[recorder] Failed to fetch price data for backfill.")
-            await store.close()
-            return
+        from backend.core.prices import get_nordpool_data_for_date
 
-        indexed_prices = {p["start_time"]: p for p in price_data}
-        updated_count = 0
+        def _local(raw: Any) -> datetime:
+            ts = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+            return tz.localize(ts) if ts.tzinfo is None else ts.astimezone(tz)
 
-        for obs in observations:
-            if obs.get("import_price_sek_kwh") is None:
-                slot_start_raw = obs["slot_start"]
-                if isinstance(slot_start_raw, str):
-                    slot_start = datetime.fromisoformat(slot_start_raw)
-                else:
-                    slot_start = slot_start_raw
+        missing = [o for o in observations if o.get("import_price_sek_kwh") is None]
+        today = datetime.now(tz).date()
+        days = sorted({_local(o["slot_start"]).date() for o in missing}, reverse=True)
 
-                if slot_start.tzinfo is None:
-                    slot_start = tz.localize(slot_start)
-                else:
-                    slot_start = slot_start.astimezone(tz)
+        # Today comes from the cached series; every other day is fetched for
+        # that day. Before, only today's series was consulted, so a slot whose
+        # price was missed (every night's 23:45, until 2026-10-11) stayed
+        # unpriced for good. Bounded per run: prices for a past day never change,
+        # and the next run picks up whatever is left.
+        indexed_prices: dict[datetime, dict[str, Any]] = {}
+        for day in days[:_BACKFILL_MAX_DAYS_PER_RUN]:
+            series = (
+                await get_nordpool_data()
+                if day == today
+                else await get_nordpool_data_for_date(day)
+            )
+            for p in series or []:
+                indexed_prices[p["start_time"]] = p
 
-                # Round to nearest 15/60 min boundary if needed, but get_nordpool_data handles it
-                # We need exact match or closest previous
-                price_slot = indexed_prices.get(slot_start)
-                if price_slot:
-                    obs["import_price_sek_kwh"] = price_slot["import_price_sek_kwh"]
-                    obs["export_price_sek_kwh"] = price_slot["export_price_sek_kwh"]
-                    updated_count += 1
+        rows_to_update: list[dict[str, Any]] = []
+        for obs in missing:
+            price_slot = indexed_prices.get(_local(obs["slot_start"]))
+            if price_slot and price_slot.get("import_price_sek_kwh") is not None:
+                rows_to_update.append(
+                    {
+                        "slot_start": obs["slot_start"],
+                        "import_price_sek_kwh": price_slot["import_price_sek_kwh"],
+                        "export_price_sek_kwh": price_slot.get("export_price_sek_kwh"),
+                    }
+                )
 
-        if updated_count > 0:
-            # We need a way to update specific observations.
-            # store.store_slot_prices handles upsert by slot_start.
-            # Convert back to list of dicts with required fields
-            rows_to_update = [
-                {
-                    "slot_start": obs["slot_start"],
-                    "import_price_sek_kwh": obs["import_price_sek_kwh"],
-                    "export_price_sek_kwh": obs["export_price_sek_kwh"],
-                }
-                for obs in observations
-                if obs.get("import_price_sek_kwh") is not None
-            ]
+        if rows_to_update:
+            # Only the rows that were missing a price — not a rewrite of every
+            # priced row in the window, as this used to do on each run.
             await store.store_slot_prices(rows_to_update)
-            logger.info(f"[recorder] Backfilled {updated_count} observation prices.")
+        logger.info(
+            "[recorder] Price backfill: %d of %d unpriced slot(s) filled across %d day(s).",
+            len(rows_to_update), len(missing), min(len(days), _BACKFILL_MAX_DAYS_PER_RUN),
+        )
 
         await store.close()
     except Exception as e:
