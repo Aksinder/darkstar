@@ -67,6 +67,15 @@ from .write_verify import VerifySignal, VerifyState, note_attempt
 
 logger = logging.getLogger(__name__)
 
+# Published after every tick that reached the inverter dispatch; the HA dead-man
+# automations watch its age.
+HEARTBEAT_ENTITY = "sensor.darkstar_executor_heartbeat"
+
+# How long a dropped SoC read may be bridged with the previous reading. Five
+# ticks: long enough for a Modbus hiccup, far too short for the battery to cross
+# the export floor unnoticed.
+SOC_HOLD_SECONDS = 300.0
+
 
 def isolate_slot_for_ev(slot: SlotPlan) -> SlotPlan:
     """The slot the controller sees while a car is actually drawing power.
@@ -360,6 +369,12 @@ class ExecutorEngine:
 
         # Config and profile mtime caching
         self._config_mtime: float | None = None
+        self._config_reload_error: str | None = None
+        # Set by _tick when the inverter dispatch actually ran; the background loop
+        # turns it into the HA heartbeat. See _publish_heartbeat.
+        self._dispatched_this_tick = False
+        # Last SoC that was actually read, with its monotonic time.
+        self._last_good_soc: tuple[float, float] | None = None
         self._profile_mtime: float | None = None
 
     def _get_db_path(self) -> str:
@@ -401,9 +416,19 @@ class ExecutorEngine:
         if self._config_mtime is not None and current_config_mtime == self._config_mtime:
             return
 
+        # Parse BEFORE touching live state, and refuse a file that does not parse.
+        # load_executor_config() answers an unreadable file with defaults
+        # (enabled=False), which silently parked the executor with the inverter in
+        # whatever mode it was last given; a half-saved or duplicate-key file is a
+        # reason to keep the running config, not to swap in an empty one.
+        new_full_config = load_yaml(self.config_path)
+        if not new_full_config and self._config_mtime is not None:
+            raise ValueError(f"{self.config_path} is empty or not valid YAML")
+        new_config = load_executor_config(self.config_path)
+
         with self._lock:
-            self.config = load_executor_config(self.config_path)
-            self._full_config = load_yaml(self.config_path)
+            self.config = new_config
+            self._full_config = new_full_config
             self._config_mtime = current_config_mtime
             self.status.enabled = self.config.enabled
             self.status.shadow_mode = self.config.shadow_mode
@@ -1110,6 +1135,63 @@ class ExecutorEngine:
         except Exception as e:
             logger.exception("Fatal error in executor background loop: %s", e)
 
+    async def _publish_heartbeat(self, tick_start: datetime) -> None:
+        """Tell HA that this tick reached the inverter dispatch.
+
+        The HA dead-man used to key on sensor.darkstar_savings_today, which the
+        cycle publisher writes from the web server's event loop — it stays fresh
+        with this thread dead, paused, disabled or failing every tick. This sensor
+        is written only from here and only after dispatcher.execute() returned, so
+        its age is the age of the last tick that actually commanded the inverter.
+        The state is the tick time, so it changes (and last_updated moves) each tick.
+        """
+        if not self._dispatched_this_tick or not self.ha_client:
+            return
+        try:
+            await self.ha_client.set_state(
+                HEARTBEAT_ENTITY,
+                tick_start.isoformat(timespec="seconds"),
+                {
+                    "friendly_name": "Darkstar executor heartbeat",
+                    "device_class": "timestamp",
+                    "icon": "mdi:heart-pulse",
+                    "shadow_mode": bool(self.config.shadow_mode),
+                },
+            )
+        except Exception:
+            logger.debug("Heartbeat publish failed", exc_info=True)
+
+    async def _reload_config_or_keep(self) -> None:
+        """Reload config; on ANY failure keep running on the previous one.
+
+        This call sits at the top of the background loop. An exception here used to
+        end the loop for good — one blank numeric field saved from Settings, or the
+        file being momentarily absent during an SMB save, and the executor thread
+        was gone until the add-on restarted, with nothing but one log line. The
+        error is reported once per distinct message and again when it clears.
+        """
+        try:
+            self.reload_config()
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            if msg != self._config_reload_error:
+                self._config_reload_error = msg
+                logger.error(
+                    "Config reload failed — keeping the previous configuration: %s", msg
+                )
+                if self.dispatcher:
+                    try:
+                        await self.dispatcher.notify_error(
+                            "Config kunde inte läsas in; Darkstar kör vidare på den "
+                            f"förra konfigurationen. {msg}"
+                        )
+                    except Exception:
+                        logger.debug("Config-reload notification failed", exc_info=True)
+            return
+        if self._config_reload_error is not None:
+            logger.info("Config reload recovered (was: %s)", self._config_reload_error)
+            self._config_reload_error = None
+
     async def _async_run_loop(self) -> None:
         """Async implementation of the background loop."""
         tz = pytz.timezone(self.config.timezone)
@@ -1123,7 +1205,7 @@ class ExecutorEngine:
         try:
             while not self._stop_event.is_set():
                 # Reload config to get latest settings
-                self.reload_config()
+                await self._reload_config_or_keep()
 
                 # Check if enabled
                 if not self.config.enabled:
@@ -1204,7 +1286,9 @@ class ExecutorEngine:
                         client.http_stats_reset()
 
                     # The Core Fix: await the async tick
+                    self._dispatched_this_tick = False
                     await self._tick()
+                    await self._publish_heartbeat(tick_start)
 
                     tick_duration = (datetime.now(tz) - tick_start).total_seconds()
 
@@ -1216,11 +1300,9 @@ class ExecutorEngine:
                     client = getattr(self, "ha_client", None)
                     if client is not None and hasattr(client, "http_stats"):
                         calls, http_s = client.http_stats()
-                    detail = "%.2fs (%d HA calls, %.2fs in HTTP, %.2fs compute)" % (
-                        tick_duration,
-                        calls,
-                        http_s,
-                        max(0.0, tick_duration - http_s),
+                    detail = (
+                        f"{tick_duration:.2f}s ({calls} HA calls, {http_s:.2f}s in HTTP, "
+                        f"{max(0.0, tick_duration - http_s):.2f}s compute)"
                     )
                     threshold = float(getattr(self.config, "slow_tick_threshold_s", 20.0))
                     if tick_duration > threshold:
@@ -2247,6 +2329,7 @@ class ExecutorEngine:
                     # Fix Issue 0: Await expected coroutine properly
                     profile_results = await self.dispatcher.execute(decision)
                     action_results.extend(profile_results)
+                    self._dispatched_this_tick = True
                 except Exception as e:
                     logger.error("Failed to execute async actions: %s", e)
                     # Append a failed result for the log (do not replace existing results)
@@ -3898,8 +3981,27 @@ class ExecutorEngine:
             results = await gather_sensor_reads(reads, context="executor_state")
 
             soc_str = results.get("soc")
+            soc_val: float | None = None
             if soc_str and soc_str not in ("unknown", "unavailable"):
-                state.current_soc_percent = float(soc_str)
+                with contextlib.suppress(ValueError, TypeError):
+                    soc_val = float(soc_str)
+            if soc_val is not None:
+                state.current_soc_percent = soc_val
+                self._last_good_soc = (soc_val, time.monotonic())
+            elif (
+                self._last_good_soc is not None
+                and time.monotonic() - self._last_good_soc[1] <= SOC_HOLD_SECONDS
+            ):
+                # A dropped read is not a new battery state: reuse the last one
+                # for a few ticks rather than the dataclass default of 50 %.
+                state.current_soc_percent = self._last_good_soc[0]
+            else:
+                state.soc_known = False
+                logger.warning(
+                    "Battery SoC unreadable (%r) and no recent reading to fall back "
+                    "on — export is blocked until it returns",
+                    soc_str,
+                )
 
             pv_str = results.get("pv_power")
             if pv_str and pv_str not in ("unknown", "unavailable"):

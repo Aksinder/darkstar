@@ -54,6 +54,10 @@ class SystemState:
 
     # SoC
     current_soc_percent: float = 50.0
+    # False when the SoC sensor is unreadable and no recent reading exists.
+    # current_soc_percent then still holds its 50 % default, which must never
+    # be used to justify discharging the battery to the grid.
+    soc_known: bool = True
     min_soc_percent: float = 10.0
 
     # Power flows

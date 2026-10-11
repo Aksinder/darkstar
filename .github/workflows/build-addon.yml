@@ -17,21 +17,32 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # The image this workflow builds is installed in the house at 03:30 with nobody
+  # watching, so the gate is the whole core suite on the pinned requirements — not
+  # the six API tests it used to be (17 % line coverage; 41 modules never imported).
+  # Same selection as ci.yml's test-core: tests/ml needs model fixtures and
+  # tests/performance asserts wall-clock times a shared runner cannot hold.
   test:
-    name: API Tests Gating
+    name: Lint + core tests (gating)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+          cache: pip
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest httpx
-      - name: Run API tests
-        run: PYTHONPATH=. pytest tests/api/test_api_routes.py -v
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check backend/ planner/ ml/ executor/ --output-format=github
+      - name: Core test suite
+        run: >
+          PYTHONPATH=. pytest tests/ -q
+          --ignore=tests/ml
+          --ignore=tests/performance
 
   build:
     needs: [test]

@@ -263,6 +263,8 @@ class HAClient:
         # Per-tick HTTP accounting, so a slow tick can say where the time went instead
         # of leaving us to guess whether it is the network or our own compute.
         self._http_calls = 0
+        # entity_id -> HTTP statuses already reported, so a missing entity logs once.
+        self._read_http_errors_logged: dict[str, set[int]] = {}
         self._http_seconds = 0.0
         self._headers = {
             "Authorization": f"Bearer {token}",
@@ -347,6 +349,21 @@ class HAClient:
             )
         except HACallError:
             # All retries exhausted, return None for graceful degradation
+            return None
+        except aiohttp.ClientResponseError as e:
+            # 4xx is not retried, so it arrives here raw. 404 is what HA answers
+            # for an entity with no state: renamed, removed, or not loaded yet
+            # after a restart. That is "unreadable", the same as a timeout — it
+            # used to propagate out of ActionDispatcher.execute() and abort the
+            # whole inverter mode every tick, fault gate included.
+            if e.status not in self._read_http_errors_logged.get(entity_id, set()):
+                self._read_http_errors_logged.setdefault(entity_id, set()).add(e.status)
+                logger.error(
+                    "HA read %s answered HTTP %s — treating the entity as unreadable "
+                    "(check that it still exists)",
+                    entity_id,
+                    e.status,
+                )
             return None
 
     async def get_state_value(self, entity_id: str) -> str | None:
@@ -871,7 +888,13 @@ class ActionDispatcher:
                 )
             ]
 
-        gate = await self._inverter_fault_gate(mode_intent)
+        # The gate's contract is "unreadable leaves it open". Any failure to ASK
+        # is therefore not allowed to stop the mode from being written.
+        try:
+            gate = await self._inverter_fault_gate(mode_intent)
+        except Exception as e:
+            logger.error("Inverter fault gate could not be evaluated (%s) — gate open", e)
+            gate = None
         if gate is not None:
             return [gate]
 
@@ -885,7 +908,17 @@ class ActionDispatcher:
         results: list[ActionResult] = []
 
         for action in mode_def.actions:
-            result = await self._execute_action(action, decision, mode_intent)
+            # One action raising must not skip the rest: leaving Forced mode is
+            # several writes, and a half-applied mode is worse than one failed step.
+            try:
+                result = await self._execute_action(action, decision, mode_intent)
+            except Exception as e:
+                logger.exception("Action on %s failed: %s", action.entity, e)
+                result = ActionResult(
+                    action_type=str(action.entity),
+                    success=False,
+                    message=f"Action raised: {type(e).__name__}: {e}",
+                )
             results.append(result)
 
             if action.settle_ms and action.settle_ms > 0:

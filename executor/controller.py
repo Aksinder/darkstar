@@ -161,7 +161,13 @@ class Controller:
             _floor = effective_export_floor_pct(
                 self.config.export_floor_soc_percent, state
             )
-            if round(state.current_soc_percent) <= _floor:
+            if not state.soc_known:
+                logger.warning(
+                    "Force-export blocked: battery SoC unknown — downgrading "
+                    "override to self_consumption"
+                )
+                mode_intent = "self_consumption"
+            elif round(state.current_soc_percent) <= _floor:
                 logger.warning(
                     "Force-export blocked: SoC %.1f%% at/below export floor %.0f%% "
                     "— downgrading override to self_consumption",
@@ -258,7 +264,14 @@ class Controller:
                 self.config.export_floor_soc_percent, state
             )
             _price_floor = self.config.min_export_price_sek_kwh
-            if round(state.current_soc_percent) <= _floor:
+            if not state.soc_known:
+                # The floor cannot be checked against a number we do not have.
+                logger.warning(
+                    "Export intent blocked: battery SoC unknown — downgrading to "
+                    "self_consumption"
+                )
+                mode_intent = "self_consumption"
+            elif round(state.current_soc_percent) <= _floor:
                 logger.warning(
                     "Export intent blocked: SoC %.1f%% at/below export floor %.0f%% "
                     "— downgrading to self_consumption",
