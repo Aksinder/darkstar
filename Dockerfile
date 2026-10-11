@@ -30,9 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install pnpm globally
 RUN npm install -g pnpm
 
-# Install Python dependencies
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies from the hashed locks (see requirements.txt header).
+# setuptools first: suncalc ships no wheel and is built against this pinned backend.
+COPY requirements-build.lock requirements.lock ./
+RUN pip3 install --no-cache-dir --require-hashes -r requirements-build.lock \
+    && pip3 install --no-cache-dir --require-hashes --no-build-isolation -r requirements.lock
 
 # Copy frontend package files first for layer caching
 COPY frontend/package.json frontend/pnpm-lock.yaml ./frontend/

@@ -23,7 +23,8 @@
 
 | Task | Command |
 |------|---------|
-| Install dependencies | `uv pip install -r requirements.txt` |
+| Install dependencies | `uv pip install --require-hashes -r requirements.lock -r requirements-dev.lock` |
+| Change a dependency | edit `requirements*.txt`, then `./scripts/lock_requirements.sh` |
 | Run dev environment | `pnpm run dev` |
 | Run single test | `uv run python -m pytest tests/test_file.py::test_name -v` |
 | Run all checks | `./scripts/lint.sh` |

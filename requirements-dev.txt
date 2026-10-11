@@ -1,5 +1,7 @@
 # Exact pins, for the same reason as requirements.txt: the build gate installs
 # this file, and a floating test tool must not be what breaks (or passes) a build.
+# Input for requirements-dev.lock (hashed, layered on requirements.lock); after
+# editing run scripts/lock_requirements.sh - see the header of requirements.txt.
 # Testing
 pytest==9.0.3
 pytest-asyncio==1.4.0
