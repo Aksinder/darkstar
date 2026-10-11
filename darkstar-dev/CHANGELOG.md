@@ -1,3 +1,7 @@
+## dev-20261011.2212 — 2026-10-11 22:14
+
+- feat(planner): optional water-floor deferral near the end of a day-bucket
+
 ## dev-20261011.2158 — 2026-10-11 22:00
 
 - fix(executor): PV-forecast branches hold at the SoC floor
