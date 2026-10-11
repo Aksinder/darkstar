@@ -669,14 +669,34 @@ class TestRecorderTimeScaling:
             ts1 = datetime(2024, 1, 1, 10, 43, 0)
             store.get_delta("pv_total", 100.0, ts1, sensor_timestamp=ts1)
 
-            # Second reading at 10:53 (10 min later)
-            ts2 = datetime(2024, 1, 1, 10, 53, 0)
+            # Sensor updated at 10:53 (10 min later); the recorder reads it at 10:58,
+            # five minutes after that update — the live shape: counters polled every
+            # 10 minutes, read every 15.
+            ts2 = datetime(2024, 1, 1, 10, 58, 0)
             sensor_ts2 = datetime(2024, 1, 1, 10, 53, 0)
             delta, is_valid = store.get_delta("pv_total", 102.0, ts2, sensor_timestamp=sensor_ts2)
 
             # Raw delta: 2.0 kWh over 10 min
-            # Scaled: 2.0 * (15/10) = 3.0 kWh
+            # Scaled: 2.0 * (15/10) = 3.0 kWh — the extra 1.0 is what the counter
+            # has gained in the 5 minutes since its own update.
             assert delta == pytest.approx(3.0, abs=0.01)
+            assert is_valid is True
+            assert store._state["pv_total"]["booked"] == pytest.approx(103.0)
+
+    def test_scaling_up_is_limited_to_what_the_counter_can_have_gained(self):
+        """A reading taken the moment the sensor updated has nothing to add: the
+        10-minute delta is booked as it is, not stretched to 15 minutes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            store.load()
+
+            ts1 = datetime(2024, 1, 1, 10, 43, 0)
+            store.get_delta("pv_total", 100.0, ts1, sensor_timestamp=ts1)
+
+            ts2 = datetime(2024, 1, 1, 10, 53, 0)
+            delta, is_valid = store.get_delta("pv_total", 102.0, ts2, sensor_timestamp=ts2)
+
+            assert delta == pytest.approx(2.0)
             assert is_valid is True
 
     def test_time_proportional_scaling_long_interval(self):
@@ -698,10 +718,37 @@ class TestRecorderTimeScaling:
             sensor_ts2 = datetime(2024, 1, 1, 10, 53, 0)
             delta, is_valid = store.get_delta("pv_total", 104.0, ts2, sensor_timestamp=sensor_ts2)
 
-            # Raw delta: 4.0 kWh over 20 min
-            # Scaled: 4.0 * (15/20) = 3.0 kWh
-            assert delta == pytest.approx(3.0, abs=0.01)
+            # Raw delta: 4.0 kWh over 20 min. Scaled it would be 4.0 * (15/20) = 3.0,
+            # but nothing of this counter has been booked ahead, so scaling down
+            # would simply discard 1.0 kWh the counter has shown.
+            assert delta == pytest.approx(4.0, abs=0.01)
             assert is_valid is True
+
+    def test_long_interval_is_scaled_down_only_by_what_was_booked_ahead(self):
+        """The sawtooth the scaling exists for: a 10-minute update read 5 minutes
+        late books 15 minutes' worth, and the following 20-minute update then
+        books 15 — together exactly what the counter moved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            store.load()
+
+            t0 = datetime(2024, 1, 1, 10, 0, 0)
+            store.get_delta("pv_total", 100.0, t0, sensor_timestamp=t0 - timedelta(minutes=5))
+            # +2.0 over the 10 minutes 09:55 -> 10:05, read at 10:15
+            first, _ = store.get_delta(
+                "pv_total", 102.0, t0 + timedelta(minutes=15),
+                sensor_timestamp=t0 + timedelta(minutes=5),
+            )
+            # +4.0 over the 20 minutes 10:05 -> 10:25, read at 10:30
+            second, _ = store.get_delta(
+                "pv_total", 106.0, t0 + timedelta(minutes=30),
+                sensor_timestamp=t0 + timedelta(minutes=25),
+            )
+
+            assert first == pytest.approx(3.0)  # 2.0 * 15/10, one kWh booked ahead
+            assert second == pytest.approx(3.0)  # 4.0 * 15/20, the kWh ahead now used up
+            assert first + second == pytest.approx(6.0)
+            assert "booked" not in store._state["pv_total"]  # level == reading again
 
     def test_backward_compatibility_missing_sensor_timestamp(self):
         """Task 4.2: No scaling when sensor_timestamp is None.
@@ -794,7 +841,13 @@ class TestRecorderTimeScaling:
             ts1 = datetime(2024, 1, 1, 10, 0, 0)
             store.get_delta("pv_total", 100.0, ts1, sensor_timestamp=ts1)
 
-            # 90 minutes later (too long)
+            # The SENSOR was silent for 90 minutes (too long), while the recorder
+            # itself kept reading every quarter and booked nothing.
+            for minutes in (15, 30, 45, 60, 75):
+                quiet, _ = store.get_delta(
+                    "pv_total", 100.0, ts1 + timedelta(minutes=minutes), sensor_timestamp=ts1
+                )
+                assert quiet == 0.0
             ts2 = datetime(2024, 1, 1, 11, 30, 0)
             sensor_ts2 = datetime(2024, 1, 1, 11, 30, 0)
             delta, is_valid = store.get_delta("pv_total", 110.0, ts2, sensor_timestamp=sensor_ts2)
@@ -802,6 +855,7 @@ class TestRecorderTimeScaling:
             # No scaling (outside 5-60 min window)
             assert delta == 10.0
             assert is_valid is True
+            assert store.multi_slot_deltas == {}
 
     def test_scaling_window_bounds_exactly_5_min(self):
         """Task 4.3: Scaling applied at exactly 5 minutes.
@@ -816,13 +870,14 @@ class TestRecorderTimeScaling:
             ts1 = datetime(2024, 1, 1, 10, 0, 0)
             store.get_delta("pv_total", 100.0, ts1, sensor_timestamp=ts1)
 
-            # Exactly 5 minutes later
-            ts2 = datetime(2024, 1, 1, 10, 5, 0)
+            # Sensor updated exactly 5 minutes later, read at the end of the quarter
+            ts2 = datetime(2024, 1, 1, 10, 15, 0)
             sensor_ts2 = datetime(2024, 1, 1, 10, 5, 0)
             delta, is_valid = store.get_delta("pv_total", 101.0, ts2, sensor_timestamp=sensor_ts2)
 
-            # Should scale: 1.0 * (15/5) = 3.0
-            assert delta == pytest.approx(3.0, abs=0.01)
+            # Scaling applies (1.0 * 15/5 = 3.0), but the booked level may run ahead
+            # of the reading by one sensor interval's energy at most: 1.0 + 1.0.
+            assert delta == pytest.approx(2.0, abs=0.01)
             assert is_valid is True
 
     def test_scaling_window_bounds_exactly_60_min(self):
@@ -838,13 +893,20 @@ class TestRecorderTimeScaling:
             ts1 = datetime(2024, 1, 1, 10, 0, 0)
             store.get_delta("pv_total", 100.0, ts1, sensor_timestamp=ts1)
 
-            # Exactly 60 minutes later
+            # The sensor's next update comes exactly 60 minutes later; the recorder
+            # read every quarter in between and booked nothing.
+            for minutes in (15, 30, 45):
+                store.get_delta(
+                    "pv_total", 100.0, ts1 + timedelta(minutes=minutes), sensor_timestamp=ts1
+                )
             ts2 = datetime(2024, 1, 1, 11, 0, 0)
             sensor_ts2 = datetime(2024, 1, 1, 11, 0, 0)
             delta, is_valid = store.get_delta("pv_total", 104.0, ts2, sensor_timestamp=sensor_ts2)
 
-            # Should scale: 4.0 * (15/60) = 1.0
-            assert delta == pytest.approx(1.0, abs=0.01)
+            # Inside the scaling window (4.0 * 15/60 = 1.0), but the three quiet
+            # quarters booked nothing, so all 4.0 kWh are still owed — booking 1.0
+            # was the leak that lost 3.0 kWh of every slow counter's tick.
+            assert delta == pytest.approx(4.0, abs=0.01)
             assert is_valid is True
 
     def test_sensor_timestamp_persisted_to_state_file(self):
@@ -862,6 +924,432 @@ class TestRecorderTimeScaling:
             content = json.loads(state_file.read_text())
             assert "sensor_timestamp" in content["pv_total"]
             assert content["pv_total"]["sensor_timestamp"] == "2024-01-01T09:58:00"
+
+
+def _polled_counter(power_kw, hours, *, poll_s=600, phase_s=200, resolution=0.1):
+    """Home Assistant style history of a counter: (last_updated, value), one entry
+    per CHANGE. The device integrates power_kw (a number or f(seconds)) and is
+    polled every poll_s; an unchanged poll leaves last_updated where it was."""
+    t0 = datetime(2026, 10, 1, 0, 0, 0)
+    out = [(t0, 1000.0)]
+    energy, last = 0.0, 1000.0
+    for t in range(10, hours * 3600 + 10, 10):
+        energy += (power_kw(t) if callable(power_kw) else power_kw) * 10 / 3600
+        if t % poll_s == phase_s % poll_s:
+            value = round(1000.0 + int(energy / resolution + 1e-9) * resolution, 6)
+            if value != last:
+                out.append((t0 + timedelta(seconds=t), value))
+                last = value
+    return out
+
+
+def _replay(store, history, hours, *, skip=lambda t: False, key="k"):
+    """Read the counter 7 s after every quarter, as the recorder does.
+
+    Returns (per-slot deltas, counter value at the first read, at the last read)."""
+    t0 = history[0][0]
+    deltas, first_value, value = [], None, None
+    for q in range(1, hours * 4 + 1):
+        now = t0 + timedelta(minutes=15 * q, seconds=7)
+        if skip(now):
+            continue
+        updated, value = [h for h in history if h[0] <= now][-1]
+        delta, valid = store.get_delta(key, value, now, sensor_timestamp=updated)
+        if first_value is None:
+            first_value = value
+            continue
+        assert valid
+        deltas.append(delta)
+    return deltas, first_value, value
+
+
+class TestRecorderBooksWhatTheCounterMoved:
+    """Finding (b): the time-proportional scaling discarded energy.
+
+    HA moves ``last_updated`` only when the value changes. A counter that ticks
+    0.1 kWh after 40 quiet minutes had the tick scaled by 15/40 although the quiet
+    slots had booked nothing; on the 10-minute poll grid even a steady 1 kW lost
+    10 % to the same arithmetic. The slot energies must add up to what the counter
+    moved, to within the one sensor interval that is still in flight.
+    """
+
+    @pytest.mark.parametrize("kw", [0.1, 0.2, 0.3, 0.5, 1.0, 3.0])
+    @pytest.mark.parametrize("poll_s", [600, 10])
+    def test_constant_load_is_fully_booked(self, kw, poll_s):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            history = _polled_counter(kw, 48, poll_s=poll_s, phase_s=poll_s if poll_s < 600 else 200)
+            deltas, first, last = _replay(store, history, 48)
+
+            assert all(d >= 0 for d in deltas)
+            # Never behind the counter, never more than one sensor interval ahead.
+            assert sum(deltas) >= last - first - 1e-9
+            assert sum(deltas) <= last - first + max(0.1, kw * poll_s / 3600) + 1e-9
+
+    def test_start_and_stop_edges_cancel(self):
+        """2 kW for 40 minutes every 3 hours: what is booked ahead at a stop edge
+        is owed back at the next start, so nothing accumulates."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            history = _polled_counter(lambda t: 2.0 if (t % 10800) < 2400 else 0.0, 48)
+            deltas, first, last = _replay(store, history, 48)
+
+            assert sum(deltas) == pytest.approx(last - first, abs=0.35)
+            assert max(deltas) <= 2.0 * 0.25 + 0.2  # no slot far above 15 min at 2 kW
+
+    def test_a_steady_counter_is_still_smoothed(self):
+        """The sawtooth fix must survive: 3 kW polled every 10 minutes books
+        0.75 kWh in every quarter, not 0.5 / 1.0 alternating."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            deltas, _, _ = _replay(store, _polled_counter(3.0, 12), 12)
+            assert deltas == pytest.approx([0.75] * len(deltas), abs=1e-6)
+
+    def test_state_written_by_the_previous_version_still_works(self):
+        """No ``booked`` field: the stored reading itself is the booked level."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "k": {
+                            "value": 100.0,
+                            "timestamp": "2026-10-01T10:00:07",
+                            "sensor_timestamp": "2026-10-01T09:53:20",
+                        }
+                    }
+                )
+            )
+            store = RecorderStateStore(state_file)
+            store.load()
+            delta, valid = store.get_delta(
+                "k",
+                100.5,
+                datetime(2026, 10, 1, 10, 15, 7),
+                sensor_timestamp=datetime(2026, 10, 1, 10, 13, 20),
+            )
+            assert valid
+            # 0.5 kWh over 20 min would scale to 0.375, but all 0.5 is still owed.
+            assert delta == pytest.approx(0.5)
+
+
+class TestRecorderBackwardSteps:
+    """Finding (a), decided against the real counter.
+
+    The live load counter is a template over several inverter counters and is blind
+    to the AC-coupled PV: while that PV charges the battery the template DECLINES,
+    quarter after quarter, and does not come back (2026-10-04..11: 83 of 671
+    quarters, all in daylight, none at night). A backward step is therefore not
+    jitter around a high-water mark. The reading is rebased and the caller falls
+    back for that slot; when the counter rises again its increments are real.
+    """
+
+    def test_sustained_decline_then_rise_books_the_rise(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 10, 0, 7)
+            values = [43085.2, 43084.8, 43084.5, 43084.1, 43083.6, 43084.0, 43084.6]
+            results = [
+                store.get_delta("load_total", v, t0 + timedelta(minutes=15 * i))
+                for i, v in enumerate(values)
+            ]
+            assert results[0] == (None, True)
+            assert results[1:5] == [(None, False)] * 4
+            # Rising again from the LOWER level: booked, not withheld until 43085.2.
+            assert results[5][1] is True and results[5][0] == pytest.approx(0.4)
+            assert results[6][1] is True and results[6][0] == pytest.approx(0.6)
+
+    def test_genuine_reset_is_rebased_and_reported_invalid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 10, 0, 7)
+            store.get_delta("pv_total", 1000.0, t0)
+            with patch("backend.recorder.logger") as mock_logger:
+                assert store.get_delta("pv_total", 0.3, t0 + timedelta(minutes=15)) == (None, False)
+                assert "Meter reset" in mock_logger.warning.call_args[0][0]
+            delta, valid = store.get_delta("pv_total", 0.9, t0 + timedelta(minutes=30))
+            assert valid and delta == pytest.approx(0.6)
+
+    def test_small_backward_step_is_not_called_a_meter_reset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 10, 0, 7)
+            store.get_delta("load_total", 43085.2, t0)
+            with patch("backend.recorder.logger") as mock_logger:
+                store.get_delta("load_total", 43085.0, t0 + timedelta(minutes=15))
+                message = mock_logger.warning.call_args[0][0]
+            assert "went backwards" in message and "Meter reset" not in message
+
+    def test_a_backward_step_drops_what_was_booked_ahead(self):
+        """The booked level must not survive a rebase as a phantom high-water mark."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 10, 0, 7)
+            store.get_delta("k", 100.0, t0, sensor_timestamp=t0 - timedelta(minutes=5))
+            store.get_delta(
+                "k", 100.6, t0 + timedelta(minutes=15),
+                sensor_timestamp=t0 + timedelta(minutes=5),
+            )
+            assert store._state["k"]["booked"] == pytest.approx(100.9)  # 0.6 * 15/10
+            store.get_delta(
+                "k", 100.2, t0 + timedelta(minutes=30),
+                sensor_timestamp=t0 + timedelta(minutes=20),
+            )
+            assert "booked" not in store._state["k"]
+            delta, valid = store.get_delta("k", 100.5, t0 + timedelta(minutes=45))
+            assert valid and delta == pytest.approx(0.3)
+
+
+class TestRecorderMultiSlotDelta:
+    """Finding (d): a delta that spans several slots.
+
+    After a recorder gap everything the counter moved arrives in one reading. It
+    used to land whole in one 15-minute row (3 h of load in one quarter), or be
+    zeroed by validation when above the per-slot limit. The row now gets the
+    share a uniform spread assigns to it and reports the whole span.
+    """
+
+    def test_three_hour_gap_books_this_slots_share(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 9, 0, 7)
+            store.get_delta("load_total", 5000.0, t0)
+            delta, valid = store.get_delta("load_total", 5012.0, t0 + timedelta(hours=3))
+
+            assert valid
+            assert delta == pytest.approx(12.0 * 900 / 10800)  # 1.0 kWh, not 12.0
+            assert store.multi_slot_deltas == {"load_total": {"kwh": 12.0, "seconds": 10800}}
+            # The whole span is consumed: the next quarter starts from the new reading.
+            nxt, _ = store.get_delta("load_total", 5013.0, t0 + timedelta(hours=3, minutes=15))
+            assert nxt == pytest.approx(1.0)
+
+    def test_gap_never_books_more_than_was_measured(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            history = _polled_counter(1.0, 24)
+            nine, noon = datetime(2026, 10, 1, 9, 0), datetime(2026, 10, 1, 12, 0)
+            deltas, first, last = _replay(store, history, 24, skip=lambda t: nine <= t < noon)
+            assert max(deltas) <= 0.45  # no row carries the 3 kWh of the gap
+            assert sum(deltas) <= last - first
+            assert sum(deltas) == pytest.approx(21 * 1.0, abs=0.5)  # 24 h minus the 3 h gap
+
+    def test_a_normal_quarter_and_a_late_cycle_are_not_flagged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 9, 0, 7)
+            store.get_delta("k", 10.0, t0)
+            store.get_delta("k", 10.5, t0 + timedelta(minutes=15, seconds=30))
+            store.get_delta("k", 11.0, t0 + timedelta(minutes=37))  # 21.5 min: one late cycle
+            assert store.multi_slot_deltas == {}
+
+    def test_an_idle_counter_across_a_gap_is_not_flagged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 9, 0, 7)
+            store.get_delta("grid_export_total", 800.0, t0)
+            delta, valid = store.get_delta("grid_export_total", 800.0, t0 + timedelta(hours=3))
+            assert (delta, valid) == (0.0, True)
+            assert store.multi_slot_deltas == {}
+
+
+class TestRecorderStateTransaction:
+    """Finding (c): a retry must not find the counters already consumed."""
+
+    def test_staged_readings_are_not_persisted_until_commit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            t0 = datetime(2026, 10, 6, 9, 0, 7)
+            store = RecorderStateStore(state_file)
+            store.get_delta("k", 10.0, t0)
+
+            store.begin()
+            assert store.get_delta("k", 10.5, t0 + timedelta(minutes=15))[0] == pytest.approx(0.5)
+            assert json.loads(state_file.read_text())["k"]["value"] == 10.0
+            store.rollback()
+            # Same question, same answer — in this object and in a fresh one.
+            assert store.get_delta("k", 10.5, t0 + timedelta(minutes=15))[0] == pytest.approx(0.5)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            store = RecorderStateStore(state_file)
+            store.get_delta("k", 10.0, t0)
+            store.begin()
+            store.get_delta("k", 10.5, t0 + timedelta(minutes=15))
+            store.commit()
+            assert json.loads(state_file.read_text())["k"]["value"] == 10.5
+            fresh = RecorderStateStore(state_file)
+            fresh.load()
+            assert fresh.get_delta("k", 10.5, t0 + timedelta(minutes=16))[0] == 0.0
+
+    def test_a_key_read_twice_in_one_cycle_sees_its_own_staged_reading(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RecorderStateStore(Path(tmpdir) / "state.json")
+            t0 = datetime(2026, 10, 6, 9, 0, 7)
+            store.get_delta("k", 10.0, t0)
+            store.begin()
+            assert store.get_delta("k", 10.5, t0 + timedelta(minutes=15))[0] == pytest.approx(0.5)
+            assert store.get_delta("k", 10.5, t0 + timedelta(minutes=15))[0] == 0.0
+
+    def test_without_a_transaction_every_reading_is_persisted_at_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            store = RecorderStateStore(state_file)
+            store.get_delta("k", 10.0, datetime(2026, 10, 6, 9, 0, 7))
+            assert json.loads(state_file.read_text())["k"]["value"] == 10.0
+
+
+_COUNTER_ENTITIES = {
+    "load_total": "sensor.total_load",
+    "grid_import_total": "sensor.total_import",
+    "grid_export_total": "sensor.total_export",
+    "battery_charge_total": "sensor.total_charge",
+    "battery_discharge_total": "sensor.total_discharge",
+}
+_READINGS_BEFORE = {
+    "sensor.total_load": 5000.0,
+    "sensor.total_import": 3000.0,
+    "sensor.total_export": 800.0,
+    "sensor.total_charge": 600.0,
+    "sensor.total_discharge": 500.0,
+}
+_READINGS_AFTER = {**_READINGS_BEFORE, "sensor.total_load": 5000.5, "sensor.total_import": 3000.5}
+
+
+class TestRecorderRetryAndGapEndToEnd:
+    """Findings (c) and (d) through record_observation_from_current_state, called
+    the way RecorderService._record_with_retry calls it (no state store passed)."""
+
+    @pytest.fixture
+    def config(self):
+        return {
+            "timezone": "Europe/Stockholm",
+            "learning": {"sqlite_path": ":memory:"},
+            "input_sensors": {
+                "pv_power": "sensor.pv_power",
+                "load_power": "sensor.load_power",
+                "grid_power": "sensor.grid_power",
+                "battery_power": "sensor.battery_power",
+                "battery_soc": "sensor.battery_soc",
+                "total_load_consumption": "sensor.total_load",
+                "total_grid_import": "sensor.total_import",
+                "total_grid_export": "sensor.total_export",
+                "total_battery_charge": "sensor.total_charge",
+                "total_battery_discharge": "sensor.total_discharge",
+            },
+            "system": {
+                "grid_meter_type": "net",
+                "has_battery": True,
+                "has_water_heater": False,
+                "grid": {"max_power_kw": 17},
+            },
+            "water_heaters": [],
+            "ev_chargers": [],
+        }
+
+    def _seed(self, state_file, minutes_ago, readings):
+        store = RecorderStateStore(state_file)
+        prev = (datetime.now(pytz.UTC) - timedelta(minutes=minutes_ago)).isoformat()
+        store._state = {
+            key: {"value": readings[entity], "timestamp": prev}
+            for key, entity in _COUNTER_ENTITIES.items()
+        }
+        store.save()
+
+    async def _cycle(self, config, state_file, readings, *, fail=False):
+        """One recorder cycle; returns the stored record, or None if it raised."""
+        now = datetime.now(pytz.UTC)
+
+        async def kw(entity):
+            return {"sensor.load_power": 2.0, "sensor.grid_power": 2.0}.get(entity, 0.0)
+
+        async def soc(entity):
+            return 50.0 if entity == "sensor.battery_soc" else None
+
+        async def entity_state(entity):
+            if entity not in readings:
+                return None
+            return {
+                "state": str(readings[entity]),
+                "attributes": {"unit_of_measurement": "kWh"},
+                "last_updated": now.isoformat(),
+            }
+
+        db = MagicMock()
+        db.get_system_state = AsyncMock(return_value=None)
+        db.set_system_state = AsyncMock()
+        db.store_slot_observations = AsyncMock(
+            side_effect=RuntimeError("database is locked") if fail else None
+        )
+        db.close = AsyncMock()
+        with (
+            patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=kw),
+            patch("backend.recorder.get_ha_sensor_float", side_effect=soc),
+            patch("backend.recorder.get_ha_entity_state", side_effect=entity_state),
+            patch(
+                "backend.recorder.get_energy_from_power_history",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("backend.recorder.get_nordpool_data", return_value=None),
+            patch("backend.recorder.LearningStore", return_value=db),
+            patch(
+                "backend.recorder.RecorderStateStore",
+                side_effect=lambda *_a, **_k: RecorderStateStore(state_file),
+            ),
+        ):
+            if fail:
+                with pytest.raises(RuntimeError):
+                    await record_observation_from_current_state(config)
+                return None
+            await record_observation_from_current_state(config)
+        return db.store_slot_observations.call_args[0][0].iloc[0].to_dict()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_a_failed_write_records_the_same_energy(self, config):
+        """Attempt 1 raises at the DB write AFTER every delta was taken. Attempt 2
+        used to read 0.0 from every counter and store a zero row."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            self._seed(state_file, 15, _READINGS_BEFORE)
+
+            assert await self._cycle(config, state_file, _READINGS_AFTER, fail=True) is None
+            # Nothing was committed by the failed attempt.
+            assert json.loads(state_file.read_text())["load_total"]["value"] == 5000.0
+
+            record = await self._cycle(config, state_file, _READINGS_AFTER)
+            assert record["load_kwh"] == pytest.approx(0.5)
+            assert record["import_kwh"] == pytest.approx(0.5)
+            assert not record.get("quality_flags")
+            # ...and now it is.
+            assert json.loads(state_file.read_text())["load_total"]["value"] == 5000.5
+
+    @pytest.mark.asyncio
+    async def test_a_lost_quarter_is_shared_out_and_flagged(self, config):
+        """Both attempts failed for the previous quarter, so this reading spans two.
+        The row gets one quarter's share and says so; a normal row says nothing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            self._seed(state_file, 30, _READINGS_BEFORE)
+            two_quarters = {**_READINGS_BEFORE, "sensor.total_load": 5001.0, "sensor.total_import": 3001.0}
+
+            record = await self._cycle(config, state_file, two_quarters)
+
+            assert record["load_kwh"] == pytest.approx(0.5, abs=0.01)
+            assert record["import_kwh"] == pytest.approx(0.5, abs=0.01)
+            flags = json.loads(record["quality_flags"])
+            assert set(flags) == {"multi_slot_delta"}
+            assert set(flags["multi_slot_delta"]) == {"load_total", "grid_import_total"}
+            assert flags["multi_slot_delta"]["load_total"]["kwh"] == pytest.approx(1.0)
+            assert flags["multi_slot_delta"]["load_total"]["seconds"] == pytest.approx(1800, abs=5)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_quarter_writes_no_flags(self, config):
+        """quarantine.py reads NULL / '{}' as "no writer claimed this row"."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "recorder_state.json"
+            self._seed(state_file, 15, _READINGS_BEFORE)
+            record = await self._cycle(config, state_file, _READINGS_AFTER)
+            assert "quality_flags" not in record or not record["quality_flags"]
 
 
 class TestBackfillInterpolation:
