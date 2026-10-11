@@ -1,3 +1,7 @@
+## dev-20261011.0708 — 2026-10-11 07:10
+
+- fix: audit safety batch — DST replan crash, executor survival, real heartbeat
+
 ## dev-20260929.1506 — 2026-09-29 15:08
 
 - feat(ev): wake a car we cannot see when a deadline is coming
