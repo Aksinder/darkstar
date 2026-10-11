@@ -1,3 +1,7 @@
+## dev-20261011.1744 — 2026-10-11 17:46
+
+- fix: audit batch 4 — boost respects fuse and groups, outage rows, pinned actions
+
 ## dev-20261011.1726 — 2026-10-11 17:27
 
 - fix: audit batch 3 — EV switch memory, stale-plan alarm, upstream ports
