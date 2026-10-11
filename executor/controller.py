@@ -252,6 +252,22 @@ class Controller:
         # then command max_discharge regardless — a 0.3 kW planned discharge in a
         # sunny slot became a 9.5 kW dump to the SoC floor (2026-09-12, seven times).
         battery_to_grid_kw = min(slot.export_kw, slot.discharge_kw)
+        # Floor for the two branches below that choose self_consumption on the
+        # strength of a PV FORECAST (the PV-driven charge and the PV-surplus hold).
+        # Both assume the roof covers the house; when it does not, self_consumption
+        # serves the house from the battery and nothing in either branch stops it —
+        # the PV-charge branch never looks at SoC, and the hold branch is only
+        # reached once SoC is already at or below the slot target. Live 2026-10-05
+        # 10:41-12:00: Hold slots at target 10 %, forecast PV 2.5-3.1 kW over a
+        # 1.2-1.6 kW load, and the pack went 7.7 -> 2.2 -> 0.0 % while every replan
+        # answered with a 1-3 minute grid-charge burst of up to 7 kW that the next
+        # slot spent again (2026-10-03 and -04 the same, in PV-charge slots too).
+        # At or below min_soc these branches hold instead: idle blocks discharge
+        # only, so real PV surplus still charges the pack, and one sensor step above
+        # the floor the ordinary rules apply again. An unknown SoC changes nothing.
+        at_floor = state.soc_known and (
+            round(state.current_soc_percent) <= state.min_soc_percent
+        )
         if battery_to_grid_kw > 0 and battery_to_grid_kw >= self.config.export_min_battery_kw:
             # Battery discharge to grid - use export mode.
             # R1 runtime SoC-floor guard (arbitrage gate): the export floor exists
@@ -327,7 +343,17 @@ class Controller:
             # battery idle while single-phase/transient loads the balanced PV feed
             # can't cover are pulled from the grid. Use self_consumption so the
             # battery covers those deficits and refills from the surplus PV.
-            mode_intent = "self_consumption"
+            # At the floor there is nothing to cover them with: hold, and let the
+            # PV that does arrive charge the pack (see at_floor above).
+            if at_floor:
+                logger.info(
+                    "PV-driven charge at the floor: SoC %.1f%% <= min_soc %.0f%% - idle "
+                    "(charges from real PV surplus, does not discharge)",
+                    state.current_soc_percent, state.min_soc_percent,
+                )
+                mode_intent = "idle"
+            else:
+                mode_intent = "self_consumption"
         elif round(state.current_soc_percent) <= slot.soc_target:
             # At or below SoC target - hold the battery.
             # Round current SoC to integer for consistent comparison with plan target.
@@ -339,7 +365,8 @@ class Controller:
             # the battery covers those deficits; the surplus PV refills it within the
             # slot, so net SoC is preserved. EV-charging slots stay idle to keep
             # battery→EV source isolation (handled by the dedicated branch below).
-            if slot.pv_kw > slot.load_kw and slot.ev_charging_kw <= 0.1:
+            # Not at the floor, though: the refill is a forecast (see at_floor above).
+            if slot.pv_kw > slot.load_kw and slot.ev_charging_kw <= 0.1 and not at_floor:
                 mode_intent = "self_consumption"
             else:
                 mode_intent = "idle"
