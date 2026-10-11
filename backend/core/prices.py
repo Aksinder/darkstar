@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -193,6 +193,46 @@ async def get_nordpool_data(
 
         traceback.print_exc()
         return []
+
+
+async def get_nordpool_data_for_date(
+    day: date, config_path: str = "config.yaml"
+) -> list[dict[str, Any]]:
+    """Processed slot prices for one PAST local day, straight from Nordpool.
+
+    get_nordpool_data() only ever holds today (and tomorrow), so a recorded slot
+    that missed its price could never be repaired afterwards. Not cached and
+    not memoised: this is called a handful of times per repair run, for days
+    whose prices no longer change. Returns [] on any failure.
+    """
+    import asyncio
+
+    with Path(config_path).open() as f:
+        config: dict[str, Any] = yaml.safe_load(f) or {}
+    # Same fee resolution as get_nordpool_data, so a repaired slot is priced
+    # the way a live one would be.
+    overrides = await _resolve_pricing_overrides(config)
+    if overrides:
+        config["pricing"] = {**config.get("pricing", {}), **overrides}
+    nordpool_config = config.get("nordpool", {})
+    price_area = nordpool_config.get("price_area", "SE4")
+    local_tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(
+                Prices(currency=nordpool_config.get("currency", "SEK")).fetch,
+                end_date=day,
+                areas=[price_area],
+                resolution=nordpool_config.get("resolution_minutes", 60),
+            ),
+            timeout=10.0,
+        )
+    except Exception as exc:
+        logger.warning("Nordpool fetch for %s failed: %s", day, exc)
+        return []
+    values = ((raw or {}).get("areas") or {}).get(price_area, {}).get("values", [])
+    entries = [v for v in values if v["start"].astimezone(local_tz).date() == day]
+    return _process_nordpool_data(entries, config) if entries else []
 
 
 def calculate_import_export_prices(
