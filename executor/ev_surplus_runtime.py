@@ -58,6 +58,11 @@ _CLAMP_STALE_AFTER_S = 3600.0
 _EV_READ_HOLD_S = 24 * 3600.0
 # Namespace of this controller's holds in backend/core/ev_hold_store.py.
 _HOLD_NAMESPACE = "servo"
+# A switch state must be this much newer than our last command to overrule it:
+# HA's optimistic echo of the command itself lands within a second or two.
+_SWITCH_RECONCILE_MARGIN_S = 30.0
+# At most one forced refresh per charger this often when a stop cannot wait.
+_STOP_VERIFY_INTERVAL_S = 120.0
 
 # Waking a car we cannot SEE. The wake button used to be pressed only after a failed
 # start — so a car whose entities went blank (the Tesla Fleet integration reports
@@ -718,6 +723,7 @@ class EVSurplusController:
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
         self._last_cmd_ts: dict[str, float] = {}
+        self._last_stop_verify_ts: dict[str, float] = {}
         # Epoch of the FIRST command of the current UNCONFIRMED episode — what the
         # commanded_draw_ttl_s bound is measured from. Deliberately not _last_cmd_ts,
         # which every write restamps and which would therefore let a servo that keeps
@@ -2110,6 +2116,54 @@ class EVSurplusController:
             return None
         return power
 
+    async def _reconcile_switch(self, ha: Any, ccfg: EVSurplusChargerCfg) -> None:
+        """Believe the switch entity when it CHANGED after our last command.
+
+        _last_switch is what Darkstar last asked for, and the switch is only
+        written when that changes. A car that stopped on its own (app, charge
+        limit, a start that did not take) therefore stayed "on" in memory and was
+        never started again — three sunny hours exporting 8 kW; one that started
+        on its own stayed "off" and could not be stopped. An entity state newer
+        than our last command and opposite to it is evidence the world moved.
+        Older-than-command states are ignored: they may simply not have caught up.
+        """
+        if ccfg.switch_entity is None:
+            return
+        remembered = self._last_switch.get(ccfg.id)
+        cmd_ts = self._last_cmd_ts.get(ccfg.id)
+        if remembered is None or cmd_ts is None:
+            return
+        try:
+            state = cast("dict[str, Any] | None", await ha.get_state(ccfg.switch_entity))
+        except Exception:
+            return
+        if not state:
+            return
+        raw = str(state.get("state")).strip().lower()
+        if raw not in ("on", "off") or (raw == "on") == remembered:
+            return
+        changed = state.get("last_changed") or state.get("last_updated")
+        if not isinstance(changed, str):
+            return
+        try:
+            changed_ts = datetime.fromisoformat(changed.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return
+        if changed_ts <= cmd_ts + _SWITCH_RECONCILE_MARGIN_S:
+            return
+        actual = raw == "on"
+        logger.warning(
+            "EV surplus: %s switch is %s since %.0f s after our last command, memory "
+            "said %s — adopting the device's state",
+            ccfg.id, raw, changed_ts - cmd_ts, "on" if remembered else "off",
+        )
+        self._last_switch[ccfg.id] = actual
+        if not actual:
+            # Same bookkeeping as a stop we issued: commanded_on derives from _last_a.
+            self._last_a[ccfg.id] = 0.0
+            self._subst_since.pop(ccfg.id, None)
+            self._subst_warned.discard(ccfg.id)
+
     def _adopt_on(self, ccfg: EVSurplusChargerCfg, power_w: float, why: str) -> None:
         """The car is drawing: remember it as ON and sync the amp memory to reality."""
         logger.info(
@@ -2175,6 +2229,27 @@ class EVSurplusController:
                         "found charging on a fresh read before turn_on "
                         f"(sensor was {'unread' if rep_age is None else f'{rep_age:.0f} s old'})",
                     )
+
+        # A stop that memory says is unnecessary, for a reason that cannot wait
+        # (fuse guard, owner's force_off): make sure the car really is off. It may
+        # have started itself since our last command, and its power sensor only
+        # polls every ~10 min — 37 A on one phase for nine ticks with no call sent.
+        if (
+            not cmd.switch_on
+            and ccfg.switch_entity is not None
+            and self._last_switch.get(ccfg.id) is False
+            and (cmd.fuse_limited or str(cmd.reason).startswith("override: force_off"))
+            and (now_ts - self._last_stop_verify_ts.get(ccfg.id, float("-inf")))
+            >= _STOP_VERIFY_INTERVAL_S
+        ):
+            rep_ts = self._power_report_ts.get(ccfg.id)
+            if rep_ts is None or (now_ts - rep_ts) > _START_VERIFY_STALE_S:
+                self._last_stop_verify_ts[ccfg.id] = now_ts
+                fresh = await self._verify_drawing(ha, ccfg)
+                if fresh is not None and fresh >= 100.0:
+                    self._adopt_on(ccfg, fresh, "found charging on a fresh read before a stop")
+
+        await self._reconcile_switch(ha, ccfg)
 
         # Switch: only toggle on change. `sw` carries what actually went to the
         # device (None = no switch write happened this tick).

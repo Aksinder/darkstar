@@ -29,6 +29,9 @@ from backend.validation import get_max_energy_per_slot, validate_energy_values
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("recorder")
 
+# The price series seen on the previous recorder wake (see the price lookup).
+_previous_price_series: list[dict[str, Any]] = []
+
 
 def finished_slot_bounds(now: datetime) -> tuple[datetime, datetime]:
     """[start, end) of the most recently COMPLETED 15-minute slot at ``now``.
@@ -707,12 +710,18 @@ async def record_observation_from_current_state(
     import_price = None
     export_price = None
     try:
+        global _previous_price_series
         _price_series = await get_nordpool_data()
-        for _p in _price_series or []:
+        # Also search the series from the previous wake. At 00:00:05 the finished
+        # slot is yesterday's 23:45, and the fresh series holds only today — so
+        # that slot went unpriced every single night and nothing repaired it.
+        for _p in [*(_price_series or []), *_previous_price_series]:
             if _p["start_time"] <= slot_start < _p["end_time"]:
                 import_price = _p.get("import_price_sek_kwh")
                 export_price = _p.get("export_price_sek_kwh")
                 break
+        if _price_series:
+            _previous_price_series = list(_price_series)
     except Exception as _price_exc:
         logger.warning(f"Price lookup for {slot_start} failed: {_price_exc}")
 

@@ -76,6 +76,10 @@ HEARTBEAT_ENTITY = "sensor.darkstar_executor_heartbeat"
 # the export floor unnoticed.
 SOC_HOLD_SECONDS = 300.0
 
+# The planner renews schedule.json every ~15 minutes. Two hours without a new one
+# is eight missed replans: report it.
+PLAN_STALE_SECONDS = 2 * 3600.0
+
 
 def isolate_slot_for_ev(slot: SlotPlan) -> SlotPlan:
     """The slot the controller sees while a car is actually drawing power.
@@ -265,6 +269,8 @@ class ExecutorEngine:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Held for the whole of a tick; see _tick.
+        self._tick_lock = threading.Lock()
 
         # Quick action storage (user-initiated time-limited overrides)
         self._quick_action: dict[str, Any] | None = None  # {type, expires_at, reason}
@@ -370,6 +376,7 @@ class ExecutorEngine:
         # Config and profile mtime caching
         self._config_mtime: float | None = None
         self._config_reload_error: str | None = None
+        self._plan_stale_notified = False
         # Set by _tick when the inverter dispatch actually ran; the background loop
         # turns it into the HA heartbeat. See _publish_heartbeat.
         self._dispatched_this_tick = False
@@ -1414,6 +1421,27 @@ class ExecutorEngine:
         await self.dispatcher.set_water_temp(temp, device.target_entity, bypass_dwell=True)
 
     async def _tick(self) -> dict[str, Any]:
+        """Run one tick, unless one is already running.
+
+        The background loop is not the only caller: "run now" and resume from the
+        API tick from the web server's thread. Two ticks at once share the dwell
+        latches, the servo state and the inverter mode write, so the second one is
+        refused rather than queued — the scheduled tick is at most a minute away.
+        """
+        if not self._tick_lock.acquire(blocking=False):
+            logger.warning("Tick skipped: another tick is still running")
+            return {
+                "success": False,
+                "executed_at": datetime.now(pytz.timezone(self.config.timezone)).isoformat(),
+                "actions": [{"type": "skip", "reason": "tick_in_progress"}],
+                "error": "tick already running",
+            }
+        try:
+            return await self._tick_inner()
+        finally:
+            self._tick_lock.release()
+
+    async def _tick_inner(self) -> dict[str, Any]:
         """
         Execute one tick of the executor loop.
 
@@ -1490,6 +1518,7 @@ class ExecutorEngine:
 
             # 2. Load current slot from schedule.json
             slot, slot_start = self._load_current_slot(now)
+            await self._check_plan_age()
             result["slot_start"] = slot_start
 
             if slot:
@@ -2404,8 +2433,10 @@ class ExecutorEngine:
                     },
                 )
 
-            # Rev F1: Update battery cost based on charging activity
-            await self._update_battery_cost(state, decision, slot)
+            # The per-tick battery-cost tracker used to run here. Nothing reads its
+            # result (the planner prices the battery from battery_economics), its
+            # arithmetic was wrong on W-unit inverters, and it opened a new DB engine
+            # and fetched prices every minute. Not called any more.
 
             self.status.last_run_status = "success"
             logger.info("Executor tick completed in %dms", duration_ms)
@@ -2540,6 +2571,39 @@ class ExecutorEngine:
             if len(ahead) >= slots_ahead:
                 break
         return cached[1], ahead
+
+    async def _check_plan_age(self) -> None:
+        """Say so, once, when the plan being followed has stopped being renewed.
+
+        The planner rewrites schedule.json every ~15 minutes. If it fails or hangs,
+        the executor keeps following the last file slot by slot — up to a day and a
+        half — and the only signal used to be the "no valid slot" fallback when the
+        file finally ran out. Control is deliberately unchanged: an old plan is
+        still a better guess than none. This only makes the failure visible.
+        """
+        try:
+            age_s = time.time() - Path(self.config.schedule_path).stat().st_mtime
+        except OSError:
+            return
+        if age_s >= PLAN_STALE_SECONDS:
+            if not self._plan_stale_notified:
+                self._plan_stale_notified = True
+                logger.error(
+                    "Plan is %.0f min old — the planner has stopped renewing it; "
+                    "still following it", age_s / 60.0,
+                )
+                if self.dispatcher:
+                    try:
+                        await self.dispatcher.notify_error(
+                            f"Planen har inte förnyats på {age_s / 3600.0:.1f} h. "
+                            "Darkstar följer den gamla planen tills planeraren "
+                            "kommer igång igen — kontrollera loggen."
+                        )
+                    except Exception:
+                        logger.debug("Stale-plan notification failed", exc_info=True)
+        elif self._plan_stale_notified:
+            self._plan_stale_notified = False
+            logger.info("Plan is being renewed again (%.0f min old)", age_s / 60.0)
 
     def _load_current_slot(self, now: datetime) -> tuple[SlotPlan | None, str | None]:
         """
