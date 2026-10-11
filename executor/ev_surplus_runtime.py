@@ -653,6 +653,13 @@ class EVSurplusController:
         # Last readable plug / home answers, for the unreadable-entity hold.
         self._last_good_plug: dict[str, tuple[bool, float]] = {}
         self._last_good_home: dict[str, tuple[bool, float]] = {}
+        # Last SoC actually read per charger, and which chargers are running on it
+        # right now. A parked car's SoC does not fall, so the remembered value is
+        # good enough to keep the deadline and plan floors armed through a
+        # blackout — with no SoC at all both floors switch off and the car gets
+        # nothing (2026-09-27/28: 13 %, departure 07:30, zero charge).
+        self._last_good_soc: dict[str, tuple[float, float]] = {}
+        self._soc_held: set[str] = set()
         self._hold_warned: set[str] = set()
         # ...and their copy on disk: without it an add-on restart during a blackout
         # of the car's entities reads "nothing to hold (never read) -> False", the car
@@ -1032,7 +1039,9 @@ class EVSurplusController:
             c = by_id.get(st.id)
             if c is None or c.soc_entity is None:
                 continue
-            if st.soc_percent is not None:
+            # A remembered SoC keeps the floors armed but is still blindness: the
+            # wake is what turns it back into a reading.
+            if st.soc_percent is not None and st.id not in self._soc_held:
                 self._blind_since.pop(st.id, None)
                 continue
             since = self._blind_since.setdefault(st.id, now_ts)
@@ -1076,8 +1085,14 @@ class EVSurplusController:
                 if isinstance(value, bool):
                     memory[key] = (value, ts)
                     restored += 1
+        for key, (value, ts) in persisted.get("soc", {}).items():
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                self._last_good_soc[key] = (float(value), ts)
+                restored += 1
         if restored:
-            logger.info("EV surplus: restored %d last-good plug/home reading(s) from disk", restored)
+            logger.info(
+                "EV surplus: restored %d last-good plug/home/SoC reading(s) from disk", restored
+            )
 
     def _persist_holds(self, now_ts: float) -> None:
         from backend.core import ev_hold_store
@@ -1089,6 +1104,7 @@ class EVSurplusController:
             {
                 "plug": cast("dict[str, tuple[Any, float]]", dict(self._last_good_plug)),
                 "home": cast("dict[str, tuple[Any, float]]", dict(self._last_good_home)),
+                "soc": cast("dict[str, tuple[Any, float]]", dict(self._last_good_soc)),
             },
             now_ts,
         )
@@ -1291,6 +1307,29 @@ class EVSurplusController:
             self._suc_notified.discard(c.id)
         override = str(res[3])
         soc = cast("float | None", res[4])
+        if c.soc_entity is not None:
+            if soc is not None:
+                # Whole percent: the store rewrites the file on every value change.
+                stored = float(round(soc))
+                if self._last_good_soc.get(c.id, (None, 0.0))[0] != stored:
+                    self._last_good_soc[c.id] = (stored, now_ts)
+                    self._persist_holds(now_ts)
+                else:
+                    self._last_good_soc[c.id] = (stored, now_ts)
+                if c.id in self._soc_held:
+                    self._soc_held.discard(c.id)
+                    logger.info("EV surplus: %s SoC readable again (%.0f %%)", c.id, soc)
+            else:
+                held_soc = self._last_good_soc.get(c.id)
+                if held_soc is not None and (now_ts - held_soc[1]) <= _EV_READ_HOLD_S:
+                    soc = held_soc[0]
+                    if c.id not in self._soc_held:
+                        self._soc_held.add(c.id)
+                        logger.warning(
+                            "EV surplus: %s SoC unreadable — using the last reading "
+                            "(%.0f %%, %.0f min old) so its charge floors stay armed",
+                            c.id, soc, (now_ts - held_soc[1]) / 60.0,
+                        )
         target = cast("float | None", res[5])
         if target is None:
             target = c.target_soc  # config-constant cap when no entity is wired/readable
@@ -1754,7 +1793,13 @@ class EVSurplusController:
                 else:
                     if held is not None and now_ts >= held[1]:
                         del self._plan_hold[st.id]
-                    self.last_plan_note[st.id] = "gated" if gated else "idle"
+                    # "gated" tells the engine the servo is skipping the slot ON
+                    # PURPOSE and mutes the charge-failure alarm. Not knowing the
+                    # SoC is not a purpose.
+                    if gated and ccfg.plan_gate_soc is not None and st.soc_percent is None:
+                        self.last_plan_note[st.id] = "soc_unknown"
+                    else:
+                        self.last_plan_note[st.id] = "gated" if gated else "idle"
             st.plan_floor_w = plan_w
 
         # Manual fleet priority: remap ChargerState.priority from the selected ordering.

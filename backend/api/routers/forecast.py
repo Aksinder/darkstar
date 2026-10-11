@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytz
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -430,38 +430,14 @@ class ToggleReflexRequest(BaseModel):
 async def toggle_reflex(payload: ToggleReflexRequest):
     """Enable or disable Aurora Reflex safely."""
     try:
-        import tempfile
+        from backend.config_migration import update_config
 
-        from ruamel.yaml import YAML
+        def _apply(data: Any) -> None:
+            data.setdefault("learning", {})["reflex_enabled"] = payload.enabled
 
-        config_path = Path("config.yaml")
-
-        # 1. Read existing config
-        yaml_handler = YAML()
-        yaml_handler.preserve_quotes = True
-
-        # Use a read lock if strictly necessary, but for now simple read is improved
-        if not config_path.exists():
-            raise HTTPException(500, "Config file not found")
-
-        with config_path.open("r", encoding="utf-8") as f:
-            loaded_yaml: Any = yaml_handler.load(f)  # type: ignore[no-untyped-call]
-            data: dict[str, Any] = cast("dict[str, Any]", loaded_yaml) if loaded_yaml else {}
-
-        # 2. Update data
-        learning_dict: dict[str, Any] = cast("dict[str, Any]", data.setdefault("learning", {}))
-        learning_dict["reflex_enabled"] = payload.enabled
-
-        # 3. Atomic Write: Write to temp file then move
-        # Create temp file in same directory to ensure atomic move works
-        with tempfile.NamedTemporaryFile(
-            "w", delete=False, dir=config_path.parent, encoding="utf-8", suffix=".tmp"
-        ) as tmp_f:
-            yaml_handler.dump(data, tmp_f)  # type: ignore[arg-type]
-            tmp_path = Path(tmp_f.name)
-
-        # Renaissance Move (Atomic Replace)
-        tmp_path.replace(config_path)
+        # Through the shared writer: the old temp-file + replace here replaced the
+        # /app/config.yaml SYMLINK instead of the real file behind it.
+        update_config(Path("config.yaml"), _apply)
 
         logger.info("Toggle Reflex: Set to %s", payload.enabled)
         return {"status": "success", "enabled": payload.enabled}

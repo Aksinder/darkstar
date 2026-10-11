@@ -1579,7 +1579,7 @@ class ExecutorEngine:
                         self._water_boost_until = None
                     # Send notification
                     if self.dispatcher:
-                        self.dispatcher._send_notification(  # type: ignore[protected-access]
+                        await self.dispatcher._send_notification(  # type: ignore[protected-access]
                             f"Water boost cancelled - battery too low ({state.current_soc_percent:.0f}% < {min_boost_soc:.0f}%)",
                             title="Darkstar Water Boost",
                         )
@@ -4336,7 +4336,10 @@ class ExecutorEngine:
         notes = getattr(self._ev_surplus, "last_plan_note", None) or {}
         if not notes:
             return False
-        return all(v != "active" for v in notes.values())
+        values = [str(v) for v in cast("dict[str, Any]", notes).values()]
+        if "soc_unknown" in values:
+            return False  # blind, not deliberate: let the failure alarm count
+        return all(v != "active" for v in values)
 
     def _ev_plan_actuation_possible(self) -> bool:
         """True when at least one charger can actually execute a planned EV slot.

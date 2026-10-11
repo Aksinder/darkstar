@@ -49,7 +49,7 @@ async def get_config() -> dict[str, Any]:
         if "home_assistant" in conf:
             cast("dict[str, Any]", conf["home_assistant"]).pop("token", None)
         if "notifications" in conf:
-            for key in ["api_key", "token", "password", "webhook_url"]:
+            for key in ["api_key", "token", "password", "webhook_url", "discord_webhook_url"]:
                 cast("dict[str, Any]", conf.get("notifications", {})).pop(key, None)
 
         return conf
@@ -106,7 +106,7 @@ async def download_config():
         if "home_assistant" in conf:
             cast("dict[str, Any]", conf["home_assistant"]).pop("token", None)
         if "notifications" in conf:
-            for key in ["api_key", "token", "password", "webhook_url"]:
+            for key in ["api_key", "token", "password", "webhook_url", "discord_webhook_url"]:
                 cast("dict[str, Any]", conf.get("notifications", {})).pop(key, None)
 
         # Convert to YAML string
@@ -854,6 +854,17 @@ async def reset_config() -> dict[str, str]:
     if default_cfg.exists():
         import shutil
 
-        shutil.copy(str(default_cfg), "config.yaml")
+        from backend.config_migration import CONFIG_WRITE_LOCK, create_timestamped_backup
+
+        # Keep what is being thrown away, and swap the file in one step so nothing
+        # reads a half-copied config. resolve(): config.yaml is a symlink in the
+        # add-on, and replace() on the link would replace the link.
+        target = Path("config.yaml").resolve()
+        with CONFIG_WRITE_LOCK:
+            if target.exists():
+                create_timestamped_backup(target)
+            tmp = target.with_name(target.name + ".reset.tmp")
+            shutil.copyfile(default_cfg, tmp)
+            tmp.replace(target)
         return {"status": "success"}
     return {"status": "error", "message": "Default config not found"}

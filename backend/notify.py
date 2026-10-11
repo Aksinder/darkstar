@@ -71,6 +71,9 @@ def _send_ha_notification(
             return False
 
         domain, svc_name = parts
+        if domain != "notify" and service != "persistent_notification.create":
+            logger.error("Refusing HA notification via non-notify service: %s", service)
+            return False
         endpoint = f"{ha_url.rstrip('/')}/api/services/{domain}/{svc_name}"
 
         response = requests.post(
