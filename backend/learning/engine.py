@@ -344,7 +344,13 @@ class LearningEngine:
                 df.set_index("timestamp")["power_value"]
                 .resample(f"{resolution_minutes}min")
                 .mean()
-                .reindex(slot_df["slot_start"].dt.floor("min"))
+                # Floor in UTC: a local floor raises on the repeated DST hour.
+                .reindex(
+                    slot_df["slot_start"]
+                    .dt.tz_convert("UTC")
+                    .dt.floor("min")
+                    .dt.tz_convert(self.timezone)
+                )
                 .fillna(0)
             )
 

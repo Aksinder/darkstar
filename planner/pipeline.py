@@ -749,15 +749,20 @@ class PlannerPipeline:
             if "adjusted_pv_kwh" in df.columns:
                 df["adjusted_pv_kwh"] = 0.0
 
-        # Determine 'now' slot
+        # Determine 'now' slot. Round in UTC and convert afterwards: flooring a
+        # LOCAL timestamp raises "Cannot infer dst time" for every instant of the
+        # repeated hour on the autumn DST night, which would fail every replan for
+        # two real hours. A quarter boundary is the same instant in UTC.
         tz = pytz.timezone(timezone_name)
         if now_override:
             if now_override.tzinfo is None:
-                now_slot = pd.Timestamp(now_override, tz="UTC").tz_convert(tz).ceil("15min")
+                now_slot = pd.Timestamp(now_override, tz="UTC").ceil("15min").tz_convert(tz)
             else:
-                now_slot = pd.Timestamp(now_override).tz_convert(tz).ceil("15min")
+                now_slot = (
+                    pd.Timestamp(now_override).tz_convert("UTC").ceil("15min").tz_convert(tz)
+                )
         else:
-            now_slot = pd.Timestamp.now(tz=tz).floor("15min")
+            now_slot = pd.Timestamp.now(tz="UTC").floor("15min").tz_convert(tz)
 
         # Per-device mid-block detection (task 3.1)
         # force_water_by_heater: heater_id → set of timestamps to force ON
@@ -1613,7 +1618,7 @@ class PlannerPipeline:
                         _win,
                         slot_min,
                         (
-                            " CLIPPED from %.1f h" % _lp.dynamic_window_hours
+                            f" CLIPPED from {_lp.dynamic_window_hours:.1f} h"
                             if _lp.dynamic_window_hours is not None
                             and _win * slot_min / 60.0 < _lp.dynamic_window_hours - 0.01
                             else ""
