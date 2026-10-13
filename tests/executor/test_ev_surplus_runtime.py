@@ -824,3 +824,60 @@ class TestNoRedundantTurnOn:
         await ctrl.run(ha, now_ts=1120.0)
         turn_ons = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
         assert not turn_ons, f"no tick may re-send turn_on, calls={ha.calls}"
+
+
+class TestOwnerMinimumLevelFloor:
+    """floor_soc_entity replaces the config floor for the recurring guarantee."""
+
+    def _charger(self, **over):
+        base = {
+            "id": "tesla", "priority": 1, "phases": 3,
+            "switch_entity": "switch.tesla", "current_entity": "number.tesla_amps",
+            "power_entity": "sensor.tesla_power", "plug_entity": "binary_sensor.tesla_plug",
+            # Oversized pack: the floor only forces once the required average power
+            # reaches the charger's minimum, whatever the hours left to 23:59 are.
+            "soc_entity": "sensor.tesla_soc", "capacity_kwh": 300,
+            "floor_soc": 40, "floor_soc_entity": "input_number.tesla_min_soc",
+            "recurring_deadline_days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "recurring_deadline_time": "23:59",
+            "min_current_a": 5, "max_current_a": 16,
+        }
+        base.update(over)
+        return base
+
+    async def _on_calls(self, states):
+        ha = FakeHA(_states(**{"sensor.pv": "0", "sensor.grid": "0", **states}))
+        cfg = parse_ev_surplus_config(_cfg_dict(chargers=[self._charger()]))
+        ctrl = EVSurplusController(cfg)
+        await ctrl.run(ha, now_ts=1_000_000.0)
+        return [c for c in ha.calls if c[:2] == ("switch", "turn_on")], ctrl
+
+    @pytest.mark.asyncio
+    async def test_baseline_deadline_forces_below_the_config_floor(self):
+        # Proves the fixture's recurrence really is binding, so the tests below
+        # are about the helper and not about a deadline that never fires.
+        on, _ = await self._on_calls({"sensor.tesla_soc": "20"})
+        assert on, "SoC 20 under the config floor 40 must grid-force"
+
+    @pytest.mark.asyncio
+    async def test_raised_minimum_forces_above_the_config_floor(self):
+        on, ctrl = await self._on_calls(
+            {"sensor.tesla_soc": "41", "input_number.tesla_min_soc": "90"}
+        )
+        assert on, "SoC 41 with minimum 90 must grid-force toward 90"
+        assert ctrl._live_floor_soc["tesla"] == 90.0
+
+    @pytest.mark.asyncio
+    async def test_lowered_minimum_releases_the_config_floor(self):
+        on, _ = await self._on_calls(
+            {"sensor.tesla_soc": "20", "input_number.tesla_min_soc": "10"}
+        )
+        assert not on, "SoC 20 with minimum 10 is satisfied"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_helper_keeps_the_config_floor(self):
+        on, ctrl = await self._on_calls(
+            {"sensor.tesla_soc": "41", "input_number.tesla_min_soc": "unavailable"}
+        )
+        assert not on, "config floor 40 is met at 41"
+        assert ctrl._live_floor_soc["tesla"] == 40.0
