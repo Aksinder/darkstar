@@ -116,3 +116,63 @@ def apply_departure_target(
         f"EV departure: {charger_id} leaves in {departure_in_hours:.1f} h — urgent band "
         f"raised {old:.0f}% -> {target_soc:.0f}% (value {top.value_sek:.2f} SEK/kWh)"
     ]
+
+
+def live_floor_soc(configured: float | None, live: float | None) -> float | None:
+    """The owner's live minimum-level helper, falling back to the config constant.
+
+    An unreadable helper (None — HA restarting, entity renamed) or a value outside
+    0-100 falls back to the configured ``floor_soc``, so a broken helper can never
+    remove or inflate the guarantee. 0 is a legal choice: "no guaranteed level".
+    """
+    if live is None or not 0.0 <= live <= 100.0:
+        return configured
+    return float(live)
+
+
+def track_floor_band(
+    band_soc: float | None, configured_floor: float | None, live_floor: float | None
+) -> float | None:
+    """Where a guarantee band's upper SoC sits once the owner moves the floor.
+
+    Shared by the planner (first incentive band) and the servo (plan-floor gate),
+    which must agree or the plan books slots the servo then refuses to back.
+    A band that IS the floor band (Tesla: band 40 == floor_soc 40) follows the
+    helper both ways. A band above the floor (FMB: comfort band 86, floor 40) is a
+    different number and only ever rises — lowering the minimum level must not
+    shrink the comfort band it sits inside.
+    """
+    if band_soc is None or live_floor is None:
+        return band_soc
+    if configured_floor is not None and abs(band_soc - configured_floor) < 1e-6:
+        return float(live_floor)
+    return max(float(band_soc), float(live_floor))
+
+
+def apply_floor_target(
+    chargers: list[EVChargerInput],
+    charger_id: str,
+    configured_floor: float | None,
+    live_floor: float | None,
+) -> list[str]:
+    """Move the charger's first band with the owner's minimum-level helper.
+
+    Runs BEFORE the one-off departure lift, which may raise the band further.
+    Later bands are lifted to at least the first so the ladder stays monotonic.
+    """
+    ch = next((c for c in chargers if c.id == charger_id), None)
+    if ch is None or not ch.incentive_buckets or live_floor is None:
+        return []
+    top = min(ch.incentive_buckets, key=lambda b: b.threshold_soc)
+    old = top.threshold_soc
+    new = track_floor_band(old, configured_floor, live_floor)
+    if new is None or abs(new - old) < 1e-6:
+        return []
+    top.threshold_soc = new
+    for b in ch.incentive_buckets:
+        if b.threshold_soc < new:
+            b.threshold_soc = new
+    return [
+        f"EV minimum level: {charger_id} guarantee band {old:.0f}% -> {new:.0f}% "
+        f"(value {top.value_sek:.2f} SEK/kWh)"
+    ]

@@ -1215,6 +1215,11 @@ executor:
       #                      the weekday recurrence is still guaranteed); the recurrence keeps the
       #                      low floor_soc band. A PAST departure timestamp is ignored entirely.
       #                      The planner also lifts the car's urgent penalty band to the trip target.
+      #   floor_soc_entity   OPTIONAL input_number (%): owner-settable minimum level. When readable
+      #                      (0-100) it replaces floor_soc as the guaranteed level at the recurring
+      #                      deadline; unreadable => floor_soc. The planner's first penalty band and
+      #                      the plan-floor gate follow it (a band equal to floor_soc tracks it both
+      #                      ways, a higher comfort band only rises). 0 = no guaranteed level.
       #   supercharger_price_sek_per_kwh  (ev_surplus level) alert threshold: when a FUTURE one-off
       #                      departure grid-forces at-home charging at a full import price above
       #                      this, notify once per plug-in session that supercharging on the road is

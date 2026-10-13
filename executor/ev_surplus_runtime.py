@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from planner.ev_priority import live_floor_soc, track_floor_band
+
 from .ev_surplus import (
     ChargerCommand,
     ChargerState,
@@ -168,6 +170,10 @@ class EVSurplusChargerCfg:
     # value per owner decision — the current SoC comes from soc_entity, the comfort cap from
     # target_soc_entity; this is the third, distinct number. None => floor uses the cap (legacy).
     floor_soc: float | None = None
+    # Owner-settable minimum level (input_number, %). When wired AND readable it replaces
+    # floor_soc as the guarantee target, and the plan-floor gate moves with it; unreadable
+    # or out of range => floor_soc. One-off departures still charge toward the trip target.
+    floor_soc_entity: str | None = None
     # Recurring deadline (e.g. the commuter car's weekday 07:30): days as lowercase
     # three-letter names, local wall-clock time "HH:MM" in `timezone`. Effective deadline =
     # earliest(future departure_entity timestamp, next recurring occurrence) — the
@@ -514,6 +520,7 @@ def parse_ev_surplus_config(
                 departure_entity=c.get("departure_entity") or None,
                 departure_target_entity=c.get("departure_target_entity") or None,
                 floor_soc=_f(c.get("floor_soc")),
+                floor_soc_entity=c.get("floor_soc_entity") or None,
                 recurring_deadline_days=tuple(
                     str(d).lower()[:3]
                     for d in cast("list[Any]", c.get("recurring_deadline_days", []) or [])
@@ -698,6 +705,8 @@ class EVSurplusController:
         # held for >= PLAN_HOLD_S even if the next replan drops the slot — bounded
         # cost (<= 30 min at the held level), and the soc-gate still ends it early.
         self._plan_hold: dict[str, tuple[float, float]] = {}
+        # Effective guarantee floor per charger this tick (helper, else config).
+        self._live_floor_soc: dict[str, float | None] = {}
         # Why each plan_floor charger did/didn't act this tick ('active' /
         # 'gated' / 'vacation' / 'idle') — read by the engine's EV-charge-failure
         # notifier so an intentionally soc-gated plan is never counted as failure.
@@ -1277,6 +1286,7 @@ class EVSurplusController:
             self._read_f(ha, c.departure_target_entity, None),
             # Appended LAST so every existing res[N] index keeps its meaning.
             self._read_limit_with_ts(ha, c.readback_entity),
+            self._read_f(ha, c.floor_soc_entity, None),
         )
         power, power_ts, report_ts = cast(
             "tuple[float | None, float | None, float | None]", res[0]
@@ -1362,11 +1372,13 @@ class EVSurplusController:
         # proved a min-race silently reproduced the incident in exactly those
         # shapes. The recurrence never charges toward the trip target (that
         # distinction is the old charge-to-90-every-night bugfix, preserved).
-        floor_soc = c.floor_soc
+        base_floor = live_floor_soc(c.floor_soc, cast("float | None", res[9]))
+        self._live_floor_soc[c.id] = base_floor
+        floor_soc = base_floor
         deadline_hours: float | None = None
         pairs: list[tuple[float, float | None]] = []  # (hours, floor_for_that_deadline)
         if rec_ts is not None:
-            pairs.append(((rec_ts - now_ts) / 3600.0, c.floor_soc))
+            pairs.append(((rec_ts - now_ts) / 3600.0, base_floor))
         dep_future = dep_ts is not None and dep_ts > now_ts
         if dep_future:
             # Trip target precedence: explicit departure_target_entity if wired,
@@ -1378,8 +1390,8 @@ class EVSurplusController:
                 trip_target
                 if trip_target is not None
                 and trip_target > 0.0
-                and (c.floor_soc is None or trip_target > c.floor_soc)
-                else c.floor_soc
+                and (base_floor is None or trip_target > base_floor)
+                else base_floor
             )
             pairs.append(((dep_ts - now_ts) / 3600.0, one_off_floor))
         if pairs:
@@ -1773,10 +1785,15 @@ class EVSurplusController:
             raw_w = max(0.0, float((plan_kw or {}).get(st.id, 0.0)) * 1000.0)
             min_on_w = max(ccfg.min_current_a, cfg.policy.min_charge_current_a) \
                 * ccfg.voltage_v * ccfg.phases
+            # The gate follows the owner's minimum-level helper by the same rule the
+            # planner moves its first band with, so both sides agree on the band.
+            gate_soc = track_floor_band(
+                ccfg.plan_gate_soc, ccfg.floor_soc, self._live_floor_soc.get(st.id)
+            )
             gated = (
-                ccfg.plan_gate_soc is None
+                gate_soc is None
                 or st.soc_percent is None
-                or st.soc_percent >= ccfg.plan_gate_soc
+                or st.soc_percent >= gate_soc
             )
             plan_w = 0.0 if (gated or raw_w < min_on_w) else raw_w
             if plan_w > 0.0:

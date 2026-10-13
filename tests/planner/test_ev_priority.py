@@ -8,7 +8,13 @@ to its 86 % band while the Tesla stood at 41 % at departure.
 
 from __future__ import annotations
 
-from planner.ev_priority import apply_departure_target, apply_priority_order
+from planner.ev_priority import (
+    apply_departure_target,
+    apply_floor_target,
+    apply_priority_order,
+    live_floor_soc,
+    track_floor_band,
+)
 from planner.solver.types import EVChargerInput, IncentiveBucket
 
 
@@ -110,3 +116,51 @@ class TestDepartureTarget:
     def test_unknown_charger_is_inert(self):
         tesla = _tesla()
         assert apply_departure_target([tesla], "polestar", 9.0, 80.0, 43.0) == []
+
+
+class TestOwnerMinimumLevel:
+    """input_number minimum level moves the guarantee band (planner) and gate (servo)."""
+
+    def test_unreadable_or_out_of_range_helper_falls_back_to_config(self):
+        assert live_floor_soc(40.0, None) == 40.0
+        assert live_floor_soc(40.0, 140.0) == 40.0
+        assert live_floor_soc(40.0, -5.0) == 40.0
+        assert live_floor_soc(40.0, 60.0) == 60.0
+        assert live_floor_soc(40.0, 0.0) == 0.0  # "no guaranteed level" is a legal choice
+
+    def test_floor_band_tracks_the_helper_both_ways(self):
+        # Tesla: band 40 IS the floor band.
+        assert track_floor_band(40.0, 40.0, 60.0) == 60.0
+        assert track_floor_band(40.0, 40.0, 25.0) == 25.0
+
+    def test_comfort_band_only_rises(self):
+        # FMB: comfort band 86 sits above floor 40 — a lower minimum must not shrink it.
+        assert track_floor_band(86.0, 40.0, 30.0) == 86.0
+        assert track_floor_band(86.0, 40.0, 60.0) == 86.0
+        assert track_floor_band(86.0, 40.0, 95.0) == 95.0
+
+    def test_no_band_or_no_floor_is_untouched(self):
+        assert track_floor_band(None, 40.0, 60.0) is None
+        assert track_floor_band(40.0, 40.0, None) == 40.0
+
+    def test_planner_band_raised_and_ladder_stays_monotonic(self):
+        t = _tesla()
+        notes = apply_floor_target([t], "tesla", 40.0, 95.0)
+        assert notes and "40% -> 95%" in notes[0]
+        assert [b.threshold_soc for b in t.incentive_buckets] == [95.0, 95.0]
+        assert t.incentive_buckets[0].value_sek == 2.5
+
+    def test_planner_band_lowered_for_the_floor_band(self):
+        t = _tesla()
+        apply_floor_target([t], "tesla", 40.0, 30.0)
+        assert [b.threshold_soc for b in t.incentive_buckets] == [30.0, 90.0]
+
+    def test_fmb_comfort_band_unchanged_by_a_lower_minimum(self):
+        f = _fmb()
+        assert apply_floor_target([f], "easee_fmb", 40.0, 30.0) == []
+        assert [b.threshold_soc for b in f.incentive_buckets] == [86.0, 100.0]
+
+    def test_no_helper_reading_is_a_noop(self):
+        t = _tesla()
+        assert apply_floor_target([t], "tesla", 40.0, None) == []
+        assert t.incentive_buckets[0].threshold_soc == 40.0

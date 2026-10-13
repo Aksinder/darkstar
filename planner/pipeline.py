@@ -123,7 +123,12 @@ async def _apply_ev_owner_levers(
     had bought every cheap night slot up to its 86 % band.
     """
     from backend.core.ha_client import get_ha_entity_state, get_ha_sensor_float
-    from planner.ev_priority import apply_departure_target, apply_priority_order
+    from planner.ev_priority import (
+        apply_departure_target,
+        apply_floor_target,
+        apply_priority_order,
+        live_floor_soc,
+    )
 
     chargers = getattr(kepler_config, "ev_chargers", None) or []
     if not chargers:
@@ -138,6 +143,17 @@ async def _apply_ev_owner_levers(
         mode = str((state or {}).get("state", "auto")).lower()
         for note in apply_priority_order(chargers, orders.get(mode)):
             logger.info("%s (select=%s)", note, mode)
+
+    # --- owner minimum level -> guarantee band --------------------------------
+    for c in surplus_cfg.get("chargers", []) or []:
+        floor_entity = c.get("floor_soc_entity")
+        if not floor_entity:
+            continue
+        cfg_floor = c.get("floor_soc")
+        cfg_floor = float(cfg_floor) if cfg_floor is not None else None
+        live = live_floor_soc(cfg_floor, await get_ha_sensor_float(str(floor_entity)))
+        for note in apply_floor_target(chargers, str(c.get("id", "")), cfg_floor, live):
+            logger.info("%s", note)
 
     # --- one-off departures -> urgent-band extension --------------------------
     slots = getattr(kepler_input, "slots", None) or []
