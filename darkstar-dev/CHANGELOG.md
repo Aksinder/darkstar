@@ -1,3 +1,7 @@
+## dev-20261013.0815 — 2026-10-13 08:17
+
+- feat(ev): owner-settable minimum level per charger (floor_soc_entity)
+
 ## dev-20261011.2212 — 2026-10-11 22:14
 
 - feat(planner): optional water-floor deferral near the end of a day-bucket
