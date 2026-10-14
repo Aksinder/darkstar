@@ -63,6 +63,10 @@ _HOLD_NAMESPACE = "servo"
 # A switch state must be this much newer than our last command to overrule it:
 # HA's optimistic echo of the command itself lands within a second or two.
 _SWITCH_RECONCILE_MARGIN_S = 30.0
+# A switch that has disagreed with our memory for this long is believed whatever its
+# timestamps say. Longer than one Tesla Fleet poll (~10 min), so a state that is merely
+# late is never adopted; short enough that a wrong belief costs minutes, not a night.
+_SWITCH_DISAGREE_ADOPT_S = 900.0
 # At most one forced refresh per charger this often when a stop cannot wait.
 _STOP_VERIFY_INTERVAL_S = 120.0
 
@@ -74,6 +78,8 @@ _STOP_VERIFY_INTERVAL_S = 120.0
 _BLIND_WAKE_AFTER_S = 3600.0        # unreadable this long before a wake is spent on it
 _BLIND_WAKE_WINDOW_H = 12.0         # ...and only with a deadline this close
 _BLIND_WAKE_COOLDOWN_S = 3 * 3600.0  # at most four presses inside the window
+_FROZEN_WAKE_AFTER_S = 1800.0       # offline this long before its snapshot is doubted
+_FROZEN_WAKE_COOLDOWN_S = 2 * 3600.0  # a car that really is away costs <= 6 presses a night
 _UNREADABLE = {"", "unknown", "unavailable", "none"}
 # Before sending switch.turn_on, a power reading older than this is re-fetched
 # (homeassistant.update_entity) so a car that started itself is adopted instead of
@@ -115,6 +121,9 @@ class EVSurplusChargerCfg:
     # presses this once (cooldown-limited) so the backoff retry lands on a woken
     # car. Pressing costs one API call and no vehicle wake-lock beyond the usual.
     wake_entity: str | None = None
+    # Vehicle online/asleep sensor (binary_sensor, "on" = online). While it reads off,
+    # every other entity of the car is a frozen snapshot from its last poll.
+    online_entity: str | None = None
     # Believe what we COMMANDED while the power sensor has not yet caught up with it.
     # A Tesla reports charger power on a multi-minute poll, so right after a start the
     # servo reads 0 W from a car that is already pulling 5 kW — and since the control
@@ -506,6 +515,7 @@ def parse_ev_surplus_config(
                 override_entity=c.get("override_entity") or None,
                 override_timeout_minutes=float(c.get("override_timeout_minutes", 0.0) or 0.0),
                 wake_entity=c.get("wake_entity") or None,
+                online_entity=c.get("online_entity") or None,
                 trust_commanded_draw=bool(c.get("trust_commanded_draw", True)),
                 commanded_draw_ttl_s=float(c.get("commanded_draw_ttl_s", 900.0)),
                 priority=int(c.get("priority", 0)),
@@ -685,6 +695,8 @@ class EVSurplusController:
         self.last_power_report_age_s: dict[str, float | None] = {}
         self._last_ts: dict[str, float] = {}
         self._last_switch: dict[str, bool] = {}
+        # When the switch entity was first seen disagreeing with _last_switch (per charger).
+        self._switch_disagree_since: dict[str, float] = {}
         self._last_stop_ts: dict[str, float] = {}  # min-OFF dwell anchors
         self._battery_tier_prev: bool = False  # battery-assist SoC hysteresis memory
         self._battery_reserve_prev: bool = False  # battery fill-deadline hysteresis memory
@@ -729,6 +741,10 @@ class EVSurplusController:
         # on that (see _wake_blind_cars).
         self._blind_since: dict[str, float] = {}
         self._last_blind_wake_ts: dict[str, float] = {}
+        # Frozen-snapshot wake: online state per charger this tick, and when it went offline.
+        self._online: dict[str, bool | None] = {}
+        self._offline_since: dict[str, float] = {}
+        self._last_frozen_wake_ts: dict[str, float] = {}
         # When we last WROTE anything for a charger — a power reading older than
         # this cannot reflect the command (see trust_commanded_draw).
         self._last_cmd_ts: dict[str, float] = {}
@@ -1033,6 +1049,64 @@ class EVSurplusController:
             return resolved
         return str(v).lower() in {s.lower() for s in states}
 
+    async def _wake_frozen_cars(
+        self, ha: Any, states: list[ChargerState], now_ts: float, shadow: bool
+    ) -> None:
+        """Wake a sleeping car whose last snapshot says away/unplugged before a deadline.
+
+        2026-10-14: the Tesla's last poll was at 19:37, 2.8 km from home at 85 km/h. It
+        parked, was plugged in, and slept at 19:47 before Tesla Fleet polled again. The
+        integration then republished that snapshot every ten minutes — "away, no cable,
+        21 %" — so the servo kept it out of the plan all night while the car stood in
+        its cable at 19 % with a 07:30 deadline. The blind wake never fired: the SoC was
+        readable, and it requires the car to look plugged in and at home.
+
+        Rule: the online sensor has read offline for half an hour, the snapshot says
+        away or unplugged, a deadline is inside twelve hours and the last known SoC is
+        below its guarantee floor. Press wake, at most every two hours. A car that
+        really is elsewhere wakes, reports where it is, and sleeps again — a few
+        presses a night is the price of never missing the one night it is home.
+        """
+        by_id = {c.id: c for c in self.cfg.chargers}
+        for st in states:
+            c = by_id.get(st.id)
+            if c is None or c.online_entity is None:
+                continue
+            if self._online.get(st.id) is not False:
+                self._offline_since.pop(st.id, None)
+                continue
+            since = self._offline_since.setdefault(st.id, now_ts)
+            if c.wake_entity is None or shadow or c.shadow:
+                continue
+            if st.plugged and st.at_home:
+                continue  # the normal path starts it, and a failed start wakes it
+            hours = st.deadline_hours
+            if hours is None or hours <= 0.0 or hours > _BLIND_WAKE_WINDOW_H:
+                continue
+            soc, floor = st.soc_percent, st.floor_soc_percent
+            if soc is None or floor is None or soc >= floor:
+                continue
+            if (now_ts - since) < _FROZEN_WAKE_AFTER_S:
+                continue
+            last = self._last_frozen_wake_ts.get(st.id, float("-inf"))
+            if (now_ts - last) < _FROZEN_WAKE_COOLDOWN_S:
+                continue
+            if (now_ts - self._last_wake_ts.get(st.id, float("-inf"))) < 300.0:
+                continue
+            self._last_frozen_wake_ts[st.id] = now_ts
+            self._last_wake_ts[st.id] = now_ts
+            try:
+                await ha.call_service("button", "press", c.wake_entity)
+                logger.warning(
+                    "EV surplus: %s asleep for %.0f min, last snapshot %s at %.0f %% "
+                    "(floor %.0f %%) with a deadline in %.1f h — pressed %s to check",
+                    st.id, (now_ts - since) / 60.0,
+                    "away" if not st.at_home else "unplugged",
+                    soc, floor, hours, c.wake_entity,
+                )
+            except Exception as e:
+                logger.warning("EV surplus: wake press for sleeping %s failed: %s", st.id, e)
+
     async def _wake_blind_cars(
         self, ha: Any, states: list[ChargerState], now_ts: float, shadow: bool
     ) -> None:
@@ -1287,6 +1361,7 @@ class EVSurplusController:
             # Appended LAST so every existing res[N] index keeps its meaning.
             self._read_limit_with_ts(ha, c.readback_entity),
             self._read_f(ha, c.floor_soc_entity, None),
+            self._read_on(ha, c.online_entity, ("on", "online", "true"), True),
         )
         power, power_ts, report_ts = cast(
             "tuple[float | None, float | None, float | None]", res[0]
@@ -1372,6 +1447,7 @@ class EVSurplusController:
         # proved a min-race silently reproduced the incident in exactly those
         # shapes. The recurrence never charges toward the trip target (that
         # distinction is the old charge-to-90-every-night bugfix, preserved).
+        self._online[c.id] = None if c.online_entity is None else bool(res[10])
         base_floor = live_floor_soc(c.floor_soc, cast("float | None", res[9]))
         self._live_floor_soc[c.id] = base_floor
         floor_soc = base_floor
@@ -1768,6 +1844,7 @@ class EVSurplusController:
             )
         )
         await self._wake_blind_cars(ha, states, now_ts, shadow)
+        await self._wake_frozen_cars(ha, states, now_ts, shadow)
         # S3 plan floors: gate + continuity hold, then attach to the states.
         # Vacation gates the WHOLE attach (mirroring the unconditional deadline
         # clear): plan slots computed pre-vacation must not grid-force an away
@@ -2133,7 +2210,9 @@ class EVSurplusController:
             return None
         return power
 
-    async def _reconcile_switch(self, ha: Any, ccfg: EVSurplusChargerCfg) -> None:
+    async def _reconcile_switch(
+        self, ha: Any, ccfg: EVSurplusChargerCfg, now_ts: float | None = None
+    ) -> None:
         """Believe the switch entity when it CHANGED after our last command.
 
         _last_switch is what Darkstar last asked for, and the switch is only
@@ -2143,13 +2222,20 @@ class EVSurplusController:
         on its own stayed "off" and could not be stopped. An entity state newer
         than our last command and opposite to it is evidence the world moved.
         Older-than-command states are ignored: they may simply not have caught up.
+
+        A disagreement that PERSISTS for _SWITCH_DISAGREE_ADOPT_S is believed anyway
+        (needs ``now_ts``). Live 2026-10-14: a stale 3 kW reading made the servo adopt
+        ON one minute after its own turn_off; every later amp write moved the command
+        clock past the switch's off-time, so the off was "older than our command" for
+        six hours — no turn_on was ever sent and the Tesla left at 29 %, floor 40.
         """
         if ccfg.switch_entity is None:
             return
         remembered = self._last_switch.get(ccfg.id)
-        cmd_ts = self._last_cmd_ts.get(ccfg.id)
-        if remembered is None or cmd_ts is None:
+        if remembered is None:
+            self._switch_disagree_since.pop(ccfg.id, None)
             return
+        cmd_ts = self._last_cmd_ts.get(ccfg.id)
         try:
             state = cast("dict[str, Any] | None", await ha.get_state(ccfg.switch_entity))
         except Exception:
@@ -2157,23 +2243,44 @@ class EVSurplusController:
         if not state:
             return
         raw = str(state.get("state")).strip().lower()
-        if raw not in ("on", "off") or (raw == "on") == remembered:
+        if raw not in ("on", "off"):
             return
+        if (raw == "on") == remembered:
+            self._switch_disagree_since.pop(ccfg.id, None)
+            return
+        if now_ts is not None:
+            since = self._switch_disagree_since.setdefault(ccfg.id, now_ts)
+            persisted = (now_ts - since) >= _SWITCH_DISAGREE_ADOPT_S
+        else:
+            persisted = False
+        newer = False
+        changed_ts: float | None = None
         changed = state.get("last_changed") or state.get("last_updated")
-        if not isinstance(changed, str):
-            return
-        try:
-            changed_ts = datetime.fromisoformat(changed.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return
-        if changed_ts <= cmd_ts + _SWITCH_RECONCILE_MARGIN_S:
+        if isinstance(changed, str):
+            try:
+                changed_ts = datetime.fromisoformat(changed.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                changed_ts = None
+        if changed_ts is not None and cmd_ts is not None:
+            newer = changed_ts > cmd_ts + _SWITCH_RECONCILE_MARGIN_S
+        if not (newer or persisted):
             return
         actual = raw == "on"
-        logger.warning(
-            "EV surplus: %s switch is %s since %.0f s after our last command, memory "
-            "said %s — adopting the device's state",
-            ccfg.id, raw, changed_ts - cmd_ts, "on" if remembered else "off",
-        )
+        if newer:
+            logger.warning(
+                "EV surplus: %s switch is %s since %.0f s after our last command, memory "
+                "said %s — adopting the device's state",
+                ccfg.id, raw, cast("float", changed_ts) - cast("float", cmd_ts),
+                "on" if remembered else "off",
+            )
+        else:
+            logger.warning(
+                "EV surplus: %s switch has read %s for %.0f min while memory said %s — "
+                "adopting the device's state",
+                ccfg.id, raw, (cast("float", now_ts) - since) / 60.0,
+                "on" if remembered else "off",
+            )
+        self._switch_disagree_since.pop(ccfg.id, None)
         self._last_switch[ccfg.id] = actual
         if not actual:
             # Same bookkeeping as a stop we issued: commanded_on derives from _last_a.
@@ -2266,7 +2373,7 @@ class EVSurplusController:
                 if fresh is not None and fresh >= 100.0:
                     self._adopt_on(ccfg, fresh, "found charging on a fresh read before a stop")
 
-        await self._reconcile_switch(ha, ccfg)
+        await self._reconcile_switch(ha, ccfg, now_ts)
 
         # Switch: only toggle on change. `sw` carries what actually went to the
         # device (None = no switch write happened this tick).
@@ -2307,6 +2414,7 @@ class EVSurplusController:
                 self._clamp_notified.discard(ccfg.id)
             self._last_switch[ccfg.id] = cmd.switch_on
             sw = cmd.switch_on if not shadow else None
+            self._switch_disagree_since.pop(ccfg.id, None)
             # Any write invalidates a power reading older than it (trust_commanded_draw).
             self._last_cmd_ts[ccfg.id] = now_ts
 
