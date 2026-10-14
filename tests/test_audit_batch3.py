@@ -82,6 +82,44 @@ def test_unreadable_or_agreeing_switch_changes_nothing() -> None:
     assert ctrl._last_switch["tesla"] is True
 
 
+def _reconcile_at(ctrl: Any, ha: Any, now_ts: float) -> None:
+    asyncio.run(ctrl._reconcile_switch(ha, ctrl.cfg.chargers[0], now_ts))
+
+
+def test_persistent_disagreement_is_believed_despite_newer_commands() -> None:
+    # Live 2026-10-14: switch off at T0 (our own stop), memory flipped to ON by a stale
+    # reading, then amp writes kept the command clock ahead of the switch's off-time.
+    ctrl = _ctrl()
+    ctrl._last_switch["tesla"] = True
+    ctrl._last_a["tesla"] = 5.0
+    ctrl._last_cmd_ts["tesla"] = T0 + 3600  # an amp write long after the switch went off
+    ha = _SwitchHA("off", T0)
+    _reconcile_at(ctrl, ha, T0 + 3600)
+    _reconcile_at(ctrl, ha, T0 + 3600 + 600)
+    assert ctrl._last_switch["tesla"] is True, "ten minutes may still be poll lag"
+    _reconcile_at(ctrl, ha, T0 + 3600 + 900)
+    assert ctrl._last_switch["tesla"] is False, "fifteen minutes of 'off' is a fact"
+    assert ctrl._last_a["tesla"] == 0.0, "so the next tick sends a real turn_on"
+
+
+def test_agreement_resets_the_disagreement_clock() -> None:
+    ctrl = _ctrl()
+    ctrl._last_switch["tesla"] = True
+    ctrl._last_cmd_ts["tesla"] = T0 + 3600
+    _reconcile_at(ctrl, _SwitchHA("off", T0), T0 + 3600)
+    _reconcile_at(ctrl, _SwitchHA("on", T0 + 3700), T0 + 3600 + 600)
+    _reconcile_at(ctrl, _SwitchHA("off", T0), T0 + 3600 + 900)
+    assert ctrl._last_switch["tesla"] is True, "the clock restarted when they agreed"
+
+
+def test_persistence_needs_a_known_belief() -> None:
+    ctrl = _ctrl()
+    ha = _SwitchHA("off", T0)
+    _reconcile_at(ctrl, ha, T0)
+    _reconcile_at(ctrl, ha, T0 + 2000)
+    assert "tesla" not in ctrl._last_switch, "no memory => nothing to correct"
+
+
 # --- stale plan ------------------------------------------------------------
 
 
