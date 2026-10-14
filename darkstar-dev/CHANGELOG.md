@@ -1,3 +1,7 @@
+## dev-20261014.2124 — 2026-10-14 21:26
+
+- fix(ev): recover a wrong switch belief and wake a car hidden by a frozen snapshot
+
 ## dev-20261013.0815 — 2026-10-13 08:17
 
 - feat(ev): owner-settable minimum level per charger (floor_soc_entity)
