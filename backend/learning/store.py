@@ -488,7 +488,11 @@ class LearningStore:
             else:
                 slot_start_dt = pd.to_datetime(slot_start_raw)  # type: ignore[reportUnknownMemberType]
             if slot_start_dt.tzinfo is None:
-                slot_start_dt = slot_start_dt.tz_localize(self.timezone)
+                from utils.time_utils import dst_safe_localize
+
+                slot_start_dt = pd.Timestamp(
+                    dst_safe_localize(slot_start_dt.to_pydatetime(), self.timezone)
+                )
             # The in-progress slot is planned over its remaining minutes only
             # (kepler.partial_first_slot): its kWh are not a whole-slot plan. Keep the
             # plan stored while it was still a full future slot instead of
