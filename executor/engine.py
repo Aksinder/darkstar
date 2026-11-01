@@ -1156,9 +1156,22 @@ class ExecutorEngine:
     def _run_loop(self) -> None:
         """Main execution loop running in background thread."""
         try:
-            asyncio.run(self._async_run_loop())
+            asyncio.run(self._async_run_loop_with_shared_ha_client())
         except Exception as e:
             logger.exception("Fatal error in executor background loop: %s", e)
+
+    async def _async_run_loop_with_shared_ha_client(self) -> None:
+        """Run the loop with a shared HA httpx client, closed when the loop stops."""
+        from backend.core.ha_client import close_ha_http_client, enable_shared_ha_http_client
+
+        enable_shared_ha_http_client()
+        try:
+            await self._async_run_loop()
+        finally:
+            try:
+                await close_ha_http_client()
+            except Exception as e:
+                logger.warning("Failed to close executor's shared HA HTTP client: %s", e)
 
     async def _publish_heartbeat(self, tick_start: datetime) -> None:
         """Tell HA that this tick reached the inverter dispatch.

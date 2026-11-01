@@ -73,3 +73,20 @@ def _reset_nordpool_fail_memo():
     prices._fetch_fail_until = 0.0
     yield
     prices._fetch_fail_until = 0.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_ha_http_client():
+    """The shared HA httpx client and the secrets cache are module globals.
+
+    Forget them on both sides of every test so a client created under one test's
+    event loop (or a mocked httpx.AsyncClient) never leaks into the next, and a
+    secrets.yaml written by one test is never served to another.
+    """
+    from backend.core import ha_client
+
+    ha_client._reset_ha_http_clients_for_tests()
+    secrets.clear_secrets_cache()
+    yield
+    ha_client._reset_ha_http_clients_for_tests()
+    secrets.clear_secrets_cache()

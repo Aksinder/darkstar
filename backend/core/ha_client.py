@@ -3,8 +3,9 @@ import contextlib
 import logging
 import math
 import re
+import threading
 import time as _time
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -26,6 +27,72 @@ from backend.core.ha_timestamps import reading_timestamp
 from backend.health import set_load_forecast_status
 
 logger = logging.getLogger("darkstar.core.ha_client")
+
+# Shared Home Assistant HTTP clients (port of upstream fdc75330, made opt-in per loop).
+# A fresh httpx.AsyncClient per call built a new SSL context every time - real CPU on
+# the 2-vCPU box. Only LONG-LIVED loops opt in: the FastAPI server loop (lifespan) and
+# the executor's background loop. Each gets its own client, because a client's pool is
+# bound to the loop that first used it. Every other loop (short asyncio.run loops in
+# recorder/ml scripts, to_thread helpers) gets a per-call client closed on exit, exactly
+# as before - caching those would leak sockets until GC once the loop is gone.
+# Value None = loop registered, client not created yet.
+_ha_http_clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient | None] = {}
+_ha_http_clients_lock = threading.Lock()
+
+
+def enable_shared_ha_http_client() -> None:
+    """Opt the CURRENT running loop in to a shared HA client.
+
+    Call only from a long-lived loop that will call close_ha_http_client() on exit.
+    """
+    loop = asyncio.get_running_loop()
+    with _ha_http_clients_lock:
+        for dead in [lp for lp in _ha_http_clients if lp.is_closed()]:
+            _ha_http_clients.pop(dead, None)
+        _ha_http_clients.setdefault(loop, None)
+
+
+def _shared_client_for(loop: asyncio.AbstractEventLoop) -> httpx.AsyncClient | None:
+    with _ha_http_clients_lock:
+        if loop not in _ha_http_clients:
+            return None
+        client = _ha_http_clients[loop]
+        if client is None or client.is_closed is not False:
+            client = httpx.AsyncClient()
+            _ha_http_clients[loop] = client
+        return client
+
+
+@contextlib.asynccontextmanager
+async def ha_http_client() -> AsyncIterator[httpx.AsyncClient]:
+    """Yield an httpx client for one HA call.
+
+    On a registered loop: the shared client, left open. Anywhere else: a fresh client,
+    closed on exit. Callers pass their own per-request ``timeout=``.
+    """
+    shared = _shared_client_for(asyncio.get_running_loop())
+    if shared is not None:
+        yield shared
+        return
+    async with httpx.AsyncClient() as client:
+        yield client
+
+
+async def close_ha_http_client() -> None:
+    """Close the current loop's shared client and opt the loop out again."""
+    loop = asyncio.get_running_loop()
+    with _ha_http_clients_lock:
+        client = _ha_http_clients.pop(loop, None)
+    if client is not None and client.is_closed is False:
+        await client.aclose()
+        logger.info("Closed shared Home Assistant HTTP client")
+
+
+def _reset_ha_http_clients_for_tests() -> None:
+    """Forget every registration (test isolation only; does not close clients)."""
+    with _ha_http_clients_lock:
+        _ha_http_clients.clear()
+
 
 # Last good EV SoC per charger, and how long it may stand in for a missing reading.
 #
@@ -173,8 +240,8 @@ async def get_ha_entity_state(entity_id: str) -> dict[str, Any] | None:
 
     endpoint = f"{url.rstrip('/')}/api/states/{entity_id}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(endpoint, headers=make_ha_headers(token))
+        async with ha_http_client() as client:
+            response = await client.get(endpoint, headers=make_ha_headers(token), timeout=10.0)
             response.raise_for_status()
             data = response.json()
             return data
@@ -305,8 +372,10 @@ async def get_energy_from_power_history(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            response = await client.get(api_url, headers=make_ha_headers(token), params=params)
+        async with ha_http_client() as client:
+            response = await client.get(
+                api_url, headers=make_ha_headers(token), params=params, timeout=12.0
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -1382,8 +1451,8 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
 
     try:
         print(f"Fetching {entity_id} data from Home Assistant...")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(api_url, headers=headers, params=params)
+        async with ha_http_client() as client:
+            response = await client.get(api_url, headers=headers, params=params, timeout=30.0)
             response.raise_for_status()
 
             data = response.json()

@@ -54,6 +54,11 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Darkstar ASGI Server Starting...")
 
+    # Long-lived server loop: HA REST calls share one httpx client (closed at shutdown).
+    from backend.core.ha_client import enable_shared_ha_http_client
+
+    enable_shared_ha_http_client()
+
     # 0. Model Bootstrap (REV // A24)
     # Ensure ML models are seeded before anything else tries to load them
     try:
@@ -247,6 +252,15 @@ async def lifespan(app: FastAPI):
         await benchmark_service.stop()
     except Exception as e:
         logger.error(f"Failed to stop hindsight benchmark: {e}")
+
+    # Close the shared HA HTTP client of this (the server's) event loop. The
+    # executor's loop owns its own client, which dies with that loop.
+    try:
+        from backend.core.ha_client import close_ha_http_client
+
+        await close_ha_http_client()
+    except Exception as e:
+        logger.error(f"Failed to close shared HA HTTP client: {e}")
 
     # Close LearningStore
     if hasattr(app.state, "learning_store") and app.state.learning_store:
