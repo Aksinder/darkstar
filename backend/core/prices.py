@@ -75,8 +75,14 @@ async def get_nordpool_data(
     if cached and len(cached) > 0:
         first_slot = cached[0]["start_time"]
         first_slot_date = first_slot.date() if hasattr(first_slot, "date") else today
+        # Only PUBLISHED prices count as "tomorrow": ML-forecast fill-ins
+        # (price_is_forecast) must not keep the cache alive past the ~13:00
+        # auction, or the forecast is served for up to an hour after real
+        # prices exist.
         has_tomorrow = any(
-            s["start_time"].date() > today for s in cached if hasattr(s["start_time"], "date")
+            s["start_time"].date() > today and not s.get("price_is_forecast")
+            for s in cached
+            if hasattr(s["start_time"], "date")
         )
 
         if first_slot_date < today:
@@ -144,8 +150,13 @@ async def get_nordpool_data(
 
         all_entries = today_values + tomorrow_values
 
-        # If no tomorrow data yet (before ~13:00 CET auction), try forecast fallback
-        if not tomorrow_values and now.hour < 13:
+        # If no tomorrow data yet (before ~13:00 CET auction), try forecast fallback.
+        # Skipped when export_includes_spot is false: the model is trained on the
+        # observed export price, which then carries no spot, so it cannot yield one.
+        _forecast_usable = bool(
+            (config.get("pricing", {}) or {}).get("export_includes_spot", True)
+        )
+        if not tomorrow_values and now.hour < 13 and _forecast_usable:
             try:
                 from ml.price_forecast import get_d1_price_forecast_fallback
 
