@@ -86,6 +86,12 @@ ACTION_FAILURE_NOTIFY_STREAK = 3
 # Hold-slot fuse relief stays on this long after the last over-budget reading, so
 # the EMS mode does not flap idle <-> self_consumption at the threshold.
 HOLD_FUSE_RELIEF_HOLD_S = 300.0
+# Manual-mode fuse relief treats a charger as drawing above this many amps/phase.
+MANUAL_RELIEF_DRAW_A = 1.0
+# An unreadable manual-override entity holds its last ON state at most this long.
+MANUAL_UNREADABLE_MAX_S = 3600.0
+# Balancer states that mean the FUSE drove the target (not the plan).
+_FUSE_DRIVEN_LB_STATES = frozenset({"throttling", "paused", "stale_fallback"})
 # Rate limit for the "sensor reads non-numeric" warning in _sensor_kw (per entity).
 BAD_SENSOR_WARN_INTERVAL_S = 600
 
@@ -329,6 +335,8 @@ class ExecutorEngine:
         self._manual_override_since: float | None = None
         self._manual_reminder_last: float | None = None
         self._manual_last_known: bool | None = None
+        self._manual_unreadable_since: float | None = None
+        self._manual_dropped_unreadable: bool = False
         self._manual_fuse_cap_a: dict[str, float] = {}
         # Hold-slot fuse relief: epoch until which an idle Hold slot may run as
         # self_consumption because a phase sat at/over the fuse guard's budget.
@@ -1910,17 +1918,29 @@ class ExecutorEngine:
                 action_results.append(await self._manual_override_tick(decision, original_slot))
                 # Downward-only safety layers stay armed (fuse relief of charger
                 # current; balancer EV caps). Never raises, never starts anything.
+                safety_ok = True
                 try:
-                    action_results.extend(await self._manual_safety_tick(decision))
+                    safety_results = await self._manual_safety_tick(decision)
+                    safety_ok = all(r.success for r in safety_results)
+                    action_results.extend(safety_results)
                 except Exception as safety_exc:
+                    safety_ok = False
                     action_results.append(
                         self._isolated_failure(
                             "manual_safety", None, safety_exc, "Manual-mode fuse relief"
                         )
                     )
                 # Alive and guarding: publish the heartbeat (manual: true) so the HA
-                # dead-man watchdogs do not undo a deliberate manual session.
-                self._dispatched_this_tick = True
+                # dead-man watchdogs do not undo a deliberate manual session. NOT when
+                # the fuse relief failed this tick: then the executor is not guarding,
+                # and a run of such ticks must let the HA EV watchdog step in.
+                if safety_ok:
+                    self._dispatched_this_tick = True
+                else:
+                    logger.warning(
+                        "Manual override: fuse relief failed this tick — heartbeat "
+                        "withheld so the HA watchdogs can act if it persists"
+                    )
                 await self._check_manual_reminder()
                 result["actions"] = [
                     {
@@ -2668,6 +2688,8 @@ class ExecutorEngine:
             return
         self._manual_override_seen = active
         self._manual_would_have = None
+        dropped_unreadable = self._manual_dropped_unreadable and not active
+        self._manual_dropped_unreadable = False
         self._manual_override_since = time.time() if active else None
         self._manual_reminder_last = None
         # Caps written by the manual fuse relief are forgotten on exit: the servo,
@@ -2702,6 +2724,13 @@ class ExecutorEngine:
                         else "."
                     ),
                     title="Darkstar: manuellt läge",
+                )
+            elif dropped_unreadable:
+                await self.dispatcher._send_notification(  # type: ignore[protected-access]
+                    f"{entity} har varit oläsbar i över "
+                    f"{MANUAL_UNREADABLE_MAX_S / 60.0:.0f} min — Darkstar släpper "
+                    "manuellt läge och styr igen. Kontrollera entiteten.",
+                    title="Darkstar: manuellt läge släppt (oläsbar)",
                 )
             else:
                 await self.dispatcher._send_notification(  # type: ignore[protected-access]
@@ -2856,7 +2885,6 @@ class ExecutorEngine:
         if grid_w is not None:
             srv.last_grid_w = grid_w
 
-        servo_last_a = cast("dict[str, float]", getattr(srv, "_last_a", {}) or {})
         for ccfg in sorted(cfg.chargers, key=lambda c: -int(getattr(c, "priority", 0))):
             volt = float(ccfg.voltage_v) or 230.0
             credit = max(0.0, -(grid_w or 0.0)) / (3.0 * volt)
@@ -2874,29 +2902,33 @@ class ExecutorEngine:
                     ccfg.home_states
                 ):
                     continue
+            # Basis = what the car MEASURABLY draws, bounded by the device's own
+            # readback (a fresh read of the limit in force). Remembered values —
+            # the servo's pre-manual command, our own earlier cap — are never "in
+            # force" against a measured draw: the human may have restarted or
+            # raised the car since (servo at 0, human starts at 16 A => 16 A is
+            # what must be shed from). Without a measurable draw, a positive
+            # readback is the basis (a lagging Tesla sensor); with neither there is
+            # nothing to shed. Measured amps keep the cut proportional: a 2 A
+            # overload never becomes a full pause because of stale memory.
             power_w = await self._read_entity_float(ccfg.power_entity)
-            own_a = max(0.0, (power_w or 0.0) / (volt * max(1, int(ccfg.phases))))
-            own_a = min(own_a, float(ccfg.max_current_a))
-            known: list[float] = []
-            for v in (
-                self._manual_fuse_cap_a.get(ccfg.id),
-                servo_last_a.get(ccfg.id),
-                await self._read_entity_float(ccfg.readback_entity),
-            ):
-                if v is not None and v >= 0.0:
-                    known.append(float(v))
-            in_force = min(known) if known else None
-            if in_force is not None:
-                own_a = min(own_a, in_force)
-            if own_a <= 0.5 and not (in_force is not None and in_force > 0.0):
-                continue  # not drawing, nothing in force to lower
+            measured_a = max(0.0, (power_w or 0.0) / (volt * max(1, int(ccfg.phases))))
+            measured_a = min(measured_a, float(ccfg.max_current_a))
+            readback_a = await self._read_entity_float(ccfg.readback_entity)
+            if measured_a > MANUAL_RELIEF_DRAW_A:
+                own_a = measured_a if readback_a is None else min(measured_a, readback_a)
+            elif readback_a is not None and readback_a > 0.0:
+                own_a = min(readback_a, float(ccfg.max_current_a))
+            else:
+                continue  # no evidence of a draw: nothing to shed
+            if own_a <= 0.5:
+                continue
             floor_a = max(float(ccfg.min_current_a), float(cfg.policy.min_charge_current_a))
             cap_a = float(math.floor(max(0.0, own_a - excess)))
             controllable = bool(ccfg.current_entity or ccfg.easee_device_id)
             if cap_a < floor_a or not controllable:
                 cap_a = 0.0
-            ref = in_force if in_force is not None else own_a
-            if cap_a >= ref:
+            if cap_a >= own_a:
                 continue  # never a raise; already at/below this
             tag = " (shadow, not sent)" if (shadow or ccfg.shadow) else ""
             try:
@@ -2971,6 +3003,11 @@ class ExecutorEngine:
             ccfg = chargers.get(out.charger_id)
             servo = servo_a.get(out.charger_id)
             if ccfg is None or servo is None or servo <= 0:
+                continue
+            # Only fuse-driven targets. "idle" carries PLAN targets ("Plan ended"
+            # -> None, "At target" -> the plan ceiling): applying those would pause
+            # or cut the human's car for a plan they switched off.
+            if out.state not in _FUSE_DRIVEN_LB_STATES:
                 continue
             held = act._cap_in_force(out.charger_id, servo)  # type: ignore[protected-access]
             in_force = float(held) if held is not None else float(servo)
@@ -4816,13 +4853,30 @@ class ExecutorEngine:
         """
         if raw is None or str(raw).strip().lower() in ("", "unknown", "unavailable", "none"):
             held = self._manual_last_known
-            if held:
-                logger.warning(
-                    "Manual override entity %s unreadable (%r) — holding last state ON",
+            if not held:
+                return False
+            now = time.time()
+            if self._manual_unreadable_since is None:
+                self._manual_unreadable_since = now
+            if (now - self._manual_unreadable_since) > MANUAL_UNREADABLE_MAX_S:
+                # Bounded hold: a dead helper must not park the executor forever.
+                logger.error(
+                    "Manual override entity %s unreadable for > %.0f min — dropping "
+                    "manual control, executor resumes",
                     self.config.manual_override_entity,
-                    raw,
+                    MANUAL_UNREADABLE_MAX_S / 60.0,
                 )
-            return bool(held)
+                self._manual_last_known = False
+                self._manual_unreadable_since = None
+                self._manual_dropped_unreadable = True
+                return False
+            logger.warning(
+                "Manual override entity %s unreadable (%r) — holding last state ON",
+                self.config.manual_override_entity,
+                raw,
+            )
+            return True
+        self._manual_unreadable_since = None
         active = str(raw).strip().lower() == "on"
         self._manual_last_known = active
         return active
