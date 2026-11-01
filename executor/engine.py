@@ -21,6 +21,7 @@ import collections
 import contextlib
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -73,6 +74,12 @@ logger = logging.getLogger(__name__)
 # Published after every tick that reached the inverter dispatch; the HA dead-man
 # automations watch its age.
 HEARTBEAT_ENTITY = "sensor.darkstar_executor_heartbeat"
+# Consecutive failed ticks of one command type before ONE notification (upstream
+# b7cddc26 idea). Command rejections are deterministic, so lower than the EV
+# zero-power threshold (5). Reset when that command type next succeeds.
+ACTION_FAILURE_NOTIFY_STREAK = 3
+# Rate limit for the "sensor reads non-numeric" warning in _sensor_kw (per entity).
+BAD_SENSOR_WARN_INTERVAL_S = 600
 
 # How long a dropped SoC read may be bridged with the previous reading. Five
 # ticks: long enough for a Modbus hiccup, far too short for the battery to cross
@@ -298,6 +305,15 @@ class ExecutorEngine:
 
         # Override notification deduplication (Issue 3 fix)
         self._last_override_type: str | None = None
+        # Manual override (executor.manual_override_entity "on"): last seen state, so
+        # the enter/leave notification fires once per transition; and the last
+        # "would have done" summary, so the INFO line fires only when it changes.
+        self._manual_override_seen: bool = False
+        # Command-failure streaks per action type -> consecutive failed ticks, and
+        # the types already notified this streak (see _track_command_failures).
+        self._action_fail_counts: dict[str, int] = {}
+        self._action_fail_notified: set[str] = set()
+        self._manual_would_have: str | None = None
 
         # Cached system state for get_status() mode_intent computation
         self._last_system_state: SystemState | None = None
@@ -1569,6 +1585,12 @@ class ExecutorEngine:
                 state, self.config.controller.min_soc_release_margin_percent
             )
             self._last_system_state = state
+            # A human on manual owns the hardware: no inverter, EV, water, sink,
+            # cyclic-load, balancer or fuse-cap writes this tick. Telemetry, the
+            # decision journal and the execution record continue. See
+            # _manual_override_tick for the full contract.
+            skip_writes = getattr(state, "manual_override_active", False) is True
+            await self._note_manual_override_transition(skip_writes)
 
             # Emit live metrics for UI sparklines (Rev E1)
             try:
@@ -1704,8 +1726,14 @@ class ExecutorEngine:
                     "reason": override.reason,
                     "priority": override.priority,
                 }
-                # Only send notification on state transition (not every tick)
-                if current_override_type != self._last_override_type and self.dispatcher:
+                # Only send notification on state transition (not every tick).
+                # Manual override has its own enter/leave notice
+                # (_note_manual_override_transition) — not a second one here.
+                if (
+                    current_override_type != self._last_override_type
+                    and self.dispatcher
+                    and current_override_type != "manual_override"
+                ):
                     await self.dispatcher.notify_override(
                         override.override_type.value, override.reason
                     )
@@ -1790,6 +1818,7 @@ class ExecutorEngine:
                 if (
                     scheduled_ev_charging
                     and not actual_ev_charging
+                    and not skip_writes  # on manual nothing commands the charger
                     and not self._ev_power_fetch_failed
                     and self._ev_plan_actuation_possible()
                     and not self._ev_plan_intentionally_suppressed()
@@ -1842,12 +1871,24 @@ class ExecutorEngine:
             self._journal_decision(decision, slot, slot_start, state, now)
 
             # Control EV Charger Switch (per-device)
-            if self._has_ev_charger and self.config.ev_chargers:
+            if self._has_ev_charger and self.config.ev_chargers and not skip_writes:
                 await self._control_ev_charger(original_slot, now)
 
             # 6. Execute actions
             action_results: list[ActionResult] = []
-            if self.dispatcher:
+            if skip_writes:
+                action_results.append(await self._manual_override_tick(decision, original_slot))
+                result["actions"] = [
+                    {
+                        "type": r.action_type,
+                        "success": r.success,
+                        "message": r.message,
+                        "skipped": r.skipped,
+                        "error_details": r.error_details,
+                    }
+                    for r in action_results
+                ]
+            elif self.dispatcher:
                 # Per-tick control-pause cache (rent-out hands-off): each input_boolean
                 # is read at most once per tick even when shared across devices — the
                 # villavagn master toggle gates both the VVB and the AC sink.
@@ -2474,6 +2515,8 @@ class ExecutorEngine:
                         except Exception:
                             pass  # Silently fail if WebSocket not available
 
+                await self._track_command_failures(action_results)
+
                 result["actions"] = [
                     {
                         "type": r.action_type,
@@ -2565,6 +2608,95 @@ class ExecutorEngine:
                 pass  # Silently fail if WebSocket not available
 
         return result
+
+    async def _note_manual_override_transition(self, active: bool) -> None:
+        """One HA notice when manual override starts, one when it ends.
+
+        Gated on notifications.on_override_activated (the flag that already covers
+        overrides). The generic override notice is suppressed for manual_override so
+        entering manual mode never produces two messages.
+        """
+        if active == self._manual_override_seen:
+            return
+        self._manual_override_seen = active
+        self._manual_would_have = None
+        entity = self.config.manual_override_entity
+        if active:
+            logger.warning(
+                "Manual override ON (%s) — executor stops ALL writes (inverter, EV, "
+                "water, sinks, cyclic loads, load balancer, fuse cap); telemetry and "
+                "recording continue",
+                entity,
+            )
+        else:
+            logger.warning("Manual override OFF (%s) — executor resumes control", entity)
+        notif = getattr(getattr(self.config, "notifications", None), "on_override_activated", True)
+        if not self.dispatcher or not notif:
+            return
+        try:
+            if active:
+                await self.dispatcher._send_notification(  # type: ignore[protected-access]
+                    f"{entity} är på — Darkstar skriver ingenting till växelriktare, "
+                    "laddbox, varmvatten eller laster förrän det slås av. Säkringsvakt "
+                    "och min-SoC-skydd agerar inte heller; mätning och loggning fortsätter.",
+                    title="Darkstar: manuellt läge",
+                )
+            else:
+                await self.dispatcher._send_notification(  # type: ignore[protected-access]
+                    f"{entity} är av — Darkstar styr igen från nästa tick.",
+                    title="Darkstar: manuellt läge avslutat",
+                )
+        except Exception as e:
+            logger.warning("Manual override notification failed: %s", e)
+
+    async def _manual_override_tick(
+        self, decision: Any, slot: SlotPlan | None
+    ) -> ActionResult:
+        """The write-free tick body while executor.manual_override_entity is "on".
+
+        Decision (owner-facing contract, override.py: "executor will not change
+        settings"): a human on manual owns the hardware, so NOTHING is written —
+        not the inverter profile, EV chargers/servo, water heaters, sinks, cyclic
+        loads, deferrable appliances, and not the safety layers either: the 25 A
+        fuse guard, load-balancer caps/release and the min-SoC floor do not act
+        (balancer caps already in force stay in force until manual ends). What the
+        executor WOULD have done is logged (INFO on change) and put on the execution
+        record. The FMB SoC estimator still runs: it publishes telemetry sensors
+        and its operator helper, never hardware. The heartbeat is NOT published
+        (nothing commanded the inverter).
+        """
+        ev_plan = {
+            k: round(float(v), 2)
+            for k, v in (getattr(slot, "ev_charger_plans", None) or {}).items()
+            if v
+        }
+        would = (
+            f"mode={getattr(decision, 'mode_intent', None)} "
+            f"soc_target={getattr(decision, 'soc_target', None)} "
+            f"water_temp={getattr(decision, 'water_temp', None)} "
+            f"water_temps={getattr(decision, 'water_temps', None) or {}} "
+            f"ev={ev_plan}"
+        )
+        if would != self._manual_would_have:
+            self._manual_would_have = would
+            logger.info("Manual override: skipping writes; would have applied %s", would)
+        else:
+            logger.debug("Manual override: skipping writes; would have applied %s", would)
+
+        fmb = getattr(self, "_fmb_soc", None)
+        if fmb is not None and self.ha_client is not None:
+            try:
+                await fmb.run(self.ha_client, time.time(), shadow=self.config.shadow_mode)
+            except Exception as fmb_exc:
+                logger.warning("FMB SoC estimator error: %s", fmb_exc)
+
+        return ActionResult(
+            action_type="manual_override",
+            success=True,
+            skipped=True,
+            message=f"Manual override active - no writes (would have: {would})",
+            entity_id=self.config.manual_override_entity or None,
+        )
 
     def _journal_decision(
         self,
@@ -4212,6 +4344,77 @@ class ExecutorEngine:
             )
         return hold
 
+    async def _track_command_failures(self, action_results: list[ActionResult]) -> None:
+        """Notify once when one command type has failed ACTION_FAILURE_NOTIFY_STREAK
+        ticks in a row; reset when it next succeeds.
+
+        Counts only real failures (success False, not skipped). Refused writes
+        (unreachable entity, inverter fault gate: skipped, not successful) and
+        unverified writes have their own once-per-episode notices
+        (notify_unreachable / notify_inverter_fault / notify_unverified), so they
+        neither count nor reset here; any successful result (including "already at
+        target") resets its type. Goes through dispatcher.notify_error, i.e.
+        gated on notifications.on_error.
+        """
+        counts: dict[str, int] = self.__dict__.setdefault("_action_fail_counts", {})
+        notified: set[str] = self.__dict__.setdefault("_action_fail_notified", set())
+        failed_types: dict[str, ActionResult] = {}
+        ok_types: set[str] = set()
+        for r in action_results:
+            if not r.success and not r.skipped:
+                failed_types.setdefault(r.action_type, r)
+            elif r.success:
+                ok_types.add(r.action_type)
+        for t in ok_types - failed_types.keys():
+            if t in notified:
+                logger.info("Command %s succeeds again after a failure streak", t)
+            counts.pop(t, None)
+            notified.discard(t)
+        for t, r in failed_types.items():
+            counts[t] = counts.get(t, 0) + 1
+            if counts[t] >= ACTION_FAILURE_NOTIFY_STREAK and t not in notified:
+                notified.add(t)
+                msg = (
+                    f"Command {t} failed {counts[t]} ticks in a row"
+                    f"{f' ({r.entity_id})' if r.entity_id else ''}: {r.message}"
+                )
+                logger.warning(msg)
+                if self.dispatcher:
+                    try:
+                        await self.dispatcher.notify_error(msg)
+                    except Exception as e:
+                        logger.warning("Command-failure notification failed: %s", e)
+
+    def _sensor_kw(self, raw: Any, entity: str | None) -> float | None:
+        """A W power state as kW, or None when absent/unknown/non-numeric.
+
+        Never raises. A non-numeric (or non-finite) state logs a WARNING at most
+        once per BAD_SENSOR_WARN_INTERVAL_S per entity, so a sensor stuck on a
+        text state cannot spam the log every tick.
+        """
+        if raw is None or raw == "" or raw in ("unknown", "unavailable"):
+            return None
+        try:
+            val = float(raw)
+        except (ValueError, TypeError):
+            val = float("nan")
+        if math.isfinite(val):
+            return val / 1000
+        warned: dict[str, float] = self.__dict__.setdefault("_bad_sensor_warned", {})
+        key = entity or "?"
+        now = time.monotonic()
+        last = warned.get(key)
+        if last is None or now - last >= BAD_SENSOR_WARN_INTERVAL_S:
+            warned[key] = now
+            logger.warning(
+                "Sensor %s reads non-numeric %r — ignoring it this tick (warning "
+                "repeats at most every %d min)",
+                key,
+                raw,
+                BAD_SENSOR_WARN_INTERVAL_S // 60,
+            )
+        return None
+
     async def _gather_system_state(self) -> SystemState:
         """Gather current system state from Home Assistant."""
         state = SystemState()
@@ -4313,21 +4516,21 @@ class ExecutorEngine:
                     soc_str,
                 )
 
-            pv_str = results.get("pv_power")
-            if pv_str and pv_str not in ("unknown", "unavailable"):
-                state.current_pv_kw = float(pv_str) / 1000  # W to kW
-
-            load_str = results.get("load_power")
-            if load_str and load_str not in ("unknown", "unavailable"):
-                state.current_load_kw = float(load_str) / 1000
-
-            imp_str = results.get("grid_import")
-            if imp_str and imp_str not in ("unknown", "unavailable"):
-                state.current_import_kw = float(imp_str) / 1000
-
-            exp_str = results.get("grid_export")
-            if exp_str and exp_str not in ("unknown", "unavailable"):
-                state.current_export_kw = float(exp_str) / 1000
+            # Per-entity safe parse (upstream 42716df2 idea): one non-numeric
+            # power state used to raise here and skip every read below it —
+            # including manual_override. A bad reading keeps the field's default.
+            pv_kw = self._sensor_kw(results.get("pv_power"), pv_power_entity)
+            if pv_kw is not None:
+                state.current_pv_kw = pv_kw  # W to kW
+            load_kw = self._sensor_kw(results.get("load_power"), load_power_entity)
+            if load_kw is not None:
+                state.current_load_kw = load_kw
+            imp_kw = self._sensor_kw(results.get("grid_import"), import_entity)
+            if imp_kw is not None:
+                state.current_import_kw = imp_kw
+            exp_kw = self._sensor_kw(results.get("grid_export"), export_entity)
+            if exp_kw is not None:
+                state.current_export_kw = exp_kw
 
             work_mode = results.get("work_mode")
             if work_mode:
@@ -4391,6 +4594,14 @@ class ExecutorEngine:
         ev_isolation_reason: str | None = None,
     ) -> ExecutionRecord:
         """Create an execution record for logging."""
+        # Top-level failure reason on the record (existing error_message column,
+        # upstream b7cddc26): which commands failed and why, so the history view
+        # does not need the per-action JSON to answer "what went wrong".
+        error_message: str | None = None
+        if not success:
+            failed = [r for r in action_results if not r.success and not r.skipped]
+            if failed:
+                error_message = "; ".join(f"{r.action_type}: {r.message}" for r in failed)[:500]
         return ExecutionRecord(
             executed_at=now_iso,
             slot_start=slot_start or now_iso,
@@ -4440,6 +4651,7 @@ class ExecutorEngine:
             ],
             # Result
             success=1 if success else 0,
+            error_message=error_message,
             duration_ms=duration_ms,
             source="native",
             executor_version=EXECUTOR_VERSION,
