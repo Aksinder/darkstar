@@ -1,3 +1,7 @@
+## dev-20261101.1757 — 2026-11-01 17:59
+
+- Merge branch 'fix/review-safety' into integrate/round3
+
 ## dev-20261101.1443 — 2026-11-01 14:45
 
 - config: ship plan-age cutoff 120, fallback planner on, load balancer observe-only
