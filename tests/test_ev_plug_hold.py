@@ -51,6 +51,8 @@ async def _run(tmp_path, *, plug_state):
     cable = {"state": plug_state, "attributes": {}, "last_changed": None}
 
     async def fake_entity_state(entity_id):
+        if entity_id == "sensor.batt_soc":  # battery SoC is read as a full state
+            return {"state": "75.0"}
         return cable if entity_id == "binary_sensor.cable" else None
 
     with (

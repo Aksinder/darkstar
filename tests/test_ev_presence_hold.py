@@ -66,6 +66,8 @@ async def _run(tmp_path, *, zone_state, soc=64.0):
     tracker = {"state": zone_state, "attributes": {}, "last_changed": None}
 
     async def fake_entity_state(entity_id):
+        if entity_id == "sensor.batt_soc":  # battery SoC is read as a full state
+            return {"state": "75.0"}
         return tracker if entity_id == "device_tracker.car" else None
 
     with (
