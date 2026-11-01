@@ -36,6 +36,24 @@ _ORE_MAGNITUDE_CEILING_SEK = 5.0
 _FETCH_FAIL_MEMO_S = 300.0
 _fetch_fail_until: float = 0.0
 
+# After the ~13:00 auction a cached series without tomorrow's real prices is re-polled,
+# at most this often while tomorrow is simply unpublished (a failed D+1 fetch backs off
+# for _FETCH_FAIL_MEMO_S instead).
+_TOMORROW_UNPUBLISHED_RETRY_S = 60.0
+_tomorrow_retry_at: float = 0.0
+
+# Last successfully fetched+processed series (any pricing key). Served, minus past
+# slots, when a fetch fails entirely -- stale-but-valid beats [] while it covers now.
+_last_good_series: list[dict[str, Any]] = []
+_stale_logged_at: float = float("-inf")
+
+# Last good reading per price-override entity: (SEK/kWh, aware UTC read time). Used when
+# HA cannot be read, so a hiccup neither silently swaps in the config literals (different
+# fees) nor changes the cache key and forces a refetch. Entities currently being served
+# from memory are in _override_stale_logged (one warning per outage, not per call).
+_override_last_good: dict[str, tuple[float, datetime]] = {}
+_override_stale_logged: set[str] = set()
+
 
 async def get_nordpool_data(
     config_path: str = "config.yaml",
@@ -72,6 +90,8 @@ async def get_nordpool_data(
     now = datetime.now(local_tz)
     today = now.date()
 
+    import time as _time
+
     if cached and len(cached) > 0:
         first_slot = cached[0]["start_time"]
         first_slot_date = first_slot.date() if hasattr(first_slot, "date") else today
@@ -94,7 +114,15 @@ async def get_nordpool_data(
             if first_slot > current_slot_start:
                 cached = None
 
-        if cached and now.hour >= 13 and not has_tomorrow:
+        # Re-poll for tomorrow's real prices after the auction, but throttled: a late
+        # publication (or a failing D+1 endpoint) must not turn every executor tick
+        # into a blocking Nordpool round-trip.
+        if (
+            cached
+            and now.hour >= 13
+            and not has_tomorrow
+            and _time.monotonic() >= _tomorrow_retry_at
+        ):
             cached = None
 
         if cached:
@@ -106,91 +134,140 @@ async def get_nordpool_data(
     resolution_minutes = nordpool_config.get("resolution_minutes", 60)
 
     import asyncio
-    import time as _time
 
     global _fetch_fail_until
     if _time.monotonic() < _fetch_fail_until:
-        return []
+        return _stale_but_valid(now)
 
     prices_client = Prices(currency=currency)
 
-    try:
-        # Fetch prices for today and tomorrow using to_thread with timeout
-        raw_today = await asyncio.wait_for(
+    async def _fetch_day(day: date) -> list[dict[str, Any]]:
+        raw = await asyncio.wait_for(
             asyncio.to_thread(
                 prices_client.fetch,
-                end_date=today,
+                end_date=day,
                 areas=[price_area],
                 resolution=resolution_minutes,
             ),
             timeout=10.0,
         )
-        today_values = []
-        if raw_today and "areas" in raw_today and price_area in raw_today["areas"]:
-            today_raw = raw_today["areas"][price_area].get("values", [])
-            today_values = [v for v in today_raw if v["start"].astimezone(local_tz).date() == today]
+        if raw and "areas" in raw and price_area in raw["areas"]:
+            values = raw["areas"][price_area].get("values", [])
+            return [v for v in values if v["start"].astimezone(local_tz).date() == day]
+        return []
 
-        tomorrow_values = []
-        if now.hour >= 13:
-            tomorrow = today + timedelta(days=1)
-            raw_tomorrow = await asyncio.wait_for(
-                asyncio.to_thread(
-                    prices_client.fetch,
-                    end_date=tomorrow,
-                    areas=[price_area],
-                    resolution=resolution_minutes,
-                ),
-                timeout=10.0,
-            )
-            if raw_tomorrow and "areas" in raw_tomorrow and price_area in raw_tomorrow["areas"]:
-                all_raw = raw_tomorrow["areas"][price_area].get("values", [])
-                tomorrow_values = [
-                    v for v in all_raw if v["start"].astimezone(local_tz).date() == tomorrow
-                ]
-
-        all_entries = today_values + tomorrow_values
-
-        # If no tomorrow data yet (before ~13:00 CET auction), try forecast fallback.
-        # Skipped when export_includes_spot is false: the model is trained on the
-        # observed export price, which then carries no spot, so it cannot yield one.
-        _forecast_usable = bool(
-            (config.get("pricing", {}) or {}).get("export_includes_spot", True)
-        )
-        if not tomorrow_values and now.hour < 13 and _forecast_usable:
-            try:
-                from ml.price_forecast import get_d1_price_forecast_fallback
-
-                forecast_fallback = await get_d1_price_forecast_fallback(config)
-                if forecast_fallback:
-                    all_entries.extend(
-                        forecast_fallback_entries(
-                            forecast_fallback, config, local_tz, int(resolution_minutes)
-                        )
-                    )
-                    print(
-                        f"[get_nordpool_data] Using D+1 price forecast fallback ({len(forecast_fallback)} slots)"
-                    )
-            except Exception as exc:
-                print(f"Warning: Failed to get D+1 price forecast fallback: {exc}")
-
-        if not all_entries:
-            _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
-            return []
-
-        processed = _process_nordpool_data(all_entries, config)
-        cache_sync.set(cache_key, processed, ttl_seconds=3600.0)
-        return processed
+    try:
+        # Fetch prices for today and tomorrow using to_thread with timeout
+        today_values = await _fetch_day(today)
     except TimeoutError:
         _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
-        print("Warning: Nordpool price fetch timed out after 10 seconds, returning empty data")
-        return []
+        print("Warning: Nordpool price fetch timed out after 10 seconds")
+        return _stale_but_valid(now)
     except Exception as exc:
         _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
         print(f"Warning: Failed to fetch Nordpool prices: {exc}")
         import traceback
 
         traceback.print_exc()
+        return _stale_but_valid(now)
+
+    try:
+        tomorrow_values: list[dict[str, Any]] = []
+        if now.hour >= 13:
+            # A failing D+1 fetch must not throw away today's good prices: keep them
+            # and let the forecast fallback cover tomorrow (retried after the memo).
+            try:
+                tomorrow_values = await _fetch_day(today + timedelta(days=1))
+            except Exception as exc:
+                _set_tomorrow_retry(_FETCH_FAIL_MEMO_S)
+                logger.warning("Nordpool D+1 fetch failed, keeping today's prices: %s", exc)
+            else:
+                if not tomorrow_values:
+                    _set_tomorrow_retry(_TOMORROW_UNPUBLISHED_RETRY_S)
+
+        all_entries = today_values + tomorrow_values
+
+        # Tomorrow's real prices not available (before the ~13:00 auction, a late
+        # publication or a failed D+1 fetch): fill tomorrow from the price forecast.
+        # Skipped when export_includes_spot is false: the model is trained on the
+        # observed export price, which then carries no spot, so it cannot yield one.
+        _forecast_usable = bool(
+            (config.get("pricing", {}) or {}).get("export_includes_spot", True)
+        )
+        if not tomorrow_values and _forecast_usable:
+            try:
+                from ml.price_forecast import get_d1_price_forecast_fallback
+
+                forecast_fallback = await get_d1_price_forecast_fallback(config)
+                if forecast_fallback:
+                    fc_entries = forecast_fallback_entries(
+                        forecast_fallback, config, local_tz, int(resolution_minutes)
+                    )
+                    # Forecast only AFTER the last real slot: it never overrides a
+                    # published price, not even a partially overlapping one.
+                    if all_entries:
+                        last_real_end = max(e["end"] for e in all_entries)
+                        fc_entries = [e for e in fc_entries if e["start"] >= last_real_end]
+                    all_entries.extend(fc_entries)
+                    print(
+                        f"[get_nordpool_data] Using D+1 price forecast fallback ({len(fc_entries)} slots)"
+                    )
+            except Exception as exc:
+                print(f"Warning: Failed to get D+1 price forecast fallback: {exc}")
+
+        if not today_values:
+            # Nordpool answered without today's prices: nothing published to plan on.
+            _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
+            return _stale_but_valid(now)
+
+        processed = _process_nordpool_data(all_entries, config)
+        cache_sync.set(cache_key, processed, ttl_seconds=3600.0)
+        _remember_good_series(processed)
+        return processed
+    except Exception as exc:
+        _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
+        print(f"Warning: Failed to process Nordpool prices: {exc}")
+        import traceback
+
+        traceback.print_exc()
+        return _stale_but_valid(now)
+
+
+def _set_tomorrow_retry(seconds: float) -> None:
+    import time as _time
+
+    global _tomorrow_retry_at
+    _tomorrow_retry_at = _time.monotonic() + seconds
+
+
+def _remember_good_series(series: list[dict[str, Any]]) -> None:
+    global _last_good_series
+    _last_good_series = list(series)
+
+
+def _stale_but_valid(now: datetime) -> list[dict[str, Any]]:
+    """Future part of the last good price series, or [] if it no longer covers now.
+
+    Serves a whole-fetch outage from what was already known (e.g. yesterday's fetch
+    that included today) instead of handing the planner/servo nothing. Returned
+    slots keep their original prices and flags; only past slots are dropped.
+    """
+    if not _last_good_series:
         return []
+    remaining = [s for s in _last_good_series if s["end_time"] > now]
+    if not remaining or remaining[0]["start_time"] > now:
+        return []
+    import time as _time
+
+    global _stale_logged_at
+    if _time.monotonic() - _stale_logged_at >= _FETCH_FAIL_MEMO_S:
+        _stale_logged_at = _time.monotonic()
+        logger.warning(
+            "Nordpool unavailable: serving last good price series (%d slots, until %s)",
+            len(remaining),
+            remaining[-1]["end_time"].isoformat(),
+        )
+    return remaining
 
 
 async def get_nordpool_data_for_date(
@@ -442,6 +519,10 @@ async def _resolve_pricing_overrides(config: dict[str, Any]) -> dict[str, Any] |
     SEK/kWh overrides, so every price consumer (recorder ML labels, schedule/forecast APIs,
     planner) shares ONE effective export price. Returns ``None`` (making zero HA calls) when no
     ``export_*_entity`` is configured.
+
+    An entity that cannot be read (HA down, ``unavailable``, exception) uses its last good
+    value from this process, logged once per outage; only an entity never read successfully
+    falls back to the config literal.
     """
     pricing_cfg: dict[str, Any] = config.get("pricing", {}) or {}
     if not any(str(pricing_cfg.get(k, "") or "").strip() for k in PRICE_COMPONENT_ENTITY_KEYS):
@@ -454,15 +535,36 @@ async def _resolve_pricing_overrides(config: dict[str, Any]) -> dict[str, Any] |
         eid = str(pricing_cfg.get(ek, "") or "").strip()
         if not eid:
             continue
-        value = price_entity_to_sek(await ha_client.get_ha_entity_state(eid))
+        try:
+            value = price_entity_to_sek(await ha_client.get_ha_entity_state(eid))
+        except Exception as exc:
+            logger.debug("Pricing: reading %s failed: %s", eid, exc)
+            value = None
         if value is not None:
             values[eid] = value
+            _override_last_good[eid] = (value, datetime.now(pytz.UTC))
+            if eid in _override_stale_logged:
+                _override_stale_logged.discard(eid)
+                logger.info("Pricing: %s readable again (%.4f SEK/kWh)", eid, value)
+            continue
+        remembered = _override_last_good.get(eid)
+        if remembered is not None:
+            values[eid] = remembered[0]
+            if eid not in _override_stale_logged:
+                _override_stale_logged.add(eid)
+                logger.warning(
+                    "Pricing: %s unreadable; using last good value %.4f SEK/kWh from %s",
+                    eid,
+                    remembered[0],
+                    remembered[1].isoformat(),
+                )
+        elif eid not in _override_stale_logged:
+            _override_stale_logged.add(eid)
+            logger.warning(
+                "Pricing: %s unreadable and never read successfully; using the config literal.",
+                eid,
+            )
     if not values:
-        # At least one entity was configured (guard above) but none were readable — don't
-        # silently use stale literals without saying so.
-        logger.warning(
-            "Pricing: configured price entity(ies) unreadable; falling back to config literals."
-        )
         return None
     return resolve_export_price_components(pricing_cfg, lambda e: values.get(e))
 

@@ -196,6 +196,7 @@ async def test_get_nordpool_partial_timeout(temp_config_file):
         patch("backend.core.prices.Prices") as mock_prices_class,
         patch("backend.core.prices.datetime") as mock_datetime,
         patch("asyncio.to_thread", side_effect=mock_to_thread),
+        patch("ml.price_forecast.get_d1_price_forecast_fallback", return_value=None),
     ):
         # Mock cache.get to always return None so fetch is always called
         mock_cache.get.return_value = None
@@ -210,6 +211,7 @@ async def test_get_nordpool_partial_timeout(temp_config_file):
 
         # Should have attempted both calls
         assert call_count == 2
-        # But should return empty list because tomorrow failed
-        # (implementation returns [] if any fetch fails)
-        assert result == []
+        # A failed D+1 fetch no longer throws away today's good prices (it used to
+        # return [] and leave the planner/servo with nothing).
+        assert len(result) == 24
+        assert not any(s["price_is_forecast"] for s in result)
