@@ -159,6 +159,16 @@ def _phase_fraction_list(fractions: dict[str, float] | None) -> list[float] | No
     return [v / total for v in vals]
 
 
+def _phase_fraction_items(
+    fractions: dict[str, float] | None,
+) -> tuple[list[str], list[float] | None]:
+    """Phase keys (upper-cased, e.g. "A") alongside _phase_fraction_list's values."""
+    vals = _phase_fraction_list(fractions)
+    if vals is None or not fractions:
+        return [], None
+    return [str(k).strip().upper() for k in fractions], vals
+
+
 # Keep only this many failed-solve dumps; each is a few hundred KB.
 _SOLVER_DUMP_KEEP = 5
 
@@ -1035,16 +1045,29 @@ class KeplerSolver:
         if config.phase_aware_enabled and (
             config.phase_load_profile or config.phase_load_fractions
         ):
-            static_fracs = _phase_fraction_list(config.phase_load_fractions)
+            # Per-device phase allocation: planned EV / water-heater energy lands
+            # 1/len(phases) on each listed phase, evenly when a device has none.
+            # Only once SOME device (or a phase-known fixed load) declares phases —
+            # without any, the rows stay exactly the base-load-only form. Pure
+            # coefficients on existing variables: no new rows, no new vars.
+            phase_devices_on: bool = (
+                any(wh.phases for wh in water_heaters)
+                or any(c.phases for c in plugged_chargers)
+                or any(sl.phased_load_kwh for sl in slots)
+            )
+            static_keys, static_fracs = _phase_fraction_items(config.phase_load_fractions)
+            # Volts -> kV, so A * kV * h = kWh. 230 V reproduces the old 0.23 exactly.
+            kv_pa: float = (config.phase_nominal_voltage_v or 230.0) / 1000.0
             for t in range(T):
                 s_pa: Any = slots[t]
+                keys: list[str] = static_keys
                 fracs: list[float] | None = None
                 if config.phase_load_profile is not None:
-                    fracs = _phase_fraction_list(
+                    keys, fracs = _phase_fraction_items(
                         config.phase_load_profile.get(s_pa.start_time.hour)
                     )
                 if fracs is None:
-                    fracs = static_fracs
+                    keys, fracs = static_keys, static_fracs
                 if not fracs:
                     continue
                 n_ph = len(fracs)
@@ -1055,18 +1078,62 @@ class KeplerSolver:
                 if h_pa <= 0.0:
                     continue
                 # kWh a phase may draw this slot before the penalty starts: A * V * h.
-                relief_kwh: float = config.phase_relief_start_a * 0.23 * h_pa
+                relief_kwh: float = config.phase_relief_start_a * kv_pa * h_pa
                 # SEK per kWh above the threshold, from SEK per ampere-hour.
-                relief_price: float = config.phase_relief_sek_per_a_h / 0.23
+                relief_price: float = config.phase_relief_sek_per_a_h / kv_pa
                 # Real balanced supply to the house = PV + battery discharge - battery
                 # charge (charging consumes from the AC bus).
                 supply_pa: Any = s_pa.pv_kwh + discharge[t] - charge[t]
+                # (planned kWh expression, its most kWh this slot, its phases) for
+                # every controllable device.
+                dev_pa: list[tuple[Any, float, list[str]]] = []
+                base_pa: float = s_pa.load_kwh
+                known_pa: dict[str, float] = {}
+                if phase_devices_on:
+                    for wh in water_heaters:
+                        wh_on: Any = water_heat[wh.id][t]
+                        if wh.id in water_boost:
+                            wh_on = wh_on + water_boost[wh.id][t]
+                        e_wh = wh.power_kw * slot_hours[t]
+                        dev_pa.append((wh_on * e_wh, e_wh, wh.phases))
+                    for c in plugged_chargers:
+                        dev_pa.append((ev_energy[c.id][t], c.max_power_kw * slot_hours[t], c.phases))
+                    known_pa = {
+                        str(k).upper(): float(v) for k, v in (s_pa.phased_load_kwh or {}).items()
+                    }
+                    base_pa = max(0.0, s_pa.load_kwh - sum(known_pa.values()))
                 for k, f in enumerate(fracs):
+                    key = keys[k]
+                    dev_terms: list[Any] = []
+                    # Upper bound of this phase's draw above the threshold (every
+                    # device at full power, battery charging flat out, no discharge).
+                    ub_pa: float = (
+                        base_pa * f
+                        + known_pa.get(key, 0.0)
+                        - (s_pa.pv_kwh - config.max_charge_power_kw * slot_hours[t]) / n_ph
+                        - relief_kwh
+                    )
+                    for expr, e_max, phs in dev_pa:
+                        hits = [p for p in phs if p in keys]
+                        share = (1.0 / len(hits) if key in hits else 0.0) if hits else 1.0 / n_ph
+                        if share > 0.0:
+                            dev_terms.append(expr * share)
+                            ub_pa += e_max * share
+                    # A row that cannot bind even at full device power keeps pi at 0
+                    # either way; leaving the binaries out of it is exact and keeps
+                    # them from coupling into rows that never matter (solve time).
+                    if ub_pa <= 1e-9:
+                        dev_terms = []
                     pi: Any = pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
                         f"phase_over_{t}_{k}", lowBound=0.0
                     )
                     prob += (  # type: ignore[operator]
-                        pi >= s_pa.load_kwh * f - supply_pa / n_ph - relief_kwh
+                        pi
+                        >= base_pa * f
+                        + known_pa.get(key, 0.0)
+                        + pulp.lpSum(dev_terms)
+                        - supply_pa / n_ph
+                        - relief_kwh
                     )
                     total_cost.append(pi * relief_price)
 

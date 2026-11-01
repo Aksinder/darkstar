@@ -37,6 +37,14 @@ class TestCoarsening:
         assert groups[96] == [96, 97, 98, 99]
         assert coarse[96].end_time - coarse[96].start_time == timedelta(hours=1)
 
+    def test_phase_known_load_is_summed(self):
+        slots = _slots(4 + 4)
+        slots[5].phased_load_kwh = {"C": 0.1}
+        slots[6].phased_load_kwh = {"C": 0.1, "A": 0.05}
+        coarse, _ = coarsen_slots(slots, fine_hours=1)
+        assert coarse[4].phased_load_kwh == {"C": 0.2, "A": 0.05}
+        assert all(c.phased_load_kwh is None for c in coarse[:4])
+
     def test_energy_is_summed_and_price_averaged(self):
         """A merged slot must present the same ENERGY at the same average price —
         anything else optimises a different day than the one that is coming."""

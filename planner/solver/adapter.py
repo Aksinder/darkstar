@@ -76,6 +76,48 @@ def _parse_load_groups(config: dict[str, Any]) -> list[LoadGroup]:
     return groups
 
 
+# Phase names accepted in per-device phase_map lists -> the learned profile's keys.
+# Same vocabulary as the load balancer (a/b/c = L1/L2/L3 on this site).
+_PHASE_KEYS = {
+    "a": "A", "b": "B", "c": "C",
+    "l1": "A", "l2": "B", "l3": "C",
+    "1": "A", "2": "B", "3": "C",
+}
+
+
+def normalize_phase_map(raw: Any, device_id: str = "?") -> list[str]:
+    """``[a|b|c|l1..l3|1..3]`` -> ``["A", ...]`` (deduplicated, order kept).
+
+    Empty/absent => [] (unknown: the fuse-relief rows split it evenly). An unknown
+    name is dropped LOUDLY — a guessed phase moves load onto the wrong conductor.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for p in cast("list[Any]", raw):
+        key = _PHASE_KEYS.get(str(p).strip().lower())
+        if key is None:
+            logger.warning("%s: phase_map entry %r unknown - ignored", device_id, p)
+        elif key not in out:
+            out.append(key)
+    return out
+
+
+def ev_surplus_phase_maps(config: dict[str, Any]) -> dict[str, Any]:
+    """``{charger_id: phase_map}`` from executor.ev_surplus.chargers[] — the servo's
+    existing per-charger wiring, the fallback when an ev_chargers[] entry has none."""
+    ex: Any = config.get("executor")
+    evs: Any = ex.get("ev_surplus") if isinstance(ex, dict) else None
+    raw: Any = evs.get("chargers") if isinstance(evs, dict) else None
+    if not isinstance(raw, list):
+        return {}
+    return {
+        str(c.get("id")): c.get("phase_map")
+        for c in cast("list[Any]", raw)
+        if isinstance(c, dict) and c.get("id") and c.get("phase_map")
+    }
+
+
 def _get_config_version(config: dict[str, Any]) -> int:
     """Detect config format version for ARC15 migration compatibility."""
     return int(config.get("config_version", 1))
@@ -313,6 +355,7 @@ def build_water_heater_inputs(
                 absorb_cap_kwh_per_day=absorb_cap,
                 absorbed_today_kwh=absorbed_today,
                 absorbed_bucket_date=state.get("absorbed_bucket_date"),
+                phases=normalize_phase_map(wh.get("phase_map"), heater_id),
             )
         )
 
@@ -341,6 +384,7 @@ def build_ev_charger_inputs(
     ev_charger_states: list[dict[str, Any]] | None = None,
     load_priority_cfg: dict[str, Any] | None = None,
     departure_target_cfg: dict[str, Any] | None = None,
+    fallback_phase_maps: dict[str, Any] | None = None,
 ) -> list[EVChargerInput]:
     """
     Build per-device EVChargerInput list from ev_chargers[] config + HA state.
@@ -359,6 +403,8 @@ def build_ev_charger_inputs(
             charger with both a deadline (its recurring ``departure_time``) and a
             ``departure_soc`` gets a soft "energy by departure" target priced at
             ``shortfall_penalty_sek_per_kwh``. Off (default) => no target.
+        fallback_phase_maps: Optional ``{charger_id: phase_map}`` used when a charger
+            has no ``phase_map`` of its own (the ev_surplus servo's per-charger map).
 
     Returns:
         List of EVChargerInput objects for enabled chargers.
@@ -459,6 +505,10 @@ def build_ev_charger_inputs(
                 incentive_buckets=buckets,
                 charge_efficiency=float(ev.get("charge_efficiency", 1.0) or 1.0),
                 departure_targets=departure_targets,
+                phases=normalize_phase_map(
+                    ev.get("phase_map") or (fallback_phase_maps or {}).get(charger_id),
+                    charger_id,
+                ),
             )
         )
 
@@ -1036,7 +1086,10 @@ def config_to_kepler_config(
     # ARC15: Load EV charging settings (per-device)
     if config_version >= 2 and ev_chargers:
         ev_inputs = build_ev_charger_inputs(
-            ev_chargers, ev_charger_states, load_priority_cfg=planner_config.get("load_priority")
+            ev_chargers,
+            ev_charger_states,
+            load_priority_cfg=planner_config.get("load_priority"),
+            fallback_phase_maps=ev_surplus_phase_maps(planner_config),
         )
     else:
         ev_inputs = []
@@ -1280,6 +1333,18 @@ def config_to_kepler_config(
     kepler_cfg.phase_relief_sek_per_a_h = float(
         phase_cfg.get("relief_sek_per_a_h", KeplerConfig.phase_relief_sek_per_a_h)
     )
+    # Reuse the site's existing line voltage: load_balancing first (the fuse guard's
+    # own amps<->W conversion), then system.grid; 230 V when neither is set.
+    _lb_cfg: Any = planner_config.get("load_balancing") or {}
+    _grid_cfg: Any = (system.get("grid") if isinstance(system, dict) else None) or {}
+    _volt_raw: Any = (_lb_cfg.get("nominal_voltage_v") if isinstance(_lb_cfg, dict) else None) or (
+        _grid_cfg.get("nominal_voltage_v") if isinstance(_grid_cfg, dict) else None
+    )
+    try:
+        _volt = float(_volt_raw) if _volt_raw is not None else 230.0
+    except (TypeError, ValueError):
+        _volt = 230.0
+    kepler_cfg.phase_nominal_voltage_v = _volt if _volt > 0 else 230.0
     if kepler_cfg.phase_aware_enabled:
         from backend.learning.phase_learning import load_phase_fractions, load_phase_profile
 
