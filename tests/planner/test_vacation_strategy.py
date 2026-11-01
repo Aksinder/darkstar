@@ -188,7 +188,7 @@ class TestRiskAppetiteIsInertWhenTheCapBinds:
     """
 
     @staticmethod
-    def _deficit_heavy(risk: int, cap_pct: float = 20.0) -> float:
+    def _deficit_heavy(risk: int, cap_pct: float = 20.0, away: bool = False) -> float:
         """Load far above PV, with a look-ahead window that actually HAS data.
 
         The deficit is summed over the 24 h BEYOND the price horizon, so a bare 24 h
@@ -201,7 +201,11 @@ class TestRiskAppetiteIsInertWhenTheCapBinds:
         floor, _ = calculate_safety_floor(
             priced,
             BATTERY,
-            {"risk_appetite": risk, "max_safety_buffer_percent": cap_pct},
+            {
+                "risk_appetite": risk,
+                "max_safety_buffer_percent": cap_pct,
+                **({"away_cap_override": True} if away else {}),
+            },
             TZ,
             full_forecast_df=full,
             price_horizon_end=priced.index[-1],
@@ -221,11 +225,22 @@ class TestRiskAppetiteIsInertWhenTheCapBinds:
 
     def test_lowering_the_cap_is_what_actually_frees_the_reserve(self):
         assert self._deficit_heavy(3, cap_pct=10.0) == pytest.approx(3.20)
-        # The cap is floored at the risk level's promised min_buffer (upstream
-        # be9aa889): at Neutral a 0 % cap still keeps the 10 % minimum...
+        # A CONFIGURED cap is floored at the risk level's promised min_buffer
+        # (upstream be9aa889): at Neutral a 0 % cap still keeps the 10 % minimum...
         assert self._deficit_heavy(3, cap_pct=0.0) == pytest.approx(3.20)
-        # ...and the away house frees it fully together with risk 5 (0 % minimum).
         assert self._deficit_heavy(5, cap_pct=0.0) == pytest.approx(1.60)  # == min_soc
+
+    def test_vacation_cap_zero_still_frees_the_reserve_at_risk_3(self):
+        # ...but the explicit away cap (dev-20260827.2119) is honoured as-is.
+        assert self._deficit_heavy(3, cap_pct=0.0, away=True) == pytest.approx(1.60)
+        assert self._deficit_heavy(3, cap_pct=10.0, away=True) == pytest.approx(3.20)
+
+    def test_pipeline_marks_the_vacation_cap_as_an_away_override(self):
+        from pathlib import Path
+
+        import planner.pipeline as mod
+
+        assert '"away_cap_override": True' in Path(mod.__file__).read_text()
 
     def test_the_cap_can_never_push_below_min_soc(self):
         # 0 % cap floors at min_soc, never under it — the battery's own limit stands.

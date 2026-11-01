@@ -1044,7 +1044,13 @@ class PlannerPipeline:
                 _base_cap = float(s_index_cfg.get("max_safety_buffer_percent", 20.0))
                 _eff_cap = min(_base_cap, max(0.0, float(_vac_cap)))
                 if _eff_cap != _base_cap:
-                    s_index_cfg = {**s_index_cfg, "max_safety_buffer_percent": _eff_cap}
+                    # Flag it: an explicit away cap is honoured as-is, not floored at
+                    # the risk level's min_buffer like the configured default cap.
+                    s_index_cfg = {
+                        **s_index_cfg,
+                        "max_safety_buffer_percent": _eff_cap,
+                        "away_cap_override": True,
+                    }
                     logger.info(
                         "Vacation: max_safety_buffer_percent %.0f -> %.0f "
                         "(floor cap = min_soc + this; the lever that actually moves it)",
