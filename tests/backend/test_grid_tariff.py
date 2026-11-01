@@ -308,3 +308,19 @@ class TestPriceConsumers:
         assert peak["import_p50"] - off["import_p50"] == pytest.approx(0.28)
         assert flat["import_p50"] - off["import_p50"] == pytest.approx(0.525 - 0.37)
         assert peak["export_p50"] == off["export_p50"] == flat["export_p50"]
+
+    @pytest.mark.asyncio
+    async def test_ml_d1_fallback_prices_each_slot_at_its_local_tou_fee(self, monkeypatch):
+        """The D+1 fallback path (get_d1_price_forecast_fallback -> derive_consumer_prices)
+        uses the per-slot ToU fee, matched on LOCAL wall time even for aware-UTC rows:
+        05:30Z is 06:30 local (peak window 06-22), 04:30Z is 05:30 local (off-peak)."""
+        import ml.price_forecast as pf
+
+        rows = [
+            {"slot_start": "2026-11-03T05:30:00+00:00", "days_ahead": 1, "spot_p50": 0.5},
+            {"slot_start": "2026-11-03T04:30:00+00:00", "days_ahead": 1, "spot_p50": 0.5},
+        ]
+        monkeypatch.setattr(pf, "_latest_forecasts_for_local_date", lambda *_a: rows)
+        out = await pf.get_d1_price_forecast_fallback(self._config())
+        assert out is not None
+        assert out[0]["import_p50"] - out[1]["import_p50"] == pytest.approx(0.28)
