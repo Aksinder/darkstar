@@ -74,6 +74,10 @@ logger = logging.getLogger(__name__)
 # Published after every tick that reached the inverter dispatch; the HA dead-man
 # automations watch its age.
 HEARTBEAT_ENTITY = "sensor.darkstar_executor_heartbeat"
+# Consecutive failed ticks of one command type before ONE notification (upstream
+# b7cddc26 idea). Command rejections are deterministic, so lower than the EV
+# zero-power threshold (5). Reset when that command type next succeeds.
+ACTION_FAILURE_NOTIFY_STREAK = 3
 # Rate limit for the "sensor reads non-numeric" warning in _sensor_kw (per entity).
 BAD_SENSOR_WARN_INTERVAL_S = 600
 
@@ -305,6 +309,10 @@ class ExecutorEngine:
         # the enter/leave notification fires once per transition; and the last
         # "would have done" summary, so the INFO line fires only when it changes.
         self._manual_override_seen: bool = False
+        # Command-failure streaks per action type -> consecutive failed ticks, and
+        # the types already notified this streak (see _track_command_failures).
+        self._action_fail_counts: dict[str, int] = {}
+        self._action_fail_notified: set[str] = set()
         self._manual_would_have: str | None = None
 
         # Cached system state for get_status() mode_intent computation
@@ -2494,6 +2502,8 @@ class ExecutorEngine:
                         except Exception:
                             pass  # Silently fail if WebSocket not available
 
+                await self._track_command_failures(action_results)
+
                 result["actions"] = [
                     {
                         "type": r.action_type,
@@ -4321,6 +4331,47 @@ class ExecutorEngine:
             )
         return hold
 
+    async def _track_command_failures(self, action_results: list[ActionResult]) -> None:
+        """Notify once when one command type has failed ACTION_FAILURE_NOTIFY_STREAK
+        ticks in a row; reset when it next succeeds.
+
+        Counts only real failures (success False, not skipped). Refused writes
+        (unreachable entity, inverter fault gate: skipped, not successful) and
+        unverified writes have their own once-per-episode notices
+        (notify_unreachable / notify_inverter_fault / notify_unverified), so they
+        neither count nor reset here; any successful result (including "already at
+        target") resets its type. Goes through dispatcher.notify_error, i.e.
+        gated on notifications.on_error.
+        """
+        counts: dict[str, int] = self.__dict__.setdefault("_action_fail_counts", {})
+        notified: set[str] = self.__dict__.setdefault("_action_fail_notified", set())
+        failed_types: dict[str, ActionResult] = {}
+        ok_types: set[str] = set()
+        for r in action_results:
+            if not r.success and not r.skipped:
+                failed_types.setdefault(r.action_type, r)
+            elif r.success:
+                ok_types.add(r.action_type)
+        for t in ok_types - failed_types.keys():
+            if t in notified:
+                logger.info("Command %s succeeds again after a failure streak", t)
+            counts.pop(t, None)
+            notified.discard(t)
+        for t, r in failed_types.items():
+            counts[t] = counts.get(t, 0) + 1
+            if counts[t] >= ACTION_FAILURE_NOTIFY_STREAK and t not in notified:
+                notified.add(t)
+                msg = (
+                    f"Command {t} failed {counts[t]} ticks in a row"
+                    f"{f' ({r.entity_id})' if r.entity_id else ''}: {r.message}"
+                )
+                logger.warning(msg)
+                if self.dispatcher:
+                    try:
+                        await self.dispatcher.notify_error(msg)
+                    except Exception as e:
+                        logger.warning("Command-failure notification failed: %s", e)
+
     def _sensor_kw(self, raw: Any, entity: str | None) -> float | None:
         """A W power state as kW, or None when absent/unknown/non-numeric.
 
@@ -4530,6 +4581,14 @@ class ExecutorEngine:
         ev_isolation_reason: str | None = None,
     ) -> ExecutionRecord:
         """Create an execution record for logging."""
+        # Top-level failure reason on the record (existing error_message column,
+        # upstream b7cddc26): which commands failed and why, so the history view
+        # does not need the per-action JSON to answer "what went wrong".
+        error_message: str | None = None
+        if not success:
+            failed = [r for r in action_results if not r.success and not r.skipped]
+            if failed:
+                error_message = "; ".join(f"{r.action_type}: {r.message}" for r in failed)[:500]
         return ExecutionRecord(
             executed_at=now_iso,
             slot_start=slot_start or now_iso,
@@ -4579,6 +4638,7 @@ class ExecutorEngine:
             ],
             # Result
             success=1 if success else 0,
+            error_message=error_message,
             duration_ms=duration_ms,
             source="native",
             executor_version=EXECUTOR_VERSION,
