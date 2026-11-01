@@ -223,3 +223,76 @@ def test_hourly_resolution_fallback_has_no_overlapping_slots():
         assert a["end"] == b["start"]
     # Hour 0 = mean of its four quarters (0.800..0.803).
     assert entries[0]["value"] == pytest.approx(801.5)
+
+
+class _Afternoon(datetime):
+    """13:20 local: the D+1 auction is out, so a cached forecast is stale."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return TZ.localize(datetime(2026, 4, 28, 13, 20))
+
+
+@pytest.mark.asyncio
+async def test_cached_forecast_is_not_served_after_the_auction(tmp_path):
+    """A cache filled before 13:00 with ML-forecast D+1 slots must be refetched after
+    13:00; forecast slots do not count as published tomorrow prices."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "timezone: Europe/Stockholm\nnordpool:\n  price_area: SE3\n  resolution_minutes: 15\n"
+    )
+    today = TZ.localize(datetime(2026, 4, 28))
+    cached = [
+        {
+            "start_time": today + timedelta(minutes=15 * i),
+            "end_time": today + timedelta(minutes=15 * (i + 1)),
+            "import_price_sek_kwh": 1.0,
+            "export_price_sek_kwh": 0.5,
+            "price_is_forecast": i >= 96,
+        }
+        for i in range(192)
+    ]
+    P._fetch_fail_until = 0.0
+    with (
+        patch.object(P, "datetime", _Afternoon),
+        patch.object(P.cache_sync, "get", return_value=cached),
+        patch.object(P.cache_sync, "set"),
+        patch.object(P.Prices, "fetch", return_value=None) as fetch,
+    ):
+        await P.get_nordpool_data(str(cfg))
+    assert fetch.called  # cache rejected -> fresh fetch for published prices
+
+
+@pytest.mark.asyncio
+async def test_no_forecast_fallback_without_spot_in_export(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "timezone: Europe/Stockholm\nnordpool:\n  price_area: SE3\n  resolution_minutes: 15\n"
+        "pricing:\n  export_includes_spot: false\n"
+    )
+    today = TZ.localize(datetime(2026, 4, 28))
+    raw_today = {
+        "areas": {
+            "SE3": {
+                "values": [
+                    {
+                        "start": today + timedelta(minutes=15 * i),
+                        "end": today + timedelta(minutes=15 * (i + 1)),
+                        "value": 400.0,
+                    }
+                    for i in range(96)
+                ]
+            }
+        }
+    }
+    P._fetch_fail_until = 0.0
+    with (
+        patch.object(P, "datetime", _Morning),
+        patch.object(P.cache_sync, "get", return_value=None),
+        patch.object(P.cache_sync, "set"),
+        patch.object(P.Prices, "fetch", return_value=raw_today),
+        patch("ml.price_forecast.get_d1_price_forecast_fallback") as fallback,
+    ):
+        slots = await P.get_nordpool_data(str(cfg))
+    fallback.assert_not_called()
+    assert not any(s["price_is_forecast"] for s in slots)
