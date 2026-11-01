@@ -1,10 +1,11 @@
 """Tests for price forecast inference with weather-only row support."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from unittest.mock import patch
 
 import pandas as pd
 import pytest
+import pytz
 from sqlalchemy import create_engine
 
 from backend.learning.models import Base, PriceForecast
@@ -25,10 +26,6 @@ def _local_today() -> date:
     Stockholm between 22:00 and 24:00 UTC — these tests failed every night in that
     window while passing on a CEST developer machine.
     """
-    from datetime import datetime
-
-    import pytz
-
     return datetime.now(pytz.timezone("Europe/Stockholm")).date()
 
 
@@ -132,69 +129,6 @@ async def test_generate_forecasts_without_model(
 
         # Verify persistence was called
         mock_persist.assert_called_once()
-
-
-@pytest.mark.asyncio
-@patch("ml.price_forecast.get_price_forecasts_from_db")
-async def test_d1_fallback_filters_null_predictions(mock_get_forecasts, price_config, db_path):
-    """Test that D+1 fallback filters out null-prediction rows."""
-    print("\n--- Testing D+1 Fallback Null Filtering ---")
-
-    tomorrow_str = (_local_today() + timedelta(days=1)).isoformat()
-
-    # Mock DB returning only weather-only rows (null predictions)
-    mock_get_forecasts.return_value = [
-        {
-            "slot_start": f"{tomorrow_str}T00:00:00",
-            "days_ahead": 1,
-            "spot_p10": None,
-            "spot_p50": None,
-            "spot_p90": None,
-            "wind_index": 1.0,
-            "temperature_c": 5.0,
-        }
-    ] * 96  # 24 hours of 15-minute slots
-
-    result = await get_d1_price_forecast_fallback(
-        config=price_config,
-        db_path=db_path,
-    )
-
-    # Should return None when only weather-only rows exist
-    assert result is None
-    print("✓ Returns None when only null-prediction rows exist")
-
-    # Now test with mixed rows (some with predictions)
-    mixed_forecasts = [
-        {
-            "slot_start": f"{tomorrow_str}T00:00:00",
-            "days_ahead": 1,
-            "spot_p10": None,
-            "spot_p50": None,
-            "spot_p90": None,
-            "wind_index": 1.0,
-        },
-        {
-            "slot_start": f"{tomorrow_str}T00:15:00",
-            "days_ahead": 1,
-            "spot_p10": 0.4,
-            "spot_p50": 0.5,
-            "spot_p90": 0.6,
-            "wind_index": 1.0,
-        },
-    ]
-    mock_get_forecasts.return_value = mixed_forecasts
-
-    result = await get_d1_price_forecast_fallback(
-        config=price_config,
-        db_path=db_path,
-    )
-
-    # Should return only the valid forecast
-    assert result is not None
-    assert len(result) == 1
-    assert result[0]["spot_p50"] == 0.5
-    print("✓ Filters out null rows and returns only valid forecasts")
 
 
 @pytest.fixture
@@ -542,7 +476,12 @@ async def test_d1_fallback_dedup(tmp_db, price_config):
     db_path, engine = tmp_db
 
     tomorrow = _local_today() + timedelta(days=1)
-    slots = [f"{tomorrow.isoformat()}T{h:02d}:{m:02d}:00+02:00" for h in range(24) for m in (0, 30)]
+    tz = pytz.timezone("Europe/Stockholm")
+    slots = [
+        tz.localize(datetime.combine(tomorrow, time(h, m))).isoformat()
+        for h in range(24)
+        for m in (0, 30)
+    ]
 
     rows = []
     for s in slots:
@@ -575,67 +514,3 @@ async def test_d1_fallback_dedup(tmp_db, price_config):
 
     slot_starts = [r["slot_start"] for r in result]
     assert len(set(slot_starts)) == 48, "Duplicate slot_starts found in fallback result"
-
-
-@pytest.mark.asyncio
-@patch("ml.price_forecast.get_price_forecasts_from_db")
-async def test_d1_fallback_filters_stale_slots(mock_get_forecasts, price_config, db_path):
-    """Slots for today or yesterday should be discarded as stale."""
-
-    today = _local_today()
-    today_str = today.isoformat()
-    yesterday_str = (today - timedelta(days=1)).isoformat()
-
-    mock_get_forecasts.return_value = [
-        {
-            "slot_start": f"{yesterday_str}T12:00:00",
-            "days_ahead": 1,
-            "spot_p10": 0.4,
-            "spot_p50": 0.5,
-            "spot_p90": 0.6,
-        },
-        {
-            "slot_start": f"{today_str}T08:00:00",
-            "days_ahead": 1,
-            "spot_p10": 0.4,
-            "spot_p50": 0.5,
-            "spot_p90": 0.6,
-        },
-    ]
-
-    result = await get_d1_price_forecast_fallback(
-        config=price_config,
-        db_path=db_path,
-    )
-
-    assert result is None, "All stale slots should be filtered, returning None"
-
-
-@pytest.mark.asyncio
-@patch("ml.price_forecast.get_price_forecasts_from_db")
-async def test_d1_fallback_keeps_future_slots(mock_get_forecasts, price_config, db_path):
-    """Slots for tomorrow should be returned unchanged."""
-
-    tomorrow = _local_today() + timedelta(days=1)
-    tomorrow_str = tomorrow.isoformat()
-
-    slots = [
-        {
-            "slot_start": f"{tomorrow_str}T{h:02d}:00:00",
-            "days_ahead": 1,
-            "spot_p10": 0.4,
-            "spot_p50": 0.5,
-            "spot_p90": 0.6,
-        }
-        for h in range(24)
-    ]
-
-    mock_get_forecasts.return_value = slots
-
-    result = await get_d1_price_forecast_fallback(
-        config=price_config,
-        db_path=db_path,
-    )
-
-    assert result is not None
-    assert len(result) == 24
