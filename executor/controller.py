@@ -150,6 +150,30 @@ class ControllerDecision:
     control_unit: str = "A"  # "A" or "W"
     source: str = "plan"  # "plan" or "override"
     reason: str = ""
+    # True only when THIS idle came from the Hold-slot branch and nothing else
+    # (min-SoC floor, EV isolation) also wants it idle. The engine may then run the
+    # tick as self_consumption while the fuse guard sees a phase at/over budget
+    # (apply_hold_fuse_relief) — the battery relieving the fuse beats holding flat.
+    hold_fuse_relief_ok: bool = False
+
+
+def apply_hold_fuse_relief(decision: ControllerDecision) -> None:
+    """Turn a relief-eligible Hold idle into self_consumption, in place.
+
+    Mirrors what decide() renders for a self_consumption slot with no planned
+    charge: charge limit = the configured max (PV may still charge the pack), the
+    discharge limit is already the pack maximum. The fuse battery cap is applied
+    after this by the engine, so a grid-charging overload is still capped.
+    """
+    if not decision.hold_fuse_relief_ok or decision.mode_intent != "idle":
+        return
+    decision.mode_intent = "self_consumption"
+    if decision.charge_value <= 0:
+        decision.charge_value = decision.max_charge
+        decision.write_charge_current = True
+    decision.reason = f"{decision.reason} | Hold-slot fuse relief: battery covers load".strip(
+        " |"
+    )
 
 
 class Controller:
@@ -365,7 +389,11 @@ class Controller:
         # min_soc + min_soc_release_margin_percent: without hysteresis the mode
         # flapped idle <-> self_consumption on every 1 % step around the floor.
         at_floor = self._at_min_soc_floor(state)
-        if battery_to_grid_kw > 0 and battery_to_grid_kw >= self.config.export_min_battery_kw:
+        hold_branch = False
+        if (
+            battery_to_grid_kw > HOLD_DISCHARGE_EPS_KW
+            and battery_to_grid_kw >= self.config.export_min_battery_kw
+        ):
             # Battery discharge to grid - use export mode.
             # R1 runtime SoC-floor guard (arbitrage gate): the export floor exists
             # only inside the MILP — between replans the plan is stale and the real
@@ -409,11 +437,15 @@ class Controller:
                 mode_intent = "self_consumption"
             else:
                 mode_intent = "export"
-        elif slot.export_kw > 0 and slot.discharge_kw > 0:
+        elif slot.export_kw > 0 and slot.discharge_kw > HOLD_DISCHARGE_EPS_KW:
             # Both flows planned but the overlap is below export_min_battery_kw: the
             # battery is serving the house while PV surplus exports on its own.
             # self_consumption does exactly that. NOT idle — idle blocks discharge and
             # would starve the load the plan meant the battery to cover.
+            # Discharge must clear HOLD_DISCHARGE_EPS_KW like the Hold test: the
+            # schedule formatter rounds to 2 decimals, so 0.005-0.01 kW of solver
+            # dust reads 0.01 and, in a sunny export slot, used to land here and
+            # reopen the Hold-slot ratchet.
             logger.info(
                 "Export intent skipped: planned battery->grid %.2f kW below "
                 "export_min_battery_kw %.2f — self_consumption",
@@ -470,6 +502,7 @@ class Controller:
             # Same fix as upstream 1dfd8c85. EV-charging hold slots land here too
             # (REV F76 Phase 3: no battery -> EV).
             mode_intent = "idle"
+            hold_branch = True
         elif round(state.current_soc_percent) <= slot.soc_target:
             # Discharge slot at its floor - hold the battery.
             # Round current SoC to integer for consistent comparison with plan target.
@@ -586,6 +619,13 @@ class Controller:
             control_unit=unit,
             source="plan",
             reason=reason,
+            hold_fuse_relief_ok=(
+                hold_branch
+                and mode_intent == "idle"
+                and not at_floor
+                and not slot.ev_isolation
+                and slot.ev_charging_kw <= 0.1
+            ),
         )
 
     def _calculate_charge_limit(self, slot: SlotPlan, state: SystemState) -> tuple[float, bool]:

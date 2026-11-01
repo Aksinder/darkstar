@@ -38,7 +38,12 @@ from backend.loads.service import LoadDisaggregator
 
 from .actions import ActionDispatcher, ActionResult, HAClient
 from .config import LoadGroupConfig, load_executor_config, load_yaml
-from .controller import ControllerDecision, MinSocFloorLatch, make_decision
+from .controller import (
+    ControllerDecision,
+    MinSocFloorLatch,
+    apply_hold_fuse_relief,
+    make_decision,
+)
 from .cyclic_run import anyone_home, should_run_opportunistically
 from .fuse_shed import should_shed_for_fuse
 from .history import ExecutionHistory, ExecutionRecord
@@ -78,6 +83,9 @@ HEARTBEAT_ENTITY = "sensor.darkstar_executor_heartbeat"
 # b7cddc26 idea). Command rejections are deterministic, so lower than the EV
 # zero-power threshold (5). Reset when that command type next succeeds.
 ACTION_FAILURE_NOTIFY_STREAK = 3
+# Hold-slot fuse relief stays on this long after the last over-budget reading, so
+# the EMS mode does not flap idle <-> self_consumption at the threshold.
+HOLD_FUSE_RELIEF_HOLD_S = 300.0
 # Rate limit for the "sensor reads non-numeric" warning in _sensor_kw (per entity).
 BAD_SENSOR_WARN_INTERVAL_S = 600
 
@@ -314,6 +322,17 @@ class ExecutorEngine:
         self._action_fail_counts: dict[str, int] = {}
         self._action_fail_notified: set[str] = set()
         self._manual_would_have: str | None = None
+        # Manual-override bookkeeping: when it started and when we last reminded
+        # (rate-limited reminder, executor.pause_reminder_minutes); the last READABLE
+        # state of the manual entity (held through unavailable/unknown blips); and the
+        # amps the manual-mode fuse relief has written per charger (only ever lowered).
+        self._manual_override_since: float | None = None
+        self._manual_reminder_last: float | None = None
+        self._manual_last_known: bool | None = None
+        self._manual_fuse_cap_a: dict[str, float] = {}
+        # Hold-slot fuse relief: epoch until which an idle Hold slot may run as
+        # self_consumption because a phase sat at/over the fuse guard's budget.
+        self._hold_fuse_relief_until: float = 0.0
 
         # Cached system state for get_status() mode_intent computation
         self._last_system_state: SystemState | None = None
@@ -1198,6 +1217,14 @@ class ExecutorEngine:
         is written only from here and only after dispatcher.execute() returned, so
         its age is the age of the last tick that actually commanded the inverter.
         The state is the tick time, so it changes (and last_updated moves) each tick.
+
+        Manual override also publishes it (attribute manual: true): the executor is
+        alive and its fuse relief is running, and the two HA watchdogs keyed on this
+        sensor would otherwise fire on a deliberate manual session — the R2 dead-man
+        (automation.darkstar_dead_man_ems_aterstallning, > 20 min) would flip the
+        human's "Forced mode" back to self-consumption, and the EV watchdog
+        (automation.darkstar_ev_laddvakt_vid_dod_add_on_sakring, > 10 min) would clamp
+        Easee 6 A / Tesla 5 A.
         """
         if not self._dispatched_this_tick or not self.ha_client:
             return
@@ -1210,6 +1237,9 @@ class ExecutorEngine:
                     "device_class": "timestamp",
                     "icon": "mdi:heart-pulse",
                     "shadow_mode": bool(self.config.shadow_mode),
+                    # On manual override the tick ran only the downward-only safety
+                    # layers (fuse relief); the inverter was NOT commanded.
+                    "manual": bool(self._manual_override_seen),
                 },
             )
         except Exception:
@@ -1585,10 +1615,10 @@ class ExecutorEngine:
                 state, self.config.controller.min_soc_release_margin_percent
             )
             self._last_system_state = state
-            # A human on manual owns the hardware: no inverter, EV, water, sink,
-            # cyclic-load, balancer or fuse-cap writes this tick. Telemetry, the
-            # decision journal and the execution record continue. See
-            # _manual_override_tick for the full contract.
+            # A human on manual owns the hardware: no inverter, water, sink,
+            # cyclic-load or EV-raising writes this tick; only the downward-only fuse
+            # relief runs. Telemetry, the decision journal, the execution record and
+            # the heartbeat continue. See _manual_override_tick for the contract.
             skip_writes = getattr(state, "manual_override_active", False) is True
             await self._note_manual_override_transition(skip_writes)
 
@@ -1878,6 +1908,20 @@ class ExecutorEngine:
             action_results: list[ActionResult] = []
             if skip_writes:
                 action_results.append(await self._manual_override_tick(decision, original_slot))
+                # Downward-only safety layers stay armed (fuse relief of charger
+                # current; balancer EV caps). Never raises, never starts anything.
+                try:
+                    action_results.extend(await self._manual_safety_tick(decision))
+                except Exception as safety_exc:
+                    action_results.append(
+                        self._isolated_failure(
+                            "manual_safety", None, safety_exc, "Manual-mode fuse relief"
+                        )
+                    )
+                # Alive and guarding: publish the heartbeat (manual: true) so the HA
+                # dead-man watchdogs do not undo a deliberate manual session.
+                self._dispatched_this_tick = True
+                await self._check_manual_reminder()
                 result["actions"] = [
                     {
                         "type": r.action_type,
@@ -2480,6 +2524,10 @@ class ExecutorEngine:
                         except Exception as defer_exc:
                             logger.warning("Deferrable appliance controller error: %s", defer_exc)
 
+                    # A Hold slot idles the battery (ratchet fix) — but not while a
+                    # phase is at/over the fuse budget: then the pack may cover the
+                    # house for this tick (after the servo refreshed the readings).
+                    self._apply_hold_fuse_relief(decision)
                     self._apply_fuse_battery_cap(decision)
 
                     # Fix Issue 0: Await expected coroutine properly
@@ -2620,13 +2668,20 @@ class ExecutorEngine:
             return
         self._manual_override_seen = active
         self._manual_would_have = None
+        self._manual_override_since = time.time() if active else None
+        self._manual_reminder_last = None
+        # Caps written by the manual fuse relief are forgotten on exit: the servo,
+        # whose memory was kept in step, rewrites its own command from here.
+        self._manual_fuse_cap_a.clear()
         entity = self.config.manual_override_entity
         if active:
             logger.warning(
-                "Manual override ON (%s) — executor stops ALL writes (inverter, EV, "
-                "water, sinks, cyclic loads, load balancer, fuse cap); telemetry and "
-                "recording continue",
+                "Manual override ON (%s) — executor stops its writes (inverter, water, "
+                "sinks, cyclic loads, deferrables, EV increases); only the fuse relief "
+                "may LOWER charger current. Telemetry, recording and the heartbeat "
+                "continue; reminder every %s min",
                 entity,
+                self.config.pause_reminder_minutes or "-",
             )
         else:
             logger.warning("Manual override OFF (%s) — executor resumes control", entity)
@@ -2636,9 +2691,16 @@ class ExecutorEngine:
         try:
             if active:
                 await self.dispatcher._send_notification(  # type: ignore[protected-access]
-                    f"{entity} är på — Darkstar skriver ingenting till växelriktare, "
-                    "laddbox, varmvatten eller laster förrän det slås av. Säkringsvakt "
-                    "och min-SoC-skydd agerar inte heller; mätning och loggning fortsätter.",
+                    f"{entity} är på — Darkstar styr inte växelriktare, varmvatten eller "
+                    "laster och höjer/startar ingen laddning förrän det slås av. "
+                    "Säkringsvakten är kvar men får bara SÄNKA laddströmmen vid "
+                    "överlast; batteriets säkringsbroms och min-SoC-skyddet agerar inte. "
+                    "Mätning, loggning och heartbeat fortsätter"
+                    + (
+                        f"; påminnelse var {self.config.pause_reminder_minutes}:e minut."
+                        if self.config.pause_reminder_minutes
+                        else "."
+                    ),
                     title="Darkstar: manuellt läge",
                 )
             else:
@@ -2657,13 +2719,13 @@ class ExecutorEngine:
         Decision (owner-facing contract, override.py: "executor will not change
         settings"): a human on manual owns the hardware, so NOTHING is written —
         not the inverter profile, EV chargers/servo, water heaters, sinks, cyclic
-        loads, deferrable appliances, and not the safety layers either: the 25 A
-        fuse guard, load-balancer caps/release and the min-SoC floor do not act
-        (balancer caps already in force stay in force until manual ends). What the
-        executor WOULD have done is logged (INFO on change) and put on the execution
-        record. The FMB SoC estimator still runs: it publishes telemetry sensors
-        and its operator helper, never hardware. The heartbeat is NOT published
-        (nothing commanded the inverter).
+        loads, deferrable appliances, no EV increase or start. The only writes left
+        are the DOWNWARD-ONLY safety layers in _manual_safety_tick (fuse relief of
+        charger current, balancer EV caps going down); the min-SoC floor and the
+        battery fuse clamp do not act. What the executor WOULD have done is logged
+        (INFO on change) and put on the execution record. The FMB SoC estimator
+        still runs: it publishes telemetry sensors and its operator helper, never
+        hardware. The heartbeat IS published (attribute manual: true).
         """
         ev_plan = {
             k: round(float(v), 2)
@@ -2696,6 +2758,317 @@ class ExecutorEngine:
             skipped=True,
             message=f"Manual override active - no writes (would have: {would})",
             entity_id=self.config.manual_override_entity or None,
+        )
+
+    async def _manual_safety_tick(self, decision: Any) -> list[ActionResult]:
+        """The safety layers that stay armed while manual override is on.
+
+        DOWNWARD-ONLY by construction (review finding: manual used to switch the
+        fuse guard off with no timeout — Easee left at 16 A, oven + VVB + spa, and
+        nothing shed before the 25 A main fuse):
+
+        * EV fuse relief (_manual_ev_fuse_relief): charger current is LOWERED (or
+          the charger paused) when a phase it draws on is over the fuse guard's
+          budget, through the servo's own write paths only (Easee RAM dynamic
+          limit, the Tesla number/switch). Never raised, never started.
+        * Load balancer, when load_balancing.actuate is on: its EV caps may only
+          go DOWN (no release, no load shed/restore).
+
+        Deliberately NOT here: the S4 battery clamp. It is not a reduction-only
+        write — it rides dispatcher.execute's full profile write (EMS mode, forced
+        command, setpoints), i.e. exactly the inverter writes manual hands to the
+        human. A standalone max_charge_power write was considered and rejected: in
+        Forced charge the Sungrow profile drives forced_charge_discharge_power too,
+        so the single register is not a proven relief, and it would fight what the
+        human just set. Water, sinks, cyclic loads, deferrables, inverter mode and
+        any increase stay hands-off.
+        """
+        results: list[ActionResult] = []
+        if self.ha_client is None:
+            return results
+        results.extend(await self._manual_ev_fuse_relief())
+        if self.config.load_balancing.enabled:
+            try:
+                await self._observe_load_balancer(decision, manual=True)
+            except Exception as lb_exc:
+                logger.warning("Load balancer (manual, reduce-only) error: %s", lb_exc)
+        return results
+
+    async def _read_entity_float(self, entity: str | None) -> float | None:
+        if not entity or self.ha_client is None:
+            return None
+        try:
+            raw = await self.ha_client.get_state_value(entity)
+        except Exception:
+            return None
+        if raw is None or str(raw) in ("unknown", "unavailable", ""):
+            return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if math.isfinite(val) else None
+
+    async def _manual_ev_fuse_relief(self) -> list[ActionResult]:
+        """Reduce-only EV fuse clamp for manual override (see _manual_safety_tick).
+
+        Same arithmetic as the servo's over-budget shed (ev_surplus.compute_ev_surplus):
+        cap = own_draw - excess, own_draw a LOWER bound (power sensor, clamped to
+        the rating and to every limit known to be in force), export-credited phases,
+        a ledger so two chargers on one phase do not both shed the same amps. Below
+        the charger's minimum it pauses: Easee dynamic limit 0, else the switch, else
+        0 A. Written only when strictly below what is known to be in force, so a
+        lagging power sensor can never turn a reduction into a raise. Blind phase
+        sensors beyond fuse_stale_after_s trip the servo's own fail-safe stop, as
+        they would outside manual mode.
+        """
+        srv = self._ev_surplus
+        ha = self.ha_client
+        out: list[ActionResult] = []
+        if srv is None or ha is None:
+            return out
+        cfg = srv.cfg
+        if not (cfg.enabled and cfg.fuse_guard_enabled and cfg.chargers):
+            return out
+        budget = srv.fuse_budget_a
+        if budget is None:
+            return out
+        now_ts = time.time()
+        shadow = bool(self.config.shadow_mode)
+        phases = await srv.read_phase_currents(ha, now_ts)
+        if phases is None:
+            last_ok = getattr(srv, "last_phase_ok_ts", None)
+            if last_ok is None or (now_ts - last_ok) > cfg.fuse_stale_after_s:
+                await srv._failsafe_stop_all(  # type: ignore[protected-access]
+                    ha, now_ts, "phase sensors stale (manual override)", shadow
+                )
+                out.append(
+                    ActionResult(
+                        action_type="manual_fuse_relief",
+                        success=True,
+                        message="Phase sensors stale - EV fail-safe stop (manual override)",
+                    )
+                )
+            return out
+        srv.last_phase_currents_a = phases
+        srv.last_phase_ok_ts = now_ts
+        grid_w = await self._read_entity_float(cfg.grid_power_entity)
+        if grid_w is not None:
+            srv.last_grid_w = grid_w
+
+        servo_last_a = cast("dict[str, float]", getattr(srv, "_last_a", {}) or {})
+        for ccfg in sorted(cfg.chargers, key=lambda c: -int(getattr(c, "priority", 0))):
+            volt = float(ccfg.voltage_v) or 230.0
+            credit = max(0.0, -(grid_w or 0.0)) / (3.0 * volt)
+            work = {p: max(0.0, a - credit) for p, a in phases.items()}
+            mine = tuple(p for p in (ccfg.phase_map or ()) if p in work) or tuple(work)
+            excess = max(work[p] for p in mine) - budget
+            if excess <= 0.0:
+                continue
+            if ccfg.home_entity:
+                where = None
+                with contextlib.suppress(Exception):
+                    where = await ha.get_state_value(ccfg.home_entity)
+                # Unreadable counts as home: shedding is the safe direction.
+                if where not in (None, "unknown", "unavailable") and str(where) not in (
+                    ccfg.home_states
+                ):
+                    continue
+            power_w = await self._read_entity_float(ccfg.power_entity)
+            own_a = max(0.0, (power_w or 0.0) / (volt * max(1, int(ccfg.phases))))
+            own_a = min(own_a, float(ccfg.max_current_a))
+            known: list[float] = []
+            for v in (
+                self._manual_fuse_cap_a.get(ccfg.id),
+                servo_last_a.get(ccfg.id),
+                await self._read_entity_float(ccfg.readback_entity),
+            ):
+                if v is not None and v >= 0.0:
+                    known.append(float(v))
+            in_force = min(known) if known else None
+            if in_force is not None:
+                own_a = min(own_a, in_force)
+            if own_a <= 0.5 and not (in_force is not None and in_force > 0.0):
+                continue  # not drawing, nothing in force to lower
+            floor_a = max(float(ccfg.min_current_a), float(cfg.policy.min_charge_current_a))
+            cap_a = float(math.floor(max(0.0, own_a - excess)))
+            controllable = bool(ccfg.current_entity or ccfg.easee_device_id)
+            if cap_a < floor_a or not controllable:
+                cap_a = 0.0
+            ref = in_force if in_force is not None else own_a
+            if cap_a >= ref:
+                continue  # never a raise; already at/below this
+            tag = " (shadow, not sent)" if (shadow or ccfg.shadow) else ""
+            try:
+                if not (shadow or ccfg.shadow):
+                    if ccfg.easee_device_id:
+                        # RAM-safe dynamic limit only — never max/circuit limits.
+                        await ha.call_service(
+                            "easee", "set_charger_dynamic_limit", None,
+                            {
+                                "device_id": ccfg.easee_device_id,
+                                "current": int(cap_a),
+                                "time_to_live": 0,
+                            },
+                        )
+                    elif cap_a > 0.0 and ccfg.current_entity:
+                        await ha.call_service(
+                            "number", "set_value", ccfg.current_entity, {"value": cap_a}
+                        )
+                    elif ccfg.switch_entity:
+                        await ha.call_service("switch", "turn_off", ccfg.switch_entity)
+                    elif ccfg.current_entity:
+                        await ha.call_service(
+                            "number", "set_value", ccfg.current_entity, {"value": 0}
+                        )
+                    else:
+                        continue  # no write path at all
+            except Exception as exc:
+                out.append(
+                    self._isolated_failure(
+                        f"manual_fuse_relief:{ccfg.id}", ccfg.current_entity, exc,
+                        f"Manual-mode fuse relief {ccfg.id}",
+                    )
+                )
+                continue
+            self._manual_fuse_cap_a[ccfg.id] = cap_a
+            # Keep the servo's memory true to the register, so on resume it writes
+            # its own command instead of dedup-skipping a stale one.
+            with contextlib.suppress(Exception):
+                srv._last_a[ccfg.id] = cap_a  # type: ignore[protected-access]
+                srv._last_ts[ccfg.id] = now_ts  # type: ignore[protected-access]
+                if cap_a == 0.0 and ccfg.switch_entity and not ccfg.easee_device_id:
+                    srv._last_switch[ccfg.id] = False  # type: ignore[protected-access]
+            shed = own_a - cap_a
+            for p in mine:
+                phases = {**phases, p: max(0.0, phases[p] - shed)}
+            verb = "paused" if cap_a == 0.0 else f"lowered to {cap_a:.0f} A"
+            msg = (
+                f"{ccfg.id} {verb} — phase over fuse budget by {excess:.1f} A "
+                f"(manual override, reduce-only){tag}"
+            )
+            logger.warning("Manual-mode fuse relief: %s", msg)
+            out.append(
+                ActionResult(
+                    action_type=f"manual_fuse_relief:{ccfg.id}",
+                    success=True,
+                    message=msg,
+                    entity_id=ccfg.current_entity or ccfg.switch_entity,
+                )
+            )
+        return out
+
+    async def _apply_balancer_reductions(
+        self,
+        status: LoadBalancerStatus,
+        chargers: dict[str, Any],
+        servo_a: dict[str, float | None],
+    ) -> list[str]:
+        """Manual override: apply only balancer EV caps BELOW what is in force."""
+        done: list[str] = []
+        act = self._balancer_actuator
+        for out in status.ev_outputs:
+            ccfg = chargers.get(out.charger_id)
+            servo = servo_a.get(out.charger_id)
+            if ccfg is None or servo is None or servo <= 0:
+                continue
+            held = act._cap_in_force(out.charger_id, servo)  # type: ignore[protected-access]
+            in_force = float(held) if held is not None else float(servo)
+            want = 0 if out.target_a is None else int(out.target_a)
+            if want >= in_force:
+                continue  # a release or a raise — not while the human is on manual
+            msg = await act._apply_ev(  # type: ignore[protected-access]
+                self.ha_client, ccfg, out.target_a, servo, self.config.shadow_mode
+            )
+            if msg:
+                done.append(msg)
+        return done
+
+    async def _check_manual_reminder(self) -> None:
+        """Remind that manual override is still on: after pause_reminder_minutes,
+        then again every that many minutes (0 disables), like the pause reminder."""
+        every_min = self.config.pause_reminder_minutes
+        since = self._manual_override_since
+        if not every_min or since is None or not self.dispatcher:
+            return
+        now = time.time()
+        anchor = self._manual_reminder_last if self._manual_reminder_last is not None else since
+        if (now - anchor) < every_min * 60.0:
+            return
+        self._manual_reminder_last = now
+        on_min = (now - since) / 60.0
+        entity = self.config.manual_override_entity
+        try:
+            await self.dispatcher._send_notification(  # type: ignore[protected-access]
+                f"{entity} har varit på i {on_min:.0f} min. Darkstar styr inte "
+                "växelriktare, varmvatten eller laster; bara säkringsvakten sänker "
+                "laddströmmen vid överlast. Slå av för att lämna tillbaka styrningen.",
+                title="Darkstar: manuellt läge fortfarande på",
+            )
+            logger.info("Manual override reminder sent (%.0f min on)", on_min)
+        except Exception as e:
+            logger.warning("Manual override reminder failed: %s", e)
+
+    def _fuse_phase_over_budget(self, now_ts: float) -> bool:
+        """Does the fuse guard see an IMPORT-side phase at/over its budget right now?
+
+        Uses the servo's own readings (refreshed earlier this tick): fresh within
+        fuse_stale_after_s, export-credited, and only while the site imports — on
+        export the battery would charge, not discharge, so relief means nothing.
+        """
+        srv = self._ev_surplus
+        if srv is None:
+            return False
+        cfg = getattr(srv, "cfg", None)
+        if cfg is None or getattr(cfg, "fuse_guard_enabled", False) is not True:
+            return False
+        budget = srv.fuse_budget_a
+        last_ok = getattr(srv, "last_phase_ok_ts", None)
+        phases = getattr(srv, "last_phase_currents_a", None)
+        grid_w = getattr(srv, "last_grid_w", None)
+        if (
+            not isinstance(budget, int | float)
+            or not isinstance(last_ok, int | float)
+            or not isinstance(phases, dict)
+            or not phases
+            or not isinstance(grid_w, int | float)
+        ):
+            return False
+        if (now_ts - last_ok) > float(cfg.fuse_stale_after_s) or grid_w <= 0.0:
+            return False
+        return max(abs(float(a)) for a in phases.values()) >= float(budget)
+
+    def _apply_hold_fuse_relief(self, decision: Any) -> None:
+        """Let a Hold slot's idle battery relieve the fuse.
+
+        Hold slots always idle (ratchet fix, controller.py); the controller marks
+        the ones it may release (decision.hold_fuse_relief_ok: not at the min-SoC
+        floor, no EV isolation). When the fuse guard sees an importing phase at/over
+        its budget, such a slot runs self_consumption so the pack covers the house
+        instead of the grid. Held for HOLD_FUSE_RELIEF_HOLD_S after the last
+        over-budget reading so the EMS mode does not flap at the threshold. No new
+        write path: the mode change rides the normal profile dispatch.
+        """
+        if not getattr(decision, "hold_fuse_relief_ok", False):
+            return
+        if getattr(decision, "mode_intent", None) != "idle":
+            return
+        now_ts = time.time()
+        over = self._fuse_phase_over_budget(now_ts)
+        if over:
+            self._hold_fuse_relief_until = now_ts + HOLD_FUSE_RELIEF_HOLD_S
+        elif now_ts >= self._hold_fuse_relief_until:
+            return
+        apply_hold_fuse_relief(decision)
+        logger.warning(
+            "Hold-slot fuse relief: %s — idle -> self_consumption so the battery "
+            "covers the house (phases %s, budget %s A)",
+            "phase at/over the fuse budget" if over else "holding after recent overload",
+            {
+                k: round(float(v), 1)
+                for k, v in (getattr(self._ev_surplus, "last_phase_currents_a", {}) or {}).items()
+            },
+            getattr(self._ev_surplus, "fuse_budget_a", None),
         )
 
     def _journal_decision(
@@ -3833,8 +4206,14 @@ class ExecutorEngine:
             logger.warning("Load balancer RELEASED: %s", line)
         return released
 
-    async def _observe_load_balancer(self, decision: Any) -> None:
+    async def _observe_load_balancer(self, decision: Any, *, manual: bool = False) -> None:
         """Run one balancer tick: log/expose what it decides, act only if allowed.
+
+        ``manual`` (executor.manual_override_entity on): only charger-current
+        REDUCTIONS below what is in force are applied (Easee dynamic limit, or a
+        switch pause — the actuator's own paths). No release, no restore, no shed of
+        loads: the human owns everything else, and a cap held at manual entry stays
+        until manual ends.
 
         Observe-only unless load_balancing.actuate is true: the live guard (S4
         fuse_guard clamp + HA automation) decides the same question, and two
@@ -3883,7 +4262,14 @@ class ExecutorEngine:
         status = self._load_balancer.tick(now, phase_current, updated_at, entries)
         self._last_balancer_status = status
 
-        if lb_cfg.actuate:
+        if manual:
+            if lb_cfg.actuate:
+                self._balancer_applied = await self._apply_balancer_reductions(
+                    status, {c.id: c for c in chargers}, servo_a
+                )
+                for line in self._balancer_applied:
+                    logger.warning("Load balancer ACTED (manual override, reduce-only): %s", line)
+        elif lb_cfg.actuate:
             self._balancer_applied = await self._balancer_actuator.apply(
                 self.ha_client,
                 status,
@@ -4421,6 +4807,26 @@ class ExecutorEngine:
             )
         return None
 
+    def _resolve_manual_override(self, raw: Any) -> bool:
+        """Manual-override state with unreadable blips held, not read as "off".
+
+        An unavailable/unknown/failed read used to mean False: writes resumed for
+        that tick and every blip sent a leave + enter notification pair. Hold the
+        last readable state instead; with nothing readable yet, False (as before).
+        """
+        if raw is None or str(raw).strip().lower() in ("", "unknown", "unavailable", "none"):
+            held = self._manual_last_known
+            if held:
+                logger.warning(
+                    "Manual override entity %s unreadable (%r) — holding last state ON",
+                    self.config.manual_override_entity,
+                    raw,
+                )
+            return bool(held)
+        active = str(raw).strip().lower() == "on"
+        self._manual_last_known = active
+        return active
+
     async def _gather_system_state(self) -> SystemState:
         """Gather current system state from Home Assistant."""
         state = SystemState()
@@ -4496,6 +4902,7 @@ class ExecutorEngine:
             override_entity = self.config.manual_override_entity
             reads.append(("manual_override", lambda e=override_entity: ha.get_state_value(e)))
 
+        manual_raw: Any = None
         try:
             results = await gather_sensor_reads(reads, context="executor_state")
 
@@ -4557,12 +4964,13 @@ class ExecutorEngine:
             # Pass water heater configuration to state
             state.has_water_heater = self._has_water_heater
 
-            manual = results.get("manual_override")
-            if manual is not None:
-                state.manual_override_active = manual == "on"
+            manual_raw = results.get("manual_override")
 
         except Exception as e:
             logger.warning("Failed to gather some system state: %s", e)
+
+        if self.config.manual_override_entity:
+            state.manual_override_active = self._resolve_manual_override(manual_raw)
 
         # Vacation export floor: an away household reserves nothing for its own
         # return, so the guard's floor may be lowered while away (owner
