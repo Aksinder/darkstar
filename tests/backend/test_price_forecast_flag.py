@@ -83,12 +83,16 @@ async def test_get_nordpool_data_flags_forecast_fallback(tmp_path):
         patch("ml.price_forecast.get_d1_price_forecast_fallback", return_value=forecast),
     ):
         slots = await P.get_nordpool_data(str(cfg))
+        known = await P.get_known_spot_by_slot(str(cfg))
 
     published = [s for s in slots if s["start_time"] < tomorrow]
     forecasted = [s for s in slots if s["start_time"] >= tomorrow]
     assert len(published) == 96 and len(forecasted) == 96
     assert not any(s["price_is_forecast"] for s in published)
     assert all(s["price_is_forecast"] for s in forecasted)
+    # Published-price map (used for price-forecast lags) never includes forecasts.
+    assert len(known) == 96
+    assert max(known) < tomorrow
 
 
 def _price_slots() -> list[dict]:

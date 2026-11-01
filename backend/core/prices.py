@@ -480,6 +480,36 @@ def _process_nordpool_data(
     return deduped
 
 
+async def get_known_spot_by_slot(config_path: str = "config.yaml") -> dict[datetime, float]:
+    """Published (non-forecast) prices keyed by tz-aware local 15-minute slot start.
+
+    Values are ``export_price_sek_kwh`` -- the same series the recorder stores in
+    ``slot_observations`` and the price model is trained on, so they can stand in
+    for an observation that does not exist yet. Slots synthesized from the ML
+    forecast fallback (``price_is_forecast``) are excluded. Coarser resolutions are
+    expanded to one key per covered quarter-hour. Empty on any failure.
+    """
+    try:
+        price_data = await get_nordpool_data(config_path)
+    except Exception as exc:
+        logger.warning("Known prices unavailable: %s", exc)
+        return {}
+
+    quarter = timedelta(minutes=15)
+    known: dict[datetime, float] = {}
+    for slot in price_data or []:
+        if slot.get("price_is_forecast"):
+            continue
+        value = slot.get("export_price_sek_kwh")
+        if value is None:
+            continue
+        cursor = slot["start_time"]
+        while cursor < slot["end_time"]:
+            known[cursor] = float(value)
+            cursor += quarter
+    return known
+
+
 async def get_current_slot_prices(config: dict[str, Any]) -> dict[str, float] | None:
     """
     Fetch prices for the current 15-minute slot.
