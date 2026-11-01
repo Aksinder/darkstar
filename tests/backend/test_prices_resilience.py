@@ -209,6 +209,60 @@ async def test_last_good_series_not_served_once_it_no_longer_covers_now(cfg):
     assert out == []
 
 
+@pytest.mark.asyncio
+async def test_stale_series_never_serves_yesterdays_forecast_as_today(cfg):
+    """Yesterday's fetch had today only as an ML forecast (D+1 unpublished). An outage
+    across midnight must give [] -- not that forecast as today's live prices, which
+    the executor consumers (C3, idle-hold, EV curve) would act on unflagged."""
+    d1, d2 = local(2026, 11, 10), local(2026, 11, 11)
+    good, _c, _f = await _run(
+        cfg,
+        local(2026, 11, 10, 18),
+        {d1.date(): _quarters(d1), d2.date(): []},
+        forecast=_forecast_rows(d2),
+    )
+    assert any(s["price_is_forecast"] for s in good)
+    out, _c, _f = await _run(cfg, local(2026, 11, 11, 0, 30), {d2.date(): RuntimeError("down")})
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_stale_series_same_day_keeps_real_today_and_flagged_tomorrow(cfg):
+    d1, d2 = local(2026, 11, 10), local(2026, 11, 11)
+    await _run(
+        cfg,
+        local(2026, 11, 10, 18),
+        {d1.date(): _quarters(d1), d2.date(): []},
+        forecast=_forecast_rows(d2),
+    )
+    out, _c, _f = await _run(cfg, local(2026, 11, 10, 19), {d1.date(): RuntimeError("down")})
+    today_rows = [s for s in out if s["start_time"] < d2]
+    tomorrow_rows = [s for s in out if s["start_time"] >= d2]
+    assert today_rows[0]["start_time"] == local(2026, 11, 10, 19)
+    assert not any(s["price_is_forecast"] for s in today_rows)
+    assert len(tomorrow_rows) == 96 and all(s["price_is_forecast"] for s in tomorrow_rows)
+
+
+@pytest.mark.asyncio
+async def test_stale_series_not_served_after_pricing_change(cfg, tmp_path):
+    """A contract/fee change during the outage changes the cache key: old-contract
+    prices must not be served under it."""
+    d1, d2 = local(2026, 11, 10), local(2026, 11, 11)
+    await _run(cfg, local(2026, 11, 10, 15), {d1.date(): _quarters(d1), d2.date(): _quarters(d2)})
+    changed = tmp_path / "changed.yaml"
+    changed.write_text(
+        "timezone: Europe/Stockholm\nnordpool:\n  price_area: SE3\n  resolution_minutes: 15\n"
+        "pricing:\n  grid_transfer_fee_sek: 0.5\n"
+    )
+    out, _c, _f = await _run(
+        str(changed), local(2026, 11, 11, 0, 30), {d2.date(): RuntimeError("down")}
+    )
+    assert out == []
+    # Same pricing as the good fetch -> still served.
+    same, _c, _f = await _run(cfg, local(2026, 11, 11, 0, 30), {})
+    assert same and same[0]["start_time"] == local(2026, 11, 11, 0, 30)
+
+
 # --- Task 3: pricing override last-good memory --------------------------------------
 
 
@@ -270,3 +324,33 @@ async def test_override_never_read_falls_back_to_literal(monkeypatch):
     monkeypatch.setattr(ha_client, "get_ha_entity_state", down)
     cfg = {"pricing": {"export_premium_entity": "sensor.premium", "export_premium_sek_kwh": 0.07}}
     assert await P._resolve_pricing_overrides(cfg) is None
+
+
+@pytest.mark.asyncio
+async def test_override_last_good_expires_after_24h(monkeypatch, caplog):
+    states = {"input_number.natavgift": {"state": "0.25"}}
+
+    async def fake_get(entity_id):
+        return states.get(entity_id)
+
+    monkeypatch.setattr(ha_client, "get_ha_entity_state", fake_get)
+    cfg = {
+        "pricing": {
+            "grid_transfer_fee_entity": "input_number.natavgift",
+            "grid_transfer_fee_sek": 0.9,
+        }
+    }
+    assert (await P._resolve_pricing_overrides(cfg))["grid_transfer_fee_sek"] == pytest.approx(0.25)
+    states["input_number.natavgift"] = {"state": "unavailable"}
+    value, _read_at = P._override_last_good["input_number.natavgift"]
+    P._override_last_good["input_number.natavgift"] = (
+        value,
+        datetime.now(pytz.UTC) - timedelta(hours=25),
+    )
+    with caplog.at_level("WARNING", logger="darkstar.core.prices"):
+        first = await P._resolve_pricing_overrides(cfg)
+        second = await P._resolve_pricing_overrides(cfg)
+    # Expired: no override -> the 0.9 literal applies downstream.
+    assert first is None and second is None
+    assert sum("expired" in r.message for r in caplog.records) == 1
+    assert len(caplog.records) == 1
