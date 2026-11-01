@@ -11,6 +11,7 @@ This module generates 7-day price forecasts by:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -142,7 +143,10 @@ async def generate_price_forecasts(
         price_area = config.get("nordpool", {}).get("price_area", "SE4")
 
         try:
-            regional_weather: dict[str, pd.DataFrame] = get_regional_weather(
+            # Threaded: the Open-Meteo fetch may sleep between retries, and this
+            # coroutine shares the event loop with the API and executor.
+            regional_weather: dict[str, pd.DataFrame] = await asyncio.to_thread(
+                get_regional_weather,
                 start_time=start_time,
                 end_time=end_time,
                 price_area=price_area,
