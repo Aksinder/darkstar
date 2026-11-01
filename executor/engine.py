@@ -42,12 +42,15 @@ from .cyclic_run import anyone_home, should_run_opportunistically
 from .fuse_shed import should_shed_for_fuse
 from .history import ExecutionHistory, ExecutionRecord
 from .load_balancer import LoadBalancer, LoadBalancerStatus
+from .load_balancer_actuator import LoadBalancerActuator
 from .load_balancer_bridge import (
+    battery_entry,
     ev_entries,
     ordered_entries,
-    phase_currents_to_int_keys,
+    read_phase_samples,
     shed_entries,
-    uniform_updated_at,
+    status_payload,
+    would_summary,
 )
 from .override import (
     OverrideResult,
@@ -340,7 +343,11 @@ class ExecutorEngine:
         # verdicts can be compared against the live guard before it is trusted
         # with the contactors. Its own anti-flap state still advances, so what we
         # observe is what it would actually have done.
-        self._load_balancer = LoadBalancer(self.config.load_balancing)
+        self._load_balancer = LoadBalancer(
+            self.config.load_balancing, interval_seconds=self.config.interval_seconds
+        )
+        self._balancer_actuator = LoadBalancerActuator()
+        self._balancer_applied: list[str] = []
         self._last_balancer_status: LoadBalancerStatus | None = None
         self._last_logged_balancer_state: str | None = None
 
@@ -598,6 +605,11 @@ class ExecutorEngine:
                 "quick_action": quick_action_status,
                 "paused": pause_status,
                 "water_boost": water_boost_status,
+                "load_balancer": status_payload(
+                    getattr(self, "_last_balancer_status", None),
+                    actuate=self.config.load_balancing.actuate,
+                    applied=getattr(self, "_balancer_applied", []),
+                ),
                 "recent_errors": list(self.recent_errors),
                 "version": EXECUTOR_VERSION,
             }
@@ -2363,7 +2375,7 @@ class ExecutorEngine:
                     # allowed to act must certainly not be allowed to crash a tick.
                     if self.config.load_balancing.enabled and self.ha_client is not None:
                         try:
-                            await self._observe_load_balancer(original_slot)
+                            await self._observe_load_balancer(decision)
                         except Exception as lb_exc:
                             logger.warning("Load balancer (observe) error: %s", lb_exc)
 
@@ -3548,69 +3560,82 @@ class ExecutorEngine:
                     )
                 )
 
-    async def _observe_load_balancer(self, slot: Any) -> None:
-        """Run one balancer tick and log what it WOULD have done.
+    async def _observe_load_balancer(self, decision: Any) -> None:
+        """Run one balancer tick: log/expose what it decides, act only if allowed.
 
-        Observe-only on purpose. The balancer is upstream code that never ran on
-        this site, and it decides the same question the live phase guard already
-        decides — who gives way when a phase is over budget. Two guards actuating
-        at once is worse than either alone, so this one watches until its verdicts
-        have been seen to agree with reality; only then does the live guard retire.
-
-        Its anti-flap state (pause clocks, shed timestamps) advances normally, so
-        what is logged is genuinely what it would have done, not a stateless guess.
+        Observe-only unless load_balancing.actuate is true: the live guard (S4
+        fuse_guard clamp + HA automation) decides the same question, and two
+        guards acting at once is worse than either alone. Its anti-flap, ledger
+        and fuse-heat state advance normally, so what is logged is genuinely what
+        it would have done. Wiring is in load_balancer_bridge (pure, tested);
+        writes are confined to load_balancer_actuator.
         """
         srv = self._ev_surplus
         if srv is None:
             return
+        lb_cfg = self.config.load_balancing
+        if self._load_balancer.config is not lb_cfg:  # hot config reload
+            self._load_balancer.configure(lb_cfg, self.config.interval_seconds)
 
-        raw = await srv.read_phase_currents(self.ha_client, time.time())
-        phase_current = phase_currents_to_int_keys(raw)
+        phase_current, updated_at = await read_phase_samples(
+            self.ha_client, dict(getattr(srv.cfg, "fuse_phase_entities", {}) or {})
+        )
         now = datetime.now(pytz.timezone(self.config.timezone))
 
         chargers = list(getattr(srv.cfg, "chargers", []) or [])
+        servo_a = {c.id: srv.commanded_current_a(c.id) for c in chargers}
         evs = ev_entries(
             chargers,
-            setpoints_a={c.id: srv.commanded_current_a(c.id) for c in chargers},
-            targets_a={c.id: self._balancer_planned_a(slot, c) for c in chargers},
+            setpoints_a={
+                cid: self._balancer_actuator.applied_setpoint_a(cid, a)
+                for cid, a in servo_a.items()
+            },
+            targets_a=servo_a,
         )
-        sheds = shed_entries(self.config.load_balancing.loads)
-        entries = ordered_entries(self.config.load_balancing.give_way_order, evs, sheds)
+        sheds = shed_entries(lb_cfg.loads)
+        profile = getattr(self, "inverter_profile", None)
+        battery = battery_entry(
+            decision,
+            self.config.controller,
+            grid_w=getattr(srv, "last_grid_w", None),
+            battery_w=getattr(srv, "last_battery_w", None),
+            control_unit=(
+                profile.behavior.control_unit
+                if profile is not None
+                else self.config.inverter.control_unit
+            ),
+        )
+        entries = ordered_entries(lb_cfg.give_way_order, evs, sheds, battery)
 
-        status = self._load_balancer.tick(
-            now, phase_current, uniform_updated_at(phase_current, now), entries
-        )
+        status = self._load_balancer.tick(now, phase_current, updated_at, entries)
         self._last_balancer_status = status
 
-        # Log on STATE CHANGE only. A guard that narrates every quiet tick trains
-        # the reader to skip its lines, which is exactly when it matters.
+        if lb_cfg.actuate:
+            self._balancer_applied = await self._balancer_actuator.apply(
+                self.ha_client,
+                status,
+                chargers={c.id: c for c in chargers},
+                servo_a=servo_a,
+                loads={ld.device_id: ld for ld in lb_cfg.loads},
+                shadow=self.config.shadow_mode,
+            )
+            for line in self._balancer_applied:
+                logger.warning("Load balancer ACTED: %s", line)
+        else:
+            self._balancer_actuator.forget()
+            self._balancer_applied = []
+
+        # Summary on STATE CHANGE only (per-entry changes are logged by the core).
         if status.state != self._last_logged_balancer_state:
             self._last_logged_balancer_state = status.state
-            acted = [f"{o.charger_id}->{o.target_a}A" for o in status.ev_outputs if o.target_a is not None]
-            acted += [f"{o.charger_id}:pause" for o in status.ev_outputs if o.target_a is None]
-            acted += [f"{o.load_id}:shed" for o in status.shed_outputs if o.shed]
             logger.info(
-                "Load balancer (OBSERVE, not acting) %s: %s | phases %s | would: %s",
+                "Load balancer (%s) %s: %s | phases %s | would: %s",
+                "ACTUATING" if lb_cfg.actuate else "OBSERVE, not acting",
                 status.state,
                 status.reason,
-                {p: round(a, 1) for p, a in status.phase_current_a.items()},
-                ", ".join(acted) or "nothing",
+                {f"L{p}": round(a, 1) for p, a in status.phase_current_a.items()},
+                would_summary(status),
             )
-
-    def _balancer_planned_a(self, slot: Any, charger: Any) -> float | None:
-        """The amps the PLAN wants this charger to draw, as the balancer's target.
-
-        Deliberately the plan and not the servo's own last command: the balancer
-        measures "held below target", and feeding it the servo's output as the
-        target would make every tick read as on-target, so it could never report
-        a constraint. None means the plan wants no charging at all.
-        """
-        plans = getattr(slot, "ev_charger_plans", None) or {} if slot is not None else {}
-        kw = float(plans.get(charger.id, 0.0) or 0.0)
-        if kw <= 0.0:
-            return None
-        phases = max(1, int(getattr(charger, "phases", 3) or 3))
-        return (kw * 1000.0) / (230.0 * phases)
 
     async def _anyone_home(self, entities: list[str]) -> bool | None:
         """Is anyone on this load's presence list home? None when nothing is readable."""
