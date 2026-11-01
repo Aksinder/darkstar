@@ -307,3 +307,38 @@ def test_run_preflight_warning_only_does_not_raise(caplog):
     with caplog.at_level(logging.WARNING, logger="darkstar.planner.preflight"):
         run_preflight(input_data, config)  # Must not raise
     assert "DATA_STALE" in caplog.text
+
+
+# --- planner's own now (upstream 846c8710) ---
+
+
+def _input_at(start: datetime, hours: int = 8) -> dict:
+    return {
+        "price_data": [_price_slot(start + timedelta(hours=i)) for i in range(hours)],
+        "forecast_data": [_forecast_slot(start + timedelta(hours=i)) for i in range(hours)],
+        "initial_state": {"battery_kwh": 5.0},
+    }
+
+
+def test_run_preflight_replay_uses_supplied_now():
+    """A replay of a past day must judge prices against the replayed now.
+
+    Against the wall clock every replayed price slot is in the past, so the run
+    would fail PRICES_UNAVAILABLE.
+    """
+    replay_now = datetime(2026, 3, 1, 10, 0, tzinfo=UTC)
+    run_preflight(_input_at(replay_now), _valid_config(), now=replay_now)  # must not raise
+
+
+def test_run_preflight_naive_now_is_utc():
+    replay_now = datetime(2026, 3, 1, 10, 0)  # naive, like a naive now_override
+    run_preflight(_input_at(replay_now.replace(tzinfo=UTC)), _valid_config(), now=replay_now)
+
+
+def test_soc_staleness_measured_against_supplied_now(caplog):
+    replay_now = datetime(2026, 3, 1, 10, 0, tzinfo=UTC)
+    input_data = _input_at(replay_now)
+    input_data["initial_state"]["soc_timestamp"] = (replay_now - timedelta(minutes=5)).isoformat()
+    with caplog.at_level(logging.WARNING, logger="darkstar.planner.preflight"):
+        check_soc_staleness(input_data, replay_now)
+    assert "DATA_STALE" not in caplog.text  # 5 min old at replay time, not months

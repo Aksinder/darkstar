@@ -745,11 +745,45 @@ class HAWebSocketClient:
         logger.info(f"🔗 Connecting to HA WebSocket: {self.url}")
         threading.Thread(target=_run_ws, daemon=True, name="HA-WebSocket").start()
 
-    def reload_monitored_entities(self):
-        """Reload the monitored entities mapping from config.yaml and HA params from secrets.yaml."""
+    def reload_monitored_entities(self) -> set[str]:
+        """Reload the monitored entities mapping from config.yaml and HA params from secrets.yaml.
+
+        Returns the entity ids that became monitored as a result of this reload.
+        The websocket subscription carries only *changes*, so an entity added to
+        the config after startup stays invisible until it happens to change on its
+        own — ``reload_and_seed_entities`` seeds its current state from this set.
+        """
         logger.info("Reloading HA configuration...")
+        previous = set(self.monitored_entities)
         self._load_config()
         self.monitored_entities = self._get_monitored_entities()
+        added = set(self.monitored_entities) - previous
+        if added:
+            logger.info("Now monitoring %d newly configured HA entities", len(added))
+        return added
+
+    async def reload_and_seed_entities(self) -> set[str]:
+        """Reload monitored entities and seed the current state of the new ones.
+
+        Ported from upstream 885b296a (minus its EV-goal sync, which this fork
+        does not have). Adding an entity only extends the local filter applied to
+        the already-running ``state_changed`` subscription; it does not replay the
+        entity's present value. Newly monitored entities are therefore fetched
+        over REST and pushed through the normal change handler — the same path
+        the startup ``get_states`` result takes.
+        """
+        from backend.core.ha_client import get_ha_entity_state
+
+        added = self.reload_monitored_entities()
+        for entity_id in sorted(added):
+            state = await get_ha_entity_state(entity_id)
+            if not state:
+                continue
+            try:
+                self._handle_state_change(entity_id, state)
+            except Exception as e:
+                logger.warning("Failed to seed state for new entity %s: %s", entity_id, e)
+        return added
 
     def _trigger_ev_replan(self, charger_id: str | None = None, plugged_in: bool = True):
         """Trigger immediate re-planning for EV state changes (Rev K25 + EVFIX + Task 7.2/7.3).
@@ -861,10 +895,22 @@ def start_ha_socket_client():
             logger.error(f"❌ Failed to start HA WebSocket client: {e}", exc_info=True)
 
 
-def reload_ha_socket_client():
-    """Trigger a reload of the monitored entities in the running client."""
+def reload_ha_socket_client() -> set[str]:
+    """Trigger a reload of the monitored entities in the running client.
+
+    Returns the newly monitored entity ids. Async callers should prefer
+    ``reload_ha_socket_client_async``, which also seeds their current state.
+    """
     if _ha_client:
-        _ha_client.reload_monitored_entities()
+        return _ha_client.reload_monitored_entities()
+    return set()
+
+
+async def reload_ha_socket_client_async() -> set[str]:
+    """Reload monitored entities and seed the current state of the new ones."""
+    if _ha_client is None:
+        return set()
+    return await _ha_client.reload_and_seed_entities()
 
 
 def stop_ha_socket_client():

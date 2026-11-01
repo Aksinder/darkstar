@@ -14,7 +14,6 @@ from typing import Any
 import pytz
 from sqlalchemy import create_engine, delete, desc, func, select, text
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from backend.learning.models import ExecutionLog
 
@@ -89,7 +88,11 @@ class ExecutionHistory:
         self.engine = create_engine(
             f"sqlite:///{db_path}",
             connect_args=connect_args,
-            poolclass=StaticPool,  # Reuse single connection
+            # Default (QueuePool) on purpose: one DBAPI connection per concurrent
+            # user. StaticPool shared a single sqlite3 connection across the
+            # executor thread and API request threads (check_same_thread=False
+            # only silences the guard), so concurrent sessions interleaved
+            # statements/transactions on one connection (upstream 62c980bb).
         )
 
         # ARC12: Enable WAL mode for concurrent read/write access

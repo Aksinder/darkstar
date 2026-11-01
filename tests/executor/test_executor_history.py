@@ -407,3 +407,36 @@ class TestCleanupOldRecords:
         records = history.get_history()
         assert len(records) == 1
         assert records[0]["commanded_work_mode"] == "New"
+
+
+def test_concurrent_threads_get_separate_sqlite_connections(history):
+    """Executor thread and API threads must not share one sqlite3 connection.
+
+    StaticPool (removed per upstream 62c980bb) handed every thread the same
+    DBAPI connection, so concurrent sessions interleaved on it.
+    """
+    import threading
+
+    barrier = threading.Barrier(2, timeout=5)
+    seen: list[int] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            with history.engine.connect() as conn:
+                seen.append(id(conn.connection.dbapi_connection))
+                barrier.wait()  # both threads hold a connection at the same time
+        except BaseException as e:  # surface to the main thread
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert len(seen) == 2
+    assert seen[0] != seen[1]
+    with history.engine.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"

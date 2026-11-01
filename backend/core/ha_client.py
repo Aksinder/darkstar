@@ -22,6 +22,7 @@ from backend.core.ev_arrival import (
     reserve_kwh,
 )
 from backend.core.ev_presence import ev_is_home, haversine_km
+from backend.core.ha_timestamps import reading_timestamp
 from backend.health import set_load_forecast_status
 
 logger = logging.getLogger("darkstar.core.ha_client")
@@ -182,9 +183,8 @@ async def get_ha_entity_state(entity_id: str) -> dict[str, Any] | None:
         return None
 
 
-async def get_ha_sensor_float(entity_id: str) -> float | None:
-    """Return numeric state of HA sensor asynchronously."""
-    state = await get_ha_entity_state(entity_id)
+def _state_float(state: dict[str, Any] | None) -> float | None:
+    """Parse an HA state's value as float; None if missing/unknown/unavailable."""
     if not state:
         return None
 
@@ -196,6 +196,11 @@ async def get_ha_sensor_float(entity_id: str) -> float | None:
         return float(raw_value)
     except (TypeError, ValueError):
         return None
+
+
+async def get_ha_sensor_float(entity_id: str) -> float | None:
+    """Return numeric state of HA sensor asynchronously."""
+    return _state_float(await get_ha_entity_state(entity_id))
 
 
 async def get_ha_sensor_kw_normalized(entity_id: str) -> float | None:
@@ -681,16 +686,28 @@ async def get_initial_state(
     input_sensors = config.get("input_sensors", {})
     soc_entity_id = input_sensors.get("battery_soc", ha_config.get("soc_entity_id"))
 
+    soc_timestamp: datetime | None = None
+
     if soc_entity_id:
-        ha_soc = await get_ha_sensor_float(soc_entity_id)
+        soc_state = await get_ha_entity_state(soc_entity_id)
+        ha_soc = _state_float(soc_state)
         if ha_soc is not None:
             battery_soc_percent = ha_soc
+            # Age of the reading for planner/preflight.py::check_soc_staleness.
+            # Uses last_reported (advances on every poll, even when the value is
+            # unchanged) so a steady-but-alive Modbus SoC is not flagged stale;
+            # falls back to last_updated/last_changed on HA < 2024.3.
+            soc_timestamp = reading_timestamp(soc_state)
         else:
             # Critical safety check: Do not default to 50% if we expected a live reading.
             # This causes "phantom charging" when HA is down.
-            raise RuntimeError(
-                f"Critical: Failed to read battery SoC from {soc_entity_id}. "
-                "Planning aborted to prevent unsafe assumptions."
+            # Typed + transient (upstream 5acfad38): an HA outage backs off and
+            # retries instead of surfacing as an UNKNOWN planner failure.
+            from planner.errors import PlannerError, PlannerErrorCode
+
+            raise PlannerError(
+                PlannerErrorCode.HA_UNAVAILABLE,
+                details={"entity_id": soc_entity_id},
             )
 
     battery_soc_percent = max(0.0, min(100.0, battery_soc_percent))
@@ -1154,7 +1171,7 @@ async def get_initial_state(
                     # net meter can go negative (export); billed import can't
                     peak_hour_elapsed_import_kwh = max(0.0, float(elapsed))
 
-    return {
+    initial_state: dict[str, Any] = {
         "battery_soc_percent": battery_soc_percent,
         "battery_kwh": battery_kwh,
         "battery_cost_sek_per_kwh": battery_cost_sek_per_kwh,
@@ -1173,6 +1190,9 @@ async def get_initial_state(
         "peak_power_baseline_kw": peak_power_baseline_kw,
         "peak_hour_elapsed_import_kwh": peak_hour_elapsed_import_kwh,
     }
+    if soc_timestamp is not None:
+        initial_state["soc_timestamp"] = soc_timestamp.isoformat()
+    return initial_state
 
 
 _SLOT_SECONDS = 15 * 60
