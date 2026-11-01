@@ -59,6 +59,24 @@ def test_compute_slot_record_balance_and_quarter_split():
     assert "repaired" in rec["quality_flags"]
 
 
+def test_compute_slot_record_subtracts_cyclic_loads():
+    """Pool pump / filter energy leaves base load, like the live recorder does."""
+    hourly = {
+        "pv": {HOUR: 8.0},
+        "imp": {HOUR: 0.4},
+        "exp": {HOUR: 0.2},
+        "cha": {HOUR: 4.0},
+        "dis": {HOUR: 0.0},
+        "water": {HOUR: 0.8},
+        "ev": {HOUR: 0.4},
+        "cyclic": {HOUR: 1.0},
+    }
+    rec = compute_slot_record(HOUR + timedelta(minutes=15), hourly, full=True)
+    assert rec is not None
+    # 0.75 without cyclic, minus 1.0 / 4
+    assert rec["load_kwh"] == pytest.approx(0.5)
+
+
 def test_compute_slot_record_clamps_negative_load_and_needs_data():
     hourly = {"pv": {HOUR: 0.4}, "imp": {}, "exp": {HOUR: 8.0}, "cha": {}, "dis": {}}
     rec = compute_slot_record(HOUR, hourly, full=True)

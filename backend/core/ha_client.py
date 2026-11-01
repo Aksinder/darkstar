@@ -414,8 +414,10 @@ async def get_power_history_batch(
         "minimal_response": False,
     }
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            response = await client.get(api_url, headers=make_ha_headers(token), params=params)
+        async with ha_http_client() as client:
+            response = await client.get(
+                api_url, headers=make_ha_headers(token), params=params, timeout=12.0
+            )
             response.raise_for_status()
             data = response.json()
     except Exception as exc:

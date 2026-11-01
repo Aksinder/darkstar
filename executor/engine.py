@@ -3069,7 +3069,13 @@ class ExecutorEngine:
         # Handle both kW and kWh fields
         charge_kw = float(slot_data.get("battery_charge_kw", 0.0) or 0.0)
         discharge_kw = float(slot_data.get("battery_discharge_kw", 0.0) or 0.0)
-        export_kw = float(slot_data.get("export_kwh", 0.0) or 0.0) * 4  # kWh to kW
+        # Prefer the planner's own kW: on a partial first slot (kepler.partial_first_slot)
+        # export_kwh covers only the remaining minutes, so kWh * 4 would under-command.
+        grid_export_kw = slot_data.get("grid_export_kw")
+        if grid_export_kw is not None:
+            export_kw = float(grid_export_kw or 0.0)
+        else:
+            export_kw = float(slot_data.get("export_kwh", 0.0) or 0.0) * 4  # kWh to kW
         # Load forecast: convert kWh per slot to kW (multiply by 4 for 15-min slots)
         load_kw = float(slot_data.get("load_forecast_kwh", 0.0) or 0.0) * 4
         # PV forecast: convert kWh per slot to kW (multiply by 4 for 15-min slots).
