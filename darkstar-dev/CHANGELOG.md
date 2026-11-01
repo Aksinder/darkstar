@@ -1,3 +1,7 @@
+## dev-20261101.1443 — 2026-11-01 14:45
+
+- config: ship plan-age cutoff 120, fallback planner on, load balancer observe-only
+
 ## dev-20261101.1215 — 2026-11-01 12:17
 
 - fix(forecast): retry Open-Meteo and never store zero PV on an outage
