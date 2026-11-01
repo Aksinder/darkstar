@@ -207,6 +207,20 @@ async def generate_forward_slots(
     if not weather_df.empty:
         df = df.merge(weather_df, left_on="slot_start", right_index=True, how="left")
 
+    # Abort on a failed weather fetch rather than store a near-zero PV forecast
+    # (physics without radiation is 0, and it would overwrite the last good forecast
+    # the planner reads). Only the next 24 h are checked: Open-Meteo's 2-day window
+    # normally leaves the tail of the 168 h horizon without radiation.
+    # Idea ported from upstream ergetie/darkstar 47e557c5.
+    near = df["slot_start"] < slot_start + timedelta(hours=24)
+    radiation = df.get("shortwave_radiation_w_m2")
+    if radiation is None or radiation[near].isna().all():
+        logger.error(
+            "AURORA forecast aborted: no Open-Meteo radiation for the next 24 h; "
+            "keeping the previously stored forecast"
+        )
+        return
+
     # Ensure ALL weather columns exist (even if empty) to match trained model feature count.
     # dni_w_m2/dhi_w_m2 are PHYSICS inputs (not ML features) — included here only so a missing
     # weather fetch degrades to the legacy GHI transposition instead of raising KeyError below.

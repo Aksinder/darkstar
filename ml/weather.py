@@ -18,6 +18,7 @@ import pytz
 import requests
 import yaml
 
+from backend.core.open_meteo_retry import is_transient_http_error, retry_sync
 from utils.time_utils import dst_safe_localize
 
 
@@ -430,8 +431,16 @@ def get_weather_series(
 
         # Fail fast on the common 1-day fetch; allow more headroom for multi-week
         # training windows (larger payload, same single request).
-        response = requests.get(url, params=params, timeout=5 if past_days <= 2 else 15)
-        response.raise_for_status()
+        timeout_s = 5 if past_days <= 2 else 15
+
+        def _fetch() -> requests.Response:
+            response = requests.get(url, params=params, timeout=timeout_s)
+            response.raise_for_status()
+            return response
+
+        # Blocks up to 6 s between retries; async callers go through
+        # async_get_weather_series (asyncio.to_thread).
+        response = retry_sync(_fetch, label="weather", is_transient=is_transient_http_error)
         payload: dict[str, Any] = response.json()  # type: ignore[assignment]
     except Exception as exc:  # pragma: no cover - defensive logging
         print(f"Warning: Failed to fetch weather data from Open-Meteo: {exc}")
