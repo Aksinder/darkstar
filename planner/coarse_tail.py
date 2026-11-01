@@ -39,6 +39,15 @@ if TYPE_CHECKING:
     from planner.solver.types import KeplerResult
 
 
+def _sum_phased(slots: list[KeplerInputSlot], members: list[int]) -> dict[str, float] | None:
+    """Sum the members' phase-known load (fuse relief); None when none has any."""
+    out: dict[str, float] = {}
+    for k in members:
+        for ph, kwh in (slots[k].phased_load_kwh or {}).items():
+            out[ph] = out.get(ph, 0.0) + kwh
+    return out or None
+
+
 def coarsen_slots(
     slots: list[KeplerInputSlot], fine_hours: float
 ) -> tuple[list[KeplerInputSlot], list[list[int]]]:
@@ -99,6 +108,7 @@ def coarsen_slots(
                 export_price_sek_kwh=sum(
                     slots[k].export_price_sek_kwh for k in members
                 ) / len(members),
+                phased_load_kwh=_sum_phased(slots, members),
             )
         )
         groups.append(members)
