@@ -462,6 +462,8 @@ class LearningStore:
                 "base_load_p10": stmt.excluded.base_load_p10,
                 "base_load_p90": stmt.excluded.base_load_p90,
                 "temp_c": stmt.excluded.temp_c,
+                # The row now holds THIS run's forecast; keep its age honest.
+                "created_at": func.current_timestamp(),
             },
         )
         async with self.AsyncSession() as session:
