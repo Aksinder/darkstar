@@ -57,3 +57,42 @@ def test_surplus_just_above_a_forced_floor_never_lands_below_it():
     cmd = compute_ev_surplus(_inputs([fmb], pv_w=5000.0, battery_w=230.0 * 7.3, soc=99.0), CFG)[0]
     assert cmd.switch_on
     assert cmd.set_current_a == 8.0
+
+
+def _fuse_inputs(chargers, l1_a, pv_w=0.0, battery_w=0.0, soc=50.0):
+    return EVSurplusInputs(
+        pv_w=pv_w, grid_w=0.0, battery_w=battery_w, battery_soc_percent=soc,
+        import_price_sek=1.0, remaining_solar_kwh=0.0, chargers=chargers,
+        phase_currents_a={"L1": l1_a},
+    )
+
+
+FUSE_CFG = EVSurplusConfig(enabled=True, fuse_budget_a=25.0)
+
+
+def test_forced_ceil_never_exceeds_fuse_cap():
+    # Fuse allows 10.4 A on L1; the 10.2 A plan floor fits under it (so the target is
+    # not "fuse_capped"), but its ceil (11 A) does not. The cap snaps DOWN to 10 A.
+    fmb = _fmb(deadline_hours=None, plan_floor_w=230.0 * 10.2, phase_map=("L1",))
+    cmd = compute_ev_surplus(_fuse_inputs([fmb], l1_a=25.0 - 10.4), FUSE_CFG)[0]
+    assert cmd.switch_on
+    assert cmd.set_current_a == 10.0
+    assert cmd.raw_amps <= 10.0
+    assert cmd.fuse_limited  # a fuse-relief write bypasses Schmitt/pacing on the way down
+
+
+def test_surplus_round_up_never_exceeds_fuse_cap():
+    # Cap 10.6 A, 10.55 A of surplus: round() would give 11 A, above the fuse allowance.
+    fmb = _fmb(deadline_hours=None, phase_map=("L1",))
+    cmd = compute_ev_surplus(
+        _fuse_inputs([fmb], l1_a=25.0 - 10.6, pv_w=5000.0, battery_w=230.0 * 10.55, soc=99.0),
+        FUSE_CFG,
+    )[0]
+    assert cmd.switch_on
+    assert cmd.set_current_a == 10.0
+
+
+def test_forced_ceil_unchanged_when_cap_has_room():
+    fmb = _fmb(deadline_hours=None, plan_floor_w=230.0 * 10.2, phase_map=("L1",))
+    cmd = compute_ev_surplus(_fuse_inputs([fmb], l1_a=25.0 - 12.0), FUSE_CFG)[0]
+    assert cmd.set_current_a == 11.0
