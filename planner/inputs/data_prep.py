@@ -51,12 +51,18 @@ def build_price_dataframe(price_data: list[dict[str, Any]], tz_name: str) -> pd.
         tz_name: Timezone name for normalization
 
     Returns:
-        DataFrame indexed by start_time with end_time, import_price_sek_kwh, export_price_sek_kwh
+        DataFrame indexed by start_time with end_time, import_price_sek_kwh,
+        export_price_sek_kwh and price_is_forecast (bool)
     """
     if not price_data:
         empty_idx = pd.DatetimeIndex([], tz=pytz.timezone(tz_name))
         return pd.DataFrame(
-            columns=["end_time", "import_price_sek_kwh", "export_price_sek_kwh"],
+            columns=[
+                "end_time",
+                "import_price_sek_kwh",
+                "export_price_sek_kwh",
+                "price_is_forecast",
+            ],
             index=empty_idx,
         )
 
@@ -76,13 +82,21 @@ def build_price_dataframe(price_data: list[dict[str, Any]], tz_name: str) -> pd.
                     if slot.get("export_price_sek_kwh") is not None
                     else (slot.get("import_price_sek_kwh") or 0.0)
                 ),
+                # Informational only: no solver term reads it. Marks D+1 slots that
+                # carry the ML price forecast instead of a published Nordpool price.
+                "price_is_forecast": slot.get("price_is_forecast") is True,
             }
         )
 
     if not records:
         empty_idx = pd.DatetimeIndex([], tz=pytz.timezone(tz_name))
         return pd.DataFrame(
-            columns=["end_time", "import_price_sek_kwh", "export_price_sek_kwh"],
+            columns=[
+                "end_time",
+                "import_price_sek_kwh",
+                "export_price_sek_kwh",
+                "price_is_forecast",
+            ],
             index=empty_idx,
         )
 
