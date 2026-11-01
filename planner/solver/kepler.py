@@ -24,6 +24,7 @@ from .types import (
     KeplerResult,
     KeplerResultSlot,
     WaterHeaterInput,
+    planned_slot_hours,
 )
 
 logger = logging.getLogger("darkstar.kepler")
@@ -242,11 +243,23 @@ class KeplerSolver:
                 status_msg="No slots to schedule",
             )
 
-        # Calculate slot duration in hours
-        slot_hours: list[float] = []
-        for s in slots:
-            duration = (s.end_time - s.start_time).total_seconds() / 3600.0
-            slot_hours.append(duration)
+        # Calculate slot duration in hours. full_slot_hours is the wall-clock slot
+        # length; slot_hours is what each slot is PLANNED over: an in-progress slot 0
+        # (input_data.first_slot_remaining_h, kepler.partial_first_slot) only has
+        # the time left in it, so every flow, power limit and cost of that slot
+        # uses the remaining duration and the reported kW is energy / remaining
+        # time. The pipeline scales slot 0's PV/load forecast to the same share.
+        full_slot_hours: list[float] = [
+            (s.end_time - s.start_time).total_seconds() / 3600.0 for s in slots
+        ]
+        slot_hours: list[float] = list(full_slot_hours)
+        if input_data.first_slot_remaining_h is not None:
+            slot_hours[0] = planned_slot_hours(slots[:1], input_data.first_slot_remaining_h)[0]
+        # Share of each slot that is still ahead (1.0 except a partial slot 0):
+        # scales fixed per-slot energies (deferrable-load blocks) to that basis.
+        slot_share: list[float] = [
+            (h / fh) if fh > 0 else 1.0 for h, fh in zip(slot_hours, full_slot_hours, strict=True)
+        ]
 
         # Problem Definition
         prob: Any = pulp.LpProblem("KeplerSchedule", pulp.LpMinimize)
@@ -765,7 +778,7 @@ class KeplerSolver:
             # across the block's slots), added to the demand side.
             deferrable_load_kwh_t: Any = (
                 pulp.lpSum(
-                    _defl_run_expr(load.id, t) * defl_energy_per_slot[load.id]
+                    _defl_run_expr(load.id, t) * defl_energy_per_slot[load.id] * slot_share[t]
                     for load in scheduled_defl
                 )
                 if scheduled_defl
@@ -882,10 +895,13 @@ class KeplerSolver:
                 )
 
             # Ramping Constraints
+            # In kW (net energy / planned hours): identical to the old energy-delta
+            # form on a uniform grid, but a short in-progress slot 0 (or a coarse-tail
+            # boundary) no longer reads as a phantom power step.
             if t > 0:
-                prob += (charge[t] - discharge[t]) - (charge[t - 1] - discharge[t - 1]) == ramp_up[
-                    t
-                ] - ramp_down[t]
+                prob += (charge[t] - discharge[t]) / h - (
+                    charge[t - 1] - discharge[t - 1]
+                ) / slot_hours[t - 1] == ramp_up[t] - ramp_down[t]
             else:
                 prob += ramp_up[t] == 0
                 prob += ramp_down[t] == 0
@@ -899,9 +915,7 @@ class KeplerSolver:
                 s.export_price_sek_kwh - config.export_threshold_sek_per_kwh
             )
             slot_export_revenue: Any = grid_export[t] * effective_export_price
-            slot_ramping_cost: Any = (
-                (ramp_up[t] + ramp_down[t]) / h
-            ) * config.ramping_cost_sek_per_kw
+            slot_ramping_cost: Any = (ramp_up[t] + ramp_down[t]) * config.ramping_cost_sek_per_kw
             slot_curtailment_cost: Any = curtailment[t] * curtailment_penalty
             slot_shedding_cost: Any = load_shedding[t] * LOAD_SHEDDING_PENALTY
             slot_import_breach_cost: Any = import_breach[t] * IMPORT_BREACH_PENALTY
@@ -1107,7 +1121,8 @@ class KeplerSolver:
             H: list[float] = [0.0]
             for _h in slot_hours:
                 H.append(H[-1] + _h)
-            h_unit: float = min(slot_hours) if slot_hours else 0.25
+            # Nominal slot length: a short in-progress slot 0 is not a grid quantum.
+            h_unit: float = min(full_slot_hours) if full_slot_hours else 0.25
 
             # Soft-cap overage price: just above the boost reward so reward-farming
             # beyond the cap nets negative per kWh, yet orders of magnitude below the
@@ -1878,7 +1893,7 @@ class KeplerSolver:
                 for load in scheduled_defl:
                     run_val: float | None = pulp.value(_defl_run_expr(load.id, t))  # type: ignore[assignment]
                     device_kw = (
-                        defl_energy_per_slot[load.id] / h
+                        defl_energy_per_slot[load.id] * slot_share[t] / h
                         if run_val is not None and run_val > 0.5 and h > 0
                         else 0.0
                     )
@@ -1931,6 +1946,10 @@ class KeplerSolver:
                         ev_charger_results=ev_charger_results,
                         deferrable_load_kw=total_defl_kw,
                         deferrable_load_results=deferrable_load_results,
+                        # Only a partial slot 0 differs from its wall-clock
+                        # length; None keeps every other slot (and the coarse-tail
+                        # split, which re-times members) on start/end arithmetic.
+                        duration_h=h if h != full_slot_hours[t] else None,
                         is_optimal=True,
                     )
                 )

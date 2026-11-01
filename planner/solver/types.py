@@ -8,6 +8,12 @@ Migrated from backend/kepler/types.py for the new planner package.
 from dataclasses import dataclass, field
 from datetime import datetime
 
+# Floor for the in-progress slot 0's planned duration (one minute). Keeps the
+# model well-conditioned in the last seconds of a slot: kW = kWh / hours, and the
+# ramp term divides by it. Upstream (ccb47c07) floors at 1 us; one minute bounds
+# the 1/h coefficients at 60 while erring by at most a minute of headroom.
+MIN_FIRST_SLOT_H = 1.0 / 60.0
+
 
 @dataclass
 class IncentiveBucket:
@@ -428,6 +434,11 @@ class KeplerInput:
 
     slots: list[KeplerInputSlot]
     initial_soc_kwh: float
+    # Hours left in slot 0 when planning starts mid-slot (kepler.partial_first_slot).
+    # Every flow, limit and cost of slot 0 is planned over this one duration, and
+    # the pipeline scales slot 0's PV/load forecast to the same share. None = the
+    # full slot is available (legacy / boundary plan).
+    first_slot_remaining_h: float | None = None
 
 
 @dataclass
@@ -463,6 +474,9 @@ class KeplerResultSlot:
     deferrable_load_results: dict[str, float] = field(
         default_factory=lambda: {}
     )  # Per-device: load_id -> kW
+    # Hours the solver planned this slot over: the time left in an in-progress
+    # slot 0, else the slot length. kW = kWh / duration_h. None = slot length.
+    duration_h: float | None = None
     is_optimal: bool = True
 
 
@@ -482,3 +496,19 @@ class KeplerResult:
     # the plan. Surfacing both makes that wedge visible instead of certifying
     # "optimal" against an objective the user never sees.
     objective_cost_sek: float | None = None
+
+
+def planned_slot_hours(
+    slots: list[KeplerInputSlot], first_slot_remaining_h: float | None = None
+) -> list[float]:
+    """Per-slot planning durations (hours) — the ONE basis for kWh <-> kW.
+
+    The wall-clock length of each slot, except that an in-progress slot 0 only
+    has the time left in it (clamped to [MIN_FIRST_SLOT_H, slot length]). Kepler,
+    the battery-only fallback and the plan validator all derive limits and
+    balances from this list, so they cannot disagree about slot 0.
+    """
+    hours = [max((s.end_time - s.start_time).total_seconds() / 3600.0, 0.0) for s in slots]
+    if hours and first_slot_remaining_h is not None and hours[0] > 0:
+        hours[0] = min(hours[0], max(MIN_FIRST_SLOT_H, float(first_slot_remaining_h)))
+    return hours

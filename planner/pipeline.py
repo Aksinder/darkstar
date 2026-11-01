@@ -34,8 +34,10 @@ from planner.preflight import run_preflight
 from planner.solver.adapter import (
     config_to_kepler_config,
     dynamic_wtp_from_prices,
+    first_slot_remaining_h,
     kepler_result_to_dataframe,
     planner_to_kepler_input,
+    scale_first_slot_to_remaining,
 )
 from planner.solver.kepler import KeplerSolver
 from planner.strategy.manual_plan import apply_manual_plan
@@ -881,16 +883,22 @@ class PlannerPipeline:
         # LOCAL timestamp raises "Cannot infer dst time" for every instant of the
         # repeated hour on the autumn DST night, which would fail every replan for
         # two real hours. A quarter boundary is the same instant in UTC.
+        #
+        # Replays FLOOR like live (they used to CEIL, i.e. plan from the NEXT
+        # boundary, so a replay of a mid-slot instant solved a different problem
+        # than the live run it reproduces). Both now plan the slot containing
+        # `real_now`; with kepler.partial_first_slot that slot is planned over
+        # only its remaining time. A naive now_override is UTC (same rule as
+        # preflight below).
         tz = pytz.timezone(timezone_name)
         if now_override:
             if now_override.tzinfo is None:
-                now_slot = pd.Timestamp(now_override, tz="UTC").ceil("15min").tz_convert(tz)
+                real_now = pd.Timestamp(now_override, tz="UTC")
             else:
-                now_slot = (
-                    pd.Timestamp(now_override).tz_convert("UTC").ceil("15min").tz_convert(tz)
-                )
+                real_now = pd.Timestamp(now_override).tz_convert("UTC")
         else:
-            now_slot = pd.Timestamp.now(tz="UTC").floor("15min").tz_convert(tz)
+            real_now = pd.Timestamp.now(tz="UTC")
+        now_slot = real_now.floor("15min").tz_convert(tz)
 
         # Per-device mid-block detection (task 3.1)
         # force_water_by_heater: heater_id → set of timestamps to force ON
@@ -1759,6 +1767,31 @@ class PlannerPipeline:
                             else ""
                         ),
                     )
+
+        # In-progress slot 0 (kepler.partial_first_slot, upstream ccb47c07): slot 0
+        # is almost always partly elapsed by the time this plan ships (replan
+        # cadence + up to 240 s of solve), yet it was planned as a whole slot —
+        # the current SoC got a full slot of PV/load and charge headroom on top.
+        # Plan it over the time left instead: the solver clamps slot 0's hours
+        # and every limit/flow to that, its PV/load forecast is scaled to the same
+        # share HERE (after every pre-solve consumer above has read full-slot
+        # forecasts: cyclic loads, coarse tail, excess-PV flags, shortfall gate),
+        # and kW = planned energy / remaining hours on the way out.
+        if bool(kepler_cfg_ct.get("partial_first_slot", False)) and kepler_input.slots:
+            _s0 = kepler_input.slots[0]
+            _rem_h = first_slot_remaining_h(_s0.start_time, _s0.end_time, real_now)
+            _s0_h = (_s0.end_time - _s0.start_time).total_seconds() / 3600.0
+            if _rem_h < _s0_h:
+                kepler_input = scale_first_slot_to_remaining(
+                    replace(kepler_input, first_slot_remaining_h=_rem_h)
+                )
+                logger.info(
+                    "Partial first slot: %.1f of %.0f min left in %s — planned over "
+                    "the remainder (PV/load scaled to that share)",
+                    _rem_h * 60.0,
+                    _s0_h * 60.0,
+                    _s0.start_time.isoformat(),
+                )
 
         # Preflight judges price horizon / SoC age against the run's own time
         # (upstream 846c8710): now_override during replay, wall clock live.
