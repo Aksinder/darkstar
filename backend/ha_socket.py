@@ -387,9 +387,13 @@ class HAWebSocketClient:
         if key and key.startswith("ev_plug_"):
             try:
                 ev_idx = int(key.split("_")[-1])
-                state_val = new_state.get("state", "").lower()
+                state_val = str(new_state.get("state") or "").strip().lower()
                 logger.info(f"EV{ev_idx} plug state changed: {entity_id}={state_val}")
 
+                # unavailable/unknown = the cloud integration lost the charger/car, not
+                # "the cable is out". Treating it as unplugged dropped the EV plan on
+                # every Easee/Tesla dropout; hold the last known state instead.
+                unreadable = state_val in ("", "unavailable", "unknown", "none")
                 is_plugged = state_val in ("on", "true", "1", "connected")
 
                 # Initialize ev_chargers data structure if needed
@@ -410,24 +414,53 @@ class HAWebSocketClient:
                         }
                     )
 
-                # Update this EV's plug status
-                if ev_idx < len(ev_chargers):
-                    ev_chargers[ev_idx]["plugged_in"] = is_plugged
-
-                # Build aggregate for backward compat
-                any_plugged = any(ev.get("plugged_in", False) for ev in ev_chargers)
-
-                # Trigger immediate re-plan on plug-in or unplug (Task 7.2/7.3: pass charger ID)
                 charger_id = (
                     self.ev_charger_configs[ev_idx].get("id", f"ev_charger_{ev_idx}")
                     if ev_idx < len(self.ev_charger_configs)
                     else f"ev_charger_{ev_idx}"
+                )
+
+                # Last REAL plug reading per charger id (None = never seen one). The
+                # ev_chargers entry defaults to plugged_in=False before any reading
+                # (and is rebuilt on config reload), so it cannot tell "unplugged"
+                # from "not yet known".
+                known: dict[str, bool] = self.__dict__.setdefault("_ev_plug_known", {})
+                previous = known.get(charger_id)
+                if unreadable:
+                    if previous is None:
+                        previous = self._planner_held_plug(charger_id)
+                    is_plugged = bool(previous)
+                    logger.warning(
+                        f"EV{ev_idx} ({charger_id}) plug sensor {state_val or 'empty'} - "
+                        f"holding last known plugged_in={is_plugged}, no re-plan"
+                    )
+                else:
+                    known[charger_id] = is_plugged
+
+                # Update this EV's plug status
+                if ev_idx < len(ev_chargers):
+                    ev_chargers[ev_idx]["plugged_in"] = is_plugged
+                    ev_chargers[ev_idx]["plug_held"] = unreadable
+
+                # Build aggregate for backward compat
+                any_plugged = any(ev.get("plugged_in", False) for ev in ev_chargers)
+
+                # Trigger immediate re-plan on a REAL plug-in or unplug only (Task
+                # 7.2/7.3: pass charger ID). Attribute churn, WS reconnect replays
+                # and unavailable/unknown blips do not change the plug state. A first
+                # reading (nothing known yet) replans only when it says plugged in.
+                transition = not unreadable and (
+                    is_plugged != previous if previous is not None else is_plugged
                 )
                 if getattr(self, "_seeding", False):
                     # Seeding a newly configured plug sensor on config save: the
                     # plug state did not change, so record it without a replan.
                     logger.info(
                         f"EV{ev_idx} ({charger_id}) plug state seeded ({state_val}) - no re-plan"
+                    )
+                elif not transition:
+                    logger.debug(
+                        f"EV{ev_idx} ({charger_id}) plug state unchanged ({state_val}) - no re-plan"
                     )
                 elif is_plugged:
                     logger.info(
@@ -793,6 +826,25 @@ class HAWebSocketClient:
             finally:
                 self._seeding = False
         return added
+
+    @staticmethod
+    def _planner_held_plug(charger_id: str) -> bool:
+        """Planner-side last-good plug reading (ha_client hold, 24 h), else False.
+
+        Used when the very first websocket reading of a plug sensor is unreadable
+        (e.g. HA restarted mid-outage), so the live view agrees with the planner.
+        """
+        try:
+            import time as _time
+
+            from backend.core.ha_client import _EV_PLUG_HOLD_S, _LAST_GOOD_EV_PLUG
+
+            held = _LAST_GOOD_EV_PLUG.get(charger_id)
+            if held is not None and _time.time() - held[1] <= _EV_PLUG_HOLD_S:
+                return bool(held[0])
+        except Exception:
+            pass
+        return False
 
     def _trigger_ev_replan(self, charger_id: str | None = None, plugged_in: bool = True):
         """Trigger immediate re-planning for EV state changes (Rev K25 + EVFIX + Task 7.2/7.3).
