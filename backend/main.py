@@ -54,6 +54,11 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Darkstar ASGI Server Starting...")
 
+    # Long-lived server loop: HA REST calls share one httpx client (closed at shutdown).
+    from backend.core.ha_client import enable_shared_ha_http_client
+
+    enable_shared_ha_http_client()
+
     # 0. Model Bootstrap (REV // A24)
     # Ensure ML models are seeded before anything else tries to load them
     try:

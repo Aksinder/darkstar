@@ -5,7 +5,7 @@ from typing import Any, cast
 import pytz
 from fastapi import APIRouter
 
-from backend.core.ha_client import get_ha_entity_state, get_ha_http_client, make_ha_headers
+from backend.core.ha_client import get_ha_entity_state, ha_http_client, make_ha_headers
 from backend.core.secrets import load_home_assistant_config, load_yaml
 
 logger = logging.getLogger("darkstar.api.ha")
@@ -41,12 +41,12 @@ async def _fetch_ha_history_avg(entity_id: str, hours: int) -> float:
     }
 
     try:
-        client = get_ha_http_client()
-        resp = await client.get(api_url, headers=headers, params=params, timeout=10.0)
-        if resp.status_code != 200:
-            return 0.0
+        async with ha_http_client() as client:
+            resp = await client.get(api_url, headers=headers, params=params, timeout=10.0)
+            if resp.status_code != 200:
+                return 0.0
 
-        data = resp.json()
+            data = resp.json()
         if not data or not data[0]:
             return 0.0
 
@@ -197,8 +197,8 @@ async def get_ha_entities() -> dict[str, list[dict[str, str]]]:
 
     try:
         headers = make_ha_headers(token)
-        client = get_ha_http_client()
-        resp = await client.get(f"{url.rstrip('/')}/api/states", headers=headers, timeout=5.0)
+        async with ha_http_client() as client:
+            resp = await client.get(f"{url.rstrip('/')}/api/states", headers=headers, timeout=5.0)
         if resp.status_code == 200:
             data = resp.json()
             # Filter and format
@@ -247,8 +247,8 @@ async def get_ha_services() -> dict[str, list[str]]:
 
     try:
         headers = make_ha_headers(token)
-        client = get_ha_http_client()
-        resp = await client.get(f"{url.rstrip('/')}/api/services", headers=headers, timeout=5.0)
+        async with ha_http_client() as client:
+            resp = await client.get(f"{url.rstrip('/')}/api/services", headers=headers, timeout=5.0)
         if resp.status_code == 200:
             data = resp.json()
             # Flatten to list of "domain.service" strings
@@ -280,8 +280,8 @@ async def test_ha_connection() -> dict[str, str]:
 
     try:
         headers = make_ha_headers(token)
-        client = get_ha_http_client()
-        resp = await client.get(f"{url.rstrip('/')}/api/", headers=headers, timeout=5.0)
+        async with ha_http_client() as client:
+            resp = await client.get(f"{url.rstrip('/')}/api/", headers=headers, timeout=5.0)
         if resp.status_code == 200:
             return {"status": "success", "message": "Connected to Home Assistant"}
         else:
