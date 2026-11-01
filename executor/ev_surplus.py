@@ -27,6 +27,7 @@ the returned per-charger commands.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 # Battery power (W) below which the EV-priority cap treats the home battery as
@@ -1118,6 +1119,20 @@ def compute_ev_surplus(
             # A fuse-capped target snaps DOWN — rounding up would exceed the budget.
             if step > 0:
                 amps = (amps // step) * step if fuse_capped else round(amps / step) * step
+                if forced and not fuse_capped:
+                    # A FORCED floor (plan floor / deadline guarantee) snaps UP: round()
+                    # could deliver up to half a step below the energy the guarantee
+                    # was sized for. The epsilon keeps an exact-grid floor (7.0000001 A
+                    # from float noise) from being bumped a whole step. Surplus-only
+                    # targets keep round() + the Schmitt band; fuse-capped stays DOWN.
+                    floor_raw_a = min(max_w, floor_w[c.id]) / (c.voltage_v * c.phases)
+                    floor_a = math.ceil(floor_raw_a / step - 1e-6) * step
+                    if floor_a > amps:
+                        amps = floor_a
+                        # The Schmitt quantizer compares RAW amps with the written
+                        # value; a raw floor 0.2 A above the last write would be
+                        # suppressed as dither and leave the car below its floor.
+                        raw_amps = max(raw_amps, floor_a)
             amps = max(c.min_current_a, min(c.max_current_a, amps))
             if cfg.fuse_budget_a is not None and fuse_phases:
                 granted_delta_a = max(0.0, amps - per_phase_now_a)

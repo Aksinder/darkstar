@@ -589,14 +589,15 @@ class TestDepartureTargetFloor:
 
     @pytest.mark.asyncio
     async def test_stale_departure_is_inert(self):
-        # A PAST departure timestamp must not raise the floor.
+        # A PAST departure timestamp must not raise the floor — once it is beyond
+        # the 4 h missed-departure grace (test_ev_missed_departure_grace.py).
         ha = FakeHA(
             _states(**{
                 "sensor.pv": "0", "sensor.grid": "0",
                 "sensor.tesla_soc": "41",
                 "input_number.tesla_departure_soc": "80",
             }),
-            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 - 3600}},
+            attrs={"input_datetime.tesla_departure": {"timestamp": 1_000_000.0 - 5 * 3600}},
         )
         await self._run(ha)
         on_calls = [c for c in ha.calls if c[:2] == ("switch", "turn_on")]
