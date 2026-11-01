@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from planner.solver.kepler import min_soc_floor_kwh
+from planner.solver.types import planned_slot_hours
 
 if TYPE_CHECKING:
     from planner.solver.types import KeplerConfig, KeplerInput, KeplerResult
@@ -127,7 +128,8 @@ def validate_plan(
     cap = config.capacity_kwh
     eta_c = config.charge_efficiency if config.charge_efficiency > 0 else 1.0
     eta_d = config.discharge_efficiency if config.discharge_efficiency > 0 else 1.0
-    hours = [max((s.end_time - s.start_time).total_seconds() / 3600.0, 0.0) for s in slots]
+    # Same per-slot basis as the solver (a partial slot 0 has only its remainder).
+    hours = planned_slot_hours(slots, getattr(input_data, "first_slot_remaining_h", None))
     initial = max(0.0, min(cap, input_data.initial_soc_kwh))
     min_soc = cap * config.min_soc_percent / 100.0
     max_soc = cap * config.max_soc_percent / 100.0
