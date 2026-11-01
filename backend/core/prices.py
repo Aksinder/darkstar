@@ -167,6 +167,9 @@ async def get_nordpool_data(
                                 "start": slot_start,
                                 "end": end_time,
                                 "value": fc.get("spot_p50", 0) * 1000,  # Convert SEK/kWh to SEK/MWh
+                                # Not a published price: flagged so the planner input,
+                                # schedule.json and logs can tell it apart.
+                                "price_is_forecast": True,
                             }
                         )
                     print(
@@ -450,6 +453,9 @@ def _process_nordpool_data(
                 "spot_price_sek_kwh": round(entry["value"] / 1000.0, 5),
                 "import_price_sek_kwh": import_price,
                 "export_price_sek_kwh": export_price,
+                # True only for D+1 slots synthesized from the ML price forecast
+                # (pre-auction fallback); published Nordpool prices are False.
+                "price_is_forecast": bool(entry.get("price_is_forecast", False)),
             }
         )
 
