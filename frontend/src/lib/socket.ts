@@ -3,6 +3,50 @@ import { Manager, Socket } from 'socket.io-client'
 // Singleton socket instance
 let socket: Socket | null = null
 
+// Connection-state store (tri-state) so the UI can show live / reconnecting /
+// offline without threading callbacks through getSocket().
+// 'connecting' = not (yet/currently) connected but within the grace window;
+// 'offline' = disconnected for longer than OFFLINE_AFTER_MS.
+export type ConnectionState = 'connected' | 'connecting' | 'offline'
+
+const OFFLINE_AFTER_MS = 10_000
+let connectionState: ConnectionState = 'connecting'
+let offlineTimer: ReturnType<typeof setTimeout> | null = null
+const connectionListeners = new Set<(state: ConnectionState) => void>()
+
+const setConnectionState = (state: ConnectionState) => {
+    if (state === connectionState) return
+    connectionState = state
+    connectionListeners.forEach((listener) => listener(state))
+}
+
+const markConnected = () => {
+    if (offlineTimer) {
+        clearTimeout(offlineTimer)
+        offlineTimer = null
+    }
+    setConnectionState('connected')
+}
+
+const markDisconnected = () => {
+    if (connectionState === 'connected') setConnectionState('connecting')
+    if (!offlineTimer && connectionState !== 'offline') {
+        offlineTimer = setTimeout(() => {
+            offlineTimer = null
+            if (!socket?.connected) setConnectionState('offline')
+        }, OFFLINE_AFTER_MS)
+    }
+}
+
+export const getConnectionState = () => connectionState
+
+export const subscribeConnection = (listener: (state: ConnectionState) => void) => {
+    connectionListeners.add(listener)
+    return () => {
+        connectionListeners.delete(listener)
+    }
+}
+
 export const getSocket = () => {
     if (!socket) {
         // REV F11: Fix Socket.IO connection for HA Ingress
@@ -62,7 +106,9 @@ export const getSocket = () => {
             reconnection: true,
             reconnectionDelay: 1000,
             reconnectionDelayMax: 5000,
-            reconnectionAttempts: 10,
+            // Never give up: after an add-on restart the backend can be gone for
+            // well over a minute. Backoff is capped by reconnectionDelayMax.
+            reconnectionAttempts: Infinity,
         })
 
         // 2. Create the Socket: Handles the application protocol (Namespace)
@@ -96,13 +142,16 @@ export const getSocket = () => {
 
         // Manually trigger connection now that listeners are attached
         debugLog('🔌 Manager: Initiating manual connection...')
+        markDisconnected() // start the offline grace timer for the first connect
         manager.open((err?: Error) => {
             if (err) {
                 console.error('🔌 Manager: Open failed:', err)
             } else {
                 debugLog('🔌 Manager: Open successful, connecting socket...')
-                socket?.connect()
             }
+            // Subscribe the socket even when the first open fails, so it joins
+            // the namespace once the manager's reconnect loop succeeds.
+            socket?.connect()
         })
 
         // Debug Socket events (Application Layer)
@@ -112,10 +161,14 @@ export const getSocket = () => {
 
         socket.on('connect', () => {
             debugLog('✅ Socket.IO CONNECTED! SID:', socket?.id)
+            markConnected()
         })
 
         socket.on('disconnect', (reason: string) => {
             console.warn('🔌 Socket.IO DISCONNECTED:', reason)
+            markDisconnected()
+            // 'io server disconnect' is not auto-retried by socket.io; force it.
+            if (reason === 'io server disconnect') socket?.connect()
         })
 
         socket.on('connect_error', (error: Error) => {
