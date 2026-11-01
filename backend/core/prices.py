@@ -151,27 +151,11 @@ async def get_nordpool_data(
 
                 forecast_fallback = await get_d1_price_forecast_fallback(config)
                 if forecast_fallback:
-                    # Convert forecast format to match Nordpool format
-                    for fc in forecast_fallback:
-                        slot_start = fc["slot_start"]
-                        if isinstance(slot_start, str):
-                            slot_start = datetime.fromisoformat(slot_start)
-                        slot_start = (
-                            slot_start.replace(tzinfo=local_tz)
-                            if slot_start.tzinfo is None
-                            else slot_start.astimezone(local_tz)
+                    all_entries.extend(
+                        forecast_fallback_entries(
+                            forecast_fallback, config, local_tz, int(resolution_minutes)
                         )
-                        end_time = slot_start + timedelta(minutes=resolution_minutes)
-                        all_entries.append(
-                            {
-                                "start": slot_start,
-                                "end": end_time,
-                                "value": fc.get("spot_p50", 0) * 1000,  # Convert SEK/kWh to SEK/MWh
-                                # Not a published price: flagged so the planner input,
-                                # schedule.json and logs can tell it apart.
-                                "price_is_forecast": True,
-                            }
-                        )
+                    )
                     print(
                         f"[get_nordpool_data] Using D+1 price forecast fallback ({len(forecast_fallback)} slots)"
                     )
@@ -236,6 +220,76 @@ async def get_nordpool_data_for_date(
     values = ((raw or {}).get("areas") or {}).get(price_area, {}).get("values", [])
     entries = [v for v in values if v["start"].astimezone(local_tz).date() == day]
     return _process_nordpool_data(entries, config) if entries else []
+
+
+def forecast_value_to_spot_sek_kwh(model_value: float, config: dict[str, Any]) -> float:
+    """Convert a price-model output back to raw spot (SEK/kWh).
+
+    The price model is trained on ``slot_observations.export_price_sek_kwh`` -- the
+    EFFECTIVE export price (spot + premium + grid_benefit - fee) -- not raw spot.
+    Feeding that straight into :func:`calculate_import_export_prices` added the export
+    adders a second time (and VAT on them into import). Subtracting the CURRENT adders
+    inverts it, so the derived export price equals the model output exactly and import
+    is built from spot as for a published slot.
+
+    With ``export_includes_spot`` false the observed export price carries no spot at all,
+    so nothing can be inverted; the value is returned unchanged.
+    """
+    pricing = config.get("pricing", {}) or {}
+    if not bool(pricing.get("export_includes_spot", True)):
+        return float(model_value)
+    adders = (
+        float(pricing.get("export_premium_sek_kwh", 0.0) or 0.0)
+        + float(pricing.get("export_grid_benefit_sek_kwh", 0.0) or 0.0)
+        - float(pricing.get("export_fee_sek_kwh", 0.0) or 0.0)
+    )
+    return float(model_value) - adders
+
+
+def forecast_fallback_entries(
+    forecasts: list[dict[str, Any]],
+    config: dict[str, Any],
+    local_tz: Any,
+    resolution_minutes: int,
+) -> list[dict[str, Any]]:
+    """Turn D+1 price-forecast rows into raw Nordpool-style entries (SEK/MWh spot).
+
+    Forecast rows are on a 15-minute grid. At a coarser Nordpool resolution they are
+    averaged into one entry per resolution bucket -- emitting each quarter with a
+    60-minute end time produced four overlapping slots per hour.
+    """
+    step = timedelta(minutes=max(15, resolution_minutes))
+    buckets: dict[datetime, list[float]] = {}
+    for fc in forecasts:
+        slot_start = fc["slot_start"]
+        if isinstance(slot_start, str):
+            slot_start = datetime.fromisoformat(slot_start)
+        slot_start = (
+            local_tz.localize(slot_start)
+            if slot_start.tzinfo is None
+            else slot_start.astimezone(local_tz)
+        )
+        if resolution_minutes > 15:
+            # Bucket on the UTC epoch: whole-hour buckets stay DST-safe.
+            epoch = int(slot_start.timestamp())
+            size = int(step.total_seconds())
+            slot_start = datetime.fromtimestamp(epoch - epoch % size, tz=pytz.UTC).astimezone(
+                local_tz
+            )
+        spot = forecast_value_to_spot_sek_kwh(float(fc.get("spot_p50") or 0.0), config)
+        buckets.setdefault(slot_start, []).append(spot)
+
+    return [
+        {
+            "start": start,
+            "end": start + step,
+            "value": sum(vals) / len(vals) * 1000.0,  # SEK/kWh -> SEK/MWh
+            # Not a published price: flagged so the planner input,
+            # schedule.json and logs can tell it apart.
+            "price_is_forecast": True,
+        }
+        for start, vals in sorted(buckets.items())
+    ]
 
 
 def calculate_import_export_prices(

@@ -24,7 +24,11 @@ import pytz
 from sqlalchemy import create_engine, func, tuple_
 from sqlalchemy.orm import sessionmaker
 
-from backend.core.prices import calculate_import_export_prices, get_known_spot_by_slot
+from backend.core.prices import (
+    calculate_import_export_prices,
+    forecast_value_to_spot_sek_kwh,
+    get_known_spot_by_slot,
+)
 from backend.learning.models import PriceForecast
 from ml.price_features import build_price_features_batch, price_knowable_until
 from ml.weather import compute_regional_wind_index, get_regional_weather
@@ -47,15 +51,19 @@ def derive_consumer_prices(
         spot_p90: P90 spot price forecast in SEK/kWh
         config: Configuration dictionary with pricing settings
 
+    The ``spot_p*`` values are price-model outputs, which are in EFFECTIVE EXPORT
+    price units (the model's training target), not raw spot. They are converted
+    back to spot first so the export adders are not counted twice.
+
     Returns:
         Dictionary with derived prices:
         - import_p10, import_p50, import_p90: Import prices
-        - export_p10, export_p50, export_p90: Export prices (same as spot)
+        - export_p10, export_p50, export_p90: Export prices (== the model outputs)
     """
-    # Convert from SEK/kWh to SEK/MWh for the calculation function
-    spot_p10_mwh = spot_p10 * 1000.0
-    spot_p50_mwh = spot_p50 * 1000.0
-    spot_p90_mwh = spot_p90 * 1000.0
+    # Model units -> raw spot, then SEK/kWh -> SEK/MWh for the calculation function
+    spot_p10_mwh = forecast_value_to_spot_sek_kwh(spot_p10, config) * 1000.0
+    spot_p50_mwh = forecast_value_to_spot_sek_kwh(spot_p50, config) * 1000.0
+    spot_p90_mwh = forecast_value_to_spot_sek_kwh(spot_p90, config) * 1000.0
 
     # Calculate import/export prices for each quantile
     import_p10, export_p10 = calculate_import_export_prices(spot_p10_mwh, config)

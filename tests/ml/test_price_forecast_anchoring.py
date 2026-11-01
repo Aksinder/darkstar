@@ -255,3 +255,17 @@ def test_training_and_inference_agree_on_lag_availability(db):
         published = {source: 0.5} if source < bound else {}
         inferred = _get_price_lags(slot, empty_session, published)
         assert pd.isna(trained.iloc[0]["price_lag_1d"]) == pd.isna(inferred["price_lag_1d"])
+
+
+@pytest.mark.parametrize(
+    ("day", "expected"),
+    [((2026, 4, 11), 96), ((2026, 3, 29), 92), ((2026, 10, 25), 100)],
+)
+def test_batch_covers_exactly_one_local_day(day, expected):
+    """[start, end) half-open: the next day's 00:00 slot is not part of this day."""
+    start = local(*day)
+    nxt = datetime(*day) + timedelta(days=1)
+    end = local(nxt.year, nxt.month, nxt.day)
+    df = build_price_features_batch(start_time=start, end_time=end, days_ahead=1)
+    assert len(df) == expected
+    assert pd.Timestamp(df.index[-1]) < end

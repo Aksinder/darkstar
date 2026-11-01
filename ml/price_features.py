@@ -298,7 +298,10 @@ def build_price_features_batch(
     tz_str = str(tz) if tz else "UTC"
 
     # Generate slot timestamps
+    # Half-open [start, end): the slot AT end_time belongs to the next day (and the
+    # next horizon) -- including it gave 97 rows per day, one mislabeled.
     slots = dst_safe_date_range(start=start_time, end=end_time, freq="15min", tz=tz_str)
+    slots = slots[slots < end_time]
 
     records: list[dict[str, Any]] = []
     for slot in slots:
