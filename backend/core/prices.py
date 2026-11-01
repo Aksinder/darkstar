@@ -8,6 +8,7 @@ import pytz
 import yaml
 from nordpool.elspot import Prices
 
+from backend.core import grid_tariff
 from backend.core.cache import cache_sync
 
 logger = logging.getLogger("darkstar.core.prices")
@@ -58,13 +59,14 @@ async def get_nordpool_data(
     # The cache key embeds the export components so a contract/sensor change invalidates any
     # stale price series instead of serving export prices computed under the old contract.
     _pc: dict[str, Any] = config.get("pricing", {}) or {}
-    cache_key = "nordpool_data:{}:{}:{}:{}:{}:{}".format(
+    cache_key = "nordpool_data:{}:{}:{}:{}:{}:{}:{}".format(
         _pc.get("export_includes_spot", True),
         _pc.get("export_premium_sek_kwh", 0.0),
         _pc.get("export_grid_benefit_sek_kwh", 0.0),
         _pc.get("export_fee_sek_kwh", 0.0),
         _pc.get("grid_transfer_fee_sek", 0.2456),
         _pc.get("energy_tax_sek", 0.439),
+        grid_tariff.cache_token(_pc),
     )
     cached = cache_sync.get(cache_key)
 
@@ -304,7 +306,7 @@ def forecast_fallback_entries(
 
 
 def calculate_import_export_prices(
-    spot_price_mwh: float, config: dict[str, Any]
+    spot_price_mwh: float, config: dict[str, Any], slot_start: datetime | None = None
 ) -> tuple[float, float]:
     """
     Calculate import and export prices from spot price.
@@ -336,7 +338,13 @@ def calculate_import_export_prices(
     """
     pricing_config = config.get("pricing", {})
     vat_percent = pricing_config.get("vat_percent", 25.0)
-    grid_transfer_fee_sek = pricing_config.get("grid_transfer_fee_sek", 0.2456)
+    # Per-slot time-of-use fee when pricing.grid_transfer_fee_schedule is enabled (else flat).
+    grid_transfer_fee_sek = grid_tariff.transfer_fee_for(
+        slot_start,
+        pricing_config,
+        pricing_config.get("grid_transfer_fee_sek", 0.2456),
+        config.get("timezone", "Europe/Stockholm"),
+    )
     energy_tax_sek = pricing_config.get("energy_tax_sek", 0.439)
 
     spot_price_sek_kwh = spot_price_mwh / 1000.0
@@ -506,7 +514,9 @@ def _process_nordpool_data(
                 start_time = entry["start"].astimezone(local_tz)
                 end_time = entry["end"].astimezone(local_tz)
 
-        import_price, export_price = calculate_import_export_prices(entry["value"], config)
+        import_price, export_price = calculate_import_export_prices(
+            entry["value"], config, slot_start=start_time
+        )
 
         result.append(
             {

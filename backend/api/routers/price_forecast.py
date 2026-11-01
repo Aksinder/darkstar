@@ -169,6 +169,7 @@ async def get_price_forecasts(
             spot_p50=forecast.get("spot_p50") or 0,
             spot_p90=forecast.get("spot_p90") or 0,
             config=config,
+            slot_start=forecast.get("slot_start"),
         )
 
         enriched_forecast = {
