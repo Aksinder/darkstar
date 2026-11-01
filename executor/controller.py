@@ -28,6 +28,12 @@ from .profiles import InverterProfile
 
 logger = logging.getLogger(__name__)
 
+# The planner labels a slot "Hold" when both battery charge and discharge are
+# <= 0.01 kW (planner/solver/adapter.py kepler_result_to_dataframe). The
+# controller uses the same threshold so a rounding-dust discharge does not turn
+# a Hold slot back into self_consumption.
+HOLD_DISCHARGE_EPS_KW = 0.01
+
 
 def effective_export_floor_pct(config_floor: float, state: object) -> float:
     """The export floor in force right now.
@@ -341,8 +347,9 @@ class Controller:
         # then command max_discharge regardless — a 0.3 kW planned discharge in a
         # sunny slot became a 9.5 kW dump to the SoC floor (2026-09-12, seven times).
         battery_to_grid_kw = min(slot.export_kw, slot.discharge_kw)
-        # Floor for the two branches below that choose self_consumption on the
-        # strength of a PV FORECAST (the PV-driven charge and the PV-surplus hold).
+        # Floor for the branch below that chooses self_consumption on the strength
+        # of a PV FORECAST (the PV-driven charge; the PV-surplus hold that used to
+        # share it now always idles — see the hold branch).
         # Both assume the roof covers the house; when it does not, self_consumption
         # serves the house from the battery and nothing in either branch stops it —
         # the PV-charge branch never looks at SoC, and the hold branch is only
@@ -444,25 +451,28 @@ class Controller:
                 mode_intent = "idle"
             else:
                 mode_intent = "self_consumption"
-        elif round(state.current_soc_percent) <= slot.soc_target:
-            # At or below SoC target - hold the battery.
-            # Round current SoC to integer for consistent comparison with plan target.
+        elif slot.discharge_kw <= HOLD_DISCHARGE_EPS_KW:
+            # Hold slot: the plan models no battery discharge (the planner's own
+            # "Hold" test is charge and discharge both <= 0.01 kW), so block
+            # discharge whatever the SoC. Idle still lets real PV surplus charge
+            # the pack (Sungrow: self-consumption EMS with a 10 W discharge cap).
             #
-            # Exception: during a PV-surplus slot (forecast PV > load), freezing the
-            # battery (idle) means any load the inverter can't cover from PV in real
-            # time — transient spikes or single-phase loads on a 3-phase PV feed — is
-            # pulled from the grid, even with a full battery. Use self_consumption so
-            # the battery covers those deficits; the surplus PV refills it within the
-            # slot, so net SoC is preserved. EV-charging slots stay idle to keep
-            # battery→EV source isolation (handled by the dedicated branch below).
-            # Not at the floor, though: the refill is a forecast (see at_floor above).
-            if slot.pv_kw > slot.load_kw and slot.ev_charging_kw <= 0.1 and not at_floor:
-                mode_intent = "self_consumption"
-            else:
-                mode_intent = "idle"
-        elif slot.discharge_kw == 0 and slot.ev_charging_kw > 0.1:
-            # REV F76 Phase 3: EV charging active - use idle instead of self_consumption
-            # to prevent any battery discharge to EV
+            # This used to self-consume in two cases: SoC above the target, and
+            # at/below it whenever FORECAST PV > load (d9dc45a9, for transients
+            # the PV feed cannot reach). Both let the pack discharge in a slot the
+            # plan holds flat, and the planner sets a Hold slot's target to the
+            # SoC it entered with — so the next replan starts lower, sets a lower
+            # target, and the slot drains again: a ratchet to the min-SoC floor.
+            # Live 2026-10-25..11-01: 43.6 kWh drained in Hold slots executed as
+            # self_consumption (34.7 via the PV>load exception under over-forecast
+            # PV, 8.9 above target); 2026-11-01 08:15-13:00 the targets stepped
+            # 70 -> 10 slot by slot, then the planner grid-charged again at 14:00.
+            # Same fix as upstream 1dfd8c85. EV-charging hold slots land here too
+            # (REV F76 Phase 3: no battery -> EV).
+            mode_intent = "idle"
+        elif round(state.current_soc_percent) <= slot.soc_target:
+            # Discharge slot at its floor - hold the battery.
+            # Round current SoC to integer for consistent comparison with plan target.
             mode_intent = "idle"
         else:
             # Above SoC target - use self_consumption

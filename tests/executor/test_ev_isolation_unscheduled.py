@@ -37,14 +37,15 @@ def _decide(slot, state=ABOVE_TARGET, **kw):
 
 class TestControllerForcesIdleUnderIsolation:
     def test_unplanned_car_with_soc_above_target_goes_idle(self):
-        slot = SlotPlan(discharge_kw=0.0, ev_charging_kw=0.0, soc_target=60, ev_isolation=True)
+        # A discharge slot: a Hold slot (discharge_kw=0) idles on its own now.
+        slot = SlotPlan(discharge_kw=1.0, ev_charging_kw=0.0, soc_target=60, ev_isolation=True)
         d = _decide(slot)
         assert d.mode_intent == "idle"
         assert "EV isolation" in d.reason
 
     def test_same_slot_without_isolation_is_self_consumption(self):
         """The control: nothing else in the slot asks for idle."""
-        slot = SlotPlan(discharge_kw=0.0, ev_charging_kw=0.0, soc_target=60)
+        slot = SlotPlan(discharge_kw=1.0, ev_charging_kw=0.0, soc_target=60)
         assert _decide(slot).mode_intent == "self_consumption"
 
     def test_pv_surplus_exception_does_not_reopen_the_battery(self):

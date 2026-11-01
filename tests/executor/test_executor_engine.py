@@ -628,7 +628,8 @@ class TestGetStatusModeIntent:
         [
             (5.0, 0.0, 0.0, 80, 0.0, 50.0, "charge"),
             (0.0, 3.0, 3.0, 10, 0.0, 80.0, "export"),
-            (0.0, 0.0, 0.0, 10, 0.0, 80.0, "self_consumption"),
+            (0.0, 0.0, 2.0, 10, 0.0, 80.0, "self_consumption"),
+            (0.0, 0.0, 0.0, 10, 0.0, 80.0, "idle"),  # Hold slot blocks discharge
             (0.0, 0.0, 0.0, 80, 0.0, 50.0, "idle"),
         ],
     )
