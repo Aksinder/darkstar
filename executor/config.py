@@ -5,6 +5,7 @@ Loads and validates the executor configuration from config.yaml.
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -659,6 +660,12 @@ class ControllerConfig:
     # unpriced slot passes (fail-open toward the plan; C3 stands down the same way).
     # Mirrors config export.min_export_price_sek_kwh.
     min_export_price_sek_kwh: float | None = None
+    # Min-SoC floor hysteresis (upstream de8b93ee idea, implemented natively). The
+    # floor guard in _follow_plan ENGAGES when the rounded live SoC is at or below
+    # battery.min_soc_percent and RELEASES only at min_soc_percent + this margin.
+    # Without it the mode flips idle <-> self_consumption on every one-point sensor
+    # step around the floor. 0 = no hysteresis (the old stateless behaviour).
+    min_soc_release_margin_percent: float = 2.0
 
 
 @dataclass
@@ -737,11 +744,52 @@ class ExecutorConfig:
     timezone: str = "Europe/Stockholm"
     pause_reminder_minutes: int = 30  # Send notification after N minutes paused
 
+    # Plan-age cutoff. None = OFF (0/negative/garbage parse to None): the executor
+    # keeps following the last schedule.json slot by slot however old it is and only
+    # the 2 h notifier speaks. When set, a plan older than this many minutes —
+    # measured from the file's mtime, an epoch value: no timezone, no DST — is dropped
+    # for that tick and the executor runs PLAN_STALE safe mode (self_consumption, no
+    # grid charge, no forced export, water heaters at temp_off, sinks off) until a
+    # fresh plan lands. Default OFF: the owner decides (solver timeouts on the 2-vCPU
+    # box are a known regime, and an old plan is often still a good plan).
+    max_plan_age_minutes: float | None = None
+
     # System profile toggles (Rev O1)
     has_solar: bool = True
     has_battery: bool = True
     has_water_heater: bool = True
     inverter_profile: str = "generic"
+
+
+def _optional_positive_float(raw: Any) -> float | None:
+    """None for missing / null / non-numeric / <= 0, else the float.
+
+    For off-by-default thresholds where 0 must mean OFF, never "always tripped".
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric config value %r (treated as off)", raw)
+        return None
+    if math.isnan(value) or value <= 0:
+        return None
+    return value
+
+
+def _non_negative_float(raw: Any, default: float) -> float:
+    """A float >= 0; missing or malformed falls back to ``default``."""
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric config value %r (default %s)", raw, default)
+        return default
+    if math.isnan(value) or value < 0:
+        return default
+    return value
 
 
 def load_yaml(path: str) -> dict[str, Any]:
@@ -1348,6 +1396,10 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         min_export_price_sek_kwh=(
             None if raw_min_export_price is None else float(str(raw_min_export_price))
         ),
+        min_soc_release_margin_percent=_non_negative_float(
+            ctrl_data.get("min_soc_release_margin_percent"),
+            ControllerConfig.min_soc_release_margin_percent,
+        ),
     )
 
     excess_pv_data: dict[str, Any] = (
@@ -1441,6 +1493,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         schedule_path=str(executor_data.get("schedule_path", "data/schedule.json")),
         timezone=timezone,
         pause_reminder_minutes=int(executor_data.get("pause_reminder_minutes", 30)),
+        max_plan_age_minutes=_optional_positive_float(executor_data.get("max_plan_age_minutes")),
         has_solar=has_solar,
         has_battery=has_battery,
         has_water_heater=has_water_heater,

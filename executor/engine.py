@@ -37,7 +37,7 @@ from backend.loads.service import LoadDisaggregator
 
 from .actions import ActionDispatcher, ActionResult, HAClient
 from .config import LoadGroupConfig, load_executor_config, load_yaml
-from .controller import ControllerDecision, make_decision
+from .controller import ControllerDecision, MinSocFloorLatch, make_decision
 from .cyclic_run import anyone_home, should_run_opportunistically
 from .fuse_shed import should_shed_for_fuse
 from .history import ExecutionHistory, ExecutionRecord
@@ -377,6 +377,12 @@ class ExecutorEngine:
         self._config_mtime: float | None = None
         self._config_reload_error: str | None = None
         self._plan_stale_notified = False
+        # True while executor.max_plan_age_minutes has dropped the plan (PLAN_STALE
+        # safe mode); drives log/notify once per transition. In memory: a restart
+        # re-evaluates from the file's age on the first tick.
+        self._plan_cutoff_active = False
+        # Min-SoC floor hysteresis; must outlive the per-tick Controller.
+        self._min_soc_latch = MinSocFloorLatch()
         # Set by _tick when the inverter dispatch actually ran; the background loop
         # turns it into the HA heartbeat. See _publish_heartbeat.
         self._dispatched_this_tick = False
@@ -1518,16 +1524,25 @@ class ExecutorEngine:
 
             # 2. Load current slot from schedule.json
             slot, slot_start = self._load_current_slot(now)
-            await self._check_plan_age()
+            plan_age_s = await self._check_plan_age(now)
+            # Opt-in plan-age cutoff: a plan past executor.max_plan_age_minutes is
+            # dropped for this tick (PLAN_STALE safe mode, see OverrideEvaluator).
+            plan_stale_reason = await self._apply_plan_age_cutoff(plan_age_s)
+            if plan_stale_reason is not None:
+                slot, slot_start = None, None
             result["slot_start"] = slot_start
 
             if slot:
                 self.status.current_slot = slot_start
-            else:
+            elif plan_stale_reason is None:
                 logger.warning("No valid slot found for current time")
 
             # 3. Gather system state
             state = await self._gather_system_state()
+            state.plan_stale_reason = plan_stale_reason
+            state.min_soc_latched = self._min_soc_latch.update(
+                state, self.config.controller.min_soc_release_margin_percent
+            )
             self._last_system_state = state
 
             # Emit live metrics for UI sparklines (Rev E1)
@@ -2258,7 +2273,8 @@ class ExecutorEngine:
                     if self.config.excess_pv.sinks:
                         is_fallback = (
                             override.override_needed
-                            and override.override_type.value == "slot_failure_fallback"
+                            and override.override_type.value
+                            in ("slot_failure_fallback", "plan_stale")
                         )
                         for sink_cfg in self.config.excess_pv.sinks:
                             if not sink_cfg.enabled:
@@ -2611,38 +2627,120 @@ class ExecutorEngine:
                 break
         return cached[1], ahead
 
-    async def _check_plan_age(self) -> None:
+    def _plan_age_seconds(self, now: datetime | None = None) -> float | None:
+        """Seconds since schedule.json was last written, or None if it is missing.
+
+        Measured from the file's mtime, which is an epoch value: no timezone, no
+        DST, no naive/aware mix. ``meta.planned_at`` is deliberately NOT used — the
+        planner stamps it with a naive LOCAL ``datetime.now()``, ambiguous in the
+        autumn DST hour and wrong by the UTC offset wherever naive is read as UTC
+        (the planner retry-stall incident). ``now`` must be aware; None = wall clock.
+        """
+        try:
+            mtime = Path(self.config.schedule_path).stat().st_mtime
+        except OSError:
+            return None
+        if now is None:
+            return time.time() - mtime
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("_plan_age_seconds needs an aware datetime")
+        return now.timestamp() - mtime
+
+    def _plan_cutoff_s(self) -> float | None:
+        """executor.max_plan_age_minutes in seconds; None when the cutoff is off."""
+        limit_min = self.config.max_plan_age_minutes
+        if limit_min is None or limit_min <= 0:
+            return None
+        return float(limit_min) * 60.0
+
+    async def _check_plan_age(self, now: datetime | None = None) -> float | None:
         """Say so, once, when the plan being followed has stopped being renewed.
 
         The planner rewrites schedule.json every ~15 minutes. If it fails or hangs,
         the executor keeps following the last file slot by slot — up to a day and a
         half — and the only signal used to be the "no valid slot" fallback when the
-        file finally ran out. Control is deliberately unchanged: an old plan is
-        still a better guess than none. This only makes the failure visible.
+        file finally ran out. Control is unchanged HERE: an old plan is still a
+        better guess than none, unless the owner opted into
+        executor.max_plan_age_minutes (see _apply_plan_age_cutoff). This only makes
+        the failure visible. Returns the plan age in seconds (None: no file).
         """
-        try:
-            age_s = time.time() - Path(self.config.schedule_path).stat().st_mtime
-        except OSError:
-            return
+        age_s = self._plan_age_seconds(now)
+        if age_s is None:
+            return None
         if age_s >= PLAN_STALE_SECONDS:
             if not self._plan_stale_notified:
                 self._plan_stale_notified = True
+                cutoff_s = self._plan_cutoff_s()
+                in_safe_mode = cutoff_s is not None and age_s > cutoff_s
                 logger.error(
-                    "Plan is %.0f min old — the planner has stopped renewing it; "
-                    "still following it", age_s / 60.0,
+                    "Plan is %.0f min old — the planner has stopped renewing it; %s",
+                    age_s / 60.0,
+                    "running PLAN_STALE safe mode" if in_safe_mode else "still following it",
                 )
-                if self.dispatcher:
+                # Entering safe mode on this very tick: _apply_plan_age_cutoff sends
+                # its own (more specific) notice right after — don't send two.
+                about_to_notify = in_safe_mode and not self._plan_cutoff_active
+                if self.dispatcher and not about_to_notify:
+                    tail = (
+                        "Darkstar kör säkert läge (egenförbrukning, ingen nätladdning, "
+                        "ingen export) tills planeraren kommer igång igen"
+                        if in_safe_mode
+                        else "Darkstar följer den gamla planen tills planeraren "
+                        "kommer igång igen"
+                    )
                     try:
                         await self.dispatcher.notify_error(
                             f"Planen har inte förnyats på {age_s / 3600.0:.1f} h. "
-                            "Darkstar följer den gamla planen tills planeraren "
-                            "kommer igång igen — kontrollera loggen."
+                            f"{tail} — kontrollera loggen."
                         )
                     except Exception:
                         logger.debug("Stale-plan notification failed", exc_info=True)
         elif self._plan_stale_notified:
             self._plan_stale_notified = False
             logger.info("Plan is being renewed again (%.0f min old)", age_s / 60.0)
+        return age_s
+
+    async def _apply_plan_age_cutoff(self, age_s: float | None) -> str | None:
+        """The opt-in plan-age cutoff (executor.max_plan_age_minutes).
+
+        Returns the safe-mode reason when this tick's plan is too old to follow,
+        else None. Off (None) -> always None: the historical behaviour of following
+        the file however old it is. A missing file is not "stale" — there is no
+        slot either, so the ordinary slot-failure fallback already applies.
+
+        Logs and notifies once per transition; leaves safe mode by itself on the
+        first tick a fresh plan is on disk.
+        """
+        cutoff_s = self._plan_cutoff_s()
+        if cutoff_s is None or age_s is None or age_s <= cutoff_s:
+            if self._plan_cutoff_active:
+                self._plan_cutoff_active = False
+                logger.warning(
+                    "Leaving PLAN_STALE safe mode (%s) — following the plan again",
+                    "cutoff off or no plan file"
+                    if cutoff_s is None or age_s is None
+                    else f"plan is {age_s / 60.0:.0f} min old",
+                )
+            return None
+
+        limit_min = cutoff_s / 60.0
+        reason = (
+            f"Plan is {age_s / 60.0:.0f} min old (> max_plan_age_minutes {limit_min:g}) "
+            "- PLAN_STALE safe mode: self-consumption, no grid charge, no export"
+        )
+        if not self._plan_cutoff_active:
+            self._plan_cutoff_active = True
+            logger.error("%s", reason)
+            if self.dispatcher:
+                try:
+                    await self.dispatcher.notify_error(
+                        f"Planen är {age_s / 60.0:.0f} min gammal (gräns {limit_min:g} min). "
+                        "Darkstar kör säkert läge — egenförbrukning, ingen nätladdning, "
+                        "ingen export, varmvatten på viloläge — tills en ny plan finns."
+                    )
+                except Exception:
+                    logger.debug("Plan-cutoff notification failed", exc_info=True)
+        return reason
 
     def _load_current_slot(self, now: datetime) -> tuple[SlotPlan | None, str | None]:
         """
