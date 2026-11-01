@@ -25,6 +25,10 @@ from planner.errors import (
 logger = logging.getLogger("darkstar.services.planner")
 
 _BACKOFF_STEPS = [60, 120, 240, 300]  # seconds, last value is cap
+# A config-blocking suspension used to last until the next settings save, so a
+# blip (e.g. one out-of-range SoC read) froze planning indefinitely. After this
+# ceiling the scheduler retries anyway; a still-broken config re-suspends.
+_SUSPENSION_CEILING_S = 1800
 
 
 @dataclass
@@ -57,6 +61,7 @@ class PlannerService:
         self._next_retry_at: datetime | None = None
         self._consecutive_failures: int = 0
         self._retry_suspended: bool = False
+        self._suspended_since: datetime | None = None  # aware UTC
 
     @property
     def retry_suspended(self) -> bool:
@@ -67,6 +72,15 @@ class PlannerService:
     def next_retry_at(self) -> datetime | None:
         """Timestamp of next scheduled retry."""
         return self._next_retry_at
+
+    @property
+    def suspension_expired(self) -> bool:
+        """Whether the active retry suspension has reached its retry ceiling."""
+        return bool(
+            self._retry_suspended
+            and self._suspended_since is not None
+            and (datetime.now(UTC) - self._suspended_since).total_seconds() >= _SUSPENSION_CEILING_S
+        )
 
     @property
     def last_error_code(self) -> PlannerErrorCode | None:
@@ -103,6 +117,7 @@ class PlannerService:
             return
         if is_config_blocking(code):
             self._retry_suspended = True
+            self._suspended_since = now
             self._next_retry_at = None
         elif is_transient(code):
             step_index = min(self._consecutive_failures - 1, len(_BACKOFF_STEPS) - 1)
@@ -115,6 +130,7 @@ class PlannerService:
     def clear_retry_suspension(self) -> None:
         """Clear retry suspension and schedule an immediate retry."""
         self._retry_suspended = False
+        self._suspended_since = None
         self._next_retry_at = datetime.now(UTC)
 
     async def _emit_progress(self, phase: str) -> None:
@@ -274,6 +290,7 @@ class PlannerService:
     def _on_success(self) -> None:
         self._consecutive_failures = 0
         self._retry_suspended = False
+        self._suspended_since = None
         self._last_error_code = None
         self._last_error_at = None
         self._last_error_details = None
