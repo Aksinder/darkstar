@@ -170,6 +170,16 @@ async def lifespan(app: FastAPI):
         # For now, let's allow it but semantic routes will 500.
         app.state.learning_store = None
 
+    # Nightly battery hindsight benchmark (03:30 local by default; read-only on
+    # observations, writes system_state). Sleeps until its run time — never at startup.
+    if app.state.learning_store is not None:
+        try:
+            from backend.services.benchmark_service import benchmark_service
+
+            await benchmark_service.start(app.state.learning_store)
+        except Exception as e:
+            logger.error(f"❌ Failed to start hindsight benchmark: {e}")
+
     # Start deferrable-load cycle publisher (publishes sensor.darkstar_* with
     # per-cycle energy/duration/phase, daily draw, and hot-water tank state).
     # Sensor writes only - controls no hardware. No-ops when nothing configured.
@@ -230,6 +240,13 @@ async def lifespan(app: FastAPI):
         ev_hold_store.disable()
     except Exception as e:
         logger.error(f"Failed to disable the EV hold store: {e}")
+
+    try:
+        from backend.services.benchmark_service import benchmark_service
+
+        await benchmark_service.stop()
+    except Exception as e:
+        logger.error(f"Failed to stop hindsight benchmark: {e}")
 
     # Close LearningStore
     if hasattr(app.state, "learning_store") and app.state.learning_store:
