@@ -5,10 +5,9 @@ end_slot + 1)` within one day, so an interval from 23:50 to 00:05 had
 start_slot=95 > end_slot=0 and contributed NOTHING — every night's last reading
 was dropped — and a gap longer than a day was credited to a single day's slots.
 
-Upstream's test module also covers a per-delta sanity guard and degraded-status
-messaging that this fork does not carry; only the slot-distribution tests apply
-here, run against the fork's own httpx call, plus direct tests of the pure
-helper.
+Upstream's degraded-status messaging is not carried by this fork. The per-delta
+sanity guard (upstream 4cac00d6) is, see TestImplausibleMeterDelta. Tests run
+against the fork's own httpx call, plus direct tests of the pure helper.
 """
 
 from datetime import datetime, timedelta
@@ -241,3 +240,42 @@ class TestDaysThatContributed:
         profile = await _run_get_load_profile(states)
         assert profile[40] == pytest.approx(0.5, rel=1e-6)
         assert sum(profile) == pytest.approx(0.5, rel=1e-6)
+
+
+class TestImplausibleMeterDelta:
+    """Ported from upstream 4cac00d6: a lifetime-counter reset (value drops to 0 and
+    comes back) must skip that one interval, not discard the whole profile."""
+
+    @staticmethod
+    def _with_reset(states: list[dict], at: int) -> list[dict]:
+        """Insert a 0 reading between states[at-1] and states[at]."""
+        t_prev = datetime.fromisoformat(states[at - 1]["last_changed"])
+        t_next = datetime.fromisoformat(states[at]["last_changed"])
+        reset = _state("0.0", t_prev + (t_next - t_prev) / 2)
+        return [*states[:at], reset, *states[at:]]
+
+    @pytest.mark.asyncio
+    async def test_counter_reset_is_skipped_not_whole_profile_discarded(self):
+        clean = _clean_lifetime_states(days=6, daily_kwh=10.0)
+        baseline = await _run_get_load_profile(clean)
+
+        profile = await _run_get_load_profile(self._with_reset(clean, 300))
+
+        # The ~19.6 MWh jump back from 0 would otherwise blow the 500 kWh/day bound
+        # and return the 0.5 kWh flat demo profile.
+        assert profile != [0.5] * 96
+        assert sum(profile) == pytest.approx(sum(baseline), rel=0.02)
+
+    @pytest.mark.asyncio
+    async def test_skipped_interval_does_not_dilute_its_slot(self):
+        clean = _clean_lifetime_states(days=6, daily_kwh=10.0)
+        baseline = await _run_get_load_profile(clean)
+        at = 300
+        profile = await _run_get_load_profile(self._with_reset(clean, at))
+
+        # Both halves of the reset interval (the drop to 0 and the jump back) are
+        # dropped -- energy AND seconds -- so the slots they span average over their
+        # remaining days at the same rate. Counting the drop's seconds with 0 energy
+        # would understate the affected slot by ~9%.
+        for slot in range(96):
+            assert profile[slot] == pytest.approx(baseline[slot], rel=1e-3), slot

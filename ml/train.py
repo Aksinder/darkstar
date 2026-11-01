@@ -7,6 +7,7 @@ Supports hybrid PV forecasting where ML learns residuals (actual - physics).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -22,6 +23,49 @@ from backend.learning import LearningEngine, get_learning_engine
 from backend.validation import get_max_energy_per_slot
 from ml.context_features import get_alarm_armed_series, get_vacation_mode_series
 from ml.weather import calculate_physics_pv, get_weather_series
+
+# quality_flags keys marking a row whose load_kwh was DERIVED from the energy-balance
+# identity instead of read from a load meter:
+#   "load_rescued"  backend/recorder.py — load register glitched/froze, so
+#                   load = pv + import - export + discharge - charge - EV - water.
+#   "repaired"      backend/learning/repair.py — statistics backfill, the same
+#                   identity on hourly sums spread flat over the four quarters.
+# Such a value folds every metering error and conversion loss of the other channels
+# into "load", and it cannot be cross-checked (the balance tripwire abstains on it).
+DERIVED_LOAD_FLAG_KEYS: tuple[str, ...] = ("load_rescued", "repaired")
+
+# Sample-weight multiplier for derived-load rows in LOAD training (PV untouched).
+# Down-weight, not exclude: on Burgbyn10 the rescue fires on 28.6% of all quarters
+# and ~90% of quarters above 2.5 kWh PV (live DB, 2026-08-04..09-01). Excluding them
+# would leave sunny-midday load learned from the ~10% of quarters where the register
+# happened to work — a small, non-random sample — while a weight keeps the coverage
+# and still lets measured rows dominate wherever both exist.
+DERIVED_LOAD_WEIGHT: float = 0.5
+
+
+def _derived_load_mask(df: pd.DataFrame) -> pd.Series:
+    """True for rows whose load_kwh is balance-derived (see DERIVED_LOAD_FLAG_KEYS).
+
+    Missing column / NULL / unparseable JSON count as measured; a truncated or
+    malformed JSON string still matches on a plain substring of the key.
+    """
+    if "quality_flags" not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    def _is_derived(raw: Any) -> bool:
+        if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+            return False
+        flags: Any = raw
+        if isinstance(raw, str):
+            try:
+                flags = json.loads(raw)
+            except ValueError:
+                return any(f'"{key}"' in raw for key in DERIVED_LOAD_FLAG_KEYS)
+        if isinstance(flags, dict):
+            return any(key in flags for key in DERIVED_LOAD_FLAG_KEYS)
+        return False
+
+    return df["quality_flags"].map(_is_derived).astype(bool)
 
 
 @dataclass
@@ -121,7 +165,8 @@ def _load_slot_observations(
             SELECT
                 slot_start,
                 load_kwh,
-                pv_kwh
+                pv_kwh,
+                quality_flags
             FROM slot_observations
             WHERE load_kwh > 0.001
               AND load_kwh <= ?
@@ -136,7 +181,8 @@ def _load_slot_observations(
             SELECT
                 slot_start,
                 load_kwh,
-                pv_kwh
+                pv_kwh,
+                quality_flags
             FROM slot_observations
             WHERE slot_start < ?
               AND load_kwh > 0.001
@@ -152,7 +198,8 @@ def _load_slot_observations(
             SELECT
                 slot_start,
                 load_kwh,
-                pv_kwh
+                pv_kwh,
+                quality_flags
             FROM slot_observations
             WHERE slot_start >= ?
               AND slot_start < ?
@@ -168,7 +215,8 @@ def _load_slot_observations(
             SELECT
                 slot_start,
                 load_kwh,
-                pv_kwh
+                pv_kwh,
+                quality_flags
             FROM slot_observations
             WHERE slot_start >= ?
               AND slot_start < ?
@@ -328,6 +376,7 @@ def train_models(
         "load_samples": 0,
         "pv_samples": 0,
         "pv_rows_dropped_no_physics": 0,
+        "load_derived_rows": 0,
         "min_date": min_date.isoformat() if min_date else None,
         "pv_training_min_date": None,
         "error": None,
@@ -476,6 +525,24 @@ def train_models(
         y_load = load_df["load_kwh"].astype(float)
         # Extract sample weights for load training samples (label-safe .loc)
         load_weights = sample_weights.loc[load_df.index].to_numpy()
+        # Balance-derived load (recorder rescue / statistics repair) is kept but
+        # down-weighted — see DERIVED_LOAD_WEIGHT for why it is not excluded.
+        derived = _derived_load_mask(load_df).to_numpy()
+        n_derived = int(derived.sum())
+        result["load_derived_rows"] = n_derived
+        if n_derived:
+            load_weights = np.where(derived, load_weights * DERIVED_LOAD_WEIGHT, load_weights)
+            sunny = (load_df["pv_kwh"].fillna(0.0) > 0.05).to_numpy()
+            sunny_share = (
+                f"{derived[sunny].mean():.0%} of {int(sunny.sum())} PV>0.05 kWh rows"
+                if sunny.any()
+                else "no PV rows"
+            )
+            print(
+                f"Load training: {n_derived}/{len(load_df)} rows "
+                f"({n_derived / len(load_df):.1%}; {sunny_share}) have balance-derived "
+                f"load (load_rescued/repaired) -> sample weight x{DERIVED_LOAD_WEIGHT}"
+            )
         result["load_samples"] = len(X_load)
         print(f"Training load models on {len(X_load)} samples...")
 
