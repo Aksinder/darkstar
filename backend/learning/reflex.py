@@ -445,7 +445,17 @@ class AuroraReflex:
         """
         import asyncio
 
+        from backend.config_migration import CONFIG_WRITE_LOCK, write_config
+
         def _apply_updates() -> tuple[Any, list[dict[str, Any]]]:
+            # Read, mutate and (unless dry-run) write under ONE hold of the shared
+            # config lock. The write used to happen after awaiting the DB updates,
+            # so a /api/config/save landing in between was silently overwritten
+            # with this stale copy.
+            with CONFIG_WRITE_LOCK:
+                return _read_mutate_write()
+
+        def _read_mutate_write() -> tuple[Any, list[dict[str, Any]]]:
             # Reload config to ensure we have the latest comment structure
             with self.config_path.open(encoding="utf-8") as f:
                 data: Any = self.yaml.load(f)  # type: ignore[reportUnknownMemberType]
@@ -479,25 +489,20 @@ class AuroraReflex:
                         target.yaml_add_eol_comment(comment, last_key)
                     except Exception as e:
                         logger.debug(f"Could not add YAML comment: {e}")
+            if not dry_run and not write_config(
+                Path(self.config_path), data, self.yaml, strict_validation=False
+            ):
+                raise RuntimeError("config write aborted")
             return data, changes_made
 
-        data, changes_made = await asyncio.to_thread(_apply_updates)
+        _data, changes_made = await asyncio.to_thread(_apply_updates)
 
         if not dry_run:
-            # Update reflex state in DB for each change
+            logger.info("Config saved.")
+            # Update reflex state in DB for each change (after the file is written,
+            # outside the lock — the DB is not the config file).
             for change in changes_made:
                 await self.store.update_reflex_state(change["param"], float(change["new"]))
-
-            def _write_config():
-                from backend.config_migration import write_config
-
-                if not write_config(
-                    Path(self.config_path), data, self.yaml, strict_validation=False
-                ):
-                    raise RuntimeError("config write aborted")
-
-            await asyncio.to_thread(_write_config)
-            logger.info("Config saved.")
 
             # Log to strategy history
             if changes_made:
