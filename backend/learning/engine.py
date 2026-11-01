@@ -23,7 +23,9 @@ class LearningEngine:
     """
 
     def __init__(self, config_path: str = "config.yaml"):
+        self._config_path: str = config_path
         self.config: dict[str, Any] = self._load_config(config_path)
+        self._config_mtime: float = self._get_config_mtime()
         self.learning_config: dict[str, Any] = self.config.get("learning", {})
         self.db_path = self.learning_config.get("sqlite_path", "data/planner_learning.db")
         self.timezone = pytz.timezone(self.config.get("timezone", "Europe/Stockholm"))
@@ -34,16 +36,31 @@ class LearningEngine:
         # Initialize Store
         self.store = LearningStore(self.db_path, self.timezone)
 
+        self._apply_config_derived_fields()
+
+    def _apply_config_derived_fields(self) -> None:
+        """(Re)derive the cheap per-config views; safe to call after a reload.
+
+        db_path, timezone and the store are deliberately NOT re-derived on reload:
+        they are structural (open DB handles) and still need a restart to change.
+        """
+        self.learning_config = self.config.get("learning", {}) or {}
         raw_map: dict[str, Any] = self.learning_config.get("sensor_map", {}) or {}
         # Corrected: {entity_id: canonical} -> {entity_id: canonical}
         self.sensor_map = {str(k).lower(): str(v).lower() for k, v in raw_map.items()}
 
         # Load inversion flags from input_sensors (REV F55)
-        input_sensors: dict[str, Any] = self.config.get("input_sensors", {})
+        input_sensors: dict[str, Any] = self.config.get("input_sensors", {}) or {}
         self.inversion_flags = {
             "battery": input_sensors.get("battery_power_inverted", False),
             "grid": input_sensors.get("grid_power_inverted", False),
         }
+
+    def _get_config_mtime(self) -> float:
+        try:
+            return Path(self._config_path).stat().st_mtime
+        except OSError:
+            return 0.0
 
     def _load_config(self, config_path: str) -> dict[str, Any]:
         """Load configuration from YAML file"""
@@ -51,9 +68,35 @@ class LearningEngine:
             with Path(config_path).open(encoding="utf-8") as f:
                 return yaml.safe_load(f)
         except FileNotFoundError:
-            # Fallback to default config
+            # Fallback to default config. _config_path keeps pointing at the
+            # user file (mtime 0.0 while missing) so it is picked up once created.
             with Path("config.default.yaml").open(encoding="utf-8") as f:
                 return yaml.safe_load(f)
+
+    def reload_config_if_changed(self) -> bool:
+        """Re-parse config only when the file's mtime changed (upstream 172d5764).
+
+        Without this, ml/forward.py and friends kept using the config captured at
+        startup, so a Settings save (e.g. PV arrays, sensors) did not reach the
+        forecast until a restart. Returns True when a reload happened. A file
+        that is missing or fails to parse leaves the current config in place.
+        """
+        current_mtime = self._get_config_mtime()
+        if current_mtime == 0.0 or current_mtime == self._config_mtime:
+            return False
+        try:
+            new_config = self._load_config(self._config_path)
+        except Exception as e:
+            logger.warning("Config reload failed, keeping previous config: %s", e)
+            return False
+        if not isinstance(new_config, dict):
+            logger.warning("Config reload produced no mapping, keeping previous config")
+            return False
+        self.config = new_config
+        self._config_mtime = current_mtime
+        self._apply_config_derived_fields()
+        logger.info("LearningEngine config reloaded (mtime changed): %s", self._config_path)
+        return True
 
     # Delegate storage methods to store (Async)
     async def store_slot_prices(self, price_rows: Any) -> None:

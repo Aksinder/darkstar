@@ -85,6 +85,12 @@ async def _run(tmp_path, soc_value):
     values = {"sensor.batt_soc": 75.0, "sensor.ev_soc": soc_value}
     with (
         patch("backend.core.ha_client.get_ha_sensor_float") as mock_sensor,
+        # battery SoC is read as a full state (soc_timestamp needs its last_reported)
+        patch(
+            "backend.core.ha_client.get_ha_entity_state",
+            new_callable=AsyncMock,
+            side_effect=lambda e: {"state": "75.0"} if e == "sensor.batt_soc" else None,
+        ),
         patch("backend.core.ha_client.get_ha_bool", new_callable=AsyncMock, return_value=False),
         patch("backend.core.secrets.load_home_assistant_config", return_value={}),
     ):

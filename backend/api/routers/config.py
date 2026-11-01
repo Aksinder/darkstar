@@ -317,6 +317,21 @@ async def save_config(
             # Log but don't fail the save if executor reload fails
             logger.warning("Failed to reload executor config after save: %s", e)
 
+        # Re-arm the HA websocket listener against the saved entity IDs (upstream
+        # 885b296a). reload_ha_socket_client() had no caller since the Flask
+        # webapp was removed, so entities added or changed in Settings were
+        # silently ignored by the listener until the next restart.
+        try:
+            from backend.ha_socket import reload_ha_socket_client_async
+
+            added = await reload_ha_socket_client_async()
+            logger.info(
+                "HA websocket entities reloaded after config save (%d newly monitored)",
+                len(added),
+            )
+        except Exception as e:
+            logger.warning("Failed to reload HA websocket entities after save: %s", e)
+
         # Clear planner retry suspension so planning resumes after config fix
         try:
             from backend.services.planner_service import planner_service
