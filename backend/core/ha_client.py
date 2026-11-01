@@ -280,8 +280,12 @@ async def get_energy_from_power_history(
     entity_id: str,
     start: datetime,
     end: datetime,
+    *,
+    idle_kw: float | None = None,
 ) -> float | None:
     """Fetch power sensor history and compute energy via average power x time.
+
+    ``idle_kw``: see :func:`integrate_power_history_kwh` (standby cutoff).
 
     Returns energy in kWh, or None if history unavailable.
     """
@@ -309,37 +313,64 @@ async def get_energy_from_power_history(
         if not data or not data[0]:
             return None
 
-        return integrate_power_history_kwh(data[0], start, end)
+        return integrate_power_history_kwh(data[0], start, end, idle_kw=idle_kw)
 
     except Exception as exc:
         logger.warning("get_energy_from_power_history(%s): %s", entity_id, exc)
         return None
 
 
-def integrate_power_history_kwh(
-    states: list[dict[str, Any]],
+async def get_power_history_batch(
+    entity_ids: list[str],
     start: datetime,
     end: datetime,
-) -> float | None:
-    """Time-weighted integral of a power-sensor history over [start, end], in kWh.
+) -> dict[str, list[dict[str, Any]]] | None:
+    """HA state history of several entities over [start, end] in ONE request.
 
-    The old implementation was an UNWEIGHTED mean of the state changes times the
-    window length. State-change history is event-driven, so a 5-minute element
-    burst contributes dozens of samples while a long idle stretch contributes
-    one — the mean was dominated by whichever mode changed most often, not by
-    time. Live consequence (2026-08-25): the house VVB's 3.5 kW bursts landed as
-    0.000 kWh whenever the (mis-chosen) window caught the idle side, and would
-    have been over-counted with a correct window. Each sample now covers exactly
-    the span until the next sample (clamped to the window), i.e. the standard
-    step-function integral of HA state history.
+    Returns ``{entity_id: states}`` (an entity HA returned nothing for is absent),
+    or None when HA is not configured or the request failed.
+    """
+    ha_config = secrets.load_home_assistant_config()
+    url = ha_config.get("url")
+    token = ha_config.get("token")
+    wanted = [e for e in dict.fromkeys(entity_ids) if e]
+    if not url or not token or not wanted:
+        return None
 
-    A sample whose value is unknown/unavailable/unparsable is skipped and the
-    previous numeric value carries across the gap — the sensor's last report is
-    the best estimate of what the element was doing while the sensor was mute.
+    api_url = f"{url.rstrip('/')}/api/history/period/{start.isoformat()}"
+    params = {
+        "filter_entity_id": ",".join(wanted),
+        "end_time": end.isoformat(),
+        "significant_changes_only": False,
+        "minimal_response": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.get(api_url, headers=make_ha_headers(token), params=params)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        logger.warning("get_power_history_batch(%s): %s", ",".join(wanted), exc)
+        return None
 
-    Samples without a parsable timestamp fall back to the legacy mean-times-
-    duration estimate, so callers that only have bare values still get an answer.
-    Returns None when no numeric samples exist at all.
+    result: dict[str, list[dict[str, Any]]] = {}
+    for series in data or []:
+        if not isinstance(series, list) or not series:
+            continue
+        entity = str(series[0].get("entity_id", "")) if isinstance(series[0], dict) else ""
+        if entity:
+            result[entity] = series
+    return result
+
+
+def _parse_power_samples(
+    states: list[dict[str, Any]],
+) -> tuple[list[tuple[datetime, float]], list[float]]:
+    """HA power-sensor states -> (time-sorted (timestamp, kW) points, untimed kW values).
+
+    unknown/unavailable/unparsable AND non-finite values are skipped: "nan"/"inf"
+    parse as floats and a single one poisons the whole integral (nan) or makes it
+    infinite. The unit is taken from the first numeric sample (W / kW / MW).
     """
     points: list[tuple[datetime, float]] = []
     bare_kw: list[float] = []
@@ -352,6 +383,8 @@ def integrate_power_history_kwh(
         try:
             value = float(state_val)
         except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
             continue
 
         if unit is None:
@@ -382,13 +415,52 @@ def integrate_power_history_kwh(
         else:
             points.append((ts, kw))
 
+    points.sort(key=lambda p: p[0])
+    return points, bare_kw
+
+
+def integrate_power_history_kwh(
+    states: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    *,
+    idle_kw: float | None = None,
+) -> float | None:
+    """Time-weighted integral of a power-sensor history over [start, end], in kWh.
+
+    The old implementation was an UNWEIGHTED mean of the state changes times the
+    window length. State-change history is event-driven, so a 5-minute element
+    burst contributes dozens of samples while a long idle stretch contributes
+    one — the mean was dominated by whichever mode changed most often, not by
+    time. Live consequence (2026-08-25): the house VVB's 3.5 kW bursts landed as
+    0.000 kWh whenever the (mis-chosen) window caught the idle side, and would
+    have been over-counted with a correct window. Each sample now covers exactly
+    the span until the next sample (clamped to the window), i.e. the standard
+    step-function integral of HA state history.
+
+    A sample whose value is unknown/unavailable/unparsable/non-finite is skipped
+    and the previous numeric value carries across the gap — the sensor's last
+    report is the best estimate of what the element was doing while it was mute.
+
+    ``idle_kw``: when set, a sample at or below it counts as 0 kW (standby draw —
+    electronics, a spa's circulation pump — is not heating; same rule as the
+    executor's ``idle_power_w``). None integrates the raw power.
+
+    Samples without a parsable timestamp fall back to the legacy mean-times-
+    duration estimate, so callers that only have bare values still get an answer.
+    Returns None when no numeric samples exist at all.
+    """
+    points, bare_kw = _parse_power_samples(states)
+    if idle_kw is not None:
+        points = [(ts, 0.0 if kw <= idle_kw else kw) for ts, kw in points]
+        bare_kw = [0.0 if kw <= idle_kw else kw for kw in bare_kw]
+
     if not points:
         if not bare_kw:
             return None
         duration_hours = (end - start).total_seconds() / 3600.0
         return (sum(bare_kw) / len(bare_kw)) * duration_hours
 
-    points.sort(key=lambda p: p[0])
     total_kwh = 0.0
     for i, (ts, kw) in enumerate(points):
         seg_start = max(ts, start)
@@ -396,6 +468,36 @@ def integrate_power_history_kwh(
         if seg_end > seg_start:
             total_kwh += kw * (seg_end - seg_start).total_seconds() / 3600.0
     return total_kwh
+
+
+def integrate_power_history_split_kwh(
+    states: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+) -> tuple[float, float] | None:
+    """Sign-split step integral of a SIGNED power history over [start, end].
+
+    Returns ``(positive_kwh, negative_kwh)`` — each held interval is booked to the
+    side of its own sign, the negative side as a magnitude — so a net meter that
+    imports for 5 minutes and exports for 10 yields both flows instead of their
+    difference. Same sample rules as :func:`integrate_power_history_kwh`;
+    untimed samples are not supported here (None). None when nothing is numeric.
+    """
+    points, _ = _parse_power_samples(states)
+    if not points:
+        return None
+    positive = 0.0
+    negative = 0.0
+    for i, (ts, kw) in enumerate(points):
+        seg_start = max(ts, start)
+        seg_end = min(points[i + 1][0], end) if i + 1 < len(points) else end
+        if seg_end > seg_start:
+            kwh = kw * (seg_end - seg_start).total_seconds() / 3600.0
+            if kwh >= 0:
+                positive += kwh
+            else:
+                negative -= kwh
+    return positive, negative
 
 
 _TRUE_STATES = {"on", "true", "yes", "1", "armed_away", "armed_home", "armed_night"}

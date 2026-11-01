@@ -863,6 +863,15 @@ learning:
     s_index_temp_weight: 0.1           # Max daily change to S-Index temperature weight (absolute value per day)
     future_price_guard_buffer_sek: 0.05  # Max daily change to future price guard buffer (SEK per day)
 
+# Observation recorder (backend/recorder.py, one row per finished 15-min slot)
+recorder:
+  balance_tolerance_kwh: 1.5           # Energy-balance tripwire: flag a slot whose residual exceeds this
+  # Diagnostics only. When true, grid import/export and battery charge/discharge are ALSO
+  # integrated from power history over exactly [slot_start, slot_end) (one HA history request
+  # per slot, sign-split) and compared with the energy-counter values in the log and in
+  # quality_flags.shadow_exact. Recorded energy columns (training data) are NOT changed.
+  exact_slot_power_shadow: false
+
 # Nordpool API Configuration (electricity prices)
 nordpool:
   price_area: "SE4"                    # Nordpool bidding zone (SE1-SE4, NO1-NO5, DK1-DK2, FI, etc.)

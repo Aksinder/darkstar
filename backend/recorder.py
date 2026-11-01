@@ -17,6 +17,8 @@ from backend.core.ha_client import (
     get_ha_entity_state,
     get_ha_sensor_float,
     get_ha_sensor_kw_normalized,
+    get_power_history_batch,
+    integrate_power_history_split_kwh,
 )
 from backend.core.prices import get_nordpool_data
 from backend.learning.backfill import BackfillEngine
@@ -291,6 +293,78 @@ def _load_config() -> dict[str, Any]:
             return {}
     except FileNotFoundError:
         return {}
+
+
+def _heater_idle_kw(heater: dict[str, Any]) -> float | None:
+    """The heater's explicit ``idle_power_w`` in kW, or None when unset/invalid."""
+    raw = heater.get("idle_power_w")
+    if raw is None or raw == "":
+        return None
+    try:
+        idle_w = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not idle_w >= 0:  # also rejects nan
+        return None
+    return idle_w / 1000.0
+
+
+async def _exact_slot_power_shadow(
+    input_sensors: dict[str, Any],
+    meter_type: str,
+    slot_start: datetime,
+    slot_end: datetime,
+) -> dict[str, float] | None:
+    """Grid/battery energy of the slot from power history (sign-split), for the shadow.
+
+    One HA history request covers every entity. Sign conventions are the ones the
+    snapshot path above uses: net grid_power is +import/-export and battery_power
+    +discharge/-charge, each flipped by its ``*_inverted`` flag; dual-meter
+    grid_import_power / grid_export_power are both positive magnitudes. Returns
+    only the flows it could integrate ({} keys missing), None when nothing worked.
+    """
+    entities: dict[str, str] = {}
+    if meter_type == "dual":
+        for key in ("grid_import_power", "grid_export_power"):
+            if input_sensors.get(key):
+                entities[key] = str(input_sensors[key])
+    elif input_sensors.get("grid_power"):
+        entities["grid_power"] = str(input_sensors["grid_power"])
+    if input_sensors.get("battery_power"):
+        entities["battery_power"] = str(input_sensors["battery_power"])
+    if not entities:
+        return None
+
+    history = await get_power_history_batch(list(entities.values()), slot_start, slot_end)
+    if not history:
+        return None
+
+    def split(key: str) -> tuple[float, float] | None:
+        states = history.get(entities.get(key, ""))
+        return integrate_power_history_split_kwh(states, slot_start, slot_end) if states else None
+
+    out: dict[str, float] = {}
+    if meter_type == "dual":
+        imp = split("grid_import_power")
+        exp = split("grid_export_power")
+        if imp is not None:
+            out["import"] = round(imp[0], 3)
+        if exp is not None:
+            out["export"] = round(exp[0], 3)
+    else:
+        grid = split("grid_power")
+        if grid is not None:
+            pos, neg = grid
+            if input_sensors.get("grid_power_inverted", False):
+                pos, neg = neg, pos
+            out["import"], out["export"] = round(pos, 3), round(neg, 3)
+    batt = split("battery_power")
+    if batt is not None:
+        pos, neg = batt
+        if input_sensors.get("battery_power_inverted", False):
+            pos, neg = neg, pos
+        out["discharge"], out["charge"] = round(pos, 3), round(neg, 3)
+    return out or None
 
 
 async def record_observation_from_current_state(
@@ -668,24 +742,47 @@ async def _record_observation(
                         # history-derived slot_device_energy value with ~0.
                         logger.debug(f"EV {charger_id}: snapshot fallback={device_kwh:.3f} kWh")
 
-    # Calculate water heater energy using power history API
+    # Calculate water heater energy using power history API.
+    #
+    # HEATING energy only: a sample at or below the heater's idle_power_w counts as 0,
+    # the executor's own "not heating" rule (executor/water_hold.py). Integrating raw
+    # power credited standby draw (electronics, a spa's circulation/filter pump) as
+    # heating — into heated_today, the absorption stats and the per-tank savings. The
+    # standby energy is not lost: it is simply not subtracted from base load below,
+    # so it stays in load_kwh where every other always-on consumer lives. Applied only
+    # when idle_power_w is set EXPLICITLY on the heater (the executor's 100 W default
+    # would silently change what an unconfigured heater records).
     water_kwh = 0.0
     water_heater_energy: dict[str, float] = {}  # Task 8.1: per-device recording
+    # Heaters whose slot energy is NOT a history measurement: "snapshot" (one power
+    # read x 15 min) or "unavailable" (no read at all, booked as 0). Flagged rather
+    # than passed off as a measured value.
+    water_unmeasured: dict[str, str] = {}
     for water_heater in config.get("water_heaters", []):
         if water_heater.get("enabled", True):
             sensor = water_heater.get("sensor")
             heater_id = str(water_heater.get("id", ""))
             if sensor:
-                energy = await get_energy_from_power_history(str(sensor), slot_start, slot_end)
+                idle_kw = _heater_idle_kw(water_heater)
+                history_kwargs: dict[str, Any] = {} if idle_kw is None else {"idle_kw": idle_kw}
+                energy = await get_energy_from_power_history(
+                    str(sensor), slot_start, slot_end, **history_kwargs
+                )
                 if energy is not None:
                     water_kwh += energy
                     if heater_id:
                         water_heater_energy[heater_id] = energy
                     logger.debug(f"Water {heater_id}: history energy={energy:.3f} kWh")
                 else:
-                    heater_power = power_results.get(f"wh_{sensor}") or 0.0
+                    snapshot_kw = power_results.get(f"wh_{sensor}")
+                    heater_power = snapshot_kw or 0.0
+                    if idle_kw is not None and heater_power <= idle_kw:
+                        heater_power = 0.0
                     device_kwh = heater_power * 0.25
                     water_kwh += device_kwh
+                    water_unmeasured[heater_id or str(sensor)] = (
+                        "unavailable" if snapshot_kw is None else "snapshot"
+                    )
                     # Snapshot fallback: aggregate only, no per-device row (see the
                     # EV branch above — a re-record must not zero a good value).
                     logger.debug(f"Water {heater_id}: snapshot fallback={device_kwh:.3f} kWh")
@@ -743,14 +840,16 @@ async def _record_observation(
     # Balance-rescue the load when the load register glitched (read invalid above) or the
     # cumulative load counter ALSO froze (delta ≈ 0 while the house demonstrably ran).
     # Energy conservation over the slot: total_load = pv + import - export + discharge -
-    # charge; base load = total - EV - water (same isolation as the normal path). All the
+    # charge; base load = total - EV - water - cyclic (same isolation as the normal path:
+    # the planner adds cyclic loads back on top of base load, so a rescued row that kept
+    # the pump energy in "base" double-counted it on ~90% of sunny quarters). All the
     # balance inputs come from channels that stay healthy through the Sungrow load-register
     # glitch, so this records a REAL value instead of skipping the slot (pre-2026-08 the
     # skip → zero-filled backfill rows poisoned eval and starved training of every
     # strong-export slot — the highest-PV data the residual model most needs).
     load_rescued = False
     balance_total_kwh = pv_kwh + import_kwh - export_kwh + batt_discharge_kwh - batt_charge_kwh
-    balance_base_kwh = max(0.0, balance_total_kwh - ev_charging_kwh - water_kwh)
+    balance_base_kwh = max(0.0, balance_total_kwh - ev_charging_kwh - water_kwh - cyclic_kwh)
 
     # Energy-balance tripwire. How far the slot is from closing:
     #   (import + pv + discharge) - (export + charge + base_load + water + EV + cyclic)
@@ -766,8 +865,8 @@ async def _record_observation(
     # show one sign, and the two largest real imbalances in that month were NEGATIVE
     # (-7.2 kWh and -3.7 kWh, both at low PV).
     #
-    # cyclic_kwh is included here though the normal path's isolation is the only place
-    # it appears; omitting it would leave a term of the identity unaccounted.
+    # cyclic_kwh is included here as in both base-load isolations above; omitting it
+    # would leave a term of the identity unaccounted.
     balance_residual_kwh = balance_total_kwh - (
         load_kwh + ev_charging_kwh + water_kwh + cyclic_kwh
     )
@@ -789,6 +888,52 @@ async def _record_observation(
         )
         load_kwh = balance_base_kwh
         load_rescued = True
+
+    # B1 shadow (opt-in, recorder.exact_slot_power_shadow): grid and battery energy
+    # integrated from POWER history over exactly [slot_start, slot_end), next to the
+    # counter deltas used above. The Sungrow counters tick every ~10 min, so their
+    # quarter is misaligned with the exact-slot EV/water/PV integrals; on a VVB/EV
+    # burst quarter that skews the balance (and, after the clamp at 0, biases base
+    # load up). This only MEASURES that: nothing here feeds a training column.
+    recorder_cfg: dict[str, Any] = config.get("recorder", {}) or {}
+    shadow_exact: dict[str, float] | None = None
+    if recorder_cfg.get("exact_slot_power_shadow", False):
+        try:
+            shadow_exact = await _exact_slot_power_shadow(
+                input_sensors, meter_type, slot_start, slot_end
+            )
+        except Exception as exc:  # a shadow must never cost the observation
+            logger.warning("Recorder: exact-slot power shadow failed: %s", exc)
+        if shadow_exact is not None:
+            shadow_exact["base"] = round(
+                max(
+                    0.0,
+                    pv_kwh
+                    + shadow_exact.get("import", import_kwh)
+                    - shadow_exact.get("export", export_kwh)
+                    + shadow_exact.get("discharge", batt_discharge_kwh)
+                    - shadow_exact.get("charge", batt_charge_kwh)
+                    - ev_charging_kwh
+                    - water_kwh
+                    - cyclic_kwh,
+                ),
+                3,
+            )
+            logger.info(
+                "Recorder shadow_exact %s: import %.3f/%s export %.3f/%s charge %.3f/%s "
+                "discharge %.3f/%s base %.3f/%.3f (counter/exact)",
+                slot_start,
+                import_kwh,
+                shadow_exact.get("import"),
+                export_kwh,
+                shadow_exact.get("export"),
+                batt_charge_kwh,
+                shadow_exact.get("charge"),
+                batt_discharge_kwh,
+                shadow_exact.get("discharge"),
+                load_kwh,
+                shadow_exact["base"],
+            )
 
     # Battery
     soc_entity = input_sensors.get("battery_soc")
@@ -898,7 +1043,6 @@ async def _record_observation(
     # NOTE: that calibration was run on a residual WITHOUT cyclic_kwh, which is not
     # persisted and so cannot be reconstructed from the database. If cyclic loads are
     # configured and material, re-check the live firing rate before trusting the default.
-    recorder_cfg: dict[str, Any] = config.get("recorder", {}) or {}
     balance_tolerance_kwh = float(recorder_cfg.get("balance_tolerance_kwh", 1.5))
     balance_tripped = (
         not load_rescued
@@ -944,8 +1088,18 @@ async def _record_observation(
         or grid_unmeasured
         or soc_stale
         or multi_slot
+        or water_unmeasured
+        or shadow_exact
     ):
         flags: dict[str, Any] = {}
+        if water_unmeasured:
+            flags["water_unmeasured"] = water_unmeasured
+        if shadow_exact:
+            # Opt-in diagnostics only; free-form key that no reader interprets
+            # (train/hindsight/savings match their own keys). Note it makes every
+            # row "claimed" for quarantine.py, harmless for live rows (never
+            # price-mint fingerprints) — which is why it is off by default.
+            flags["shadow_exact"] = shadow_exact
         if multi_slot:
             flags["multi_slot_delta"] = multi_slot
         if grid_unmeasured:
