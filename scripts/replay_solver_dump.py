@@ -83,7 +83,14 @@ def rehydrate_input(inp: dict[str, Any]) -> KeplerInput:
         )
         for s in inp["slots"]
     ]
-    return KeplerInput(slots=slots, initial_soc_kwh=float(inp["initial_soc_kwh"]))
+    rem = inp.get("first_slot_remaining_h")
+    return KeplerInput(
+        slots=slots,
+        initial_soc_kwh=float(inp["initial_soc_kwh"]),
+        # Partial first slot (kepler.partial_first_slot): dumps carry the remainder
+        # and the already-scaled slot 0, so replay solves the same instance.
+        first_slot_remaining_h=float(rem) if rem is not None else None,
+    )
 
 
 def rehydrate_config(cfg: dict[str, Any]) -> KeplerConfig:

@@ -7,6 +7,7 @@ Migrated from backend/kepler/adapter.py during Rev K13 modularization.
 
 import logging
 import math
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, cast
 
@@ -25,6 +26,7 @@ from .types import (
     LoadGroup,
     LoadPriority,
     WaterHeaterInput,
+    planned_slot_hours,
 )
 
 logger = logging.getLogger(__name__)
@@ -523,6 +525,42 @@ def planner_to_kepler_input(
         )
 
     return KeplerInput(slots=slots, initial_soc_kwh=initial_soc_kwh)  # type: ignore[arg-type]
+
+
+def first_slot_remaining_h(slot_start: datetime, slot_end: datetime, now: datetime) -> float:
+    """Hours left in the slot [slot_start, slot_end) at ``now`` (aware instants).
+
+    Clamped to [0, slot length]: ``now`` before the slot (a boundary plan) gives
+    the full slot, ``now`` past its end gives 0 (the solver floors it).
+    """
+    slot_h = max(0.0, (slot_end - slot_start).total_seconds() / 3600.0)
+    left = (slot_end - now).total_seconds() / 3600.0
+    return max(0.0, min(slot_h, left))
+
+
+def scale_first_slot_to_remaining(kepler_input: KeplerInput) -> KeplerInput:
+    """Scale the in-progress slot's forecast energy to the time left in it.
+
+    The forecast load and PV of slot 0 are full-slot energies; the solver plans
+    that slot over ``first_slot_remaining_h`` only, so the energy still to come
+    in it is the remaining share (upstream ccb47c07). Uses the SAME clamped
+    duration as the solver (planned_slot_hours) so balance and limits agree.
+    Replaces slot 0 with a scaled copy — the original object may be shared with
+    the fine-grid list the coarse tail expands onto. A boundary plan (or None)
+    is returned unchanged.
+    """
+    remaining_h = kepler_input.first_slot_remaining_h
+    if remaining_h is None or not kepler_input.slots:
+        return kepler_input
+    first = kepler_input.slots[0]
+    slot_h = (first.end_time - first.start_time).total_seconds() / 3600.0
+    planned_h = planned_slot_hours([first], remaining_h)[0]
+    if slot_h <= 0 or planned_h >= slot_h:
+        return kepler_input
+    share = planned_h / slot_h
+    slots = list(kepler_input.slots)
+    slots[0] = replace(first, load_kwh=first.load_kwh * share, pv_kwh=first.pv_kwh * share)
+    return replace(kepler_input, slots=slots)
 
 
 def _comfort_level_to_penalty(
@@ -1264,7 +1302,8 @@ def kepler_result_to_dataframe(
     prev_soc_kwh = initial_soc_kwh
 
     for s in result.slots:
-        duration_h = (s.end_time - s.start_time).total_seconds() / 3600.0
+        # A partial slot 0 was planned over the time left in it: kW = kWh / that.
+        duration_h = s.duration_h or (s.end_time - s.start_time).total_seconds() / 3600.0
         if duration_h <= 0:
             duration_h = 0.25
 

@@ -34,7 +34,13 @@ import pulp  # type: ignore[import]
 
 from planner.errors import PlannerError, PlannerErrorCode
 from planner.solver.kepler import min_soc_floor_kwh
-from planner.solver.types import KeplerConfig, KeplerInput, KeplerResult, KeplerResultSlot
+from planner.solver.types import (
+    KeplerConfig,
+    KeplerInput,
+    KeplerResult,
+    KeplerResultSlot,
+    planned_slot_hours,
+)
 
 logger = logging.getLogger("darkstar.planner.battery_lp")
 
@@ -91,7 +97,8 @@ def solve_battery_only(
         raise ValueError("benchmark mode needs BenchmarkTerms")
     live = mode == "live"
 
-    hours = [max((s.end_time - s.start_time).total_seconds() / 3600.0, 0.0) for s in slots]
+    # Same per-slot basis as kepler: a partial slot 0 is planned over its remainder.
+    hours = planned_slot_hours(slots, input_data.first_slot_remaining_h)
     cap = config.capacity_kwh
     eta_c = config.charge_efficiency if config.charge_efficiency > 0 else 1.0
     eta_d = config.discharge_efficiency if config.discharge_efficiency > 0 else 1.0
@@ -257,6 +264,11 @@ def solve_battery_only(
                 cost_sek=cost,
                 import_price_sek_kwh=s.import_price_sek_kwh,
                 export_price_sek_kwh=s.export_price_sek_kwh,
+                duration_h=(
+                    hours[t]
+                    if hours[t] != (s.end_time - s.start_time).total_seconds() / 3600.0
+                    else None
+                ),
                 is_optimal=True,
             )
         )
