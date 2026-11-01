@@ -126,9 +126,12 @@ class TestConfig:
         )
         assert cfg.controller.min_soc_release_margin_percent == expected
 
-    def test_default_yaml_ships_cutoff_off(self):
+    def test_default_yaml_ships_cutoff_120(self):
+        # Owner decision 2026-11-01: the shipped default is 120 min (never below 60).
         cfg = load_executor_config(str(Path(__file__).parents[2] / "config.default.yaml"))
-        assert cfg.max_plan_age_minutes is None
+        assert cfg.max_plan_age_minutes == 120.0
+        assert cfg.load_balancing.enabled is True
+        assert cfg.load_balancing.actuate is False
         assert cfg.controller.min_soc_release_margin_percent == 2.0
 
 
