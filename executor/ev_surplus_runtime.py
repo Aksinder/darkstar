@@ -69,6 +69,13 @@ _HELD_SOC_BLIND_DRAW_S = 1800.0
 # power) for up to _MISSED_DEPARTURE_GRACE_S after it, then is dropped.
 _MISSED_DEPARTURE_GRACE_S = 4 * 3600.0
 _MISSED_DEPARTURE_URGENT_H = 0.25
+# The grace only arms for a departure the car was OBSERVED plugged in at home for
+# (continuously since at or before the departure, within one tick of slack). An
+# observation gap longer than _PRESENCE_GAP_S (restart, stalled loop) breaks the
+# continuity — the car may have left and come back unseen. The gap exceeds the
+# store's SAVE_MIN_INTERVAL_S (the on-disk last-seen may lag by that) plus a restart.
+_PRESENCE_GAP_S = 900.0
+_MISSED_DEPARTURE_PRESENCE_SLACK_S = 180.0
 # Namespace of this controller's holds in backend/core/ev_hold_store.py.
 _HOLD_NAMESPACE = "servo"
 # A switch state must be this much newer than our last command to overrule it:
@@ -700,6 +707,14 @@ class EVSurplusController:
         self._held_soc_draw_s: dict[str, float] = {}
         self._held_soc_tick_ts: dict[str, float] = {}
         self._hold_warned: set[str] = set()
+        # Missed one-off departures: the departure ts whose grace has ENDED (car left,
+        # target met, SoC unknown) per charger, and which chargers are in grace now.
+        self._missed_dep_done: dict[str, float] = {}
+        self._missed_dep_active: set[str] = set()
+        # Per charger: (since, last_seen) of the current CONTINUOUS plugged-at-home
+        # observation run. Both this and _missed_dep_done are persisted with the holds,
+        # so a restart neither re-arms an ended grace nor forgets a car that never left.
+        self._present_run: dict[str, tuple[float, float]] = {}
         # ...and their copy on disk: without it an add-on restart during a blackout
         # of the car's entities reads "nothing to hold (never read) -> False", the car
         # drops out of the fleet, no start is ever commanded and so the wake button —
@@ -753,10 +768,6 @@ class EVSurplusController:
         # Chargers whose one-off departure entity holds a FUTURE timestamp as of
         # the latest read — the only state the supercharger alert may fire in.
         self._dep_future: set[str] = set()
-        # Missed one-off departures: the departure ts whose grace has ENDED (car left,
-        # target met, SoC unknown) per charger, and which chargers are in grace now.
-        self._missed_dep_done: dict[str, float] = {}
-        self._missed_dep_active: set[str] = set()
         self._last_wake_ts: dict[str, float] = {}
         # When each car's SoC first went unreadable, and when a wake was last spent
         # on that (see _wake_blind_cars).
@@ -1198,21 +1209,35 @@ class EVSurplusController:
         Up to _MISSED_DEPARTURE_GRACE_S after the departure, only while the car has
         stayed plugged in at home since it passed (one unplugged/away tick ends it
         for good — the trip happened), and only while the SoC is known and below
-        the trip floor (an unknown SoC pauses it). Reaching the floor ends it too; a NEW departure timestamp
-        starts fresh.
+        the trip floor (an unknown SoC pauses it). Reaching the floor ends it too; a
+        NEW departure timestamp starts fresh.
+
+        The car must have been OBSERVED plugged in at home at the departure and
+        continuously since (``_present_run``): a car that left at or after the
+        departure and came back unseen (restart, stalled loop) did make its trip —
+        arming then would force full power into the morning peak for nothing. The
+        ended-marker is persisted, so a restart does not re-arm an ended grace.
         """
         missed_s = now_ts - dep_ts
         if missed_s < 0.0 or missed_s > _MISSED_DEPARTURE_GRACE_S:
-            self._missed_dep_done.pop(cid, None)
+            if self._missed_dep_done.pop(cid, None) is not None:
+                self._persist_holds(now_ts)
             return False
         if self._missed_dep_done.get(cid) == dep_ts:
             return False
+        run = self._present_run.get(cid)
+        if present and (
+            run is None or run[0] > dep_ts + _MISSED_DEPARTURE_PRESENCE_SLACK_S
+        ):
+            # Plugged at home now, but not seen so since the departure: not missed.
+            present = False
         if soc is None:
             # Unknown SoC: cannot tell met from unmet, and the floors are off anyway.
             # Not terminal — a returning reading resumes the (still bounded) grace.
             return False
         if not present or trip_floor is None or soc >= trip_floor:
             self._missed_dep_done[cid] = dep_ts
+            self._persist_holds(now_ts)
             if cid in self._missed_dep_active:
                 self._missed_dep_active.discard(cid)
                 logger.info("EV surplus: %s missed-departure grace ended", cid)
@@ -1226,6 +1251,20 @@ class EVSurplusController:
                 cid, missed_s / 60.0, soc, trip_floor, _MISSED_DEPARTURE_GRACE_S / 3600.0,
             )
         return True
+
+    def _note_presence(self, cid: str, present: bool, now_ts: float) -> None:
+        """Track the continuous plugged-at-home run the missed-departure grace needs."""
+        run = self._present_run.get(cid)
+        if not present:
+            if self._present_run.pop(cid, None) is not None:
+                self._persist_holds(now_ts)
+            return
+        if run is None or now_ts - run[1] > _PRESENCE_GAP_S or now_ts < run[1]:
+            # New run, or an unobserved gap: the car may have left and come back.
+            self._present_run[cid] = (now_ts, now_ts)
+        else:
+            self._present_run[cid] = (run[0], now_ts)
+        self._persist_holds(now_ts)
 
     def _clear_held_soc_roll(self, cid: str) -> None:
         self._held_soc_kwh.pop(cid, None)
@@ -1286,6 +1325,14 @@ class EVSurplusController:
             if isinstance(value, int | float) and not isinstance(value, bool):
                 self._last_good_soc[key] = (float(value), ts)
                 restored += 1
+        # Missed-departure state: the ended-grace marker (value = departure ts) and
+        # the plugged-at-home run (value = since, ts = last seen).
+        for key, (value, _ts) in persisted.get("missed_dep_done", {}).items():
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                self._missed_dep_done[key] = float(value)
+        for key, (value, ts) in persisted.get("present_run", {}).items():
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                self._present_run[key] = (float(value), ts)
         if restored:
             logger.info(
                 "EV surplus: restored %d last-good plug/home/SoC reading(s) from disk", restored
@@ -1302,6 +1349,12 @@ class EVSurplusController:
                 "plug": cast("dict[str, tuple[Any, float]]", dict(self._last_good_plug)),
                 "home": cast("dict[str, tuple[Any, float]]", dict(self._last_good_home)),
                 "soc": cast("dict[str, tuple[Any, float]]", dict(self._last_good_soc)),
+                "missed_dep_done": {
+                    k: (dep, now_ts) for k, dep in self._missed_dep_done.items()
+                },
+                "present_run": {
+                    k: (since, seen) for k, (since, seen) in self._present_run.items()
+                },
             },
             now_ts,
         )
@@ -1580,6 +1633,7 @@ class EVSurplusController:
             and (base_floor is None or trip_target > base_floor)
             else base_floor
         )
+        self._note_presence(c.id, plugged and at_home, now_ts)
         if dep_future and dep_ts is not None:
             pairs.append(((dep_ts - now_ts) / 3600.0, one_off_floor))
         elif dep_ts is not None and self._missed_departure_grace(
