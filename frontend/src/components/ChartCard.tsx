@@ -207,7 +207,7 @@ const chartOptions: ChartConfiguration['options'] = {
         y4: {
             position: 'left',
             min: 0,
-            max: 1.5,
+            max: 9,
             title: { display: false, text: 'kW (PV)' },
             grid: { display: false },
             ticks: { display: false },
@@ -1069,15 +1069,15 @@ export default function ChartCard({
                     ...chartOptions?.scales,
                     y1: {
                         ...chartOptions?.scales?.y1,
-                        max: Math.max(scaling.gridMaxKw, scaling.inverterMaxKw),
+                        max: Math.max(scaling.gridMaxKw, scaling.inverterMaxKw, scaling.solarKwp),
                     },
                     y2: {
                         ...chartOptions?.scales?.y2,
-                        max: Math.max(scaling.gridMaxKw, scaling.inverterMaxKw),
+                        max: Math.max(scaling.gridMaxKw, scaling.inverterMaxKw, scaling.solarKwp),
                     },
                     y4: {
                         ...chartOptions?.scales?.y4,
-                        max: scaling.solarKwp,
+                        max: Math.max(scaling.gridMaxKw, scaling.inverterMaxKw, scaling.solarKwp),
                     },
                 },
             },
@@ -1100,16 +1100,18 @@ export default function ChartCard({
 
         const chart = chartRef.current
         if (chart.options?.scales) {
-            const gridInverterMax = Math.max(scaling.gridMaxKw, scaling.inverterMaxKw)
+            // One shared kW ceiling for bars (y1/y2) and the PV line (y4) so equal
+            // kW renders at equal height, and PV above grid/inverter limit isn't clipped.
+            const sharedPowerMax = Math.max(scaling.gridMaxKw, scaling.inverterMaxKw, scaling.solarKwp)
 
             if (chart.options.scales.y1) {
-                chart.options.scales.y1.max = gridInverterMax
+                chart.options.scales.y1.max = sharedPowerMax
             }
             if (chart.options.scales.y2) {
-                chart.options.scales.y2.max = gridInverterMax
+                chart.options.scales.y2.max = sharedPowerMax
             }
             if (chart.options.scales.y4) {
-                chart.options.scales.y4.max = scaling.solarKwp
+                chart.options.scales.y4.max = sharedPowerMax
             }
 
             chart.update('none') // Update without animation for instant response
