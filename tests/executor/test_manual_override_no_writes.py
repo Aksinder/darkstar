@@ -294,16 +294,63 @@ async def test_manual_relief_lowers_easee_dynamic_limit_on_overload():
 
 
 @pytest.mark.asyncio
-async def test_manual_relief_never_raises_a_lower_limit_on_a_stale_power_sensor():
-    # Power sensor still says 16 A, but 8 A is already in force: cap 12 > 8 -> recompute
-    # from 8 (own draw is a LOWER bound): 8 - 4 = 4 < 6 A floor -> pause (0), a cut.
-    srv = _servo({"a": 27.0, "b": 18.0, "c": 18.0}, last_a={"easee": 8.0})
+async def test_manual_relief_sheds_a_car_the_human_started_despite_servo_memory_zero():
+    # Servo had the charger at 0 before manual; the human started it at 16 A. The
+    # remembered 0 is not "in force" against a measured 16 A draw: shed 16 -> 12.
+    srv = _servo({"a": 27.0, "b": 18.0, "c": 18.0}, last_a={"easee": 0.0})
     ha = _ha({"sensor.grid": "12000", "sensor.easee_power": str(16 * 230 * 3)})
     eng = _engine_for_relief(srv, ha)
     await eng._manual_ev_fuse_relief()
     ha.call_service.assert_awaited_once_with(
         "easee", "set_charger_dynamic_limit", None,
-        {"device_id": EASEE, "current": 0, "time_to_live": 0},
+        {"device_id": EASEE, "current": 12, "time_to_live": 0},
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_relief_sheds_again_after_human_restarts_a_paused_car():
+    srv = _servo({"a": 27.0, "b": 18.0, "c": 18.0}, last_a={"easee": 0.0})
+    ha = _ha({"sensor.grid": "12000", "sensor.easee_power": str(16 * 230 * 3)})
+    eng = _engine_for_relief(srv, ha)
+    eng._manual_fuse_cap_a["easee"] = 0.0  # relief paused it earlier this session
+    await eng._manual_ev_fuse_relief()
+    assert ha.call_service.await_args.args[3]["current"] == 12
+
+
+@pytest.mark.asyncio
+async def test_manual_relief_cut_is_proportional_to_measured_draw():
+    # Stale servo memory of 8 A must not turn a 2 A cut on a measured 16 A draw into
+    # a full pause: basis is the measurement -> 14 A.
+    srv = _servo({"a": 25.0, "b": 18.0, "c": 18.0}, last_a={"easee": 8.0})
+    ha = _ha({"sensor.grid": "12000", "sensor.easee_power": str(16 * 230 * 3)})
+    eng = _engine_for_relief(srv, ha)
+    await eng._manual_ev_fuse_relief()
+    assert ha.call_service.await_args.args[3]["current"] == 14
+
+
+@pytest.mark.asyncio
+async def test_manual_relief_no_draw_and_no_readback_sheds_nothing():
+    srv = _servo({"a": 27.0, "b": 18.0, "c": 18.0}, last_a={"easee": 16.0})
+    ha = _ha({"sensor.grid": "12000", "sensor.easee_power": "0"})
+    eng = _engine_for_relief(srv, ha)
+    assert await eng._manual_ev_fuse_relief() == []
+    ha.call_service.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_relief_lagging_tesla_sensor_uses_readback():
+    from executor.ev_surplus_runtime import EVSurplusChargerCfg
+
+    tesla = EVSurplusChargerCfg(
+        id="tesla", current_entity="number.tesla_current", switch_entity="switch.tesla",
+        power_entity="sensor.tesla_power", phases=3, min_current_a=5.0, max_current_a=16.0,
+    )
+    srv = _servo({"a": 26.0, "b": 20.0, "c": 20.0}, chargers=[tesla])
+    ha = _ha({"sensor.grid": "9000", "sensor.tesla_power": "0", "number.tesla_current": "16"})
+    eng = _engine_for_relief(srv, ha)
+    await eng._manual_ev_fuse_relief()
+    ha.call_service.assert_awaited_once_with(
+        "number", "set_value", "number.tesla_current", {"value": 13.0}
     )
 
 
@@ -429,3 +476,69 @@ async def test_balancer_reductions_only_lower():
     status.ev_outputs = [EVBalancerOutput("easee", 10, "throttling")]
     assert await eng._apply_balancer_reductions(status, {"easee": ccfg}, {"easee": 16.0}) == []
     act._apply_ev.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_balancer_plan_targets_are_ignored_on_manual():
+    from executor.load_balancer import EVBalancerOutput
+    from executor.load_balancer_actuator import LoadBalancerActuator
+
+    eng = ExecutorEngine.__new__(ExecutorEngine)
+    eng.ha_client = MagicMock()
+    eng.config = MagicMock(shadow_mode=False)
+    act = LoadBalancerActuator()
+    act._apply_ev = AsyncMock(return_value="x")  # type: ignore[method-assign]
+    eng._balancer_actuator = act
+    ccfg = MagicMock(id="easee")
+    for out in (
+        EVBalancerOutput("easee", None, "idle", reason="Plan ended"),
+        EVBalancerOutput("easee", 10, "idle", reason="At target"),
+    ):
+        status = MagicMock(ev_outputs=[out])
+        assert await eng._apply_balancer_reductions(status, {"easee": ccfg}, {"easee": 16.0}) == []
+    act._apply_ev.assert_not_awaited()
+    # A fuse-driven pause still applies.
+    status = MagicMock(ev_outputs=[EVBalancerOutput("easee", None, "paused")])
+    assert await eng._apply_balancer_reductions(status, {"easee": ccfg}, {"easee": 16.0}) == ["x"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_withheld_when_manual_safety_fails(eng_ha):
+    eng, _ha, _states = eng_ha
+    with patch.object(eng, "_manual_safety_tick", AsyncMock(side_effect=RuntimeError("boom"))):
+        result = await eng.run_once()
+    assert result["success"] is True
+    assert eng._dispatched_this_tick is False
+    assert any(a["type"] == "manual_safety" and not a["success"] for a in result["actions"])
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_withheld_when_a_relief_write_failed(eng_ha):
+    from executor.actions import ActionResult
+
+    eng, _ha, _states = eng_ha
+    bad = ActionResult(action_type="manual_fuse_relief:x", success=False, message="no")
+    with patch.object(eng, "_manual_safety_tick", AsyncMock(return_value=[bad])):
+        await eng.run_once()
+    assert eng._dispatched_this_tick is False
+
+
+@pytest.mark.asyncio
+async def test_unreadable_manual_hold_is_capped_then_dropped_with_notice(eng_ha):
+    eng, _ha, states = eng_ha
+    await eng.run_once()  # manual on
+    states[MANUAL] = "unavailable"
+    await eng.run_once()
+    eng.dispatcher.execute.assert_not_awaited()
+    assert eng._manual_unreadable_since is not None
+    eng._manual_unreadable_since -= 61 * 60
+    await eng.run_once()
+    assert eng.dispatcher.execute.await_count == 1  # control resumed
+    titles = [c.kwargs.get("title") for c in eng.dispatcher._send_notification.await_args_list]
+    assert titles == ["Darkstar: manuellt läge", "Darkstar: manuellt läge släppt (oläsbar)"]
+    await eng.run_once()  # still unreadable: stays off, no new notices
+    assert eng.dispatcher.execute.await_count == 2
+    assert eng.dispatcher._send_notification.await_count == 2
+    states[MANUAL] = "on"
+    await eng.run_once()  # readable ON again re-enters manual
+    assert eng.dispatcher.execute.await_count == 2
