@@ -6,8 +6,7 @@
  * Flow dots animate from sources through the bus to loads.
  */
 
-import { useMemo, useState, useCallback, useEffect } from 'react'
-import { motion } from 'framer-motion'
+import { useMemo, useState, useCallback, useEffect, type CSSProperties } from 'react'
 import { NODE_REGISTRY, type PowerFlowData } from './PowerFlowRegistry'
 import { Plug } from 'lucide-react'
 
@@ -74,34 +73,6 @@ function toPathD(pts: { x: number; y: number }[]): string {
     return pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
 }
 
-function samplePath(pts: { x: number; y: number }[], n: number) {
-    const segs: number[] = []
-    let total = 0
-    for (let i = 1; i < pts.length; i++) {
-        const d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
-        segs.push(d)
-        total += d
-    }
-    if (total === 0) return pts.map((p, i) => ({ ...p, t: i / Math.max(pts.length - 1, 1) }))
-    return Array.from({ length: n + 1 }, (_, k) => {
-        const t = k / n
-        const target = t * total
-        let traveled = 0
-        for (let i = 0; i < segs.length; i++) {
-            if (traveled + segs[i] >= target || i === segs.length - 1) {
-                const segT = segs[i] > 0 ? Math.min((target - traveled) / segs[i], 1) : 0
-                return {
-                    x: pts[i].x + (pts[i + 1].x - pts[i].x) * segT,
-                    y: pts[i].y + (pts[i + 1].y - pts[i].y) * segT,
-                    t,
-                }
-            }
-            traveled += segs[i]
-        }
-        return { ...pts[pts.length - 1], t: 1 }
-    })
-}
-
 function partitionFlow(data: PowerFlowData, enabledIds: Set<string>): { sources: Entity[]; loads: Entity[] } {
     const sources: Entity[] = []
     const loads: Entity[] = []
@@ -127,14 +98,16 @@ function partitionFlow(data: PowerFlowData, enabledIds: Set<string>): { sources:
 }
 
 // =============================================================================
-// FLOW DOTS
+// FLOW DOTS — CSS offset-path animation (see .flow-dot in index.css)
 // =============================================================================
+
+const MAX_DOTS = 3
 
 function FlowDots({
     waypoints,
     color,
     power,
-    dotCount = 3,
+    dotCount = MAX_DOTS,
 }: {
     waypoints: { x: number; y: number }[]
     color: string
@@ -142,28 +115,27 @@ function FlowDots({
     dotCount?: number
 }) {
     const speed = Math.min(power * 0.2, 1.5)
-    const duration = Math.max(2.8 - speed, 0.7)
-    const samples = useMemo(() => samplePath(waypoints, 24), [waypoints])
-    const kfCx = samples.map((p) => p.x)
-    const kfCy = samples.map((p) => p.y)
-    const kfTimes = samples.map((p) => p.t)
-    const kfOp = kfTimes.map((t) => (t < 0.07 ? t / 0.07 : t > 0.93 ? (1 - t) / 0.07 : 0.88))
+    // Quantise so small power jitter doesn't keep re-timing the animation.
+    const duration = Math.round(Math.max(2.8 - speed, 0.7) * 10) / 10
+    const pathD = useMemo(() => toPathD(waypoints), [waypoints])
 
     return (
         <>
-            {Array.from({ length: dotCount }, (_, i) => (
-                <motion.circle
+            {Array.from({ length: Math.min(dotCount, MAX_DOTS) }, (_, i) => (
+                <circle
                     key={i}
                     r={3}
                     fill={color}
-                    animate={{ cx: kfCx, cy: kfCy, opacity: kfOp }}
-                    transition={{
-                        duration,
-                        repeat: Infinity,
-                        delay: (i / dotCount) * duration,
-                        ease: 'linear',
-                        times: kfTimes,
-                    }}
+                    className="flow-dot"
+                    style={
+                        {
+                            offsetPath: `path('${pathD}')`,
+                            '--flow-dur': `${duration}s`,
+                            // Fixed phase per dot index (not i/dotCount) so a changing
+                            // dot count adds/removes dots without shifting the others.
+                            '--flow-delay': `${(-(i / MAX_DOTS) * duration).toFixed(2)}s`,
+                        } as CSSProperties
+                    }
                 />
             ))}
         </>
@@ -508,9 +480,9 @@ export default function PowerFlowCard({ data, systemConfig }: PowerFlowCardProps
                     fill="none"
                 />
             ))}
-            {pairPaths.map((p, i) => (
+            {pairPaths.map((p) => (
                 <FlowDots
-                    key={`dots-${i}`}
+                    key={`dots-${p.src.id}-${p.load.id}`}
                     waypoints={p.pts}
                     color={p.src.color}
                     power={p.kw}
