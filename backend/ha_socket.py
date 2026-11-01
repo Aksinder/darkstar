@@ -436,6 +436,13 @@ class HAWebSocketClient:
                     )
                 else:
                     known[charger_id] = is_plugged
+                    if previous is None:
+                        # First real reading (restart, config reload): compare it with
+                        # what the PLANNER believes — its 24 h last-good hold — so a
+                        # car the planner still holds "plugged" that reads unplugged
+                        # replans, and one it already holds plugged does not. With no
+                        # hold this is False: only a plug-in replans, as before.
+                        previous = self._planner_held_plug(charger_id)
 
                 # Update this EV's plug status
                 if ev_idx < len(ev_chargers):
@@ -448,10 +455,8 @@ class HAWebSocketClient:
                 # Trigger immediate re-plan on a REAL plug-in or unplug only (Task
                 # 7.2/7.3: pass charger ID). Attribute churn, WS reconnect replays
                 # and unavailable/unknown blips do not change the plug state. A first
-                # reading (nothing known yet) replans only when it says plugged in.
-                transition = not unreadable and (
-                    is_plugged != previous if previous is not None else is_plugged
-                )
+                # reading is compared with the planner's held belief (above).
+                transition = not unreadable and is_plugged != previous
                 if getattr(self, "_seeding", False):
                     # Seeding a newly configured plug sensor on config save: the
                     # plug state did not change, so record it without a replan.
