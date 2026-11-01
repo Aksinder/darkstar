@@ -905,6 +905,11 @@ price_forecast:
   enabled: false                       # Master toggle for price forecasting (disabled by default)
   min_training_samples: 500            # Minimum paired samples before model activates
   model_name: "price_model.lgb"        # LightGBM model filename
+  post_publication_run: true           # After D+1 prices are published (polled from 14:00 local),
+                                       # re-run the forecast for D+2..D+7 with the published D+1
+                                       # prices as lags. Train/serve consistent: a row issued at or
+                                       # after 14:00 is treated as "D+1 known" by both inference and
+                                       # training (ml/price_features.price_knowable_until).
 
 # Forecasting Adjustments (Aurora ML tuning)
 forecasting:

@@ -30,7 +30,11 @@ from backend.core.prices import (
     get_known_spot_by_slot,
 )
 from backend.learning.models import PriceForecast
-from ml.price_features import build_price_features_batch, price_knowable_until
+from ml.price_features import (
+    POST_PUBLICATION_HOUR,
+    build_price_features_batch,
+    price_knowable_until,
+)
 from ml.weather import compute_regional_wind_index, get_regional_weather
 
 logger = logging.getLogger(__name__)
@@ -84,6 +88,7 @@ async def generate_price_forecasts(
     config: dict[str, Any],
     db_path: str = "data/planner_learning.db",
     model_path: Path | None = None,
+    days_ahead_range: range | None = None,
 ) -> list[dict[str, Any]]:
     """
     Generate price forecasts for D+1 through D+7.
@@ -92,6 +97,8 @@ async def generate_price_forecasts(
         config: Configuration dictionary
         db_path: Path to SQLite database for persisting forecasts
         model_path: Path to trained price model (if None, uses config)
+        days_ahead_range: Horizons to forecast (default D+1..D+7). The
+            post-publication run passes ``range(2, 8)``: D+1 is published then.
 
     Returns:
         List of forecast records with spot prices and weather features
@@ -154,13 +161,31 @@ async def generate_price_forecasts(
         len(known_spot),
         knowable_until.isoformat(),
     )
+    # After POST_PUBLICATION_HOUR the shared rule treats D+1 as published, and training
+    # will use D+1 observations as lags for these rows. If D+1 is in fact NOT published
+    # (late auction), inference cannot supply those lags -> the D+2 rows (the only ones
+    # whose lag_1d / 24h window lies in D+1) would be train/serve inconsistent, so they
+    # are not produced at all.
+    end_of_today = tz.localize(
+        datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+    )
+    skip_days_ahead: set[int] = set()
+    if knowable_until > end_of_today and not _covers(known_spot, end_of_today, knowable_until):
+        skip_days_ahead.add(2)
+        logger.warning(
+            "Price forecast issued after %02d:00 but D+1 prices are not published; "
+            "skipping D+2 rows to keep training lags consistent",
+            POST_PUBLICATION_HOUR,
+        )
 
     engine = create_engine(f"sqlite:///{db_path}")
     SessionLocal = sessionmaker(bind=engine)
     lag_session = SessionLocal()
 
     try:
-        for days_ahead in range(1, 8):  # D+1 to D+7
+        for days_ahead in days_ahead_range or range(1, 8):  # D+1 to D+7
+            if days_ahead in skip_days_ahead:
+                continue
             forecast_date = now.date() + timedelta(days=days_ahead)
             start_time = datetime.combine(forecast_date, datetime.min.time())
             start_time = tz.localize(start_time)
@@ -294,6 +319,20 @@ async def generate_price_forecasts(
         print(f"Generated and persisted {len(all_forecasts)} price forecasts")
 
     return all_forecasts
+
+
+def _covers(known: dict[datetime, float], start: datetime, end: datetime) -> bool:
+    """True when every 15-minute slot in [start, end) has a published price.
+
+    Steps in UTC so a 23/25-hour DST day is walked by real quarters (92/100).
+    """
+    cursor = start.astimezone(pytz.UTC)
+    stop = end.astimezone(pytz.UTC)
+    while cursor < stop:
+        if cursor not in known:  # aware datetimes hash/compare by instant
+            return False
+        cursor += timedelta(minutes=15)
+    return True
 
 
 async def _load_known_spot() -> dict[datetime, float]:

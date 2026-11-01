@@ -15,6 +15,7 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pytz
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
@@ -265,10 +266,12 @@ def _add_price_lag_features(
                 if result and result.export_price_sek_kwh is not None:
                     df.at[idx, "price_lag_7d"] = result.export_price_sek_kwh
 
-            # Trailing 24-hour average: the whole window ends at lag_1d, so it is
-            # knowable exactly when lag_1d is.
-            if lag_1d_knowable:
-                trailing_start = lag_1d - timedelta(hours=23)
+            # Trailing 24-hour average over the knowable PART of the window: inference
+            # averages whatever it has before the bound (observed + published), so a
+            # window straddling the bound is partial there too -- masking it entirely
+            # here made a D+2 row NaN in training but a partial mean at inference.
+            trailing_start = lag_1d - timedelta(hours=23)
+            if trailing_start < knowable_until:
                 results = (
                     session.query(SlotObservation)
                     .filter(
@@ -279,7 +282,10 @@ def _add_price_lag_features(
                     .all()
                 )
                 prices = [
-                    r.export_price_sek_kwh for r in results if r.export_price_sek_kwh is not None
+                    r.export_price_sek_kwh
+                    for r in results
+                    if r.export_price_sek_kwh is not None
+                    and _parse_local(r.slot_start, timezone) < knowable_until
                 ]
                 if prices:
                     df.at[idx, "price_lag_24h_avg"] = sum(prices) / len(prices)
@@ -291,6 +297,14 @@ def _add_price_lag_features(
         print(f"Warning: Error computing price lags: {exc}")
 
     return df
+
+
+def _parse_local(value: str, timezone: str) -> datetime:
+    """Stored slot key -> aware datetime (naive keys are local wall time)."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return pytz.timezone(timezone).localize(parsed)
+    return parsed
 
 
 def _is_swedish_holiday(dt: datetime) -> bool:
