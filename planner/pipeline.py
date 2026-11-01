@@ -1281,13 +1281,27 @@ class PlannerPipeline:
             kepler_input.slots,
             cast("list[dict[str, Any]]", initial_state.get("cyclic_load_states", []) or []),
         )
-        for by_slot in cyclic_plan.values():
+        # A cyclic load with a phase_map also records its kWh per phase, so the
+        # fuse-relief rows put it on its own phase instead of the learned base split.
+        from planner.solver.adapter import normalize_phase_map
+
+        cyclic_phases: dict[str, list[str]] = {
+            str(c.get("id")): normalize_phase_map(c.get("phase_map"), str(c.get("id")))
+            for c in cast("list[Any]", active_config.get("cyclic_loads", []) or [])
+            if isinstance(c, dict) and c.get("id")
+        }
+        for lid, by_slot in cyclic_plan.items():
+            phs = cyclic_phases.get(lid) or []
             for t, kw in by_slot.items():
                 if 0 <= t < len(kepler_input.slots):
-                    kepler_input.slots[t].load_kwh += kw * (
-                        (kepler_input.slots[t].end_time - kepler_input.slots[t].start_time)
-                        .total_seconds() / 3600.0
-                    )
+                    sl = kepler_input.slots[t]
+                    e_kwh = kw * ((sl.end_time - sl.start_time).total_seconds() / 3600.0)
+                    sl.load_kwh += e_kwh
+                    if phs:
+                        known = dict(sl.phased_load_kwh or {})
+                        for ph in phs:
+                            known[ph] = known.get(ph, 0.0) + e_kwh / len(phs)
+                        sl.phased_load_kwh = known
         if cyclic_plan:
             logger.info(
                 "Cyclic loads pre-scheduled (fixed load, outside the MILP): %s",
@@ -1477,7 +1491,7 @@ class PlannerPipeline:
             # from execution for the whole trip (nightly phantom-failure territory). Strip
             # the per-SoC incentives (=> zero planned EV energy); plugged/at_home state is
             # untouched, so any_ev_charging still reflects reality if a car charges anyway.
-            from planner.solver.adapter import build_ev_charger_inputs
+            from planner.solver.adapter import build_ev_charger_inputs, ev_surplus_phase_maps
 
             # Strip with an EMPTY LIST, never None: dict.get's default only applies when
             # the key is absent, so an explicit None would flow into the adapter's bucket
@@ -1497,6 +1511,7 @@ class PlannerPipeline:
                 ev_charger_states_with_deadline,
                 load_priority_cfg=active_config.get("load_priority"),
                 departure_target_cfg=active_config.get("ev_departure_target"),
+                fallback_phase_maps=ev_surplus_phase_maps(active_config),
             )
 
             # Owner EV levers: priority select re-weighting + one-off departure
