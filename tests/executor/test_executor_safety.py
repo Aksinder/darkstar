@@ -410,8 +410,10 @@ class TestTick:
 
 
 def _hold_slot() -> SlotPlan:
-    # Hold at target 10 with forecast PV > load: self_consumption above the floor.
-    return SlotPlan(soc_target=10, pv_kw=2.5, load_kw=1.2)
+    # A discharge slot whose target sits below every SoC used here, so only the
+    # min-SoC floor guard decides between idle and self_consumption. (A Hold slot,
+    # discharge_kw=0, idles at any SoC now and could not show the latch.)
+    return SlotPlan(soc_target=0, discharge_kw=1.0)
 
 
 class TestMinSocLatch:

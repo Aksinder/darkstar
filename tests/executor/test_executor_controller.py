@@ -183,24 +183,49 @@ class TestControllerFollowPlan:
 
         assert decision.mode_intent == "idle"
 
-    def test_idle_mode_when_soc_slightly_above_target(self, controller):
-        """When SoC rounds above target, use self_consumption (not idle)."""
+    def test_hold_slot_slightly_above_target_stays_idle(self, controller):
+        """A Hold slot (no planned discharge) blocks discharge even when SoC rounds
+        above its target: self_consumption there drained the pack and the next
+        replan's Hold target (= entry SoC) stepped down with it (ratchet)."""
         slot = SlotPlan(export_kw=0.0, charge_kw=0.0, soc_target=78)
-        # Battery at 78.6% rounds to 79, which is > 78, so self_consumption
+        state = SystemState(current_soc_percent=78.6)
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "idle"
+
+    def test_hold_slot_well_above_target_stays_idle(self, controller):
+        slot = SlotPlan(export_kw=0.0, charge_kw=0.0, soc_target=50)
+        state = SystemState(current_soc_percent=80)
+
+        decision = controller.decide(slot, state)
+
+        assert decision.mode_intent == "idle"
+
+    def test_discharge_slot_above_target_uses_self_consumption(self, controller):
+        """A planned discharge to the house self-consumes above its target."""
+        slot = SlotPlan(export_kw=0.0, charge_kw=0.0, discharge_kw=2.0, soc_target=50)
+        # 78.6 rounds to 79 > 50
         state = SystemState(current_soc_percent=78.6)
 
         decision = controller.decide(slot, state)
 
         assert decision.mode_intent == "self_consumption"
 
-    def test_self_consumption_when_above_soc_target(self, controller):
-        """When above SoC target, use self_consumption mode intent."""
-        slot = SlotPlan(export_kw=0.0, charge_kw=0.0, soc_target=50)
-        state = SystemState(current_soc_percent=80)
+    def test_discharge_slot_at_target_holds(self, controller):
+        slot = SlotPlan(export_kw=0.0, charge_kw=0.0, discharge_kw=2.0, soc_target=50)
+        state = SystemState(current_soc_percent=50.4)
 
         decision = controller.decide(slot, state)
 
-        assert decision.mode_intent == "self_consumption"
+        assert decision.mode_intent == "idle"
+
+    def test_rounding_dust_discharge_is_still_a_hold(self, controller):
+        """The planner calls <= 0.01 kW a Hold; so does the controller."""
+        slot = SlotPlan(discharge_kw=0.008, soc_target=50)
+        state = SystemState(current_soc_percent=80)
+
+        assert controller.decide(slot, state).mode_intent == "idle"
 
     # Tests for PV surplus vs battery export mode selection (Bug fix)
     def test_pv_surplus_uses_self_consumption_not_export(self, controller):
@@ -291,10 +316,11 @@ class TestControllerFollowPlan:
         # Below target with no charge/export planned - use idle to hold battery
         assert decision.mode_intent == "idle"
 
-    def test_pv_surplus_hold_uses_self_consumption_not_idle(self, controller):
-        """At SoC target during a PV-surplus slot, use self_consumption so the
-        battery can cover load deficits (transient/single-phase loads the 3-phase
-        PV feed can't reach) instead of freezing and forcing a grid import."""
+    def test_pv_surplus_hold_stays_idle(self, controller):
+        """At SoC target during a forecast PV-surplus Hold slot: idle. Idle caps
+        discharge only, so real surplus still charges the pack; self_consumption
+        here drained it whenever the PV forecast was too high (2026-10-25..11-01:
+        34.7 kWh), and every replan then held at the lower SoC."""
         slot = SlotPlan(
             charge_kw=0.0,
             export_kw=0.0,
@@ -307,7 +333,7 @@ class TestControllerFollowPlan:
 
         decision = controller.decide(slot, state)
 
-        assert decision.mode_intent == "self_consumption"
+        assert decision.mode_intent == "idle"
 
     def test_hold_without_pv_surplus_stays_idle(self, controller):
         """At SoC target with no PV surplus (e.g. overnight reserve hold), keep
@@ -375,8 +401,8 @@ class TestControllerFollowPlan:
         """Verify default self_consumption fallback sets charge_value to max_charge_a (not 0)
         when nothing is planned and SoC is above target.
         """
-        # When charge_kw is 0 and soc > target, it falls back to self_consumption
-        slot = SlotPlan(charge_kw=0.0, soc_target=50)
+        # A planned discharge above target falls back to self_consumption
+        slot = SlotPlan(charge_kw=0.0, discharge_kw=2.0, soc_target=50)
         state = SystemState(current_soc_percent=80)
 
         decision = controller.decide(slot, state)
@@ -396,7 +422,7 @@ class TestControllerFollowPlan:
         )
         controller = Controller(config, InverterConfig(), profile=profile)
 
-        slot = SlotPlan(charge_kw=0.0, soc_target=50, export_kw=0.0, discharge_kw=0.0)
+        slot = SlotPlan(charge_kw=0.0, soc_target=50, export_kw=0.0, discharge_kw=2.0)
         state = SystemState(current_soc_percent=80)
 
         decision = controller.decide(slot, state)
