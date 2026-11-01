@@ -88,3 +88,31 @@ async def test_config_save_reloads_ha_socket_entities(tmp_path, monkeypatch) -> 
     await config_router.save_config({"timezone": "Europe/Stockholm"})
 
     reload_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_seeding_plug_sensor_records_state_without_replan() -> None:
+    """A plug sensor added on config save is seeded, but nothing physically changed,
+    so it must not force an EV replan; a real plug event still does."""
+    client = _bare_client({})
+    client.ev_charger_configs = [{"id": "tesla", "name": "Tesla"}]
+    plug_state = {"entity_id": "binary_sensor.tesla_plug", "state": "on"}
+    with (
+        patch.object(client, "_load_config"),
+        patch.object(
+            client,
+            "_get_monitored_entities",
+            return_value={"binary_sensor.tesla_plug": "ev_plug_0"},
+        ),
+        patch(
+            "backend.core.ha_client.get_ha_entity_state", new=AsyncMock(return_value=plug_state)
+        ),
+        patch.object(client, "_trigger_ev_replan") as replan,
+        patch("backend.events.emit_ha_entity_change"),
+    ):
+        await client.reload_and_seed_entities()
+        replan.assert_not_called()
+        assert client.latest_values["ev_chargers"][0]["plugged_in"] is True
+
+        client._handle_state_change("binary_sensor.tesla_plug", {"state": "off"})
+        replan.assert_called_once_with(charger_id="tesla", plugged_in=False)

@@ -423,7 +423,13 @@ class HAWebSocketClient:
                     if ev_idx < len(self.ev_charger_configs)
                     else f"ev_charger_{ev_idx}"
                 )
-                if is_plugged:
+                if getattr(self, "_seeding", False):
+                    # Seeding a newly configured plug sensor on config save: the
+                    # plug state did not change, so record it without a replan.
+                    logger.info(
+                        f"EV{ev_idx} ({charger_id}) plug state seeded ({state_val}) - no re-plan"
+                    )
+                elif is_plugged:
                     logger.info(
                         f"EV{ev_idx} ({charger_id}) plugged in - triggering immediate re-plan"
                     )
@@ -779,10 +785,13 @@ class HAWebSocketClient:
             state = await get_ha_entity_state(entity_id)
             if not state:
                 continue
+            self._seeding = True
             try:
                 self._handle_state_change(entity_id, state)
             except Exception as e:
                 logger.warning("Failed to seed state for new entity %s: %s", entity_id, e)
+            finally:
+                self._seeding = False
         return added
 
     def _trigger_ev_replan(self, charger_id: str | None = None, plugged_in: bool = True):
