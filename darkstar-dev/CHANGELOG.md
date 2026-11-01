@@ -1,3 +1,7 @@
+## dev-20261101.1215 — 2026-11-01 12:17
+
+- fix(forecast): retry Open-Meteo and never store zero PV on an outage
+
 ## dev-20261014.2124 — 2026-10-14 21:26
 
 - fix(ev): recover a wrong switch belief and wake a car hidden by a frozen snapshot
