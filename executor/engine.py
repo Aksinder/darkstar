@@ -298,6 +298,11 @@ class ExecutorEngine:
 
         # Override notification deduplication (Issue 3 fix)
         self._last_override_type: str | None = None
+        # Manual override (executor.manual_override_entity "on"): last seen state, so
+        # the enter/leave notification fires once per transition; and the last
+        # "would have done" summary, so the INFO line fires only when it changes.
+        self._manual_override_seen: bool = False
+        self._manual_would_have: str | None = None
 
         # Cached system state for get_status() mode_intent computation
         self._last_system_state: SystemState | None = None
@@ -1556,6 +1561,12 @@ class ExecutorEngine:
                 state, self.config.controller.min_soc_release_margin_percent
             )
             self._last_system_state = state
+            # A human on manual owns the hardware: no inverter, EV, water, sink,
+            # cyclic-load, balancer or fuse-cap writes this tick. Telemetry, the
+            # decision journal and the execution record continue. See
+            # _manual_override_tick for the full contract.
+            skip_writes = getattr(state, "manual_override_active", False) is True
+            await self._note_manual_override_transition(skip_writes)
 
             # Emit live metrics for UI sparklines (Rev E1)
             try:
@@ -1691,8 +1702,14 @@ class ExecutorEngine:
                     "reason": override.reason,
                     "priority": override.priority,
                 }
-                # Only send notification on state transition (not every tick)
-                if current_override_type != self._last_override_type and self.dispatcher:
+                # Only send notification on state transition (not every tick).
+                # Manual override has its own enter/leave notice
+                # (_note_manual_override_transition) — not a second one here.
+                if (
+                    current_override_type != self._last_override_type
+                    and self.dispatcher
+                    and current_override_type != "manual_override"
+                ):
                     await self.dispatcher.notify_override(
                         override.override_type.value, override.reason
                     )
@@ -1777,6 +1794,7 @@ class ExecutorEngine:
                 if (
                     scheduled_ev_charging
                     and not actual_ev_charging
+                    and not skip_writes  # on manual nothing commands the charger
                     and not self._ev_power_fetch_failed
                     and self._ev_plan_actuation_possible()
                     and not self._ev_plan_intentionally_suppressed()
@@ -1829,12 +1847,24 @@ class ExecutorEngine:
             self._journal_decision(decision, slot, slot_start, state, now)
 
             # Control EV Charger Switch (per-device)
-            if self._has_ev_charger and self.config.ev_chargers:
+            if self._has_ev_charger and self.config.ev_chargers and not skip_writes:
                 await self._control_ev_charger(original_slot, now)
 
             # 6. Execute actions
             action_results: list[ActionResult] = []
-            if self.dispatcher:
+            if skip_writes:
+                action_results.append(await self._manual_override_tick(decision, original_slot))
+                result["actions"] = [
+                    {
+                        "type": r.action_type,
+                        "success": r.success,
+                        "message": r.message,
+                        "skipped": r.skipped,
+                        "error_details": r.error_details,
+                    }
+                    for r in action_results
+                ]
+            elif self.dispatcher:
                 # Per-tick control-pause cache (rent-out hands-off): each input_boolean
                 # is read at most once per tick even when shared across devices — the
                 # villavagn master toggle gates both the VVB and the AC sink.
@@ -2552,6 +2582,95 @@ class ExecutorEngine:
                 pass  # Silently fail if WebSocket not available
 
         return result
+
+    async def _note_manual_override_transition(self, active: bool) -> None:
+        """One HA notice when manual override starts, one when it ends.
+
+        Gated on notifications.on_override_activated (the flag that already covers
+        overrides). The generic override notice is suppressed for manual_override so
+        entering manual mode never produces two messages.
+        """
+        if active == self._manual_override_seen:
+            return
+        self._manual_override_seen = active
+        self._manual_would_have = None
+        entity = self.config.manual_override_entity
+        if active:
+            logger.warning(
+                "Manual override ON (%s) — executor stops ALL writes (inverter, EV, "
+                "water, sinks, cyclic loads, load balancer, fuse cap); telemetry and "
+                "recording continue",
+                entity,
+            )
+        else:
+            logger.warning("Manual override OFF (%s) — executor resumes control", entity)
+        notif = getattr(getattr(self.config, "notifications", None), "on_override_activated", True)
+        if not self.dispatcher or not notif:
+            return
+        try:
+            if active:
+                await self.dispatcher._send_notification(  # type: ignore[protected-access]
+                    f"{entity} är på — Darkstar skriver ingenting till växelriktare, "
+                    "laddbox, varmvatten eller laster förrän det slås av. Säkringsvakt "
+                    "och min-SoC-skydd agerar inte heller; mätning och loggning fortsätter.",
+                    title="Darkstar: manuellt läge",
+                )
+            else:
+                await self.dispatcher._send_notification(  # type: ignore[protected-access]
+                    f"{entity} är av — Darkstar styr igen från nästa tick.",
+                    title="Darkstar: manuellt läge avslutat",
+                )
+        except Exception as e:
+            logger.warning("Manual override notification failed: %s", e)
+
+    async def _manual_override_tick(
+        self, decision: Any, slot: SlotPlan | None
+    ) -> ActionResult:
+        """The write-free tick body while executor.manual_override_entity is "on".
+
+        Decision (owner-facing contract, override.py: "executor will not change
+        settings"): a human on manual owns the hardware, so NOTHING is written —
+        not the inverter profile, EV chargers/servo, water heaters, sinks, cyclic
+        loads, deferrable appliances, and not the safety layers either: the 25 A
+        fuse guard, load-balancer caps/release and the min-SoC floor do not act
+        (balancer caps already in force stay in force until manual ends). What the
+        executor WOULD have done is logged (INFO on change) and put on the execution
+        record. The FMB SoC estimator still runs: it publishes telemetry sensors
+        and its operator helper, never hardware. The heartbeat is NOT published
+        (nothing commanded the inverter).
+        """
+        ev_plan = {
+            k: round(float(v), 2)
+            for k, v in (getattr(slot, "ev_charger_plans", None) or {}).items()
+            if v
+        }
+        would = (
+            f"mode={getattr(decision, 'mode_intent', None)} "
+            f"soc_target={getattr(decision, 'soc_target', None)} "
+            f"water_temp={getattr(decision, 'water_temp', None)} "
+            f"water_temps={getattr(decision, 'water_temps', None) or {}} "
+            f"ev={ev_plan}"
+        )
+        if would != self._manual_would_have:
+            self._manual_would_have = would
+            logger.info("Manual override: skipping writes; would have applied %s", would)
+        else:
+            logger.debug("Manual override: skipping writes; would have applied %s", would)
+
+        fmb = getattr(self, "_fmb_soc", None)
+        if fmb is not None and self.ha_client is not None:
+            try:
+                await fmb.run(self.ha_client, time.time(), shadow=self.config.shadow_mode)
+            except Exception as fmb_exc:
+                logger.warning("FMB SoC estimator error: %s", fmb_exc)
+
+        return ActionResult(
+            action_type="manual_override",
+            success=True,
+            skipped=True,
+            message=f"Manual override active - no writes (would have: {would})",
+            entity_id=self.config.manual_override_entity or None,
+        )
 
     def _journal_decision(
         self,
