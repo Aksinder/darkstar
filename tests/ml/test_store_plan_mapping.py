@@ -40,7 +40,8 @@ async def test_store_plan_mappings(store, memory_db_path):
     """
 
     # 1. Create a dummy DataFrame
-    now = datetime.now(TZ).replace(second=0, microsecond=0)
+    # Future slots: store_plan skips the in-progress slot (planned over its remainder).
+    now = datetime.now(TZ).replace(second=0, microsecond=0) + timedelta(minutes=15)
 
     # Create 4 slots (1 hour)
     slots = []
@@ -88,7 +89,8 @@ async def test_store_plan_projected_soc_percent(store, memory_db_path):
     """
     Verify that store_plan correctly persists projected_soc_percent to database.
     """
-    now = datetime.now(TZ).replace(second=0, microsecond=0)
+    # Future slots: store_plan skips the in-progress slot (planned over its remainder).
+    now = datetime.now(TZ).replace(second=0, microsecond=0) + timedelta(minutes=15)
 
     # Create 4 slots with varying projected SoC values
     slots = []
@@ -131,7 +133,8 @@ async def test_get_plans_range_returns_projected_soc_percent(store):
     """
     Verify that get_plans_range returns projected_soc_percent for each slot.
     """
-    now = datetime.now(TZ).replace(second=0, microsecond=0)
+    # Future slots: store_plan skips the in-progress slot (planned over its remainder).
+    now = datetime.now(TZ).replace(second=0, microsecond=0) + timedelta(minutes=15)
 
     # Create and store slots with projected_soc_percent
     slots = []

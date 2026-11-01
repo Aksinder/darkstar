@@ -166,18 +166,18 @@ async def generate_price_forecasts(
     )
     # After POST_PUBLICATION_HOUR the shared rule treats D+1 as published, and training
     # will use D+1 observations as lags for these rows. If D+1 is in fact NOT published
-    # (late auction), inference cannot supply those lags -> the D+2 rows (the only ones
-    # whose lag_1d / 24h window lies in D+1) would be train/serve inconsistent, so they
-    # are not produced at all.
+    # (late auction), inference cannot supply those lags -> every row whose lag window
+    # can reach into D+1 (D+2 via lag_1d, D+3 via the 24h average, longer lags further
+    # out) would be train/serve inconsistent, so only D+1 rows are produced.
     end_of_today = tz.localize(
         datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
     )
     skip_days_ahead: set[int] = set()
     if knowable_until > end_of_today and not _covers(known_spot, end_of_today, knowable_until):
-        skip_days_ahead.add(2)
+        skip_days_ahead.update(range(2, 8))
         logger.warning(
             "Price forecast issued after %02d:00 but D+1 prices are not published; "
-            "skipping D+2 rows to keep training lags consistent",
+            "skipping D+2..D+7 rows to keep training lags consistent",
             POST_PUBLICATION_HOUR,
         )
 

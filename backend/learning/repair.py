@@ -251,11 +251,18 @@ async def repair_observations(
     # energy loops): water uses wh["sensor"], and EV is gated on
     # system.has_ev_charger — repaired rows must have the same base-load
     # semantics as live rows or the training target shifts between them.
-    water_sensors = [
-        str(wh.get("sensor"))
+    water_heaters_cfg = [
+        wh
         for wh in config.get("water_heaters", [])
         if wh.get("enabled", True) and wh.get("sensor")
     ]
+    water_sensors = [str(wh.get("sensor")) for wh in water_heaters_cfg]
+    # Same standby rule as the live recorder (idle_power_w): an hour whose mean
+    # power is at or below the heater's idle threshold is standby, not heating,
+    # and stays in base load. Hourly means can't split a mixed hour exactly.
+    from backend.recorder import _heater_idle_kw
+
+    water_idle_kw = {str(wh.get("sensor")): _heater_idle_kw(wh) for wh in water_heaters_cfg}
     ev_sensors = (
         [
             str(ev.get("sensor"))
@@ -303,7 +310,10 @@ async def repair_observations(
     ):
         merged: dict[datetime, float] = {}
         for s in sensors:
+            idle_kw = water_idle_kw.get(s) if name == "water" else None
             for hour, kwh in _hourly_kwh(stats, s, "mean_kw").items():
+                if idle_kw is not None and kwh <= idle_kw:
+                    kwh = 0.0
                 merged[hour] = merged.get(hour, 0.0) + kwh
         hourly[name] = merged
 

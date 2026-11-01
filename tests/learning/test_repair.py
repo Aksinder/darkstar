@@ -239,3 +239,33 @@ async def test_clamped_live_row_with_real_pv_is_not_touched(monkeypatch):
     assert result["artifact_rows"] == 0
     assert result["repaired"] == 0
     assert engine.store.written is None
+
+
+@pytest.mark.asyncio
+async def test_repair_applies_heater_idle_cutoff_and_cyclic(monkeypatch):
+    """Standby-only heater hours stay in base load (live recorder rule) and cyclic
+    loads leave base load, so repaired rows mean the same as live rows."""
+    start = HOUR
+    end = HOUR + timedelta(hours=1)
+    engine = _FakeEngine([])
+    monkeypatch.setattr("backend.learning.get_learning_engine", lambda: engine)
+
+    async def fake_stats(entity_ids, s, e, **kw):
+        return {
+            "sensor.solpaneler": [{"start": _epoch_ms(HOUR), "mean": 4.0}],
+            "sensor.total_imported_energy": [{"start": _epoch_ms(HOUR), "change": 0.8}],
+            "sensor.spa_power": [{"start": _epoch_ms(HOUR), "mean": 0.04}],  # standby only
+            "sensor.pool_power": [{"start": _epoch_ms(HOUR), "mean": 0.4}],
+        }
+
+    monkeypatch.setattr(repair_mod, "fetch_statistics_during_period", fake_stats)
+    cfg = _config()
+    cfg["water_heaters"] = [{"id": "spa", "sensor": "sensor.spa_power", "idle_power_w": 60}]
+    cfg["cyclic_loads"] = [{"id": "poolpump", "power_sensor": "sensor.pool_power"}]
+
+    live = await repair_observations(cfg, start, end, dry_run=False)
+    assert live["repaired"] == 4
+    written = engine.store.written
+    # load = (4.0 + 0.8 - 0.4) / 4 per slot; the 0.04 kW spa standby stays in it.
+    assert (written["load_kwh"] - 1.1).abs().max() < 1e-6
+    assert (written["water_kwh"]).abs().max() < 1e-9

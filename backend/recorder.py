@@ -983,6 +983,11 @@ async def _record_observation(
         # slot is yesterday's 23:45, and the fresh series holds only today — so
         # that slot went unpriced every single night and nothing repaired it.
         for _p in [*(_price_series or []), *_previous_price_series]:
+            # A forecast-filled slot (ML D+1 fallback, possibly served stale across
+            # midnight) is model output, not a billed price: never record it as an
+            # observation. Leave the price NULL so backfill_missing_prices fills it.
+            if _p.get("price_is_forecast"):
+                continue
             if _p["start_time"] <= slot_start < _p["end_time"]:
                 import_price = _p.get("import_price_sek_kwh")
                 export_price = _p.get("export_price_sek_kwh")

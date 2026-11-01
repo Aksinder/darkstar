@@ -213,10 +213,11 @@ async def test_post_publication_run_uses_published_d1_as_lags(db):
 
 
 @pytest.mark.asyncio
-async def test_late_publication_drops_d2_rows_instead_of_inconsistent_lags(db):
+async def test_late_publication_keeps_only_d1_rows(db):
     db_path, _ = db
     seen = await _generate(db_path, local(2026, 11, 10, 15), {})
-    assert [h for h, _ in seen] == [1, 3, 4, 5, 6, 7]
+    # D+3 also reaches into D+1 through the 24h average; only D+1 rows are safe.
+    assert [h for h, _ in seen] == [1]
 
 
 @pytest.mark.asyncio
@@ -228,7 +229,7 @@ async def test_post_publication_run_on_dst_eve_needs_all_100_quarters(db):
     assert [h for h, _ in full] == [2, 3]
     partial = dict.fromkeys(d1[:96], 0.4)  # a 96-slot assumption would call this complete
     short = await _generate(db_path, local(2027, 10, 30, 15), partial, range(2, 4))
-    assert [h for h, _ in short] == [3]
+    assert [h for h, _ in short] == []
 
 
 # --- scheduler ------------------------------------------------------------------------------

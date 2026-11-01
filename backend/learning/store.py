@@ -476,6 +476,7 @@ class LearningStore:
             return
 
         rows: list[dict[str, Any]] = []
+        now_ts = pd.Timestamp.now(tz="UTC")
         for row in plan_df.to_dict("records"):
             slot_start_raw = row.get("start_time") or row.get("slot_start")
             if not slot_start_raw:
@@ -483,11 +484,18 @@ class LearningStore:
 
             slot_start: str
             if isinstance(slot_start_raw, datetime | pd.Timestamp):
-                slot_start = slot_start_raw.astimezone(self.timezone).isoformat()
+                slot_start_dt = pd.Timestamp(slot_start_raw)
             else:
-                slot_start = (  # type: ignore[reportUnknownVariableType]
-                    pd.to_datetime(slot_start_raw).astimezone(self.timezone).isoformat()  # type: ignore[reportUnknownMemberType]
-                )
+                slot_start_dt = pd.to_datetime(slot_start_raw)  # type: ignore[reportUnknownMemberType]
+            if slot_start_dt.tzinfo is None:
+                slot_start_dt = slot_start_dt.tz_localize(self.timezone)
+            # The in-progress slot is planned over its remaining minutes only
+            # (kepler.partial_first_slot): its kWh are not a whole-slot plan. Keep the
+            # plan stored while it was still a full future slot instead of
+            # overwriting it with a partial one (plan-vs-actual compares whole slots).
+            if slot_start_dt <= now_ts < slot_start_dt + pd.Timedelta(minutes=15):
+                continue
+            slot_start = slot_start_dt.astimezone(self.timezone).isoformat()
 
             rows.append(
                 {
