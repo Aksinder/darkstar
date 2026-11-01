@@ -21,6 +21,10 @@ class OverrideType(Enum):
 
     NONE = "none"
     SLOT_FAILURE_FALLBACK = "slot_failure_fallback"
+    # The plan on disk is older than executor.max_plan_age_minutes (opt-in). Same
+    # hands-off posture as SLOT_FAILURE_FALLBACK for grid charge, export, water and
+    # sinks, but the battery serves the house (self_consumption) instead of holding.
+    PLAN_STALE = "plan_stale"
     MANUAL_OVERRIDE = "manual_override"
     # User-initiated quick actions
     FORCE_CHARGE = "force_charge"
@@ -82,6 +86,15 @@ class SystemState:
     # Slot info
     slot_exists: bool = True
     slot_valid: bool = True
+
+    # Set by the engine when the plan-age cutoff (executor.max_plan_age_minutes)
+    # dropped this tick's plan: the human-readable reason. None = plan usable / off.
+    plan_stale_reason: str | None = None
+
+    # Min-SoC floor latch, owned by the ENGINE across ticks (MinSocFloorLatch) and
+    # copied here every tick. None = no latch supplied (direct callers, old tests):
+    # the controller then uses the stateless "SoC <= min_soc" check.
+    min_soc_latched: bool | None = None
 
     # Manual override toggle
     manual_override_active: bool = False
@@ -154,7 +167,8 @@ class OverrideEvaluator:
 
         Overrides are evaluated in priority order (highest first):
         1. Manual override (user explicitly took control) - Priority 10
-        2. Slot failure fallback - Priority 8
+        2. Plan too old (executor.max_plan_age_minutes, opt-in) - Priority 9
+        3. Slot failure fallback - Priority 8
         """
         # Priority 10: Manual override
         if state.manual_override_active:
@@ -164,6 +178,26 @@ class OverrideEvaluator:
                 priority=10.0,
                 reason="Manual override is active - executor will not change settings",
                 actions={},  # No actions, let user control
+            )
+
+        # Priority 9: Plan too old (opt-in cutoff). Checked before the slot-failure
+        # fallback because the engine drops the stale slot, so slot_exists is False
+        # too — the more specific reason must win. soc_target = min_soc: on profiles
+        # that write soc_target as a discharge floor (Deye) the battery may serve
+        # the house down to the planner's floor, and never charges from the grid.
+        if state.plan_stale_reason:
+            stale_actions: dict[str, Any] = {
+                "grid_charging": False,
+                "soc_target": round(state.min_soc_percent),
+            }
+            if state.has_water_heater:
+                stale_actions["water_temp"] = self.water_temp_off
+            return OverrideResult(
+                override_needed=True,
+                override_type=OverrideType.PLAN_STALE,
+                priority=9.0,
+                reason=state.plan_stale_reason,
+                actions=stale_actions,
             )
 
         # Priority 8: Slot failure fallback

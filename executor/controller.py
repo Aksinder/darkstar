@@ -13,6 +13,7 @@ Determines:
 """
 
 import logging
+import math
 from dataclasses import dataclass
 
 # from typing import Any, Dict, Optional, Tuple
@@ -42,6 +43,58 @@ def effective_export_floor_pct(config_floor: float, state: object) -> float:
     if vac is None:
         return config_floor
     return min(float(config_floor), float(vac))
+
+
+class MinSocFloorLatch:
+    """Min-SoC floor guard with hysteresis (upstream de8b93ee, implemented natively).
+
+    ENGAGES when the rounded live SoC is at or below ``min_soc_percent`` and
+    RELEASES only once it reaches ``min_soc_percent + release_margin``. The
+    Controller is rebuilt every tick, so the engine owns one instance for its
+    lifetime and copies the result into ``SystemState.min_soc_latched``.
+
+    - Unknown SoC neither engages nor releases: the previous state stands (a held
+      floor stays held — the safe direction; an unlatched one stays unlatched).
+    - Restart: the latch starts released, so the first known reading applies the
+      plain ``SoC <= min_soc`` rule — exactly the pre-latch behaviour. Inside the
+      band (min < SoC < min + margin) a restart therefore releases early once;
+      the cost is at most one flip, never a discharge below min_soc.
+    """
+
+    def __init__(self) -> None:
+        self.engaged = False
+
+    @staticmethod
+    def _number(value: object) -> float | None:
+        """A finite real number, else None. The engine fills SystemState from HA
+        reads (and tests from doubles), so the annotation is not a guarantee."""
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        return None if math.isnan(value) or math.isinf(value) else float(value)
+
+    def update(self, state: SystemState, release_margin: float) -> bool:
+        soc_raw = self._number(state.current_soc_percent)
+        floor = self._number(state.min_soc_percent)
+        if state.soc_known is not True or soc_raw is None or floor is None:
+            # Unknown / malformed reading: neither engage nor release.
+            return self.engaged
+        soc = round(soc_raw)
+        if self.engaged:
+            # "> floor" too, so margin 0 reproduces the stateless rule exactly
+            # (held AT the floor, released one step above it).
+            if soc >= floor + max(0.0, release_margin) and soc > floor:
+                self.engaged = False
+                logger.info(
+                    "Min-SoC latch released: SoC %d%% >= min %.0f%% + %.0f",
+                    soc, floor, release_margin,
+                )
+        elif soc <= floor:
+            self.engaged = True
+            logger.info(
+                "Min-SoC latch engaged: SoC %d%% <= min %.0f%% (releases at %.0f%%)",
+                soc, floor, floor + max(0.0, release_margin),
+            )
+        return self.engaged
 
 
 @dataclass
@@ -177,6 +230,22 @@ class Controller:
                 mode_intent = "self_consumption"
             else:
                 mode_intent = "export"
+        elif override.override_type.value == "plan_stale":
+            # Plan too old to trust (opt-in cutoff): plain self-consumption — the
+            # battery covers the house from PV and its own charge, nothing is
+            # bought from or forced to the grid. Two holds, same as the plan path:
+            # at the min-SoC floor (latched), and while a car draws power (the
+            # battery must not feed the car; the slot carries ev_isolation).
+            if self._at_min_soc_floor(state):
+                logger.info(
+                    "Plan-stale safe mode at the floor: SoC %.1f%% (min %.0f%%) - idle",
+                    state.current_soc_percent, state.min_soc_percent,
+                )
+                mode_intent = "idle"
+            elif slot.ev_isolation:
+                mode_intent = "idle"
+            else:
+                mode_intent = "self_consumption"
 
         # For overrides, we typically don't actively charge/discharge
         # unless specifically requested
@@ -217,6 +286,12 @@ class Controller:
         max_charge = self.config.max_charge_w if unit == "W" else self.config.max_charge_a
         max_discharge = self.config.max_discharge_w if unit == "W" else self.config.max_discharge_a
 
+        if override.override_type.value == "plan_stale" and mode_intent == "self_consumption":
+            # As in _follow_plan: a self_consumption charge limit of 0 would stop
+            # PV from charging the pack on profiles that write charge_value.
+            charge_value = max_charge
+            write_charge = True
+
         return ControllerDecision(
             mode_intent=mode_intent,
             charge_value=charge_value,
@@ -237,6 +312,20 @@ class Controller:
             # make C3 stand down (None = unknown) for every override tick.
             export_price_sek_kwh=slot.export_price_sek_kwh,
         )
+
+    @staticmethod
+    def _at_min_soc_floor(state: SystemState) -> bool:
+        """Is the battery held at the min-SoC floor this tick?
+
+        The engine's latch (state.min_soc_latched) decides when supplied; it
+        carries the hysteresis and keeps its state through an unreadable SoC.
+        Without it (direct callers) the old stateless rule applies: rounded SoC
+        at or below min_soc, and an unknown SoC is never "at the floor".
+        """
+        latched = state.min_soc_latched
+        if latched is not None:
+            return bool(latched)
+        return state.soc_known and (round(state.current_soc_percent) <= state.min_soc_percent)
 
     def _follow_plan(self, slot: SlotPlan, state: SystemState) -> ControllerDecision:
         """Follow the slot plan for normal operation using 4 mode intents."""
@@ -265,9 +354,10 @@ class Controller:
         # At or below min_soc these branches hold instead: idle blocks discharge
         # only, so real PV surplus still charges the pack, and one sensor step above
         # the floor the ordinary rules apply again. An unknown SoC changes nothing.
-        at_floor = state.soc_known and (
-            round(state.current_soc_percent) <= state.min_soc_percent
-        )
+        # With the engine's latch (MinSocFloorLatch) "one sensor step above" becomes
+        # min_soc + min_soc_release_margin_percent: without hysteresis the mode
+        # flapped idle <-> self_consumption on every 1 % step around the floor.
+        at_floor = self._at_min_soc_floor(state)
         if battery_to_grid_kw > 0 and battery_to_grid_kw >= self.config.export_min_battery_kw:
             # Battery discharge to grid - use export mode.
             # R1 runtime SoC-floor guard (arbitrage gate): the export floor exists
@@ -377,6 +467,20 @@ class Controller:
         else:
             # Above SoC target - use self_consumption
             mode_intent = "self_consumption"
+
+        if at_floor and mode_intent in ("self_consumption", "export"):
+            # Shared min-SoC floor guard (upstream de8b93ee D1). The branches above
+            # only consult at_floor where SoC <= the slot target; a slot whose
+            # target sits below the current SoC landed in "above target ->
+            # self_consumption" — so the latch's band (min < SoC < min + margin)
+            # was never held there and the mode flapped one sensor step above the
+            # floor. Idle blocks discharge only: PV surplus still charges the pack,
+            # and a planned grid charge (mode "charge") is untouched.
+            logger.info(
+                "Min-SoC floor hold: SoC %.1f%% (min %.0f%%, latched) - %s -> idle",
+                state.current_soc_percent, state.min_soc_percent, mode_intent,
+            )
+            mode_intent = "idle"
 
         if slot.ev_isolation and mode_intent in ("self_consumption", "export"):
             # A car is drawing power right now — planned or not. discharge_kw=0
