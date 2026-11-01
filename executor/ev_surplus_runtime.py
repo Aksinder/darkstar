@@ -58,6 +58,12 @@ _CLAMP_STALE_AFTER_S = 3600.0
 # integration that went dark has not said the cable is out or the car left — the
 # 2026-09-10 outage turned "unknown" into "unplugged" and idled a 33 % car all night.
 _EV_READ_HOLD_S = 24 * 3600.0
+# A held SoC is rolled forward by delivered energy while the charger draws more than
+# this; one tick may credit at most _HELD_SOC_MAX_DT_S. Without a capacity_kwh to roll
+# against, the hold is dropped after _HELD_SOC_BLIND_DRAW_S of drawing.
+_HELD_SOC_DRAW_MIN_W = 100.0
+_HELD_SOC_MAX_DT_S = 120.0
+_HELD_SOC_BLIND_DRAW_S = 1800.0
 # Namespace of this controller's holds in backend/core/ev_hold_store.py.
 _HOLD_NAMESPACE = "servo"
 # A switch state must be this much newer than our last command to overrule it:
@@ -682,6 +688,12 @@ class EVSurplusController:
         # nothing (2026-09-27/28: 13 %, departure 07:30, zero charge).
         self._last_good_soc: dict[str, tuple[float, float]] = {}
         self._soc_held: set[str] = set()
+        # While a HELD SoC is in use and the charger delivers, the car is no longer
+        # parked: energy delivered since the hold began (kWh at the plug), seconds of
+        # drawing, and the previous tick's timestamp. Cleared by a fresh reading.
+        self._held_soc_kwh: dict[str, float] = {}
+        self._held_soc_draw_s: dict[str, float] = {}
+        self._held_soc_tick_ts: dict[str, float] = {}
         self._hold_warned: set[str] = set()
         # ...and their copy on disk: without it an add-on restart during a blackout
         # of the car's entities reads "nothing to hold (never read) -> False", the car
@@ -1163,6 +1175,50 @@ class EVSurplusController:
                     "EV surplus: wake press for unreadable %s failed: %s", st.id, e
                 )
 
+    def _clear_held_soc_roll(self, cid: str) -> None:
+        self._held_soc_kwh.pop(cid, None)
+        self._held_soc_draw_s.pop(cid, None)
+        self._held_soc_tick_ts.pop(cid, None)
+        self._hold_warned.discard(f"{cid}:soc_stale")
+
+    def _roll_held_soc(
+        self, c: EVSurplusChargerCfg, held: float, power_w: float, now_ts: float
+    ) -> float | None:
+        """Roll a HELD SoC forward by the energy delivered since the hold began.
+
+        The hold exists because a parked car's SoC does not fall — but one that is
+        CHARGING does rise, and a frozen value blinds both the deadline floor (keeps
+        forcing toward a floor already met) and the target cap (never stops). Same
+        integration as the FMB dead-reckoning: plug kWh x efficiency / usable
+        capacity. Without a capacity there is nothing to integrate against, so the
+        hold is trusted for at most _HELD_SOC_BLIND_DRAW_S of drawing, then dropped
+        (None: no floor, no cap — the same as no SoC at all). A fresh reading always
+        wins; this runs only while the reading is missing.
+        """
+        prev_ts = self._held_soc_tick_ts.get(c.id)
+        self._held_soc_tick_ts[c.id] = now_ts
+        if prev_ts is not None and power_w > _HELD_SOC_DRAW_MIN_W:
+            # A gap longer than a few ticks (restart, stalled loop) is not credited:
+            # under-counting keeps the deadline floor armed, over-counting would not.
+            dt = min(max(0.0, now_ts - prev_ts), _HELD_SOC_MAX_DT_S)
+            self._held_soc_kwh[c.id] = self._held_soc_kwh.get(c.id, 0.0) + power_w * dt / 3.6e6
+            self._held_soc_draw_s[c.id] = self._held_soc_draw_s.get(c.id, 0.0) + dt
+        kwh = self._held_soc_kwh.get(c.id, 0.0)
+        if c.capacity_kwh > 0.0:
+            gain = kwh * max(0.05, c.charge_efficiency) / c.capacity_kwh * 100.0
+            return min(100.0, held + gain)
+        if self._held_soc_draw_s.get(c.id, 0.0) > _HELD_SOC_BLIND_DRAW_S:
+            if f"{c.id}:soc_stale" not in self._hold_warned:
+                self._hold_warned.add(f"{c.id}:soc_stale")
+                logger.warning(
+                    "EV surplus: %s held SoC %.0f %% is stale — the car has been "
+                    "charging on it for %.0f min with no capacity_kwh to roll it "
+                    "forward; treating SoC as unknown",
+                    c.id, held, self._held_soc_draw_s[c.id] / 60.0,
+                )
+            return None
+        return held
+
     def _restore_holds(self) -> None:
         """Refill the plug/home holds from disk (a no-op while the store is off)."""
         from backend.core import ev_hold_store
@@ -1410,6 +1466,7 @@ class EVSurplusController:
                 if c.id in self._soc_held:
                     self._soc_held.discard(c.id)
                     logger.info("EV surplus: %s SoC readable again (%.0f %%)", c.id, soc)
+                self._clear_held_soc_roll(c.id)
             else:
                 held_soc = self._last_good_soc.get(c.id)
                 if held_soc is not None and (now_ts - held_soc[1]) <= _EV_READ_HOLD_S:
@@ -1421,6 +1478,9 @@ class EVSurplusController:
                             "(%.0f %%, %.0f min old) so its charge floors stay armed",
                             c.id, soc, (now_ts - held_soc[1]) / 60.0,
                         )
+                    soc = self._roll_held_soc(c, soc, power, now_ts)
+                else:
+                    self._clear_held_soc_roll(c.id)
         target = cast("float | None", res[5])
         if target is None:
             target = c.target_soc  # config-constant cap when no entity is wired/readable
