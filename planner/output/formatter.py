@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 import pytz
 
@@ -139,6 +140,14 @@ def dataframe_to_json_response(
         record["reason"] = reason
         record["priority"] = priority
         record["is_historical"] = record.get("is_historical", False)
+
+        # Price provenance: True = ML forecast (D+1 before the Nordpool auction).
+        # Normalized to a JSON bool: a missing/NaN cell (bool(nan) is True!) or a
+        # numpy bool must not leak into schedule.json.
+        forecast_flag = record.get("price_is_forecast")
+        record["price_is_forecast"] = isinstance(forecast_flag, bool | np.bool_) and bool(
+            forecast_flag
+        )
 
         # Normalize water_heaters: ensure it's always a dict, not NaN
         water_heaters_val = record.get("water_heaters")
