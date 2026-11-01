@@ -38,43 +38,45 @@ class TestFloor:
         d = controller.decide(_hold(), SystemState(current_soc_percent=soc))
         assert d.mode_intent == "idle"
 
-    def test_one_sensor_step_above_the_floor_is_released(self, controller):
-        """11.1 % is the Sungrow sensor's next step above 10.0 %. Above the slot
-        target the ordinary rule applies — the guard adds no dead band of its own."""
-        d = controller.decide(_hold(), SystemState(current_soc_percent=11.1))
-        assert d.mode_intent == "self_consumption"
+    @pytest.mark.parametrize("soc", [11.1, 44.4, 100.0])
+    def test_hold_slot_idles_above_the_floor_too(self, controller, soc):
+        """The PV>load exception is gone (Hold slots always idle): forecast surplus
+        no longer opens the pack for discharge. 2026-10-25..11-01 it drained 34.7
+        kWh in Hold slots under over-forecast PV and ratcheted the targets down."""
+        d = controller.decide(_hold(soc_target=50), SystemState(current_soc_percent=soc))
+        assert d.mode_intent == "idle"
 
-    def test_exception_unchanged_above_the_floor(self, controller):
-        """The case the exception was written for: a full pack, at its target, with
-        sun. Still self-consumption."""
+    def test_full_pack_with_sun_idles_and_keeps_charge_path(self, controller):
+        """The case d9dc45a9 was written for (full pack, at target, sun): idle now.
+        Idle caps discharge only — the charge ceiling stays at the maximum, so real
+        surplus still reaches the pack."""
         d = controller.decide(
             _hold(soc_target=100, pv_kw=11.0, load_kw=1.5),
             SystemState(current_soc_percent=100.0),
         )
-        assert d.mode_intent == "self_consumption"
+        assert d.mode_intent == "idle"
+        assert d.max_charge == ControllerConfig().max_charge_a
 
-    def test_exception_unchanged_mid_range_below_target(self, controller):
-        """Below a mid-range Hold target the exception still applies — only the
-        floor is new."""
-        d = controller.decide(
-            _hold(soc_target=50), SystemState(current_soc_percent=44.4)
-        )
-        assert d.mode_intent == "self_consumption"
-
-    def test_floor_follows_the_configured_min_soc(self, controller):
-        """A site with min_soc 20: 18.8 % holds, 21.1 % does not (target 30)."""
-        slot = _hold(soc_target=30)
-        low = SystemState(current_soc_percent=18.8, min_soc_percent=20.0)
-        high = SystemState(current_soc_percent=21.1, min_soc_percent=20.0)
-        assert controller.decide(slot, low).mode_intent == "idle"
-        assert controller.decide(slot, high).mode_intent == "self_consumption"
-
-    def test_unknown_soc_keeps_the_old_behaviour(self, controller):
-        """soc_known=False leaves current_soc_percent at its 50 % default: the guard
-        must not read meaning into a number nobody measured."""
+    def test_unknown_soc_hold_idles(self, controller):
         state = SystemState(soc_known=False, min_soc_percent=60.0)
         d = controller.decide(_hold(soc_target=80), state)
-        assert d.mode_intent == "self_consumption"
+        assert d.mode_intent == "idle"
+
+
+class TestHoldRatchet:
+    """2026-11-01 08:15-13:00: Hold slots, forecast PV 2.4-3.2 kW over a ~1.5 kW
+    load, actual PV 0.6-1.6 kW. Each replan set the Hold target to the SoC it
+    entered with (planner/output/soc_target.py), the slot self-consumed, and the
+    next replan held lower: 70 -> 68 -> 63 -> ... -> 10 %."""
+
+    def test_replans_cannot_step_the_target_down(self, controller):
+        soc = 70.0
+        for target in (70, 68, 63, 60, 58, 54, 52, 51, 50, 48, 44, 39, 36, 33, 27, 19, 13):
+            for live in (soc + 0.6, soc, soc - 0.6):
+                slot = _hold(soc_target=target, pv_kw=3.0, load_kw=1.5)
+                d = controller.decide(slot, SystemState(current_soc_percent=live))
+                assert d.mode_intent == "idle", (target, live)
+            soc = float(target)
 
 
 class TestPvDrivenChargeFloor:
