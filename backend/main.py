@@ -248,6 +248,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to stop hindsight benchmark: {e}")
 
+    # Close the shared HA HTTP client of this (the server's) event loop. The
+    # executor's loop owns its own client, which dies with that loop.
+    try:
+        from backend.core.ha_client import close_ha_http_client
+
+        await close_ha_http_client()
+    except Exception as e:
+        logger.error(f"Failed to close shared HA HTTP client: {e}")
+
     # Close LearningStore
     if hasattr(app.state, "learning_store") and app.state.learning_store:
         await app.state.learning_store.close()
