@@ -4,6 +4,7 @@ import { NavLink, Link, useLocation } from 'react-router-dom'
 import { DarkstarLogo } from './DarkstarLogo'
 import { Api } from '../lib/api'
 import ThemeToggle from './ThemeToggle'
+import { useConnectionState } from '../lib/hooks'
 
 const Item = ({
     to,
@@ -47,22 +48,8 @@ const Item = ({
 export default function Sidebar() {
     const { pathname } = useLocation()
     const [mobileOpen, setMobileOpen] = useState(false)
-    const [connected, setConnected] = useState<boolean | null>(null)
+    const connection = useConnectionState()
     const [version, setVersion] = useState<string>('...')
-
-    useEffect(() => {
-        const check = async () => {
-            try {
-                await Api.status()
-                setConnected(true)
-            } catch {
-                setConnected(false)
-            }
-        }
-        check()
-        const i = setInterval(check, 30000)
-        return () => clearInterval(i)
-    }, [])
 
     // Fetch version from backend API (always current)
     useEffect(() => {
@@ -100,18 +87,18 @@ export default function Sidebar() {
                     <div className="py-2 flex flex-col items-center gap-2">
                         <div
                             className={`h-1.5 w-1.5 rounded-full transition-all duration-500 ${
-                                connected === true
+                                connection === 'connected'
                                     ? 'bg-good shadow-[0_0_8px_rgba(31,178,86,0.5)]'
-                                    : connected === false
+                                    : connection === 'offline'
                                       ? 'bg-bad'
-                                      : 'bg-slate-700'
+                                      : 'bg-warn animate-pulse motion-reduce:animate-none'
                             }`}
                             title={
-                                connected === true
-                                    ? 'System Online'
-                                    : connected === false
-                                      ? 'System Offline'
-                                      : 'Connecting...'
+                                connection === 'connected'
+                                    ? 'Live — connected to Darkstar'
+                                    : connection === 'offline'
+                                      ? 'Offline — retrying in the background'
+                                      : 'Reconnecting…'
                             }
                         />
 

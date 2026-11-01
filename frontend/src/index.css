@@ -725,6 +725,42 @@ body::before {
         animation: flow 0.5s linear infinite;
     }
 
+    /* Power-flow dots: CSS offset-path motion (compositor-driven, survives
+       React re-renders without restarting). Timing via --flow-dur/--flow-delay. */
+    @keyframes flow-dot {
+        0% {
+            offset-distance: 0%;
+            opacity: 0;
+        }
+
+        8% {
+            opacity: 0.88;
+        }
+
+        92% {
+            opacity: 0.88;
+        }
+
+        100% {
+            offset-distance: 100%;
+            opacity: 0;
+        }
+    }
+
+    .flow-dot {
+        offset-distance: 0%;
+        offset-rotate: 0deg;
+        opacity: 0;
+        animation: flow-dot var(--flow-dur, 2s) linear var(--flow-delay, 0s) infinite;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .flow-dot {
+            animation: none;
+            display: none;
+        }
+    }
+
     /* ========== SYSTEM ALERT (sticky top) ========== */
     .system-alert-container {
         position: sticky;
