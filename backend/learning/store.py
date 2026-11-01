@@ -645,6 +645,48 @@ class LearningStore:
             await session.execute(stmt)
             await session.commit()
 
+    async def get_system_states(self, keys: list[str]) -> dict[str, str]:
+        """Several system_state values by key; missing keys are absent."""
+        if not keys:
+            return {}
+        async with self.AsyncSession() as session:
+            result = await session.execute(
+                select(SystemState.key, SystemState.value).where(SystemState.key.in_(keys))
+            )
+            return {row.key: row.value for row in result.all() if row.value is not None}
+
+    async def get_slot_observation_rows(
+        self, start: datetime, end: datetime
+    ) -> list[dict[str, Any]]:
+        """Full slot_observations rows whose slot_start INSTANT is in [start, end).
+
+        slot_start strings carry mixed +01:00/+02:00 offsets, so a string range is not
+        a time range across DST (see get_observation_rows_between). Query a string
+        window padded by a day on each side, then filter on the parsed instant.
+        Rows come back sorted by real time.
+        """
+        pad = timedelta(days=1)
+        async with self.AsyncSession() as session:
+            result = await session.execute(
+                select(SlotObservation.__table__).where(
+                    SlotObservation.slot_start >= (start - pad).isoformat(),
+                    SlotObservation.slot_start < (end + pad).isoformat(),
+                )
+            )
+            rows = [dict(row) for row in result.mappings()]
+        out: list[tuple[datetime, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                ts = datetime.fromisoformat(str(row["slot_start"]))
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = self.timezone.localize(ts) if hasattr(self.timezone, "localize") else ts
+            if start <= ts < end:
+                out.append((ts, row))
+        out.sort(key=lambda pair: pair[0])
+        return [row for _, row in out]
+
     async def get_system_state(self, key: str) -> str | None:
         """
         Get the specific system state value by key using Async SQLAlchemy.

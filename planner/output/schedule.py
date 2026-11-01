@@ -50,6 +50,7 @@ async def save_schedule_to_json(
     window_responsibilities: list[dict[str, Any]],
     planner_state: dict[str, Any],
     output_path: str = SCHEDULE_JSON_PATH,
+    extra_meta: dict[str, Any] | None = None,
 ) -> None:
     """
     Save the final schedule to schedule.json in the required format.
@@ -93,6 +94,11 @@ async def save_schedule_to_json(
             "s_index": s_index_debug or {},
         },
     }
+    # Plan provenance (plan_source: kepler | fallback, plan_validation, fallback info)
+    # from planner/plan_guard.py. Never overrides the core keys above.
+    if extra_meta:
+        for key, value in extra_meta.items():
+            output["meta"].setdefault(key, value)
 
     # Add debug payload if enabled
     debug_config = config.get("debug", {})

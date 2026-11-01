@@ -284,3 +284,55 @@ async def get_energy_range(
             "slot_count": 0,
             "error": str(e),
         }
+
+
+BENCHMARK_DEFAULT_DAYS = 30
+BENCHMARK_MAX_DAYS = 366
+
+
+@router.get(
+    "/energy/battery-benchmark",
+    summary="Get Battery Hindsight Benchmark",
+    description=(
+        "Stored nightly battery hindsight results (actual vs battery-only optimum vs "
+        "grid-only) for inclusive local dates, plus totals. Never triggers a solve."
+    ),
+)
+async def get_battery_benchmark(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    store: LearningStore = Depends(get_learning_store),
+) -> dict[str, Any]:
+    """Read stored benchmark results (backend/services/benchmark_service.py)."""
+    import json
+
+    import pytz
+    from fastapi import HTTPException
+
+    from backend.hindsight_benchmark import state_key, summarize
+
+    tz = pytz.timezone(str(load_yaml("config.yaml").get("timezone", "Europe/Stockholm")))
+    end = end_date or datetime.now(tz).date() - timedelta(days=1)
+    start = start_date or end - timedelta(days=BENCHMARK_DEFAULT_DAYS - 1)
+    if end < start:
+        raise HTTPException(status_code=400, detail="end_date must not be before start_date")
+    if (end - start).days + 1 > BENCHMARK_MAX_DAYS:
+        raise HTTPException(status_code=400, detail=f"Range exceeds {BENCHMARK_MAX_DAYS} days")
+
+    days = [start + timedelta(days=k) for k in range((end - start).days + 1)]
+    stored = await store.get_system_states([state_key(d) for d in days])
+    records: list[dict[str, Any]] = []
+    for day in days:
+        raw = stored.get(state_key(day))
+        if raw is None:
+            continue
+        try:
+            records.append(json.loads(raw))
+        except ValueError:
+            logger.warning("Ignoring unreadable hindsight benchmark for %s", day)
+    return {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "days": records,
+        "totals": summarize(records),
+    }
