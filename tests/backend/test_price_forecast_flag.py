@@ -4,6 +4,7 @@ The flag flows prices.py -> planner input frame -> schedule.json and must not
 change planner economics (no solver term reads it).
 """
 
+import itertools
 import json
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -219,7 +220,7 @@ def test_hourly_resolution_fallback_has_no_overlapping_slots():
         _forecast_rows(), {"timezone": "Europe/Stockholm"}, TZ, 60
     )
     assert len(entries) == 24
-    for a, b in zip(entries, entries[1:], strict=False):
+    for a, b in itertools.pairwise(entries):
         assert a["end"] == b["start"]
     # Hour 0 = mean of its four quarters (0.800..0.803).
     assert entries[0]["value"] == pytest.approx(801.5)
