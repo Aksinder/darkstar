@@ -832,6 +832,18 @@ class PlannerPipeline:
         timezone_name = active_config.get("timezone", "Europe/Stockholm")
         df = prepare_df(input_data, timezone_name)
 
+        # Price provenance is informational (no solver term reads it); log it so a
+        # plan built partly on ML-forecast prices is visible in the planner log.
+        if "price_is_forecast" in df.columns and bool(df["price_is_forecast"].any()):
+            _fc = df.index[df["price_is_forecast"].astype(bool)]
+            logger.info(
+                "Prices: %d of %d slots are ML forecasts (unpublished, %s .. %s)",
+                len(_fc),
+                len(df),
+                _fc.min().isoformat(),
+                _fc.max().isoformat(),
+            )
+
         # Rev O1: Zero out PV if no solar panels
         if not has_solar:
             logger.info("No solar panels - zeroing PV forecasts")
