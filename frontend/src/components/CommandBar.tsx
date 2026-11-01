@@ -9,6 +9,7 @@ import { useToast } from '../lib/useToast'
 type PlannerMeta = {
     planned_at?: string
     planner_version?: string
+    plan_source?: string
     s_index?: PlannerSIndex
 } | null
 
@@ -235,6 +236,8 @@ export default function CommandBar({
         const timeStr = planned.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         planBadge = `Plan: ${timeStr}`
     }
+    // Battery-only fallback plan (Kepler failed; water/EV/sinks not scheduled).
+    if (plannerMeta?.plan_source === 'fallback') planBadge = `${planBadge} · FALLBACK`
 
     const riskLabel =
         ({ 1: 'Safety', 2: 'Conservative', 3: 'Neutral', 4: 'Aggressive', 5: 'Gambler' } as Record<number, string>)[

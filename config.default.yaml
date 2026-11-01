@@ -792,6 +792,15 @@ learning:
                                        # battery/water/EV entry, so it writes pv_kwh=0.0 rows that pass ml/train.py's
                                        # `load_kwh > 0.001` filter into the automatic retrain. Audit before enabling.
 
+  # Nightly battery hindsight benchmark: re-solves each finished day as a battery-only
+  # optimum on the RECORDED load/PV/prices and compares it with what the battery
+  # actually did and with a grid-only (no battery) baseline. Read-only on
+  # observations; results in system_state, served by GET /api/energy/battery-benchmark.
+  hindsight_benchmark:
+    enabled: true
+    run_at: "03:30"                    # LOCAL time; after the 03:00 ML training
+    window_days: 14                    # finished days (re)scored per run when missing/failed
+
   # Rate Limits for Aurora Reflex Parameter Tuning
   # These limits prevent instability by capping how much each parameter can change per day
   # Reflex analyzes historical data and gradually adjusts parameters within these bounds
@@ -955,6 +964,24 @@ kepler:
   #   time_limit_s: 240
   #   gap_rel: 0.01
   #   highs_options: {}
+
+  # Battery-only FALLBACK planner (planner/plan_guard.py). When Kepler fails
+  # (SOLVER_TIMEOUT incl. the comfort-floor tripwire reject, infeasible, undefined) or
+  # the plan validator rejects its plan (enforce mode), the default is to keep the last
+  # good plan — which can be hours old. With this enabled, and the last plan older than
+  # min_plan_age_minutes, a small battery-only plan (solves in < 2 s) is shipped
+  # instead, marked meta.plan_source: "fallback" (logs + dashboard badge). Water
+  # heaters, EVs, excess-PV sinks and deferrable loads are NOT scheduled in it — their
+  # own executor-side floors/servos keep running.
+  fallback:
+    enabled: false
+    min_plan_age_minutes: 30
+
+  # Independent plan validator: re-checks every plan (Kepler and fallback) for SoC
+  # range/trajectory, per-slot energy balance, power limits and cost bookkeeping.
+  # mode: log (warn only, default) | enforce (reject plans with errors) | off
+  plan_validator:
+    mode: log
 
 # =============================================================================
 # Home Assistant Integration
