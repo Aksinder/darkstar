@@ -990,6 +990,14 @@ executor:
   interval_seconds: 60                           # How often to run (default: 1 minute)
   pause_reminder_minutes: 30                     # Notify if paused longer than this
   history_retention_days: 30                     # Keep execution history for N days
+  # Plan-age cutoff (minutes). null/0 = OFF: the executor follows the last schedule.json
+  # however old it is (a notification still fires after 2 h without a new plan). When set,
+  # a plan older than this (by file mtime) is dropped and the executor runs a safe mode —
+  # self-consumption, no grid charging, no forced export, water heaters at temp_off, excess-PV
+  # sinks off — until the planner writes a fresh plan. Suggested if enabled: 120 (= the 2 h
+  # notification, 8 missed ~15-min replans). Avoid < 60: a 240 s HiGHS budget + CBC retry +
+  # backoff can legitimately skip 2-3 replans, and safe mode skips planned water heating.
+  max_plan_age_minutes: null
 
   # Price-conditioned grid-export curtailment (C3): when the EFFECTIVE export price
   # (pricing.export_* => spot + premium + grid_benefit - fee, i.e. what you are actually paid)
@@ -1038,6 +1046,10 @@ executor:
     min_charge_w: 500.0                # Minimum meaningful charge power (W)
     round_step_w: 100.0                # Round power commands to nearest X watts
     write_threshold_w: 100.0           # Only write power if change exceeds X watts (EEPROM protection)
+
+    # Min-SoC floor hysteresis: the floor hold (block discharge) engages at SoC <= battery.min_soc_percent
+    # and releases only at min_soc_percent + this many points. 0 = no hysteresis (old behaviour).
+    min_soc_release_margin_percent: 2.0
 
   # Water Heater Control
   # The executor controls your water heater by setting a target temperature.
