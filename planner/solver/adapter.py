@@ -1100,10 +1100,16 @@ def config_to_kepler_config(
         max_discharge_power_kw=max_discharge_kw,
         charge_efficiency=charge_eff,
         discharge_efficiency=discharge_eff,
-        wear_cost_sek_per_kwh=float(
-            planner_config.get("battery_economics", {}).get(
-                "battery_cycle_cost_kwh", get_val("wear_cost_sek_per_kwh", 0.0)
-            )
+        # Both knobs are FLOORS, so the higher configured value wins (upstream
+        # 8fcfd4cf). battery_cycle_cost_kwh used to take precedence outright, so a
+        # lower cycle cost silently undercut a wear_cost override/config (owner
+        # rule: wear never below 0.45 SEK/kWh).
+        wear_cost_sek_per_kwh=max(
+            float(
+                (planner_config.get("battery_economics", {}) or {}).get("battery_cycle_cost_kwh")
+                or 0.0
+            ),
+            get_val("wear_cost_sek_per_kwh", 0.0),
         ),
         max_export_power_kw=(
             float(system.get("grid", {}).get("max_power_kw"))
