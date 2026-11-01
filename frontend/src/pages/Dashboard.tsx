@@ -12,7 +12,7 @@ import PowerFlowCard from '../components/PowerFlowCard'
 import CommandBar from '../components/CommandBar'
 import BatteryStrategyCard from '../components/BatteryStrategyCard'
 import { GridDomain, ResourcesDomain } from '../components/CommandDomains'
-import { useSocket } from '../lib/hooks'
+import { useOnReconnect, useSocket } from '../lib/hooks'
 import { useToast } from '../lib/useToast'
 
 type PlannerMeta = {
@@ -434,6 +434,10 @@ export default function Dashboard() {
     useEffect(() => {
         fetchAllData()
     }, [fetchAllData])
+
+    // Socket pushes sent while we were disconnected (e.g. add-on restart) are
+    // lost — refetch everything once the socket is back.
+    useOnReconnect(fetchAllData)
 
     const toggleAutomationScheduler = async () => {
         if (automationSaving) return
