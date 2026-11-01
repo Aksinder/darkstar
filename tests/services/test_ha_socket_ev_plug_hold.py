@@ -22,8 +22,11 @@ def _client() -> ha_socket.HAWebSocketClient:
 
 @pytest.fixture
 def env():
+    import backend.core.ha_client as hc
+
     client = _client()
     with (
+        patch.dict(hc._LAST_GOOD_EV_PLUG, {}, clear=True),
         patch.object(client, "_trigger_ev_replan") as replan,
         patch("backend.events.emit_ha_entity_change"),
         patch("backend.events.emit_live_metrics"),
@@ -106,4 +109,36 @@ def test_seeding_still_suppresses_replan(env):
     client._seeding = False
     replan.assert_not_called()
     _feed(client, "off")
+    replan.assert_called_once_with(charger_id="easee_fmb", plugged_in=False)
+
+
+def test_first_real_unplug_vs_planner_held_plugged_replans(env):
+    # Restart with the planner still holding "plugged": the first REAL reading says
+    # unplugged — a change against the planner's belief, so it must replan.
+    client, replan = env
+    with patch.object(ha_socket.HAWebSocketClient, "_planner_held_plug", return_value=True):
+        _feed(client, "off")
+    replan.assert_called_once_with(charger_id="easee_fmb", plugged_in=False)
+    assert client.latest_values["ev_chargers"][0]["plugged_in"] is False
+
+
+def test_first_real_plugged_vs_planner_held_plugged_does_not_replan(env):
+    client, replan = env
+    with patch.object(ha_socket.HAWebSocketClient, "_planner_held_plug", return_value=True):
+        _feed(client, "on")
+    replan.assert_not_called()
+
+
+def test_first_real_unplug_without_planner_hold_does_not_replan(env):
+    client, replan = env
+    _feed(client, "off")
+    replan.assert_not_called()
+
+
+def test_held_then_real_unplug_after_restart_replans(env):
+    # previous=None, first reading unreadable (held plugged), then the real unplug.
+    client, replan = env
+    with patch.object(ha_socket.HAWebSocketClient, "_planner_held_plug", return_value=True):
+        _feed(client, "unavailable")
+        _feed(client, "off")
     replan.assert_called_once_with(charger_id="easee_fmb", plugged_in=False)
