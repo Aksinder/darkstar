@@ -1048,7 +1048,10 @@ class KeplerSolver:
                 if not fracs:
                     continue
                 n_ph = len(fracs)
-                h_pa: float = (s_pa.end_time - s_pa.start_time).total_seconds() / 3600.0
+                # Planned hours (partial slot 0 = remaining time), the same basis
+                # as slot 0's scaled load/pv: the full slot length would hand slot 0
+                # a full-slot ampere allowance against a fraction of its energy.
+                h_pa: float = slot_hours[t]
                 if h_pa <= 0.0:
                     continue
                 # kWh a phase may draw this slot before the penalty starts: A * V * h.

@@ -43,16 +43,20 @@ _fetch_fail_until: float = 0.0
 _TOMORROW_UNPUBLISHED_RETRY_S = 60.0
 _tomorrow_retry_at: float = 0.0
 
-# Last successfully fetched+processed series (any pricing key). Served, minus past
-# slots, when a fetch fails entirely -- stale-but-valid beats [] while it covers now.
+# Last successfully fetched+processed series and the pricing cache key it was priced
+# under. Served, minus past slots and minus forecast rows for today, when a fetch fails
+# entirely -- stale-but-valid beats [] while it covers now. Never served under a
+# different key: a contract/TOU change during an outage must not reuse old prices.
 _last_good_series: list[dict[str, Any]] = []
+_last_good_key: str | None = None
 _stale_logged_at: float = float("-inf")
 
 # Last good reading per price-override entity: (SEK/kWh, aware UTC read time). Used when
-# HA cannot be read, so a hiccup neither silently swaps in the config literals (different
+# HA cannot be read (for at most _OVERRIDE_LAST_GOOD_MAX_AGE, then the config literal), so a hiccup neither silently swaps in the config literals (different
 # fees) nor changes the cache key and forces a refetch. Entities currently being served
 # from memory are in _override_stale_logged (one warning per outage, not per call).
 _override_last_good: dict[str, tuple[float, datetime]] = {}
+_OVERRIDE_LAST_GOOD_MAX_AGE = timedelta(hours=24)
 _override_stale_logged: set[str] = set()
 
 
@@ -139,7 +143,7 @@ async def get_nordpool_data(
 
     global _fetch_fail_until
     if _time.monotonic() < _fetch_fail_until:
-        return _stale_but_valid(now)
+        return _stale_but_valid(now, cache_key)
 
     prices_client = Prices(currency=currency)
 
@@ -164,14 +168,14 @@ async def get_nordpool_data(
     except TimeoutError:
         _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
         print("Warning: Nordpool price fetch timed out after 10 seconds")
-        return _stale_but_valid(now)
+        return _stale_but_valid(now, cache_key)
     except Exception as exc:
         _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
         print(f"Warning: Failed to fetch Nordpool prices: {exc}")
         import traceback
 
         traceback.print_exc()
-        return _stale_but_valid(now)
+        return _stale_but_valid(now, cache_key)
 
     try:
         tomorrow_values: list[dict[str, Any]] = []
@@ -220,11 +224,11 @@ async def get_nordpool_data(
         if not today_values:
             # Nordpool answered without today's prices: nothing published to plan on.
             _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
-            return _stale_but_valid(now)
+            return _stale_but_valid(now, cache_key)
 
         processed = _process_nordpool_data(all_entries, config)
         cache_sync.set(cache_key, processed, ttl_seconds=3600.0)
-        _remember_good_series(processed)
+        _remember_good_series(processed, cache_key)
         return processed
     except Exception as exc:
         _fetch_fail_until = _time.monotonic() + _FETCH_FAIL_MEMO_S
@@ -232,7 +236,7 @@ async def get_nordpool_data(
         import traceback
 
         traceback.print_exc()
-        return _stale_but_valid(now)
+        return _stale_but_valid(now, cache_key)
 
 
 def _set_tomorrow_retry(seconds: float) -> None:
@@ -242,21 +246,41 @@ def _set_tomorrow_retry(seconds: float) -> None:
     _tomorrow_retry_at = _time.monotonic() + seconds
 
 
-def _remember_good_series(series: list[dict[str, Any]]) -> None:
-    global _last_good_series
+def _remember_good_series(series: list[dict[str, Any]], cache_key: str) -> None:
+    global _last_good_series, _last_good_key
     _last_good_series = list(series)
+    _last_good_key = cache_key
 
 
-def _stale_but_valid(now: datetime) -> list[dict[str, Any]]:
+def _stale_but_valid(now: datetime, cache_key: str) -> list[dict[str, Any]]:
     """Future part of the last good price series, or [] if it no longer covers now.
 
     Serves a whole-fetch outage from what was already known (e.g. yesterday's fetch
     that included today) instead of handing the planner/servo nothing. Returned
-    slots keep their original prices and flags; only past slots are dropped.
+    slots keep their original prices and flags; past slots are dropped, and so are
+    ML-forecast rows (price_is_forecast) for any slot starting today or earlier:
+    yesterday's D+1 forecast must never become today's "live" price, because
+    executor consumers (export curtailment, idle-hold, EV curve) do not check the
+    flag. Forecast rows for tomorrow may remain, still flagged. Nothing is served
+    when the pricing cache key changed since (contract / TOU change mid-outage).
     """
     if not _last_good_series:
         return []
-    remaining = [s for s in _last_good_series if s["end_time"] > now]
+    if cache_key != _last_good_key:
+        logger.warning(
+            "Nordpool unavailable and pricing changed since the last good fetch: "
+            "not serving prices computed under the old pricing."
+        )
+        return []
+    # start_time is local-aware (pytz-normalised in _process_nordpool_data), so its
+    # .date() is the slot's local day; now is local too.
+    today = now.date()
+    remaining = [
+        s
+        for s in _last_good_series
+        if s["end_time"] > now
+        and not (s.get("price_is_forecast") and s["start_time"].date() <= today)
+    ]
     if not remaining or remaining[0]["start_time"] > now:
         return []
     import time as _time
@@ -556,6 +580,22 @@ async def _resolve_pricing_overrides(config: dict[str, Any]) -> dict[str, Any] |
                 logger.info("Pricing: %s readable again (%.4f SEK/kWh)", eid, value)
             continue
         remembered = _override_last_good.get(eid)
+        if (
+            remembered is not None
+            and datetime.now(pytz.UTC) - remembered[1] > _OVERRIDE_LAST_GOOD_MAX_AGE
+        ):
+            # Too old to trust: forget it and fall back to the config literal (one
+            # warning; the entity stays in _override_stale_logged, so the branch
+            # below stays quiet until it is readable again).
+            del _override_last_good[eid]
+            remembered = None
+            _override_stale_logged.add(eid)
+            logger.warning(
+                "Pricing: %s unreadable for over %s; last good value expired, using the "
+                "config literal.",
+                eid,
+                _OVERRIDE_LAST_GOOD_MAX_AGE,
+            )
         if remembered is not None:
             values[eid] = remembered[0]
             if eid not in _override_stale_logged:
