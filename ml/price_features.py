@@ -91,22 +91,55 @@ def _is_swedish_holiday(date: datetime) -> bool:
     return date.month == 6 and 20 <= date.day <= 26 and date.weekday() == 5
 
 
+# Local hour from which a forecast run is treated as issued AFTER the D+1 day-ahead
+# publication (Nord Pool publishes ~12:45-13:00 CET; 14:00 leaves margin). Shared by
+# inference and training so both derive the same knowable bound from issue_timestamp
+# alone -- no schema column needed (upstream stores ``known_prices_until`` instead).
+POST_PUBLICATION_HOUR = 14
+
+# The post-publication bound only applies to rows issued from this instant on. Rows
+# issued earlier (e.g. manual runs after 14:00 by older code) were inferred with the
+# end-of-issue-day cap, so training must keep using that bound for them.
+POST_PUBLICATION_RULE_SINCE = datetime(2026, 11, 1, 23, 0, tzinfo=pytz.UTC)  # 2026-11-02 00:00 CET
+
+
+def _localize(naive: datetime, tz: Any) -> datetime:
+    return tz.localize(naive) if hasattr(tz, "localize") else naive.replace(tzinfo=tz)
+
+
+def is_post_publication_issue(issue_timestamp: datetime, tz: Any) -> bool:
+    """True when a run issued at ``issue_timestamp`` may use published D+1 prices as lags."""
+    if isinstance(tz, str):
+        tz = pytz.timezone(tz)
+    if issue_timestamp.tzinfo is None:  # stored local wall time: never the container's tz
+        issue_timestamp = _localize(issue_timestamp, tz)
+    if issue_timestamp < POST_PUBLICATION_RULE_SINCE:
+        return False
+    return issue_timestamp.astimezone(tz).hour >= POST_PUBLICATION_HOUR
+
+
 def price_knowable_until(issue_timestamp: datetime, tz: Any) -> datetime:
-    """End (exclusive) of the price horizon guaranteed published at ``issue_timestamp``.
+    """End (exclusive) of the price horizon treated as published at ``issue_timestamp``.
 
     Day-ahead prices for a local day are published the afternoon before it, so
     every price up to the local midnight that ends the issue day is known at any
-    issue time. D+1 is only known after the ~13:00 auction, which a training row
-    cannot prove after the fact -- so it is deliberately NOT counted. Training
-    masks lags with this bound and inference caps its published-price lags at
-    the same bound, keeping the two feature distributions identical.
+    issue time. From ``POST_PUBLICATION_HOUR`` local time on (for rows issued since
+    ``POST_PUBLICATION_RULE_SINCE``) the bound is the end of D+1 instead: the
+    ~13:00 auction is over. Training masks lags with this bound and inference caps
+    its published-price lags at the same bound, keeping the two feature
+    distributions identical. Inference that cannot actually supply D+1 at such an
+    issue time (late publication) must not persist the affected rows -- see
+    ``generate_price_forecasts``.
     """
     if isinstance(tz, str):
         tz = pytz.timezone(tz)
+    if issue_timestamp.tzinfo is None:
+        issue_timestamp = _localize(issue_timestamp, tz)
     local_issue = issue_timestamp.astimezone(tz)
-    next_day = local_issue.date() + timedelta(days=1)
+    days = 2 if is_post_publication_issue(issue_timestamp, tz) else 1
+    next_day = local_issue.date() + timedelta(days=days)
     midnight = datetime.combine(next_day, datetime.min.time())
-    return tz.localize(midnight) if hasattr(tz, "localize") else midnight.replace(tzinfo=tz)
+    return _localize(midnight, tz)
 
 
 def build_price_features(

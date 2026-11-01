@@ -70,9 +70,17 @@ def _reset_nordpool_fail_memo():
     fetch must not silence get_nordpool_data for every later test."""
     from backend.core import prices
 
-    prices._fetch_fail_until = 0.0
+    def _reset() -> None:
+        prices._fetch_fail_until = 0.0
+        prices._tomorrow_retry_at = 0.0
+        prices._last_good_series = []
+        prices._stale_logged_at = float("-inf")
+        prices._override_last_good.clear()
+        prices._override_stale_logged.clear()
+
+    _reset()
     yield
-    prices._fetch_fail_until = 0.0
+    _reset()
 
 
 @pytest.fixture(autouse=True)

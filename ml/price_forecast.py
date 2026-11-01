@@ -31,7 +31,11 @@ from backend.core.prices import (
     get_known_spot_by_slot,
 )
 from backend.learning.models import PriceForecast
-from ml.price_features import build_price_features_batch, price_knowable_until
+from ml.price_features import (
+    POST_PUBLICATION_HOUR,
+    build_price_features_batch,
+    price_knowable_until,
+)
 from ml.weather import compute_regional_wind_index, get_regional_weather
 
 logger = logging.getLogger(__name__)
@@ -87,6 +91,7 @@ async def generate_price_forecasts(
     config: dict[str, Any],
     db_path: str = "data/planner_learning.db",
     model_path: Path | None = None,
+    days_ahead_range: range | None = None,
 ) -> list[dict[str, Any]]:
     """
     Generate price forecasts for D+1 through D+7.
@@ -95,6 +100,8 @@ async def generate_price_forecasts(
         config: Configuration dictionary
         db_path: Path to SQLite database for persisting forecasts
         model_path: Path to trained price model (if None, uses config)
+        days_ahead_range: Horizons to forecast (default D+1..D+7). The
+            post-publication run passes ``range(2, 8)``: D+1 is published then.
 
     Returns:
         List of forecast records with spot prices and weather features
@@ -157,13 +164,31 @@ async def generate_price_forecasts(
         len(known_spot),
         knowable_until.isoformat(),
     )
+    # After POST_PUBLICATION_HOUR the shared rule treats D+1 as published, and training
+    # will use D+1 observations as lags for these rows. If D+1 is in fact NOT published
+    # (late auction), inference cannot supply those lags -> the D+2 rows (the only ones
+    # whose lag_1d / 24h window lies in D+1) would be train/serve inconsistent, so they
+    # are not produced at all.
+    end_of_today = tz.localize(
+        datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+    )
+    skip_days_ahead: set[int] = set()
+    if knowable_until > end_of_today and not _covers(known_spot, end_of_today, knowable_until):
+        skip_days_ahead.add(2)
+        logger.warning(
+            "Price forecast issued after %02d:00 but D+1 prices are not published; "
+            "skipping D+2 rows to keep training lags consistent",
+            POST_PUBLICATION_HOUR,
+        )
 
     engine = create_engine(f"sqlite:///{db_path}")
     SessionLocal = sessionmaker(bind=engine)
     lag_session = SessionLocal()
 
     try:
-        for days_ahead in range(1, 8):  # D+1 to D+7
+        for days_ahead in days_ahead_range or range(1, 8):  # D+1 to D+7
+            if days_ahead in skip_days_ahead:
+                continue
             forecast_date = now.date() + timedelta(days=days_ahead)
             start_time = datetime.combine(forecast_date, datetime.min.time())
             start_time = tz.localize(start_time)
@@ -297,6 +322,20 @@ async def generate_price_forecasts(
         print(f"Generated and persisted {len(all_forecasts)} price forecasts")
 
     return all_forecasts
+
+
+def _covers(known: dict[datetime, float], start: datetime, end: datetime) -> bool:
+    """True when every 15-minute slot in [start, end) has a published price.
+
+    Steps in UTC so a 23/25-hour DST day is walked by real quarters (92/100).
+    """
+    cursor = start.astimezone(pytz.UTC)
+    stop = end.astimezone(pytz.UTC)
+    while cursor < stop:
+        if cursor not in known:  # aware datetimes hash/compare by instant
+            return False
+        cursor += timedelta(minutes=15)
+    return True
 
 
 async def _load_known_spot() -> dict[datetime, float]:
@@ -480,70 +519,101 @@ async def get_price_forecasts_from_db(
         return []
 
 
+def _latest_forecasts_for_local_date(
+    db_path: str, target_date: Any, tz: Any
+) -> list[dict[str, Any]]:
+    """Latest-issued valid forecast row per slot of one LOCAL day, any horizon.
+
+    Selection is by local date range, not a row limit: a DST day has 92 or 100
+    quarters. ``days_ahead`` is ignored on purpose -- a D+2 row issued yesterday is
+    a valid forecast for tomorrow, and between 00:00 and the daily run it is the
+    newest one there is. Issue times are compared as instants (offsets differ
+    across a DST switch, so the ISO strings do not sort).
+    """
+    engine = create_engine(f"sqlite:///{db_path}")
+    session = sessionmaker(bind=engine)()
+    try:
+        # Coarse string prefilter (slot_start is stored as local ISO), exact filter below.
+        lo = (target_date - timedelta(days=1)).isoformat()
+        hi = (target_date + timedelta(days=2)).isoformat()
+        rows = (
+            session.query(PriceForecast)
+            .filter(
+                PriceForecast.slot_start >= lo,
+                PriceForecast.slot_start < hi,
+                PriceForecast.spot_p50.isnot(None),
+            )
+            .all()
+        )
+        best: dict[datetime, tuple[datetime, dict[str, Any]]] = {}
+        for pf in rows:
+            try:
+                slot = datetime.fromisoformat(pf.slot_start)
+                issued = datetime.fromisoformat(pf.issue_timestamp)
+            except (TypeError, ValueError):
+                continue
+            slot = tz.localize(slot) if slot.tzinfo is None else slot.astimezone(tz)
+            issued = tz.localize(issued) if issued.tzinfo is None else issued
+            if slot.date() != target_date:
+                continue
+            current = best.get(slot)
+            if current is not None and current[0] >= issued:
+                continue
+            best[slot] = (
+                issued,
+                {
+                    "slot_start": slot.isoformat(),
+                    "issue_timestamp": pf.issue_timestamp,
+                    "days_ahead": pf.days_ahead,
+                    "spot_p10": pf.spot_p10,
+                    "spot_p50": pf.spot_p50,
+                    "spot_p90": pf.spot_p90,
+                    "wind_index": pf.wind_index,
+                    "temperature_c": pf.temperature_c,
+                    "cloud_cover": pf.cloud_cover,
+                    "radiation_wm2": pf.radiation_wm2,
+                },
+            )
+        return [row for _slot, (_issued, row) in sorted(best.items())]
+    finally:
+        session.close()
+        engine.dispose()
+
+
 async def get_d1_price_forecast_fallback(
     config: dict[str, Any],
     db_path: str = "data/planner_learning.db",
 ) -> list[dict[str, Any]] | None:
     """
-    Get D+1 price forecast for fallback when real Nordpool prices not yet available.
+    Price forecast for TOMORROW (local), used while its real prices are unpublished.
 
-    Returns forecast records for D+1 if available, otherwise None.
-    Filters out weather-only rows (null-prediction rows) to ensure only valid
-    forecasts are returned to the planner.
+    Takes the latest-issued valid forecast per slot regardless of ``days_ahead``
+    (yesterday's D+2 row covers tomorrow between 00:00 and the daily run). Weather-only
+    (null-prediction) rows are never returned. Returns None when nothing is available.
     """
     try:
-        forecasts = await get_price_forecasts_from_db(
-            db_path=db_path,
-            days_ahead=1,
-            limit=96,  # 24 hours * 4 slots per hour
+        tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+        tomorrow = datetime.now(tz).date() + timedelta(days=1)
+        valid_forecasts = await asyncio.to_thread(
+            _latest_forecasts_for_local_date, db_path, tomorrow, tz
         )
-
-        # Filter out weather-only rows (null-prediction rows)
-        valid_forecasts = [f for f in forecasts if f.get("spot_p50") is not None]
-
-        # Deduplicate on slot_start (defence-in-depth against DB duplicates leaking through)
-        seen: set[str] = set()
-        deduped: list[dict[str, Any]] = []
-        for f in valid_forecasts:
-            slot = f["slot_start"]
-            if slot not in seen:
-                seen.add(slot)
-                deduped.append(f)
-        if len(deduped) < len(valid_forecasts):
-            logger.warning(
-                "get_d1_price_forecast_fallback dropped %d duplicate slot_start entries",
-                len(valid_forecasts) - len(deduped),
-            )
-        valid_forecasts = deduped
-
-        # Filter out stale slots (date <= today)
-        today_local = datetime.now(pytz.timezone(config.get("timezone", "Europe/Stockholm"))).date()
-        future_forecasts: list[dict[str, Any]] = []
-        for f in valid_forecasts:
-            slot_dt = f["slot_start"]
-            if isinstance(slot_dt, str):
-                slot_dt = datetime.fromisoformat(slot_dt)
-            slot_date = slot_dt.date() if hasattr(slot_dt, "date") else None
-            if slot_date and slot_date > today_local:
-                future_forecasts.append(f)
-
-        stale_count = len(valid_forecasts) - len(future_forecasts)
-        if stale_count > 0:
-            logger.info(
-                "get_d1_price_forecast_fallback discarded %d stale slots (date <= today)",
-                stale_count,
-            )
-        valid_forecasts = future_forecasts
-
         if not valid_forecasts:
             return None
+
+        horizons = sorted({f["days_ahead"] for f in valid_forecasts})
+        logger.info(
+            "D+1 price forecast fallback: %d slots for %s (horizons %s)",
+            len(valid_forecasts),
+            tomorrow.isoformat(),
+            horizons,
+        )
 
         # Derive consumer prices for each forecast
         for forecast in valid_forecasts:
             consumer_prices = derive_consumer_prices(
-                spot_p10=forecast.get("spot_p10", 0),
-                spot_p50=forecast.get("spot_p50", 0),
-                spot_p90=forecast.get("spot_p90", 0),
+                spot_p10=forecast.get("spot_p10") or 0.0,
+                spot_p50=forecast.get("spot_p50") or 0.0,
+                spot_p90=forecast.get("spot_p90") or 0.0,
                 config=config,
                 slot_start=forecast.get("slot_start"),
             )
@@ -552,5 +622,5 @@ async def get_d1_price_forecast_fallback(
         return valid_forecasts
 
     except Exception as exc:
-        print(f"Error getting D+1 fallback: {exc}")
+        logger.warning("Error getting D+1 price forecast fallback: %s", exc)
         return None
