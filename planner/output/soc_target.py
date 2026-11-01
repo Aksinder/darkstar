@@ -156,11 +156,19 @@ def apply_soc_target_percent(
             block_target = projected[end]
             if block_target is None:
                 block_target = projected[start]
+            # A projected block end below min_soc only occurs during a planned
+            # partial recovery (kepler recovery window); raising it to min_soc
+            # would make the executor charge beyond the plan.
+            lower_bound = (
+                min(min_soc_percent, float(block_target))
+                if block_target is not None
+                else min_soc_percent
+            )
             if block_target is None and entry_list[start] is not None:
                 block_target = entry_list[start]
 
             block_value = float(block_target) if block_target is not None else targets[start]
-            block_value = max(min_soc_percent, min(max_soc_percent, block_value))
+            block_value = max(lower_bound, min(max_soc_percent, block_value))
 
             # Apply manual constraints if present
             if any(manual_actions[k] == "charge" for k in block):
