@@ -170,37 +170,61 @@ water_heating:
 #                                  # budget (the price gates and the plan floor still hold).
 
 # Real-time per-phase load balancing (main-fuse protection)
-# Ported from upstream. OBSERVE-ONLY in this build: it logs the decision it
-# would have made and actuates nothing, so its verdicts can be compared against
-# the live HA phase guard before either one is retired. Two guards actuating at
-# once is worse than either alone.
-#
-# system:
-#   grid:
-#     main_fuse_a: 25            # the fuse this guard protects
+# Ported from upstream (decision core + thermal fuse model). OBSERVE-ONLY by
+# default: every tick it reads the fuse guard's phase sensors (each with its
+# own HA last_reported timestamp), decides who WOULD give way, and logs/exposes
+# that (log lines "Load balancer (OBSERVE, not acting) ..." and
+# "Load balancer charger:<id>: ...", plus /api/executor/status -> load_balancer
+# with per-phase headroom, fuse heat and trip margin). Nothing is written to a
+# device unless actuate: true. The live guard (ev_surplus.fuse_guard + its
+# battery clamp + the HA watchdog) is unaffected either way; two guards acting
+# at once is worse than either alone, so compare verdicts before enabling.
+# Phases come from ev_surplus.fuse_guard.phase_entities (a/b/c = L1/L2/L3).
 #
 # load_balancing:
-#   enabled: false
-#   resume_delay_s: 120          # how long relief must hold before restoring
-#   resume_margin_percent: 90    # restore only below this % of the fuse. The live
-#                                # guard latched for 3.5 h because its release
-#                                # threshold sat BELOW the shed load's own draw —
-#                                # a margin below the fuse cannot do that.
+#   enabled: false               # run the balancer at all (observe)
+#   actuate: false               # ACT on its decisions. EV current ONLY via the
+#                                # Easee dynamic limit (RAM, time_to_live 0; an
+#                                # Easee pause = dynamic limit 0, never its
+#                                # "enabled" switch); other chargers only paused
+#                                # via their switch_entity; shed loads only via
+#                                # their own loads[].entity switch. Never a
+#                                # persistent charger setting. Battery: never
+#                                # (the fuse_guard battery clamp owns it).
+#   protected_fuse_a: 25         # the fuse it protects (else system.grid.main_fuse_a)
+#   fuse_preset: typ_c           # typ_c (MCB) | diazed_gg (screw fuse) | custom
+#   fuse_safety_percent:         # relief at this % of trip-time heat
+#                                # (empty = 80 typ_c / 65 diazed_gg)
+#   # fuse_custom_points:        # only with fuse_preset: custom (exactly two)
+#   #   - {overload_percent: 130, time_s: 1200}
+#   #   - {overload_percent: 300, time_s: 4}
+#   target_margin_percent: 85    # increases/resumes/restores keep the averaged
+#                                # phase current below this % of the fuse
+#   resume_delay_s: 120          # restore delay for a shed load / stale escalation
+#   resume_confirm_s: 10         # a paused charger re-fits after this long in margin
+#   ramp_up_window_s: 60         # averaging window for increases
 #   increase_step_a: 1           # ramp chargers back up one amp at a time
-#   sensor_stale_after_s: 30     # a phase sensor older than this is not trusted
-#   nominal_voltage_v: 220       # for phases reported in W rather than A
-#   notify_interventions: false  # notify on shed/pause; routine ramps never notify
-#   replan_after_throttled_s: 600  # replan once a charger is held down this long
+#   max_step_interval_s: 30      # next increase waits for the last to settle
+#   pending_timeout_s: 60        # a granted step counts against room this long
+#   sensor_stale_after_s: 30     # a phase reading older than this is not trusted
+#   nominal_voltage_v: 230
+#   auto_include_devices: true   # append chargers/loads/battery missing below
 #   loads:                       # on/off loads the guard may shed
 #     - device_type: water_heater   # water_heater | ev_charger | custom_entity
 #       device_id: spa
-#       phases: [2]              # empty = unknown = counts against every phase
+#       phases: [b]              # a/b/c, l1..l3 or 1..3. EMPTY = not sheddable.
+#       power_kw: 1.8            # restore power (unset = wait for a free phase)
+#       power_sensor:            # optional live W sensor for the restore check
+#       entity:                  # switch.* to actually turn off when actuate is
+#                                # on; without it the load is observe-only
+#       min_on_s: 300
+#       min_off_s: 300
 #   give_way_order:              # ORDER IS THE POLICY — the top gives way first.
 #     - {kind: charger, id: easee_fmb}   # throttle to floor, then pause
 #     - {kind: shed, id: spa}            # then switch this off
-#     - {kind: shed, id: villavagn}      # only then this
-#   # Missing devices are appended automatically on load (chargers before sheds);
-#   # entries naming a device that no longer exists are dropped with a warning.
+#     - {kind: battery}                  # house battery grid charging (observe)
+#   # Missing devices are appended automatically on load (chargers before sheds,
+#   # battery last); entries naming a device that no longer exists are dropped.
 
 # Water Heaters (Array for multiple water heaters)
 # ARC15: Replaces deferrable_loads entry for water heating
