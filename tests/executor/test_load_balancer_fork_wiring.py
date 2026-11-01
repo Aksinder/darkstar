@@ -413,6 +413,55 @@ class TestActuator:
         assert ha.calls == []
 
 
+class TestReleaseAll:
+    """Turning actuate off / disabling the balancer must hand back what it holds."""
+
+    def _release(self, act, ha, servo, loads=None):
+        return asyncio.run(
+            act.release_all(
+                ha,
+                chargers={"easee_fmb": EASEE, "tesla": TESLA},
+                servo_a=servo,
+                loads=loads or {},
+                shadow=False,
+            )
+        )
+
+    def test_easee_cap_and_tesla_pause_and_shed_are_released(self):
+        ha, act = FakeHA(), LoadBalancerActuator()
+        loads = {"spa": BalancedLoadConfig(device_id="spa", phases=[2], entity="switch.spa")}
+        _apply(
+            act,
+            ha,
+            _status(
+                [
+                    EVBalancerOutput("easee_fmb", None, "paused"),
+                    EVBalancerOutput("tesla", None, "paused"),
+                ],
+                [ShedLoadOutput("spa", "water_heater", True, actively_shedding=True)],
+            ),
+            {"easee_fmb": 16.0, "tesla": 16.0},
+            loads=loads,
+        )
+        assert act.holds_anything
+        ha.calls.clear()
+        self._release(act, ha, {"easee_fmb": 16.0, "tesla": 16.0}, loads)
+        assert (
+            "easee",
+            "set_charger_dynamic_limit",
+            None,
+            {"device_id": "dev123", "current": 16, "time_to_live": 0},
+        ) in ha.calls
+        assert ("switch", "turn_on", "switch.tesla", None) in ha.calls
+        assert ("switch", "turn_on", "switch.spa", None) in ha.calls
+        assert not act.holds_anything
+
+    def test_nothing_held_writes_nothing(self):
+        ha, act = FakeHA(), LoadBalancerActuator()
+        assert self._release(act, ha, {"easee_fmb": 16.0}) == []
+        assert ha.calls == []
+
+
 # --- engine wiring: observe-only by default ------------------------------------
 
 
@@ -458,6 +507,7 @@ def _engine_stub(actuate: bool, ha: FakeHA, shadow: bool = False):
         ha_client=ha,
         inverter_profile=None,
     )
+    stub._release_load_balancer = lambda: ExecutorEngine._release_load_balancer(stub)
     return stub
 
 

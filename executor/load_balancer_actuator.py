@@ -76,11 +76,62 @@ class LoadBalancerActuator:
         self._ev_servo_at_cap.pop(charger_id, None)
 
     def forget(self) -> None:
-        """Drop every cap (actuate switched off / balancer disabled)."""
+        """Drop every cap WITHOUT writing anything (use release_all to hand back)."""
         self._ev_cap.clear()
         self._ev_path.clear()
         self._ev_servo_at_cap.clear()
         self._shed_off.clear()
+
+    @property
+    def holds_anything(self) -> bool:
+        return bool(self._ev_cap or self._shed_off)
+
+    async def release_all(
+        self,
+        ha: Any,
+        *,
+        chargers: dict[str, Any],
+        servo_a: dict[str, float | None],
+        loads: dict[str, BalancedLoadConfig],
+        shadow: bool,
+    ) -> list[str]:
+        """Hand everything we hold back, then forget it.
+
+        Called when actuate is switched off or the balancer is disabled: merely
+        forgetting would leave an Easee at the capped (or 0 A) dynamic limit and
+        shed loads off, with nothing left that knows about it.
+        """
+        done: list[str] = []
+        tag = " (shadow, not sent)" if shadow else ""
+        for cid, cap in list(self._ev_cap.items()):
+            ccfg = chargers.get(cid)
+            path = self._ev_path.get(cid)
+            servo = servo_a.get(cid)
+            try:
+                if path == "easee" and ccfg is not None and getattr(ccfg, "easee_device_id", None):
+                    # Servo off -> 0 A is what it wants anyway; otherwise its own command.
+                    amps = round(servo) if servo is not None and servo > 0 else 0
+                    if amps != cap:
+                        await self._write_easee(ha, ccfg.easee_device_id, amps, shadow)
+                        done.append(f"{cid}: released cap -> servo {amps}A (Easee dynamic){tag}")
+                elif path == "switch" and ccfg is not None and servo is not None and servo > 0:
+                    switch = getattr(ccfg, "switch_entity", None)
+                    if switch:
+                        await self._write_switch(ha, switch, True, shadow)
+                        done.append(f"{cid}: released pause -> {switch} on{tag}")
+            except Exception as exc:  # keep releasing the rest
+                logger.warning("Load balancer: release of %s failed: %s", cid, exc)
+        for load_id in list(self._shed_off):
+            load = loads.get(load_id)
+            entity = getattr(load, "entity", None) if load is not None else None
+            if entity and str(entity).startswith(_SWITCH_DOMAINS):
+                try:
+                    await self._write_switch(ha, entity, True, shadow)
+                    done.append(f"{load_id}: restored via {entity} on{tag}")
+                except Exception as exc:
+                    logger.warning("Load balancer: restore of %s failed: %s", load_id, exc)
+        self.forget()
+        return done
 
     async def apply(
         self,

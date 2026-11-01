@@ -2394,6 +2394,12 @@ class ExecutorEngine:
                             await self._observe_load_balancer(decision)
                         except Exception as lb_exc:
                             logger.warning("Load balancer (observe) error: %s", lb_exc)
+                    elif self._balancer_actuator.holds_anything and self.ha_client is not None:
+                        # Disabled while caps/sheds were in force: release them.
+                        try:
+                            await self._release_load_balancer()
+                        except Exception as lb_exc:
+                            logger.warning("Load balancer release error: %s", lb_exc)
 
                     # FMB SoC estimator (publishes the dead-reckoned FMB SoC). Isolated so a
                     # transient HA read can never break the main actuation.
@@ -3658,6 +3664,24 @@ class ExecutorEngine:
                     )
                 )
 
+    async def _release_load_balancer(self) -> list[str]:
+        """Write back every cap/shed the balancer still holds, then forget them."""
+        if not self._balancer_actuator.holds_anything:
+            return []
+        srv = self._ev_surplus
+        chargers = list(getattr(srv.cfg, "chargers", []) or []) if srv is not None else []
+        servo_a = {c.id: srv.commanded_current_a(c.id) for c in chargers} if srv else {}
+        released = await self._balancer_actuator.release_all(
+            self.ha_client,
+            chargers={c.id: c for c in chargers},
+            servo_a=servo_a,
+            loads={ld.device_id: ld for ld in self.config.load_balancing.loads},
+            shadow=self.config.shadow_mode,
+        )
+        for line in released:
+            logger.warning("Load balancer RELEASED: %s", line)
+        return released
+
     async def _observe_load_balancer(self, decision: Any) -> None:
         """Run one balancer tick: log/expose what it decides, act only if allowed.
 
@@ -3720,8 +3744,8 @@ class ExecutorEngine:
             for line in self._balancer_applied:
                 logger.warning("Load balancer ACTED: %s", line)
         else:
-            self._balancer_actuator.forget()
-            self._balancer_applied = []
+            # actuate off: hand back anything still held from when it was on.
+            self._balancer_applied = await self._release_load_balancer()
 
         # Summary on STATE CHANGE only (per-entry changes are logged by the core).
         if status.state != self._last_logged_balancer_state:
