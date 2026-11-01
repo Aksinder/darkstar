@@ -14,6 +14,7 @@ from backend.api.deps import get_learning_store
 from backend.core.prices import get_nordpool_data
 from backend.core.secrets import load_yaml
 from backend.learning.store import LearningStore
+from utils.atomic_io import atomic_write_json
 
 # executor/history needs access
 # We might need to adjust python path in dev-backend.sh if not matching
@@ -519,9 +520,9 @@ async def save_schedule(request_body: dict[str, Any]) -> dict[str, str]:
             meta["last_manual_override"] = datetime.now().isoformat()
             existing["meta"] = meta
 
-        # Write back
-        with schedule_path.open("w") as f:
-            json.dump(existing, f, indent=2, default=str)
+        # Write back atomically: the executor reads this file every tick and a
+        # truncating open("w") rewrite once handed it torn JSON.
+        atomic_write_json(schedule_path, existing, indent=2, default=str)
 
         logger.info("Schedule saved with %d overrides", len(overrides))
         return {"status": "success", "message": f"Saved {len(overrides)} overrides"}
