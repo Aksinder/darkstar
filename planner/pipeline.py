@@ -13,7 +13,7 @@ import copy
 import json
 import logging
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -112,7 +112,11 @@ def _load_previous_schedule() -> list[dict[str, Any]]:
 
 
 async def _apply_ev_owner_levers(
-    kepler_config: Any, active_config: dict[str, Any], kepler_input: Any
+    kepler_config: Any,
+    active_config: dict[str, Any],
+    kepler_input: Any,
+    *,
+    vacation_enabled: bool = False,
 ) -> None:
     """Feed the owner's EV helpers into the MILP's incentive ladders.
 
@@ -124,6 +128,7 @@ async def _apply_ev_owner_levers(
     """
     from backend.core.ha_client import get_ha_entity_state, get_ha_sensor_float
     from planner.ev_priority import (
+        add_departure_energy_target,
         apply_departure_target,
         apply_floor_target,
         apply_priority_order,
@@ -163,6 +168,9 @@ async def _apply_ev_owner_levers(
         slots[-1].end_time - slots[0].start_time
     ).total_seconds() / 3600.0
     now_ts = slots[0].start_time.timestamp()
+    dep_cfg: dict[str, Any] = active_config.get("ev_departure_target", {}) or {}
+    dep_penalty = float(dep_cfg.get("shortfall_penalty_sek_per_kwh", 0.0) or 0.0)
+    dep_target_on = bool(dep_cfg.get("enabled", False)) and dep_penalty > 0.0
     for c in surplus_cfg.get("chargers", []) or []:
         dep_entity = c.get("departure_entity")
         # Trip target: explicit departure_target_entity if wired, else the car's
@@ -179,6 +187,23 @@ async def _apply_ev_owner_levers(
             chargers, str(c.get("id", "")), hours, target, horizon_hours
         ):
             logger.info("%s", note)
+        # Opt-in soft energy target for the same trip (ev_departure_target). Only a
+        # future departure inside the horizon, never while away (vacation clears
+        # the servo's deadlines too).
+        if (
+            dep_target_on
+            and not vacation_enabled
+            and hours is not None
+            and 0.0 < hours <= horizon_hours
+        ):
+            for note in add_departure_energy_target(
+                chargers,
+                str(c.get("id", "")),
+                slots[0].start_time + timedelta(hours=hours),
+                target,
+                dep_penalty,
+            ):
+                logger.info("%s", note)
 
 
 def _load_hot_water_states(
@@ -1458,6 +1483,7 @@ class PlannerPipeline:
                 solver_ev_cfg,
                 ev_charger_states_with_deadline,
                 load_priority_cfg=active_config.get("load_priority"),
+                departure_target_cfg=active_config.get("ev_departure_target"),
             )
 
             # Owner EV levers: priority select re-weighting + one-off departure
@@ -1466,7 +1492,12 @@ class PlannerPipeline:
             # replaced wholesale right here). Entities come from the servo's own
             # config block; every read is fail-soft, leaving ladders unchanged.
             try:
-                await _apply_ev_owner_levers(kepler_config, active_config, kepler_input)
+                await _apply_ev_owner_levers(
+                    kepler_config,
+                    active_config,
+                    kepler_input,
+                    vacation_enabled=vacation_enabled,
+                )
             except Exception:
                 logger.exception("EV owner levers failed — configured ladders unchanged")
 

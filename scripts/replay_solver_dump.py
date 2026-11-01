@@ -48,6 +48,7 @@ from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
     DeferrableLoadInput,
     EVChargerInput,
+    EVDepartureTarget,
     ExcessPVSinkSpec,
     IncentiveBucket,
     KeplerConfig,
@@ -96,6 +97,10 @@ def rehydrate_config(cfg: dict[str, Any]) -> KeplerConfig:
                 "deadline": _dt(e.get("deadline")),
                 "incentive_buckets": [
                     _build(IncentiveBucket, b) for b in e.get("incentive_buckets") or []
+                ],
+                "departure_targets": [
+                    _build(EVDepartureTarget, {**t, "deadline": _dt(t.get("deadline"))})
+                    for t in e.get("departure_targets") or []
                 ],
             },
         )
