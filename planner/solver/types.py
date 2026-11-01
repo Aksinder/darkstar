@@ -89,6 +89,24 @@ class WaterHeaterInput:
 
 
 @dataclass
+class EVDepartureTarget:
+    """Soft "energy in the car by departure" goal for one EV (default: none).
+
+    The solver adds ONE continuous shortfall slack per target (no binaries):
+    grid energy charged in slots that END by ``deadline`` plus the slack must cover
+    ``(target_soc - current_soc) x capacity / charge_efficiency``. Each kWh of slack
+    costs ``shortfall_penalty_sek_per_kwh`` — read it as "the most I will pay per
+    grid kWh to have the car at target by then". It coexists with penalty_levels:
+    the ladder still caps how much the car may take in total, so a target above the
+    top band can only be partly met (the remainder is a constant penalty).
+    """
+
+    deadline: datetime
+    target_soc_percent: float
+    shortfall_penalty_sek_per_kwh: float
+
+
+@dataclass
 class EVChargerInput:
     """Per-device EV charger input for the Kepler MILP solver."""
 
@@ -99,6 +117,11 @@ class EVChargerInput:
     plugged_in: bool
     deadline: datetime | None
     incentive_buckets: list[IncentiveBucket] = field(default_factory=lambda: [])
+    # Grid -> car efficiency (charger + on-board losses). Energy delivered INTO the
+    # car is grid energy x this, so SoC goals (incentive buckets, departure targets)
+    # need more grid energy than their SoC span. 1.0 = legacy (no losses modelled).
+    charge_efficiency: float = 1.0
+    departure_targets: list[EVDepartureTarget] = field(default_factory=lambda: [])
 
 
 @dataclass
