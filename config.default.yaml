@@ -683,9 +683,19 @@ load_priority:
 # relief_start_a and buys extra balanced discharge (supply/3 off each phase) when one
 # approaches the fuse — and does nothing at all for a comfortably balanced house.
 # Uses the per-hour phase profile learned by phase_observer (fractions_by_hour in
-# phase_model.json); with no learned split, this is inert. Limitation: only the BASE
-# load is phase-attributed — solver-scheduled loads (water blocks, EV plans) are not,
-# so relief comes from discharge, not from moving those loads.
+# phase_model.json); with no learned split, this is inert.
+# Per-device phases: once ANY planned load declares a phase_map, the planned energy
+# of every EV charger and water heater (incl. spa) enters the same per-phase rows —
+# 1/len(phase_map) on each listed phase, an even 1/3 split for devices without one —
+# so relief can also come from MOVING a single-phase load off its phase's tight
+# hours. Reuses the existing keys (a/b/c = L1/L2/L3; l1..l3 and 1..3 also accepted):
+#   water_heaters[].phase_map: [a, b, c]   # e.g. a three-phase house VVB
+#   cyclic_loads[].phase_map:  [b]         # pre-scheduled fixed load, put on its phase
+#   ev_chargers[].phase_map:   [a]         # e.g. a 1-phase car landing on L1; when
+#                                          #   absent, the same-id
+#                                          #   executor.ev_surplus.chargers[] phase_map
+# No device with a phase_map => exactly the base-load-only rows. Amps <-> kWh use
+# load_balancing.nominal_voltage_v (else system.grid.nominal_voltage_v, else 230).
 phase_aware:
   enabled: false
   relief_start_a: 20                 # start penalizing when a phase draws more than this (A);

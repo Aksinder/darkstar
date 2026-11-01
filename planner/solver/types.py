@@ -92,6 +92,10 @@ class WaterHeaterInput:
     # [0, min_kwh_per_day] in the solver, so it can only ever LOWER bucket 0 and can
     # never touch a later bucket.
     first_bucket_min_kwh: float | None = None
+    # Grid phases this heater draws on, normalised to "A"/"B"/"C" (config:
+    # water_heaters[].phase_map). Only read by the fuse-relief rows: planned energy is
+    # split 1/len(phases) onto each listed phase. EMPTY = unknown => even split.
+    phases: list[str] = field(default_factory=lambda: [])
 
 
 @dataclass
@@ -128,6 +132,10 @@ class EVChargerInput:
     # need more grid energy than their SoC span. 1.0 = legacy (no losses modelled).
     charge_efficiency: float = 1.0
     departure_targets: list[EVDepartureTarget] = field(default_factory=lambda: [])
+    # Grid phases this charger draws on, normalised to "A"/"B"/"C" (config:
+    # ev_chargers[].phase_map, else the same-id executor.ev_surplus charger's
+    # phase_map). Only read by the fuse-relief rows. EMPTY = unknown => even split.
+    phases: list[str] = field(default_factory=lambda: [])
 
 
 @dataclass
@@ -363,10 +371,12 @@ class KeplerConfig:
     # zero when every phase is comfortably inside the fuse, steep enough to buy
     # discharge when one approaches it. No import-price coupling at all.
     #
-    # Limitation, stated honestly: the per-phase deficit is computed from the BASE
-    # load forecast split (phase_load_fractions/profile). Solver-scheduled loads
-    # (water blocks, EV plans) are not phase-attributed yet, so relief comes from
-    # discharge, not from moving those loads off the heavy phase's dear hours.
+    # Base load is split by the learned profile (phase_load_fractions/profile).
+    # Solver-scheduled loads (EV per charger, water heaters incl. spa) enter the
+    # same rows once ANY device declares phases (phase_map): 1/len(phases) on each
+    # listed phase, an even split for devices without one. So relief can come from
+    # MOVING a single-phase load off its phase's tight hours, not only discharge.
+    # No device with phases => rows identical to the base-load-only form.
     phase_aware_enabled: bool = False
     # Start penalizing when a phase's grid draw exceeds this many amperes (~230 V).
     # Default 20 A leaves 5 A of margin on a 25 A main fuse.
@@ -376,6 +386,9 @@ class KeplerConfig:
     # comfortably above wear + terminal value, so the solver acts near the fuse and
     # only there.
     phase_relief_sek_per_a_h: float = 2.0
+    # Line-to-neutral voltage converting amps <-> kWh in the relief rows
+    # (load_balancing.nominal_voltage_v, else system.grid.nominal_voltage_v).
+    phase_nominal_voltage_v: float = 230.0
     phase_load_fractions: dict[str, float] | None = None
     phase_load_profile: dict[int, dict[str, float]] | None = None
 
@@ -426,6 +439,10 @@ class KeplerInputSlot:
     pv_kwh: float
     import_price_sek_kwh: float
     export_price_sek_kwh: float
+    # Part of load_kwh whose grid phase is KNOWN (fixed loads planned outside the
+    # MILP with a phase_map, e.g. cyclic pumps): {"A": kWh, ...}. The fuse-relief
+    # rows split only the remainder by the learned profile. None = nothing known.
+    phased_load_kwh: dict[str, float] | None = None
 
 
 @dataclass
