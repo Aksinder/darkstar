@@ -19,6 +19,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from backend.learning.models import SlotObservation
+from ml.price_features import price_knowable_until
 
 
 def train_price_model(
@@ -27,6 +28,7 @@ def train_price_model(
     model_name: str = "price_model.lgb",
     min_training_samples: int = 500,
     recency_half_life_days: float = 30.0,
+    timezone: str = "Europe/Stockholm",
 ) -> bool:
     """
     Train LightGBM quantile models for spot price forecasting.
@@ -40,6 +42,7 @@ def train_price_model(
         model_name: Base filename for the model
         min_training_samples: Minimum samples required to train
         recency_half_life_days: Half-life for exponential decay sample weighting
+        timezone: Local timezone of the price area (calendar features and lag lookups)
 
     Returns:
         True if training succeeded, False otherwise
@@ -50,7 +53,7 @@ def train_price_model(
     model_dir.mkdir(parents=True, exist_ok=True)
 
     # Build training dataset by joining price_forecasts with slot_observations
-    training_data = _build_training_dataset(db_path)
+    training_data = _build_training_dataset(db_path, timezone=timezone)
 
     if training_data is None or training_data.empty:
         print("No training data available (no price forecasts with matching observations).")
@@ -114,7 +117,9 @@ def train_price_model(
         return False
 
 
-def _build_training_dataset(db_path: str) -> pd.DataFrame | None:
+def _build_training_dataset(
+    db_path: str, timezone: str = "Europe/Stockholm"
+) -> pd.DataFrame | None:
     """
     Build training dataset by joining price_forecasts with slot_observations.
 
@@ -169,15 +174,22 @@ def _build_training_dataset(db_path: str) -> pd.DataFrame | None:
 
         session.close()
 
-        # Parse timestamps
-        df["slot_start"] = pd.to_datetime(df["slot_start"], format="ISO8601", utc=True)
-        df["issue_timestamp"] = pd.to_datetime(df["issue_timestamp"], format="ISO8601", utc=True)
+        # Parse timestamps, then express them in LOCAL time: inference builds its
+        # calendar features (hour, weekday, holiday) from local slot starts, and
+        # slot_observations keys are local ISO strings -- a UTC isoformat never
+        # string-matches one, which left every training lag NaN.
+        df["slot_start"] = pd.to_datetime(
+            df["slot_start"], format="ISO8601", utc=True
+        ).dt.tz_convert(timezone)
+        df["issue_timestamp"] = pd.to_datetime(
+            df["issue_timestamp"], format="ISO8601", utc=True
+        ).dt.tz_convert(timezone)
 
         # Add calendar features
         df = _add_calendar_features(df)
 
         # Add price lag features
-        df = _add_price_lag_features(df, db_path)
+        df = _add_price_lag_features(df, db_path, timezone=timezone)
 
         return df
 
@@ -200,8 +212,17 @@ def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _add_price_lag_features(df: pd.DataFrame, db_path: str) -> pd.DataFrame:
-    """Add price lag features (1d, 7d, 24h avg) from slot_observations."""
+def _add_price_lag_features(
+    df: pd.DataFrame, db_path: str, timezone: str = "Europe/Stockholm"
+) -> pd.DataFrame:
+    """Add price lag features (1d, 7d, 24h avg) from slot_observations.
+
+    Each lag is masked to NaN unless its source slot was knowable when the row
+    was issued: before ``price_knowable_until(issue_timestamp)`` (end of the
+    issue day -- recorded, or published day-ahead). Inference caps its lags at the
+    same bound, so training never sees a lag that inference could not have had
+    (a D+5 row used to get the actual price of D+4 as ``price_lag_1d``).
+    """
     df = df.copy()
 
     # Initialize lag columns with NaN
@@ -215,40 +236,48 @@ def _add_price_lag_features(df: pd.DataFrame, db_path: str) -> pd.DataFrame:
         session = SessionLocal()
 
         for idx, row in df.iterrows():
-            slot_start = row["slot_start"]
+            # Local time: slot_observations keys are local ISO strings.
+            slot_start = pd.Timestamp(row["slot_start"]).tz_convert(timezone)
+            knowable_until = price_knowable_until(
+                pd.Timestamp(row["issue_timestamp"]).to_pydatetime(), timezone
+            )
 
             # Price lag 1 day ago
             lag_1d = slot_start - timedelta(days=1)
-            result = (
-                session.query(SlotObservation)
-                .filter(SlotObservation.slot_start == lag_1d.isoformat())
-                .first()
-            )
-            if result and result.export_price_sek_kwh is not None:
-                df.at[idx, "price_lag_1d"] = result.export_price_sek_kwh
+            lag_1d_knowable = lag_1d < knowable_until
+            if lag_1d_knowable:
+                result = (
+                    session.query(SlotObservation)
+                    .filter(SlotObservation.slot_start == lag_1d.isoformat())
+                    .first()
+                )
+                if result and result.export_price_sek_kwh is not None:
+                    df.at[idx, "price_lag_1d"] = result.export_price_sek_kwh
 
             # Price lag 7 days ago
             lag_7d = slot_start - timedelta(days=7)
-            result = (
-                session.query(SlotObservation)
-                .filter(SlotObservation.slot_start == lag_7d.isoformat())
-                .first()
-            )
-            if result and result.export_price_sek_kwh is not None:
-                df.at[idx, "price_lag_7d"] = result.export_price_sek_kwh
-
-            # Trailing 24-hour average
-            trailing_start = lag_1d - timedelta(hours=23)
-            results = (
-                session.query(SlotObservation)
-                .filter(
-                    SlotObservation.slot_start >= trailing_start.isoformat(),
-                    SlotObservation.slot_start <= lag_1d.isoformat(),
-                    SlotObservation.export_price_sek_kwh.isnot(None),
+            if lag_7d < knowable_until:
+                result = (
+                    session.query(SlotObservation)
+                    .filter(SlotObservation.slot_start == lag_7d.isoformat())
+                    .first()
                 )
-                .all()
-            )
-            if results:
+                if result and result.export_price_sek_kwh is not None:
+                    df.at[idx, "price_lag_7d"] = result.export_price_sek_kwh
+
+            # Trailing 24-hour average: the whole window ends at lag_1d, so it is
+            # knowable exactly when lag_1d is.
+            if lag_1d_knowable:
+                trailing_start = lag_1d - timedelta(hours=23)
+                results = (
+                    session.query(SlotObservation)
+                    .filter(
+                        SlotObservation.slot_start >= trailing_start.isoformat(),
+                        SlotObservation.slot_start <= lag_1d.isoformat(),
+                        SlotObservation.export_price_sek_kwh.isnot(None),
+                    )
+                    .all()
+                )
                 prices = [
                     r.export_price_sek_kwh for r in results if r.export_price_sek_kwh is not None
                 ]
@@ -256,6 +285,7 @@ def _add_price_lag_features(df: pd.DataFrame, db_path: str) -> pd.DataFrame:
                     df.at[idx, "price_lag_24h_avg"] = sum(prices) / len(prices)
 
         session.close()
+        engine.dispose()
 
     except Exception as exc:
         print(f"Warning: Error computing price lags: {exc}")

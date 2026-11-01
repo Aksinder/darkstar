@@ -260,6 +260,7 @@ async def train_all_models(
                 model_name=price_model_name,
                 min_training_samples=min_price_samples,
                 recency_half_life_days=30.0,
+                timezone=str(engine.config.get("timezone", "Europe/Stockholm")),
             )
 
             # Determine model path for forecasting
