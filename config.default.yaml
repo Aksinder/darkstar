@@ -1051,9 +1051,9 @@ kepler:
   # whole slot (full-slot PV/load and charge/discharge headroom on top of the current
   # SoC). true plans it over the time left: PV/load scaled to the remaining share,
   # every limit/flow over the remaining hours, kW = planned energy / remaining hours.
-  # Off until the executor derives slot-0 export power from grid_export_kw rather than
-  # export_kwh x 4 (it would command too little export in a partial slot).
-  partial_first_slot: false
+  # The executor reads slot export power from grid_export_kw (planner kW), so a
+  # partial slot 0 commands the right export power.
+  partial_first_slot: true
 
   # Solver runtime knobs. Absent/0 = built-in defaults (240 s budget, 1 % MIP gap).
   # highs_options is forwarded verbatim to HiGHS (setOptionValue) — an ops escape

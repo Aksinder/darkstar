@@ -183,6 +183,7 @@ def compute_slot_record(
     dis = q("dis")
     water = q("water")
     ev = q("ev")
+    cyclic = q("cyclic")
 
     load = max(
         0.0,
@@ -192,7 +193,8 @@ def compute_slot_record(
         + (dis or 0.0)
         - (cha or 0.0)
         - (water or 0.0)
-        - (ev or 0.0),
+        - (ev or 0.0)
+        - (cyclic or 0.0),
     )
     record: dict[str, Any] = {
         "slot_start": slot_start,
@@ -263,6 +265,17 @@ async def repair_observations(
         if config.get("system", {}).get("has_ev_charger", False)
         else []
     )
+    # Cyclic loads (pool pump, filter) are subtracted from base load by the live
+    # recorder too: the planner adds them back as fixed load, so a repaired row
+    # that kept them in base load would count them twice.
+    cyclic_sensors = [
+        str(c.get("power_sensor") or c.get("sensor"))
+        for c in config.get("cyclic_loads", []) or []
+        if isinstance(c, dict)
+        and c.get("enabled", True)
+        and (c.get("power_sensor") or c.get("sensor"))
+        and c.get("id")
+    ]
 
     series_spec: list[tuple[str, str | None, str]] = [
         ("pv", input_sensors.get("pv_power"), "mean_kw"),
@@ -271,7 +284,9 @@ async def repair_observations(
         ("cha", input_sensors.get("total_battery_charge"), "change"),
         ("dis", input_sensors.get("total_battery_discharge"), "change"),
     ]
-    entity_ids = [e for _, e, _ in series_spec if e] + water_sensors + ev_sensors
+    entity_ids = (
+        [e for _, e, _ in series_spec if e] + water_sensors + ev_sensors + cyclic_sensors
+    )
     if not input_sensors.get("pv_power"):
         return {"error": "no pv_power sensor configured", "repaired": 0}
 
@@ -280,8 +295,12 @@ async def repair_observations(
     hourly: dict[str, dict[datetime, float]] = {
         name: _hourly_kwh(stats, entity, kind) for name, entity, kind in series_spec
     }
-    # Sum multi-device water/EV into single series.
-    for name, sensors in (("water", water_sensors), ("ev", ev_sensors)):
+    # Sum multi-device water/EV/cyclic into single series.
+    for name, sensors in (
+        ("water", water_sensors),
+        ("ev", ev_sensors),
+        ("cyclic", cyclic_sensors),
+    ):
         merged: dict[datetime, float] = {}
         for s in sensors:
             for hour, kwh in _hourly_kwh(stats, s, "mean_kw").items():

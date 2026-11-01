@@ -252,6 +252,12 @@ class TestParseSlotPlan:
 
         assert slot.export_kw == 8.0  # 2 kWh * 4 = 8 kW
 
+    def test_export_prefers_planner_kw_on_partial_slot(self, engine):
+        """A partial slot 0 carries export energy for the remaining minutes only;
+        the planner's grid_export_kw is the power to command, not kWh x 4."""
+        slot = engine._parse_slot_plan({"export_kwh": 1.0, "grid_export_kw": 8.0})
+        assert slot.export_kw == 8.0
+
     def test_export_price_preserved(self, engine):
         slot = engine._parse_slot_plan({"export_price_sek_kwh": -0.05})
         assert slot.export_price_sek_kwh == -0.05
