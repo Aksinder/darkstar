@@ -76,13 +76,16 @@ async def _run_get_load_profile(states: list[dict]) -> list[float]:
 
     client = AsyncMock()
     client.get = AsyncMock(return_value=response)
+    client_cm = MagicMock()
+    client_cm.__aenter__ = AsyncMock(return_value=client)
+    client_cm.__aexit__ = AsyncMock(return_value=False)
 
     cfg = {
         "timezone": "Europe/Stockholm",
         "input_sensors": {"total_load_consumption": "sensor.lifetime_kwh"},
     }
     with (
-        patch("backend.core.ha_client.get_ha_http_client", return_value=client),
+        patch("backend.core.ha_client.httpx.AsyncClient", return_value=client_cm),
         patch(
             "backend.core.secrets.load_home_assistant_config",
             return_value={"url": "http://homeassistant:8123", "token": "test_token"},
