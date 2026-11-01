@@ -29,6 +29,7 @@ from planner.inputs.learning import load_learning_overlays
 from planner.inputs.weather import fetch_temperature_forecast
 from planner.output.schedule import SCHEDULE_JSON_PATH, save_schedule_to_json
 from planner.output.soc_target import apply_soc_target_percent
+from planner.plan_guard import settings_from_config as plan_guard_settings, solve_guarded
 from planner.preflight import run_preflight
 from planner.solver.adapter import (
     config_to_kepler_config,
@@ -1765,7 +1766,16 @@ class PlannerPipeline:
         run_preflight(input_data, active_config, now=now_override)
 
         solver = KeplerSolver()
-        result = await asyncio.to_thread(solver.solve, kepler_input, kepler_config)
+        # Plan guard: independent validation + opt-in battery-only fallback on solver
+        # failure (planner/plan_guard.py). Defaults keep the old behaviour.
+        result, plan_meta = await asyncio.to_thread(
+            solve_guarded,
+            solver.solve,
+            kepler_input,
+            kepler_config,
+            plan_guard_settings(active_config),
+            Path(SCHEDULE_JSON_PATH),
+        )
 
         if result.slots:
             logger.info(
@@ -1952,6 +1962,7 @@ class PlannerPipeline:
                 s_index_debug,
                 window_responsibilities,
                 planner_state_debug,
+                extra_meta=plan_meta,
             )
 
             # Rev UI5: Always store plan to slot_plans for performance tracking
