@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -8,6 +9,7 @@ from ruamel.yaml import YAML
 
 from backend.api.routers.executor import get_executor_instance
 from backend.config_migration import (
+    CONFIG_WRITE_LOCK,
     remove_deprecated_keys,
     template_aware_merge,
     write_config,
@@ -249,63 +251,73 @@ async def save_config(
                     source[key] = coerced_value
             return source
 
-        config_path = Path("config.yaml")
-        default_path = Path("config.default.yaml")
+        def _locked_read_modify_write() -> list[dict[str, str]]:
+            # The WHOLE read-modify-write runs under CONFIG_WRITE_LOCK (shared with
+            # update_config, reflex and every other in-process writer). Only the
+            # write used to be locked: two saves that both read before either wrote
+            # left the later one silently dropping the earlier one's change. Run in
+            # a worker thread so waiting on the lock never stalls the event loop.
+            with CONFIG_WRITE_LOCK:
+                config_path = Path("config.yaml")
+                default_path = Path("config.default.yaml")
 
-        # REV F57: ALWAYS start with fresh template (preserves structure/comments)
-        if not default_path.exists():
-            raise HTTPException(500, "config.default.yaml not found")
+                # REV F57: ALWAYS start with fresh template (preserves structure/comments)
+                if not default_path.exists():
+                    raise HTTPException(500, "config.default.yaml not found")
 
-        # Load template as base (has all comments and structure)
-        with default_path.open(encoding="utf-8") as df:
-            template_config: dict[str, Any] = yaml_handler.load(df) or {}  # type: ignore[no-untyped-call]
+                # Load template as base (has all comments and structure)
+                with default_path.open(encoding="utf-8") as df:
+                    template_config: dict[str, Any] = yaml_handler.load(df) or {}  # type: ignore[no-untyped-call]
 
-        # Load user config for current values
-        with config_path.open(encoding="utf-8") as f:
-            user_data: dict[str, Any] = yaml_handler.load(f) or {}  # type: ignore[no-untyped-call]
+                # Load user config for current values
+                with config_path.open(encoding="utf-8") as f:
+                    user_data: dict[str, Any] = yaml_handler.load(f) or {}  # type: ignore[no-untyped-call]
 
-        # Filter secrets before merging
-        filter_secrets(payload, SECRET_KEYS)
+                # Filter secrets before merging
+                filter_secrets(payload, SECRET_KEYS)
 
-        # Merge payload into user data first
-        # We use template_config as schema for type coercion
-        deep_update(user_data, payload, template_config)
+                # Merge payload into user data first
+                # We use template_config as schema for type coercion
+                deep_update(user_data, payload, template_config)
 
-        # Then merge user values into fresh template (preserves template structure)
-        template_aware_merge(template_config, user_data)
+                # Then merge user values into fresh template (preserves template structure)
+                template_aware_merge(template_config, user_data)
 
-        # Clean deprecated keys
-        template_config, cleanup_changed = remove_deprecated_keys(template_config)
-        if cleanup_changed:
-            logger.info("Backend save: Removed deprecated keys")
+                # Clean deprecated keys
+                template_config, cleanup_changed = remove_deprecated_keys(template_config)
+                if cleanup_changed:
+                    logger.info("Backend save: Removed deprecated keys")
 
-        # template_config now has: template structure + comments + user values
-        data = template_config
+                # template_config now has: template structure + comments + user values
+                data = template_config
 
-        # REV LCL01: Validate config before saving and collect warnings/errors
-        validation_issues = _validate_config_for_save(data)
-        errors = [i for i in validation_issues if i["severity"] == "error"]
-        warnings = [i for i in validation_issues if i["severity"] == "warning"]
+                # REV LCL01: Validate config before saving and collect warnings/errors
+                validation_issues = _validate_config_for_save(data)
+                errors = [i for i in validation_issues if i["severity"] == "error"]
+                warnings = [i for i in validation_issues if i["severity"] == "warning"]
 
-        # If there are critical errors, reject the save
-        if errors:
-            raise HTTPException(
-                400,
-                detail={
-                    "message": "Configuration has critical errors",
-                    "errors": errors,
-                    "warnings": warnings,
-                },
-            )
+                # If there are critical errors, reject the save
+                if errors:
+                    raise HTTPException(
+                        400,
+                        detail={
+                            "message": "Configuration has critical errors",
+                            "errors": errors,
+                            "warnings": warnings,
+                        },
+                    )
 
-        # Save the config through the atomic writer (even if warnings exist).
-        # write_config writes to a .tmp sibling then atomically replaces the target,
-        # creating a timestamped backup first. Returns False if aborted or failed.
-        if not write_config(config_path, data, yaml_handler):
-            raise HTTPException(
-                500,
-                detail={"message": "Config save aborted - post-write validation failed"},
-            )
+                # Save the config through the atomic writer (even if warnings exist).
+                # write_config writes to a .tmp sibling then atomically replaces the target,
+                # creating a timestamped backup first. Returns False if aborted or failed.
+                if not write_config(config_path, data, yaml_handler):
+                    raise HTTPException(
+                        500,
+                        detail={"message": "Config save aborted - post-write validation failed"},
+                    )
+                return warnings
+
+        warnings = await asyncio.to_thread(_locked_read_modify_write)
 
         # REV F53: Notify executor to reload config after successful save
         try:
