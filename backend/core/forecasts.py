@@ -1,5 +1,6 @@
 import logging
-from datetime import datetime, timedelta
+from bisect import bisect_right
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +22,54 @@ def get_forecast_db_path() -> str:
     from pathlib import Path
 
     return str(Path("data/planner_learning.db").resolve())
+
+
+# How far back build_db_forecast_for_slots looks for a stored day to fill a coverage
+# gap from. Stored forecasts are kept, so yesterday is normally there; two days keeps
+# the extra read (and get_forecast_slots' weather fetch) on the cheap past_days path.
+_PV_FALLBACK_LOOKBACK_DAYS = 2
+
+
+def _estimate_from_same_time_of_day(
+    ts: datetime,
+    by_tod: dict[time, list[tuple[date, float]]],
+) -> float | None:
+    """Stored value at the same local time of day: latest earlier day, else earliest later day."""
+    candidates = by_tod.get(ts.time())
+    if not candidates:
+        return None
+    day = ts.date()
+    earlier = [item for item in candidates if item[0] < day]
+    if earlier:
+        return max(earlier, key=lambda item: item[0])[1]
+    later = [item for item in candidates if item[0] > day]
+    if later:
+        return min(later, key=lambda item: item[0])[1]
+    return None
+
+
+def _interpolate_small_pv_gaps(slots: list[dict[str, Any]], max_gap_slots: int = 2) -> None:
+    """Linearly interpolate PV across genuine small gaps (1-2 slots) between stored slots.
+
+    Operates in place on slots flagged ``pv_estimated``; longer gaps and gaps at either
+    end keep their same-time-of-day estimate.
+    """
+    i = 0
+    while i < len(slots):
+        if not slots[i].get("pv_estimated"):
+            i += 1
+            continue
+        end = i
+        while end < len(slots) and slots[end].get("pv_estimated"):
+            end += 1
+        size = end - i
+        if size <= max_gap_slots and i > 0 and end < len(slots):
+            prev_pv = float(slots[i - 1]["pv_forecast_kwh"])
+            next_pv = float(slots[end]["pv_forecast_kwh"])
+            for j in range(i, end):
+                fraction = (j - i + 1) / (size + 1)
+                slots[j]["pv_forecast_kwh"] = prev_pv + fraction * (next_pv - prev_pv)
+        i = end
 
 
 async def get_forecast_data(
@@ -395,6 +444,9 @@ async def _get_forecast_data_async(
                     declination=tilt_list_clean,
                     azimuth=azimuth_list_clean,
                     dc_kwp=kwp_list_clean,
+                    # Slots start at today 00:00 at the earliest; the library
+                    # default (92 days) only adds unused history to every fetch.
+                    past_days=1,
                 ) as forecast:
                     return await forecast.estimate()
 
@@ -424,11 +476,9 @@ async def _get_forecast_data_async(
                 rounded_time = slot_time.replace(
                     minute=(slot_time.minute // 15) * 15, second=0, microsecond=0
                 )
-                power_watts = 0.0
-                for solar_time, solar_power in solar_data_dict.items():
-                    if solar_time == rounded_time:
-                        power_watts = solar_power
-                        break
+                # Aware datetimes hash/compare by UTC instant, so a direct lookup
+                # matches keys across fixed-offset and pytz zones.
+                power_watts = solar_data_dict.get(rounded_time, 0.0)
                 pv_kwh_forecast.append(power_watts * 0.25 / 1000.0)
 
         # REV F60 Phase 7: Clear forecast errors after successful forecast
@@ -656,20 +706,41 @@ async def build_db_forecast_for_slots(
     if not records:
         return []
 
+    def _index(recs: list[dict[str, Any]]) -> dict[datetime, dict[str, Any]]:
+        out: dict[datetime, dict[str, Any]] = {}
+        for rec in recs:
+            ts = rec["slot_start"]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts)
+            if ts.tzinfo is None:
+                ts = pytz.UTC.localize(ts)
+            out[ts.astimezone(local_tz)] = rec
+        return out
+
     # Index forecasts by localised slot_start for quick lookup
-    indexed: dict[datetime, dict[str, Any]] = {}
-    for rec in records:
-        ts = rec["slot_start"]
-        if isinstance(ts, str):
-            ts = datetime.fromisoformat(ts)
-        if ts.tzinfo is None:
-            ts = pytz.UTC.localize(ts)
-        indexed[ts.astimezone(local_tz)] = rec
+    indexed = _index(records)
+    slot_times = [slot["start_time"].astimezone(local_tz) for slot in price_slots]
+
+    if any(ts not in indexed for ts in slot_times):
+        # Coverage gap: also load the stored days just before the horizon so a missing
+        # slot can borrow the same time of day from yesterday. Only on a miss, so the
+        # normal replan keeps its narrow (cheap) read.
+        lookback = await get_forecast_slots(
+            start_time - timedelta(days=_PV_FALLBACK_LOOKBACK_DAYS), start_time, version
+        )
+        indexed = {**_index(lookback or []), **indexed}
+
+    sorted_stored = sorted(indexed.keys())
+    pv_by_tod: dict[time, list[tuple[date, float]]] = {}
+    for local_ts in sorted_stored:
+        pv_by_tod.setdefault(local_ts.time(), []).append(
+            (local_ts.date(), float(indexed[local_ts]["final"]["pv_kwh"]))
+        )
 
     result: list[dict[str, Any]] = []
-    for slot in price_slots:
-        ts = slot["start_time"].astimezone(local_tz)
+    for ts in slot_times:
         rec = indexed.get(ts)
+        estimated = rec is None
 
         # Default values in case no forecast is found
         pv = 0.0
@@ -680,21 +751,25 @@ async def build_db_forecast_for_slots(
         load_p90 = None
 
         if rec is None:
-            # Defensive fallback: find closest forecast at or before requested slot
-            fallback_ts = None
-            for forecast_ts in sorted(indexed.keys()):
-                if forecast_ts <= ts:
-                    fallback_ts = forecast_ts
-                else:
-                    break
-
-            if fallback_ts is not None:
-                rec = indexed[fallback_ts]
-                print(
-                    f"Warning: No exact forecast match for {ts}, using fallback from {fallback_ts}"
+            # Load keeps the closest stored forecast at or before the slot.
+            pos = bisect_right(sorted_stored, ts)
+            if pos > 0:
+                fallback_ts = sorted_stored[pos - 1]
+                fallback_rec = indexed[fallback_ts]
+                logger.warning(
+                    "No exact forecast match for %s, using fallback from %s", ts, fallback_ts
                 )
-
-        if rec is not None:
+                load = float(fallback_rec["final"]["load_kwh"])
+                prob_data = fallback_rec.get("probabilistic", {}) or {}
+                load_p10 = prob_data.get("load_p10")
+                load_p90 = prob_data.get("load_p90")
+            # PV must never repeat the last stored slot (midday PV carried into the
+            # night, or a night zero into the day): take the same local time of day
+            # from the nearest stored day. PV bands stay unknown (None).
+            tod_pv = _estimate_from_same_time_of_day(ts, pv_by_tod)
+            if tod_pv is not None:
+                pv = tod_pv
+        else:
             # Use new nested structure from ml/api.py get_forecast_slots()
             pv = float(rec["final"]["pv_kwh"])
             load = float(rec["final"]["load_kwh"])
@@ -714,7 +789,9 @@ async def build_db_forecast_for_slots(
                 "pv_p90": pv_p90,
                 "load_p10": load_p10,
                 "load_p90": load_p90,
+                "pv_estimated": estimated,
             }
         )
 
+    _interpolate_small_pv_gaps(result)
     return result
