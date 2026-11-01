@@ -21,6 +21,7 @@ import collections
 import contextlib
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -73,6 +74,8 @@ logger = logging.getLogger(__name__)
 # Published after every tick that reached the inverter dispatch; the HA dead-man
 # automations watch its age.
 HEARTBEAT_ENTITY = "sensor.darkstar_executor_heartbeat"
+# Rate limit for the "sensor reads non-numeric" warning in _sensor_kw (per entity).
+BAD_SENSOR_WARN_INTERVAL_S = 600
 
 # How long a dropped SoC read may be bridged with the previous reading. Five
 # ticks: long enough for a Modbus hiccup, far too short for the battery to cross
@@ -4318,6 +4321,36 @@ class ExecutorEngine:
             )
         return hold
 
+    def _sensor_kw(self, raw: Any, entity: str | None) -> float | None:
+        """A W power state as kW, or None when absent/unknown/non-numeric.
+
+        Never raises. A non-numeric (or non-finite) state logs a WARNING at most
+        once per BAD_SENSOR_WARN_INTERVAL_S per entity, so a sensor stuck on a
+        text state cannot spam the log every tick.
+        """
+        if raw is None or raw == "" or raw in ("unknown", "unavailable"):
+            return None
+        try:
+            val = float(raw)
+        except (ValueError, TypeError):
+            val = float("nan")
+        if math.isfinite(val):
+            return val / 1000
+        warned: dict[str, float] = self.__dict__.setdefault("_bad_sensor_warned", {})
+        key = entity or "?"
+        now = time.monotonic()
+        last = warned.get(key)
+        if last is None or now - last >= BAD_SENSOR_WARN_INTERVAL_S:
+            warned[key] = now
+            logger.warning(
+                "Sensor %s reads non-numeric %r — ignoring it this tick (warning "
+                "repeats at most every %d min)",
+                key,
+                raw,
+                BAD_SENSOR_WARN_INTERVAL_S // 60,
+            )
+        return None
+
     async def _gather_system_state(self) -> SystemState:
         """Gather current system state from Home Assistant."""
         state = SystemState()
@@ -4419,21 +4452,21 @@ class ExecutorEngine:
                     soc_str,
                 )
 
-            pv_str = results.get("pv_power")
-            if pv_str and pv_str not in ("unknown", "unavailable"):
-                state.current_pv_kw = float(pv_str) / 1000  # W to kW
-
-            load_str = results.get("load_power")
-            if load_str and load_str not in ("unknown", "unavailable"):
-                state.current_load_kw = float(load_str) / 1000
-
-            imp_str = results.get("grid_import")
-            if imp_str and imp_str not in ("unknown", "unavailable"):
-                state.current_import_kw = float(imp_str) / 1000
-
-            exp_str = results.get("grid_export")
-            if exp_str and exp_str not in ("unknown", "unavailable"):
-                state.current_export_kw = float(exp_str) / 1000
+            # Per-entity safe parse (upstream 42716df2 idea): one non-numeric
+            # power state used to raise here and skip every read below it —
+            # including manual_override. A bad reading keeps the field's default.
+            pv_kw = self._sensor_kw(results.get("pv_power"), pv_power_entity)
+            if pv_kw is not None:
+                state.current_pv_kw = pv_kw  # W to kW
+            load_kw = self._sensor_kw(results.get("load_power"), load_power_entity)
+            if load_kw is not None:
+                state.current_load_kw = load_kw
+            imp_kw = self._sensor_kw(results.get("grid_import"), import_entity)
+            if imp_kw is not None:
+                state.current_import_kw = imp_kw
+            exp_kw = self._sensor_kw(results.get("grid_export"), export_entity)
+            if exp_kw is not None:
+                state.current_export_kw = exp_kw
 
             work_mode = results.get("work_mode")
             if work_mode:
