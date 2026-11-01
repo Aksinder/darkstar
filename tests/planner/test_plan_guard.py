@@ -375,6 +375,28 @@ def test_read_last_plan_naive_and_aware(tmp_path: Path):
     assert read_last_plan(tmp_path / "missing.json") == (None, "none")
 
 
+def test_read_last_plan_naive_planned_aware_now(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Naive local planned_at vs an aware UTC `now` must compare instants.
+
+    Stripping the zone off `now` read UTC wall time as local and was off by the
+    UTC offset (1-2 h in Stockholm), clamping a fresh plan's age to 0.
+    """
+    from datetime import UTC
+
+    monkeypatch.setenv("TZ", "Europe/Stockholm")
+    time.tzset()
+    try:
+        path = tmp_path / "s.json"
+        planned_local_naive = datetime(2026, 7, 1, 12, 0)  # CEST, UTC+2
+        path.write_text(json.dumps({"meta": {"planned_at": planned_local_naive.isoformat()}}))
+        now_utc = datetime(2026, 7, 1, 10, 30, tzinfo=UTC)  # 12:30 local
+        age, _ = read_last_plan(path, now=now_utc)
+        assert age == pytest.approx(30, abs=0.01)
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
+
+
 @pytest.mark.asyncio
 async def test_schedule_meta_carries_plan_source(tmp_path: Path):
     from planner.output.schedule import save_schedule_to_json

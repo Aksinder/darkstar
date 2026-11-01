@@ -99,11 +99,14 @@ def read_last_plan(schedule_path: Path, now: datetime | None = None) -> tuple[fl
     except Exception:
         return None, "none"
     source = str(meta.get("plan_source") or "kepler")
-    if planned.tzinfo is None:
-        ref = now.replace(tzinfo=None) if now is not None else datetime.now()
-    else:
-        ref = now if now is not None and now.tzinfo is not None else datetime.now(UTC)
-    return max(0.0, (ref - planned).total_seconds() / 60.0), source
+    # Compare instants, never wall clocks: a naive planned_at is container-local
+    # time, so localize it (astimezone() on a naive value assumes local) instead of
+    # stripping the zone off an aware `now` — that was off by the UTC offset.
+    planned_aware = planned if planned.tzinfo is not None else planned.astimezone()
+    ref = now if now is not None else datetime.now(UTC)
+    if ref.tzinfo is None:
+        ref = ref.astimezone()
+    return max(0.0, (ref - planned_aware).total_seconds() / 60.0), source
 
 
 def _log_validation(source: str, report: PlanValidation, mode: str) -> None:
