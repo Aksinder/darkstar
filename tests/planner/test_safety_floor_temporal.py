@@ -286,8 +286,9 @@ class TestCalculateSafetyFloor:
             price_horizon_end=price_horizon_end,
         )
 
+        # The 10% cap is floored at Risk 1's promised 25% min_buffer (be9aa889).
         min_soc_kwh = 0.12 * 34.2
-        max_allowed = min_soc_kwh + (0.10 * 34.2)
+        max_allowed = min_soc_kwh + (0.25 * 34.2)
         assert debug["using_extended_data"] is True
         assert debug["temporal_deficit_kwh"] > 30.0
         assert floor_kwh == pytest.approx(max_allowed, abs=0.01)
@@ -298,7 +299,8 @@ class TestCalculateSafetyFloor:
         df = build_test_df(load_kwh=100.0, pv_kwh=5.0)
 
         battery_cfg = {"capacity_kwh": 34.2, "min_soc_percent": 12.0}
-        s_index_cfg = {"risk_appetite": 1, "max_safety_buffer_percent": 10.0}  # Low cap
+        # Risk 4 (min_buffer 3%) under a 10% cap, so the cap is what binds.
+        s_index_cfg = {"risk_appetite": 4, "max_safety_buffer_percent": 10.0}
 
         floor_kwh, _debug = calculate_safety_floor(df, battery_cfg, s_index_cfg, "Europe/Stockholm")
 
@@ -310,6 +312,19 @@ class TestCalculateSafetyFloor:
             f"Floor ({floor_kwh:.2f}) should be capped at {max_allowed:.2f} "
             f"(10% of capacity above min_soc)"
         )
+
+    @pytest.mark.parametrize("cap_pct", [10.0, 20.0])
+    def test_safety_floor_cap_never_below_risk_min_buffer(self, cap_pct):
+        """Risk 1 promises a 25% buffer; a lower cap must not silently clip it
+        (upstream be9aa889 — the cap is floored at the risk level's min_buffer)."""
+        df = build_test_df(load_kwh=100.0, pv_kwh=5.0)
+        battery_cfg = {"capacity_kwh": 34.2, "min_soc_percent": 12.0}
+        s_index_cfg = {"risk_appetite": 1, "max_safety_buffer_percent": cap_pct}
+
+        floor_kwh, debug = calculate_safety_floor(df, battery_cfg, s_index_cfg, "Europe/Stockholm")
+
+        assert floor_kwh == pytest.approx(0.12 * 34.2 + 0.25 * 34.2, abs=0.01)
+        assert debug["max_buffer_kwh"] == pytest.approx(0.25 * 34.2, abs=0.01)
 
     def test_safety_floor_price_horizon_expansion(self):
         """

@@ -851,3 +851,42 @@ class TestAbsorbCapConfigOverride:
     def test_garbage_cap_is_ignored(self):
         cfg = self._cfg(absorb_cap_kwh_per_day="kanske")
         assert self._build(cfg, {}).absorb_cap_kwh_per_day is None
+
+
+class TestWearCostFloor:
+    """battery_cycle_cost_kwh and wear_cost_sek_per_kwh are both floors: max() wins.
+
+    battery_cycle_cost_kwh used to take precedence outright, so a lower cycle cost
+    silently undercut a higher wear cost (owner rule: wear never below 0.45).
+    """
+
+    @staticmethod
+    def _cfg(cycle: float | None, wear: float | None) -> dict:
+        config: dict = {
+            "battery": {"capacity_kwh": 16.0, "max_charge_a": 100, "max_discharge_a": 100}
+        }
+        if cycle is not None:
+            config["battery_economics"] = {"battery_cycle_cost_kwh": cycle}
+        if wear is not None:
+            config["wear_cost_sek_per_kwh"] = wear
+        return config
+
+    @pytest.mark.parametrize(
+        ("cycle", "wear", "expected"),
+        [
+            (0.2, 0.45, 0.45),  # lower cycle cost no longer undercuts the wear floor
+            (0.6, 0.45, 0.6),
+            (0.45, None, 0.45),
+            (None, 0.45, 0.45),
+            (None, None, 0.0),
+        ],
+    )
+    def test_max_of_configured_values(self, cycle, wear, expected):
+        kc = config_to_kepler_config(self._cfg(cycle, wear))
+        assert kc.wear_cost_sek_per_kwh == pytest.approx(expected)
+
+    def test_override_cannot_go_below_cycle_cost(self):
+        kc = config_to_kepler_config(
+            self._cfg(0.45, None), overrides={"wear_cost_sek_per_kwh": 0.1}
+        )
+        assert kc.wear_cost_sek_per_kwh == pytest.approx(0.45)

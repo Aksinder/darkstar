@@ -138,6 +138,7 @@ def _split_slot(
                 grid_import_kwh=coarse.grid_import_kwh * share,
                 grid_export_kwh=coarse.grid_export_kwh * share,
                 cost_sek=coarse.cost_sek * share,
+                duration_h=None,  # members are re-timed; kW from their own length
                 soc_kwh=soc_start
                 + (coarse.charge_kwh - coarse.discharge_kwh) * share * n,
             )
