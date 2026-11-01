@@ -82,15 +82,12 @@ def test_smoke_ha_entities(client):
     ]
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
-    mock_ctx = MagicMock()
-    mock_ctx.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_ctx.__aexit__ = AsyncMock(return_value=False)
     with (
         patch(
             "backend.core.secrets.load_home_assistant_config",
             return_value={"url": "http://test:8123", "token": "test"},
         ),
-        patch("httpx.AsyncClient", return_value=mock_ctx),
+        patch("backend.api.routers.ha.get_ha_http_client", return_value=mock_client),
     ):
         resp = client.get("/api/ha/entities")
     assert resp.status_code != 500
@@ -102,15 +99,12 @@ def test_smoke_ha_services(client):
     mock_response.json.return_value = [{"domain": "light", "services": {"turn_on": {}}}]
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
-    mock_ctx = MagicMock()
-    mock_ctx.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_ctx.__aexit__ = AsyncMock(return_value=False)
     with (
         patch(
             "backend.core.secrets.load_home_assistant_config",
             return_value={"url": "http://test:8123", "token": "test"},
         ),
-        patch("httpx.AsyncClient", return_value=mock_ctx),
+        patch("backend.api.routers.ha.get_ha_http_client", return_value=mock_client),
     ):
         resp = client.get("/api/ha/services")
     assert resp.status_code != 500
@@ -121,15 +115,12 @@ def test_smoke_ha_test(client):
     mock_response.status_code = 200
     mock_client = MagicMock()
     mock_client.get = AsyncMock(return_value=mock_response)
-    mock_ctx = MagicMock()
-    mock_ctx.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_ctx.__aexit__ = AsyncMock(return_value=False)
     with (
         patch(
             "backend.core.secrets.load_home_assistant_config",
             return_value={"url": "http://test:8123", "token": "test"},
         ),
-        patch("httpx.AsyncClient", return_value=mock_ctx),
+        patch("backend.api.routers.ha.get_ha_http_client", return_value=mock_client),
     ):
         resp = client.post("/api/ha/test")
     assert resp.status_code != 500
