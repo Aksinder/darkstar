@@ -5,6 +5,7 @@ Loads and validates the executor configuration from config.yaml.
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -560,17 +561,57 @@ class BalancedLoadConfig:
     entity: str | None = None
     on_value: str = "1"
     off_value: str = "0"
+    # Estimated power (kW) and an optional live power sensor (W), used to decide
+    # whether a shed load fits back in (restore). Unset = worst case: a full main
+    # fuse on its phases, so it only restores when the whole phase is free.
+    power_kw: float | None = None
+    power_sensor: str | None = None
+    # Anti-wear: minimum seconds a load stays on / off. An overload shed is
+    # still immediate; only restores wait.
+    min_on_s: int = 300
+    min_off_s: int = 300
+
+
+# Fixed id of the single battery give-way entry (upstream a0477e23).
+BATTERY_GIVE_WAY_ID = "battery"
+
+# Nominal grid phase voltage (Sweden: 230 V). Upstream keeps this in
+# backend.core.ev_power, which this fork does not carry.
+DEFAULT_NOMINAL_VOLTAGE_V = 230.0
+
+# Valid ranges (inclusive) for the ported balancer settings (upstream values).
+FUSE_PRESETS = ("typ_c", "diazed_gg", "custom")
+TARGET_MARGIN_RANGE: tuple[float, float] = (50.0, 100.0)
+RESUME_CONFIRM_RANGE: tuple[float, float] = (5.0, 300.0)
+RAMP_UP_WINDOW_RANGE: tuple[float, float] = (10.0, 600.0)
+MAX_STEP_INTERVAL_RANGE: tuple[float, float] = (5.0, 300.0)
+PENDING_TIMEOUT_RANGE: tuple[float, float] = (10.0, 600.0)
+MIN_ON_OFF_RANGE: tuple[float, float] = (0.0, 3600.0)
+_LB_PHASE_NAMES = {"1": 1, "2": 2, "3": 3, "l1": 1, "l2": 2, "l3": 3, "a": 1, "b": 2, "c": 3}
+# The shipped default of the superseded resume_margin_percent: a config still
+# carrying exactly this value never tuned it, so it gets the new 85 % default.
+LEGACY_RESUME_MARGIN_DEFAULT = 90.0
+
+
+@dataclass(frozen=True)
+class FuseCustomPoint:
+    """One point of a custom fuse trip curve: overload (% of rating) -> seconds."""
+
+    overload_percent: float
+    time_s: float
 
 
 @dataclass
 class GiveWayOrderEntry:
     """One entry in the unified give-way order (top gives way first).
 
-    kind="charger" references a type="current" ev_chargers[].id (throttle to
-    floor, then pause); kind="shed" references a loads[].device_id (switch off).
+    kind="charger" references a current-controllable charger (throttle to
+    floor, then pause); kind="shed" references a loads[].device_id (switch off);
+    kind="battery" (single entry, id always BATTERY_GIVE_WAY_ID) is the house
+    battery's planned grid charging (cap the charge power, then pause it).
     """
 
-    kind: str = "shed"  # "charger" | "shed"
+    kind: str = "shed"  # "charger" | "shed" | "battery"
     id: str = ""
 
 
@@ -582,24 +623,59 @@ class LoadBalancingConfig:
     # Sourced from system.grid.main_fuse_a in YAML; folded in here for convenience
     # since it is always consumed alongside the rest of this config as a unit.
     main_fuse_a: int | None = None
+    # ACTUATION GATE (fork-only). False = observe-only: the balancer computes,
+    # logs and exposes every decision but nothing it decides is written to a
+    # device. True = its EV reductions/pauses and shed-load switch-offs are
+    # applied — EV current ONLY via the Easee dynamic limit, stops/sheds ONLY via
+    # existing HA switches; never a persistent charger setting. The battery
+    # give-way stays observe-only even then (the S4 fuse_guard clamp owns it).
+    actuate: bool = False
     resume_delay_s: int = 120
-    resume_margin_percent: float = 90.0
+    # A balancer-paused charger re-fits once its phases have fitted its minimum
+    # current (within target_margin_percent) for this long (escalating back-off
+    # after repeated pauses).
+    resume_confirm_s: int = 10
+    # Increases, resumes and restores keep each phase's averaged current at or
+    # below this share of main_fuse_a. Supersedes resume_margin_percent (a
+    # user-tuned legacy value is still honoured).
+    target_margin_percent: float = 85.0
+    # Thermal trip-curve model of the protected fuse: "typ_c" (MCB), "diazed_gg"
+    # (screw-in fuse) or "custom" (two fuse_custom_points). Relief is demanded
+    # only once integrated heat reaches fuse_safety_percent of the trip time
+    # (default 80 typ_c / 65 diazed_gg), or a trip would come within one
+    # executor interval (urgent).
+    fuse_preset: str = "typ_c"
+    fuse_safety_percent: float | None = None
+    fuse_custom_points: list[FuseCustomPoint] = field(
+        default_factory=lambda: [FuseCustomPoint(130, 1200), FuseCustomPoint(300, 4)]
+    )
+    # Rolling-average window for increases/resume/restore.
+    ramp_up_window_s: int = 60
     increase_step_a: int = 1
     sensor_stale_after_s: int = 30
-    # Fallback voltage (V) for converting a power-mode phase to current when
-    # that phase has no configured grid_voltage_l* entity. Unrelated to
-    # ControllerConfig.nominal_voltage_v (DC battery voltage).
-    nominal_voltage_v: float = 220.0
+    # Voltage (V) for power->current conversion and the battery's W<->A math.
+    # Unrelated to ControllerConfig.nominal_voltage_v (DC battery voltage).
+    nominal_voltage_v: float = DEFAULT_NOMINAL_VOLTAGE_V
     loads: list[BalancedLoadConfig] = field(default_factory=lambda: [])
     # Unified give-way order across chargers and shed loads; the top entry
     # gives way first. Self-healed on load (see heal_give_way_order).
     give_way_order: list[GiveWayOrderEntry] = field(default_factory=lambda: [])
+    # True: heal_give_way_order appends devices missing from give_way_order.
+    # False: the list is taken literally (only entries naming a gone device drop).
+    auto_include_devices: bool = True
     # Notify (HA notify / Discord fallback) on shed, pause, and stale-fallback
     # transitions. Routine throttle/ramp adjustments never notify.
     notify_interventions: bool = False
     # Trigger one replan (via the plug/unplug replan path) after a charger has
     # been held below its planner target (or paused) this long, continuously.
     replan_after_throttled_s: int = 600
+    # Coordinated ramping (upstream ccb47c07): an actuator's next increase waits
+    # for its previous step to settle, at most max_step_interval_s; a granted
+    # increase counts against the room until measured or pending_timeout_s.
+    max_step_interval_s: int = 30
+    pending_timeout_s: int = 60
+    # Legacy (superseded by target_margin_percent); kept so old configs parse.
+    resume_margin_percent: float = 90.0
 
 
 @dataclass
@@ -823,11 +899,20 @@ def _parse_load_balancing_config(
                 )
                 continue
             phases_raw = load_item.get("phases", [])
-            phases = (
-                [int(p) for p in cast("list[Any]", phases_raw)]
-                if isinstance(phases_raw, list)
-                else []
-            )
+            phases: list[int] = []
+            for p in cast("list[Any]", phases_raw) if isinstance(phases_raw, list) else []:
+                # 1/2/3, "l1".."l3", or the fuse guard's meter names "a"/"b"/"c"
+                # (= L1/L2/L3 on this site). Unknown names are dropped LOUDLY —
+                # a guessed phase budgets the wrong conductor.
+                phase = _LB_PHASE_NAMES.get(str(p).strip().lower())
+                if phase is None:
+                    logger.warning(
+                        "load_balancing.loads[%s].phases: unknown phase %r ignored",
+                        load_item.get("device_id", "?"),
+                        p,
+                    )
+                elif phase not in phases:
+                    phases.append(phase)
             loads.append(
                 BalancedLoadConfig(
                     device_type=device_type,
@@ -836,6 +921,24 @@ def _parse_load_balancing_config(
                     entity=_str_or_none(load_item.get("entity")),
                     on_value=str(load_item.get("on_value", "1")),
                     off_value=str(load_item.get("off_value", "0")),
+                    power_kw=_positive_float_or_none(load_item.get("power_kw"), "power_kw"),
+                    power_sensor=_str_or_none(load_item.get("power_sensor")),
+                    min_on_s=int(
+                        _ranged_number(
+                            load_item.get("min_on_s", BalancedLoadConfig.min_on_s),
+                            "load_balancing.loads[].min_on_s",
+                            MIN_ON_OFF_RANGE,
+                            BalancedLoadConfig.min_on_s,
+                        )
+                    ),
+                    min_off_s=int(
+                        _ranged_number(
+                            load_item.get("min_off_s", BalancedLoadConfig.min_off_s),
+                            "load_balancing.loads[].min_off_s",
+                            MIN_ON_OFF_RANGE,
+                            BalancedLoadConfig.min_off_s,
+                        )
+                    ),
                 )
             )
 
@@ -848,6 +951,15 @@ def _parse_load_balancing_config(
             entry_item = cast("dict[str, Any]", item)
             kind = str(entry_item.get("kind", "")).lower()
             entry_id = str(entry_item.get("id", ""))
+            if kind == "battery":
+                if any(e.kind == "battery" for e in give_way_order):
+                    logger.warning(
+                        "load_balancing.give_way_order: duplicate battery entry %r, skipping",
+                        entry_item,
+                    )
+                    continue
+                give_way_order.append(GiveWayOrderEntry(kind="battery", id=BATTERY_GIVE_WAY_ID))
+                continue
             if kind not in ("charger", "shed") or not entry_id:
                 logger.warning(
                     "load_balancing.give_way_order: invalid entry %r, skipping", entry_item
@@ -855,12 +967,55 @@ def _parse_load_balancing_config(
                 continue
             give_way_order.append(GiveWayOrderEntry(kind=kind, id=entry_id))
 
+    # load_balancing.protected_fuse_a (upstream): the fuse this guard protects,
+    # overriding system.grid.main_fuse_a. Invalid => unconfigured (never guessed).
+    protected_raw = lb_data.get("protected_fuse_a")
+    if protected_raw is not None:
+        if (
+            isinstance(protected_raw, int | float)
+            and not isinstance(protected_raw, bool)
+            and math.isfinite(protected_raw)
+            and 1 <= protected_raw <= 125
+            and float(protected_raw).is_integer()
+        ):
+            main_fuse_a = int(protected_raw)
+        else:
+            logger.warning(
+                "Invalid load_balancing.protected_fuse_a: %r; protection unconfigured",
+                protected_raw,
+            )
+            main_fuse_a = None
+
     return LoadBalancingConfig(
         enabled=bool(lb_data.get("enabled", False)),
+        actuate=lb_data.get("actuate", False) is True,
         main_fuse_a=main_fuse_a,
         resume_delay_s=int(lb_data.get("resume_delay_s", LoadBalancingConfig.resume_delay_s)),
         resume_margin_percent=float(
             lb_data.get("resume_margin_percent", LoadBalancingConfig.resume_margin_percent)
+        ),
+        target_margin_percent=_ranged_number(
+            resolve_target_margin_percent(lb_data),
+            "load_balancing.target_margin_percent",
+            TARGET_MARGIN_RANGE,
+            LoadBalancingConfig.target_margin_percent,
+        ),
+        resume_confirm_s=int(
+            _ranged_number(
+                lb_data.get("resume_confirm_s", LoadBalancingConfig.resume_confirm_s),
+                "load_balancing.resume_confirm_s",
+                RESUME_CONFIRM_RANGE,
+                LoadBalancingConfig.resume_confirm_s,
+            )
+        ),
+        **_load_fuse_settings(lb_data),
+        ramp_up_window_s=int(
+            _ranged_number(
+                lb_data.get("ramp_up_window_s", LoadBalancingConfig.ramp_up_window_s),
+                "load_balancing.ramp_up_window_s",
+                RAMP_UP_WINDOW_RANGE,
+                LoadBalancingConfig.ramp_up_window_s,
+            )
         ),
         increase_step_a=int(lb_data.get("increase_step_a", LoadBalancingConfig.increase_step_a)),
         sensor_stale_after_s=int(
@@ -871,26 +1026,173 @@ def _parse_load_balancing_config(
         ),
         loads=loads,
         give_way_order=give_way_order,
+        auto_include_devices=lb_data.get("auto_include_devices", True) is not False,
         notify_interventions=bool(lb_data.get("notify_interventions", False)),
         replan_after_throttled_s=int(
             lb_data.get("replan_after_throttled_s", LoadBalancingConfig.replan_after_throttled_s)
         ),
+        max_step_interval_s=int(
+            _ranged_number(
+                lb_data.get("max_step_interval_s", LoadBalancingConfig.max_step_interval_s),
+                "load_balancing.max_step_interval_s",
+                MAX_STEP_INTERVAL_RANGE,
+                LoadBalancingConfig.max_step_interval_s,
+            )
+        ),
+        pending_timeout_s=int(
+            _ranged_number(
+                lb_data.get("pending_timeout_s", LoadBalancingConfig.pending_timeout_s),
+                "load_balancing.pending_timeout_s",
+                PENDING_TIMEOUT_RANGE,
+                LoadBalancingConfig.pending_timeout_s,
+            )
+        ),
     )
 
 
-def heal_give_way_order(lb: LoadBalancingConfig, current_type_charger_ids: list[str]) -> None:
+def resolve_target_margin_percent(lb_data: dict[str, Any]) -> Any:
+    """target_margin_percent, else a user-tuned legacy resume_margin_percent, else 85."""
+    if lb_data.get("target_margin_percent") is not None:
+        return lb_data["target_margin_percent"]
+    legacy = lb_data.get("resume_margin_percent")
+    if legacy is not None:
+        try:
+            if float(legacy) != LEGACY_RESUME_MARGIN_DEFAULT:
+                return legacy
+        except (TypeError, ValueError):
+            pass
+    return LoadBalancingConfig.target_margin_percent
+
+
+def validate_fuse_settings(lb: dict[str, Any]) -> list[str]:
+    """Fuse preset / safety / custom-curve validation (upstream 6bd57c53)."""
+    errors: list[str] = []
+    preset = lb.get("fuse_preset", "typ_c")
+    if preset not in FUSE_PRESETS:
+        errors.append("load_balancing.fuse_preset must be typ_c, diazed_gg or custom")
+    safety = lb.get("fuse_safety_percent")
+    if safety is not None and (
+        isinstance(safety, bool) or not isinstance(safety, int | float) or not 50 <= safety <= 100
+    ):
+        errors.append("load_balancing.fuse_safety_percent must be a number in range 50-100")
+    if preset == "custom":
+        raw_points: Any = lb.get(
+            "fuse_custom_points",
+            [{"overload_percent": 130, "time_s": 1200}, {"overload_percent": 300, "time_s": 4}],
+        )
+        points: list[dict[str, Any]] = []
+        valid = isinstance(raw_points, list) and len(cast("list[Any]", raw_points)) == 2
+        if valid:
+            for raw_point in cast("list[Any]", raw_points):
+                if not isinstance(raw_point, dict):
+                    valid = False
+                    break
+                point = cast("dict[str, Any]", raw_point)
+                points.append(point)
+                for key, low, high in (("overload_percent", 101, 1000), ("time_s", 0.5, 86400)):
+                    value: Any = point.get(key)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int | float)
+                        or not low <= value <= high
+                    ):
+                        valid = False
+        if not valid:
+            errors.append(
+                "load_balancing.fuse_custom_points must contain exactly two points: "
+                "overload_percent 101-1000, time_s 0.5-86400"
+            )
+        else:
+            first, second = sorted(points, key=lambda p: p["overload_percent"])
+            if (
+                first["overload_percent"] == second["overload_percent"]
+                or first["time_s"] <= second["time_s"]
+            ):
+                errors.append(
+                    "load_balancing.fuse_custom_points: higher overload_percent must have "
+                    "strictly shorter time_s"
+                )
+    return errors
+
+
+def _load_fuse_settings(lb: dict[str, Any]) -> dict[str, Any]:
+    errors = validate_fuse_settings(lb)
+    if errors:
+        for error in errors:
+            logger.warning("%s — using default fuse settings", error)
+        return {}
+    settings: dict[str, Any] = {
+        "fuse_preset": lb.get("fuse_preset", "typ_c"),
+        "fuse_safety_percent": lb.get("fuse_safety_percent"),
+    }
+    if settings["fuse_preset"] == "custom" and "fuse_custom_points" in lb:
+        settings["fuse_custom_points"] = [
+            FuseCustomPoint(float(p["overload_percent"]), float(p["time_s"]))
+            for p in sorted(lb["fuse_custom_points"], key=lambda p: p["overload_percent"])
+        ]
+    return settings
+
+
+def _ranged_number(raw: Any, key: str, valid: tuple[float, float], default: float) -> float:
+    """Parse a number in an inclusive range; invalid/out-of-range -> default (logged)."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s value %r — using default %s", key, raw, default)
+        return float(default)
+    if math.isnan(value) or not valid[0] <= value <= valid[1]:
+        logger.warning(
+            "%s=%r is outside the valid range %g-%g — using default %s",
+            key,
+            raw,
+            valid[0],
+            valid[1],
+            default,
+        )
+        return float(default)
+    return value
+
+
+def _positive_float_or_none(raw: Any, key: str) -> float | None:
+    """Optional positive number (e.g. loads[].power_kw); invalid -> None (logged)."""
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = math.nan
+    if isinstance(raw, bool) or not math.isfinite(value) or value <= 0:
+        logger.warning("load_balancing.loads[].%s=%r must be a positive number — ignored", key, raw)
+        return None
+    return value
+
+
+def heal_give_way_order(
+    lb: LoadBalancingConfig,
+    current_type_charger_ids: list[str],
+    battery_available: bool = False,
+) -> None:
     """Self-heal load_balancing.give_way_order on config load (in place).
 
     - Drops entries referencing devices that no longer exist, or chargers no
-      longer type="current" (logged warning).
+      longer current-controllable (logged warning).
     - Appends current-type chargers missing from the list after the last
       charger entry (at the top when there is none).
     - Appends loads[] entries missing from the list at the end.
+    - Keeps one battery entry while the site has a battery, drops it otherwise,
+      and appends it at the very end when missing (upstream a0477e23 D9).
+    With auto_include_devices: false only the dropping happens.
     """
     shed_ids = [ld.device_id for ld in lb.loads if ld.device_id]
 
     healed: list[GiveWayOrderEntry] = []
     for entry in lb.give_way_order:
+        if entry.kind == "battery":
+            if not battery_available:
+                logger.warning("load_balancing.give_way_order: dropping battery entry — no battery")
+            elif not any(e.kind == "battery" for e in healed):
+                healed.append(GiveWayOrderEntry(kind="battery", id=BATTERY_GIVE_WAY_ID))
+            continue
         if (entry.kind == "charger" and entry.id in current_type_charger_ids) or (
             entry.kind == "shed" and entry.id in shed_ids
         ):
@@ -903,6 +1205,10 @@ def heal_give_way_order(lb: LoadBalancingConfig, current_type_charger_ids: list[
                 entry.id,
                 "type: current EV charger" if entry.kind == "charger" else "loads[] entry",
             )
+
+    if not lb.auto_include_devices:
+        lb.give_way_order = healed
+        return
 
     listed_chargers = {e.id for e in healed if e.kind == "charger"}
     missing_chargers = [c for c in current_type_charger_ids if c not in listed_chargers]
@@ -920,7 +1226,37 @@ def heal_give_way_order(lb: LoadBalancingConfig, current_type_charger_ids: list[
             healed.append(GiveWayOrderEntry(kind="shed", id=shed_id))
             logger.info("load_balancing.give_way_order: appended missing shed load '%s'", shed_id)
 
+    if battery_available and not any(e.kind == "battery" for e in healed):
+        healed.append(GiveWayOrderEntry(kind="battery", id=BATTERY_GIVE_WAY_ID))
+        logger.info("load_balancing.give_way_order: appended missing battery entry")
+
     lb.give_way_order = healed
+
+
+def servo_current_charger_ids(data: dict[str, Any]) -> list[str]:
+    """Current-controllable chargers of OUR EV layer (executor.ev_surplus.chargers).
+
+    Upstream's balancer throttles top-level ev_chargers[] of type "current"; this
+    fork's chargers live in the ev_surplus servo and are top-level type "binary"
+    (planner view). Without this, heal_give_way_order would drop every charger
+    entry and the balancer would guard no car. A charger counts when it has an
+    amp path (current_entity or easee_device_id), mirroring ChargerCfg.controllable.
+    """
+    executor_raw: Any = data.get("executor", {})
+    if not isinstance(executor_raw, dict):
+        return []
+    srv: Any = cast("dict[str, Any]", executor_raw).get("ev_surplus", {})
+    if not isinstance(srv, dict):
+        return []
+    out: list[str] = []
+    for item in cast("list[Any]", cast("dict[str, Any]", srv).get("chargers", []) or []):
+        if not isinstance(item, dict):
+            continue
+        c = cast("dict[str, Any]", item)
+        cid = str(c.get("id", "") or "")
+        if cid and (c.get("current_entity") or c.get("easee_device_id")):
+            out.append(cid)
+    return out
 
 
 def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
@@ -973,7 +1309,10 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
             if str(charger_item.get("type", "binary")).lower() != "current":
                 continue
             current_type_charger_ids.append(str(charger_item.get("id", f"ev_charger_{idx}")))
-    heal_give_way_order(load_balancing, current_type_charger_ids)
+    for servo_id in servo_current_charger_ids(data):
+        if servo_id not in current_type_charger_ids:
+            current_type_charger_ids.append(servo_id)
+    heal_give_way_order(load_balancing, current_type_charger_ids, battery_available=has_battery)
 
     executor_data: dict[str, Any] = (
         data.get("executor", {}) if isinstance(data.get("executor"), dict) else {}
