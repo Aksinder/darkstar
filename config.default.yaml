@@ -226,6 +226,13 @@ water_heating:
 #   # Missing devices are appended automatically on load (chargers before sheds,
 #   # battery last); entries naming a device that no longer exists are dropped.
 
+# Active block (owner decision 2026-11-01): OBSERVE only. Compare its verdicts
+# with ev_surplus.fuse_guard for a few days before ever setting actuate: true.
+load_balancing:
+  enabled: true
+  actuate: false
+  protected_fuse_a: 25
+
 # Water Heaters (Array for multiple water heaters)
 # ARC15: Replaces deferrable_loads entry for water heating
 water_heaters:
@@ -1016,7 +1023,7 @@ kepler:
   # heaters, EVs, excess-PV sinks and deferrable loads are NOT scheduled in it — their
   # own executor-side floors/servos keep running.
   fallback:
-    enabled: false
+    enabled: true          # Burgbyn10 default since 2026-11-01 (owner decision)
     min_plan_age_minutes: 30
 
   # Independent plan validator: re-checks every plan (Kepler and fallback) for SoC
@@ -1066,7 +1073,8 @@ executor:
   # sinks off — until the planner writes a fresh plan. Suggested if enabled: 120 (= the 2 h
   # notification, 8 missed ~15-min replans). Avoid < 60: a 240 s HiGHS budget + CBC retry +
   # backoff can legitimately skip 2-3 replans, and safe mode skips planned water heating.
-  max_plan_age_minutes: null
+  # Burgbyn10 default since 2026-11-01 (owner decision): 120.
+  max_plan_age_minutes: 120
 
   # Price-conditioned grid-export curtailment (C3): when the EFFECTIVE export price
   # (pricing.export_* => spot + premium + grid_benefit - fee, i.e. what you are actually paid)
