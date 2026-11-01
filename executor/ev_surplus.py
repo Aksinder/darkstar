@@ -1053,6 +1053,7 @@ def compute_ev_surplus(
         # target below min-on falls through to OFF — even for a deadline floor:
         # fuse safety trumps the punch-through). ---
         fuse_capped = False
+        fuse_cap_a: float | None = None  # per-phase amp ceiling while a fuse allowance exists
         per_phase_now_a = _fuse_own_draw_a(c)
         delta_allowed_a, fuse_phases, over_budget = _fuse_delta_allowed_a(
             c, inputs, cfg, fuse_alloc_a
@@ -1074,6 +1075,7 @@ def compute_ev_surplus(
                         cap_a,
                         min(c.max_current_a, max(c.min_current_a, cfg.min_charge_current_a)),
                     )
+            fuse_cap_a = cap_a
             cap_w = cap_a * c.voltage_v * c.phases
             if cap_w < target_w:
                 target_w = cap_w
@@ -1134,6 +1136,27 @@ def compute_ev_surplus(
                         # suppressed as dither and leave the car below its floor.
                         raw_amps = max(raw_amps, floor_a)
             amps = max(c.min_current_a, min(c.max_current_a, amps))
+            if fuse_cap_a is not None and amps > fuse_cap_a + 1e-6:
+                # Never above the fuse allowance: the forced ceil (or a round() up)
+                # can land a step past a cap that only bounded target_w within a
+                # step (cap 10.4 A, floor 10.2 A -> ceil 11 A). Snap the cap DOWN.
+                cap_step_a = (
+                    math.floor(fuse_cap_a / step + 1e-6) * step if step > 0 else fuse_cap_a
+                )
+                cap_step_a = min(c.max_current_a, cap_step_a)
+                if cap_step_a < c.min_current_a:
+                    commands.append(
+                        ChargerCommand(c.id, switch_on=False, set_current_a=0.0,
+                                       target_power_w=0.0,
+                                       reason=f"off: fuse (cap {fuse_cap_a:.1f}A); {why}",
+                                       fuse_limited=True)
+                    )
+                    continue
+                amps = cap_step_a
+                raw_amps = min(raw_amps, amps)
+                fuse_capped = True
+                if "+fuse" not in tag:
+                    tag += "+fuse"
             if cfg.fuse_budget_a is not None and fuse_phases:
                 granted_delta_a = max(0.0, amps - per_phase_now_a)
                 for p in fuse_phases:
