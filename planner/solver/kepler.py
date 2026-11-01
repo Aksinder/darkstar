@@ -783,6 +783,10 @@ class KeplerSolver:
                 + curtailment[t]
                 == s.pv_kwh + discharge[t] + grid_import[t] + load_shedding[t]
             )
+            # Curtailment can only discard PV. Without this bound the balance lets
+            # it absorb imported or discharged energy ("import and dump" at
+            # negative prices); found by the independent plan validator.
+            prob += curtailment[t] <= max(0.0, s.pv_kwh)
 
             # Per-device block start detection (task 2.7)
             if water_enabled:

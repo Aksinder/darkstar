@@ -75,3 +75,28 @@ class TestPriceConditionedCurtailment:
         result = KeplerSolver().solve(_full_battery_surplus(-0.05), _config(0.1))
         assert result.is_optimal
         assert result.slots[0].grid_export_kwh == pytest.approx(1.0, abs=0.01)
+
+
+class TestCurtailmentOnlyDiscardsPV:
+    def test_no_import_and_dump_at_negative_import_price(self):
+        """Curtailment may only discard PV: with no PV and a full battery, a negative
+        import price must not make the plan import energy just to "curtail" it."""
+        start = datetime(2025, 6, 1, 12, 0)
+        slots = [
+            KeplerInputSlot(
+                start_time=start + timedelta(minutes=15 * i),
+                end_time=start + timedelta(minutes=15 * (i + 1)),
+                load_kwh=0.0,
+                pv_kwh=0.5 if i == 0 else 0.0,
+                import_price_sek_kwh=-1.0,
+                export_price_sek_kwh=-1.0,
+            )
+            for i in range(4)
+        ]
+        config = _config()
+        config.max_import_power_kw = 5.0
+        config.enable_export = False  # leave curtailment as the only possible sink
+        result = KeplerSolver().solve(KeplerInput(slots=slots, initial_soc_kwh=10.0), config)
+        assert result.is_optimal
+        for slot in result.slots:
+            assert slot.grid_import_kwh == pytest.approx(0.0, abs=1e-6)
