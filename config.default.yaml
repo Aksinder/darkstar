@@ -434,6 +434,11 @@ ev_chargers:
     type: binary                     # Load type: binary (ON/OFF) only. Variable power control not yet implemented
     nominal_power_kw: 11.0           # Nominal power for load calculations
     departure_time: ""               # Daily departure time "HH:MM" (24-hour). Car must be ready by this time.
+    # Planner-only (the ev_surplus servo has its own charge_efficiency / floor_soc):
+    charge_efficiency: 1.0           # grid -> car efficiency; SoC goals need grid kWh / this.
+    #                               #   1.0 = legacy (no losses). Typical 0.85-0.92.
+    departure_soc: null              # SoC % wanted by departure_time. Only used when
+    #                               #   ev_departure_target.enabled (see below); null = none.
     switch_entity: ""                # HA entity to enable/disable smart charging (e.g. switch.ev_charger)
     replan_on_plugin: true           # Re-run planner immediately when this EV plugs in
     replan_on_unplug: false          # Re-run planner immediately when this EV unplugs
@@ -481,6 +486,19 @@ ev_chargers:
   #   switch_entity: ""
   #   replan_on_plugin: true
   #   replan_on_unplug: false
+
+# EV departure energy target (default OFF). A soft "energy in the car by departure"
+# goal for the MILP: (departure_soc - current SoC) x capacity / charge_efficiency grid kWh
+# must be charged in slots ending by the deadline, else every missing kWh costs
+# shortfall_penalty_sek_per_kwh (read: the most you pay per grid kWh to be at target).
+# One continuous slack per target, no new binaries. Coexists with penalty_levels (which
+# still cap how much the car takes in total). Targets come from ev_chargers[].departure_soc
+# at the recurring departure_time, and from a future one-off departure_entity (+ its trip
+# target) under executor.ev_surplus.chargers. The planner never actuates the EV — the
+# ev_surplus servo stays the guarantee; this only books cheap slots earlier. Vacation: off.
+ev_departure_target:
+  enabled: false
+  shortfall_penalty_sek_per_kwh: 3.0   # >= ~2.5 outbids nearly every import price
 
 # Deferrable household loads (dishwasher, washing machine, ...).
 # Darkstar schedules each queued run into the globally cheapest window (free PV

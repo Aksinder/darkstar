@@ -33,7 +33,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from planner.solver.types import EVDepartureTarget
+
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from planner.solver.types import EVChargerInput
 
 logger = logging.getLogger("darkstar.ev_priority")
@@ -175,4 +179,36 @@ def apply_floor_target(
     return [
         f"EV minimum level: {charger_id} guarantee band {old:.0f}% -> {new:.0f}% "
         f"(value {top.value_sek:.2f} SEK/kWh)"
+    ]
+
+
+def add_departure_energy_target(
+    chargers: list[EVChargerInput],
+    charger_id: str,
+    deadline: datetime | None,
+    target_soc: float | None,
+    penalty_sek_per_kwh: float,
+) -> list[str]:
+    """Give a live one-off departure its own soft energy target (ev_departure_target).
+
+    Complements the band lift above: the band says what a kWh is worth, this says
+    how many kWh must be in the car by when. Coexists with a recurring target —
+    each is its own constraint, so the binding one decides. Inert for an unknown
+    charger, a missing deadline/target, or a non-positive penalty.
+    """
+    if deadline is None or target_soc is None or target_soc <= 0.0 or penalty_sek_per_kwh <= 0.0:
+        return []
+    ch = next((c for c in chargers if c.id == charger_id), None)
+    if ch is None:
+        return []
+    ch.departure_targets.append(
+        EVDepartureTarget(
+            deadline=deadline,
+            target_soc_percent=float(target_soc),
+            shortfall_penalty_sek_per_kwh=float(penalty_sek_per_kwh),
+        )
+    )
+    return [
+        f"EV departure: {charger_id} energy target {target_soc:.0f}% by "
+        f"{deadline.strftime('%Y-%m-%d %H:%M')} (shortfall {penalty_sek_per_kwh:.2f} SEK/kWh)"
     ]

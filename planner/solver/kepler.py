@@ -77,6 +77,24 @@ def min_soc_floor_kwh(
     return floors
 
 
+def ev_charge_efficiency(charger: Any) -> float:
+    """Grid -> car efficiency to plan with; anything outside (0, 1] means 1.0 (legacy)."""
+    eff = float(getattr(charger, "charge_efficiency", 1.0) or 1.0)
+    return eff if 0.0 < eff <= 1.0 else 1.0
+
+
+def ev_departure_need_grid_kwh(charger: Any, target_soc_percent: float) -> float:
+    """Grid kWh needed to lift the car from its current SoC to ``target_soc_percent``.
+
+    (target - current) x capacity / charge_efficiency, clamped to [0, the grid energy
+    that fills the car to 100 %].
+    """
+    cap = float(charger.battery_capacity_kwh or 0.0)
+    target = min(100.0, float(target_soc_percent))
+    delivered = max(0.0, (target - float(charger.current_soc_percent)) / 100.0 * cap)
+    return delivered / ev_charge_efficiency(charger)
+
+
 # pulp is untyped; pin the one solution-status constant the guard relies on.
 _LP_SOLUTION_OPTIMAL: int = int(pulp.constants.LpSolutionOptimal)  # type: ignore[reportUnknownMemberType]
 
@@ -451,10 +469,38 @@ class KeplerSolver:
                 prev_threshold_soc = b.threshold_soc
                 accum_energy_cap += bucket_capacity_kwh
 
-            # Total energy for this device must equal sum of its buckets
-            prob += pulp.lpSum(ev_energy[d][t] for t in range(T)) == pulp.lpSum(
-                ev_bucket_charged[d][i] for i in range(num_buckets)
-            )
+            # Energy DELIVERED into the car (grid x charge_efficiency) must equal the
+            # sum of its buckets — bucket capacities are SoC spans, i.e. car-side kWh.
+            prob += ev_charge_efficiency(charger) * pulp.lpSum(
+                ev_energy[d][t] for t in range(T)
+            ) == pulp.lpSum(ev_bucket_charged[d][i] for i in range(num_buckets))
+
+        # Soft departure energy targets (default none): one continuous shortfall slack
+        # per target, no binaries. Grid energy charged in slots ending by the deadline
+        # plus the slack covers the need; the slack is priced in the objective below.
+        ev_departure_shortfall: list[tuple[Any, float]] = []
+        for charger in plugged_chargers:
+            d = charger.id
+            safe_d = d.replace("-", "_").replace(".", "_")
+            for k, tgt in enumerate(charger.departure_targets or []):
+                penalty = float(tgt.shortfall_penalty_sek_per_kwh)
+                need_kwh = ev_departure_need_grid_kwh(charger, tgt.target_soc_percent)
+                window = [t for t in range(T) if slots[t].end_time <= tgt.deadline]
+                if penalty <= 0.0 or need_kwh <= 1e-6 or not window:
+                    continue
+                short = pulp.LpVariable(
+                    f"ev_departure_short_{safe_d}_{k}", lowBound=0.0, upBound=need_kwh
+                )
+                prob += pulp.lpSum(ev_energy[d][t] for t in window) + short >= need_kwh
+                ev_departure_shortfall.append((short, penalty))
+                logger.info(
+                    "EV %s: departure target %.0f%% by %s = %.2f grid kWh (penalty %.2f SEK/kWh)",
+                    d,
+                    tgt.target_soc_percent,
+                    tgt.deadline.strftime("%Y-%m-%d %H:%M"),
+                    need_kwh,
+                    penalty,
+                )
 
         # Per-device slack variables for daily minimum soft constraints
         water_min_kwh_violation: dict[str, dict[int, Any]] = {}
@@ -1032,6 +1078,10 @@ class KeplerSolver:
         # grid top-ups. Wear cost still discourages pointless churn.
         if config.battery_value_sek_per_kwh > 0:
             total_cost.append(-config.battery_value_sek_per_kwh * soc[T])
+
+        # EV departure targets: each grid kWh still missing at departure costs its penalty.
+        for short, penalty in ev_departure_shortfall:
+            total_cost.append(penalty * short)
 
         # Rev // F51: Removed legacy EV target SoC constraint.
         # Replaced by Incentive Buckets in the objective function.
@@ -1893,6 +1943,12 @@ class KeplerSolver:
                 const_count,
                 final_total_cost,
             )
+            for short, _penalty in ev_departure_shortfall:
+                _short_val = pulp.value(short) or 0.0  # type: ignore[arg-type]
+                if _short_val > 1e-3:
+                    logger.info(
+                        "EV departure target short by %.2f grid kWh (%s)", _short_val, short.name
+                    )
 
         objective_cost: float | None = None
         if is_optimal:

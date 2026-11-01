@@ -15,6 +15,7 @@ import pandas as pd
 from .types import (
     DeferrableLoadInput,
     EVChargerInput,
+    EVDepartureTarget,
     ExcessPVSinkSpec,
     IncentiveBucket,
     KeplerConfig,
@@ -337,6 +338,7 @@ def build_ev_charger_inputs(
     ev_chargers_config: list[dict[str, Any]],
     ev_charger_states: list[dict[str, Any]] | None = None,
     load_priority_cfg: dict[str, Any] | None = None,
+    departure_target_cfg: dict[str, Any] | None = None,
 ) -> list[EVChargerInput]:
     """
     Build per-device EVChargerInput list from ev_chargers[] config + HA state.
@@ -351,6 +353,10 @@ def build_ev_charger_inputs(
             from that tier's ``base_wtp_sek_per_kwh`` — folding EV charging onto the same
             unified WTP scale as deferrable/water loads while preserving the SoC-bucket
             capacity structure. Off (or no ``wtp_tier``) => legacy per-bucket penalty_sek.
+        departure_target_cfg: Optional ``ev_departure_target`` block. When enabled, a
+            charger with both a deadline (its recurring ``departure_time``) and a
+            ``departure_soc`` gets a soft "energy by departure" target priced at
+            ``shortfall_penalty_sek_per_kwh``. Off (default) => no target.
 
     Returns:
         List of EVChargerInput objects for enabled chargers.
@@ -364,6 +370,10 @@ def build_ev_charger_inputs(
         for tier_id, tier in tiers.items():
             tier_spec: dict[str, Any] = tier or {}
             ev_tier_wtp[str(tier_id)] = float(tier_spec.get("base_wtp_sek_per_kwh", 0.0))
+
+    dep_cfg: dict[str, Any] = departure_target_cfg or {}
+    dep_penalty = float(dep_cfg.get("shortfall_penalty_sek_per_kwh", 0.0) or 0.0)
+    dep_enabled = bool(dep_cfg.get("enabled", False)) and dep_penalty > 0.0
 
     enabled_ev: list[dict[str, Any]] = [ev for ev in ev_chargers_config if ev.get("enabled", True)]
 
@@ -425,6 +435,17 @@ def build_ev_charger_inputs(
                     "ev_charger %s references unknown wtp_tier %r - ignoring", charger_id, tier_id
                 )
 
+        departure_targets: list[EVDepartureTarget] = []
+        departure_soc = ev.get("departure_soc")
+        if dep_enabled and deadline is not None and departure_soc is not None:
+            departure_targets.append(
+                EVDepartureTarget(
+                    deadline=deadline,
+                    target_soc_percent=float(departure_soc),
+                    shortfall_penalty_sek_per_kwh=dep_penalty,
+                )
+            )
+
         result.append(
             EVChargerInput(
                 id=charger_id,
@@ -434,6 +455,8 @@ def build_ev_charger_inputs(
                 plugged_in=plugged_in,
                 deadline=deadline,
                 incentive_buckets=buckets,
+                charge_efficiency=float(ev.get("charge_efficiency", 1.0) or 1.0),
+                departure_targets=departure_targets,
             )
         )
 
