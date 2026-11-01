@@ -1,12 +1,19 @@
 import asyncio
+import contextlib
 import logging
+import os
+import sqlite3
+import tempfile
+import time
 from collections.abc import Coroutine  # noqa: TC003
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 
+from backend.api.deps import get_learning_store
 from backend.api.models.system import (
     LogInfoResponse,
     StatusResponse,
@@ -21,6 +28,7 @@ from backend.core.ha_client import (
 )
 from backend.core.secrets import load_yaml
 from backend.core.version import get_version as _get_git_version
+from backend.learning.store import LearningStore
 
 logger = logging.getLogger("darkstar.api.system")
 router = APIRouter(tags=["system"])
@@ -308,4 +316,130 @@ async def get_system_health() -> SystemHealthResponse:
         planner=planner_health,
         forecast=forecast_health,
         system=system_metrics,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Database snapshot (port of upstream c5264cb8, endpoint only - the diagnostics
+# bundle and upstream's raw-config download were deliberately not taken).
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_PREFIX = ".db-snapshot-"
+_SNAPSHOT_BUSY_TIMEOUT_S = 30.0
+_SNAPSHOT_CHUNK = 1024 * 1024
+# A snapshot whose stream never finished (client vanished before the first byte)
+# must not lock the endpoint forever, nor leave its temp file behind for good.
+_SNAPSHOT_STALE_S = 30 * 60
+# monotonic start time of the snapshot in flight (backup + stream), or None.
+_snapshot_started: float | None = None
+
+
+def _remove_file(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
+def _sweep_stale_snapshots(directory: Path) -> None:
+    """Delete snapshot temp files an interrupted download left behind."""
+    cutoff = time.time() - _SNAPSHOT_STALE_S
+    with contextlib.suppress(OSError):
+        for leftover in directory.glob(f"{_SNAPSHOT_PREFIX}*"):
+            with contextlib.suppress(OSError):
+                if leftover.stat().st_mtime < cutoff:
+                    leftover.unlink()
+
+
+def _snapshot_database_sync(db_path: Path) -> Path:
+    """Copy the database with SQLite's online backup API into a temp file.
+
+    Runs in a worker thread. The live DB is opened read-only and copied in ONE
+    backup step, i.e. inside one read transaction: in WAL mode (LearningStore
+    sets it) that never blocks the planner's writers, and unlike a paged backup
+    it cannot be restarted over and over by concurrent writes. The result is a
+    single self-contained file (journal_mode=DELETE); the caller deletes it.
+    """
+    if not db_path.is_file():
+        raise FileNotFoundError(f"Database file not found: {db_path}")
+
+    _sweep_stale_snapshots(db_path.parent)
+    fd, name = tempfile.mkstemp(dir=db_path.parent, prefix=_SNAPSHOT_PREFIX, suffix=".db")
+    os.close(fd)
+    dest = Path(name)
+    try:
+        src = sqlite3.connect(
+            f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=_SNAPSHOT_BUSY_TIMEOUT_S
+        )
+        try:
+            dst = sqlite3.connect(dest)
+            try:
+                src.backup(dst)
+                dst.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except BaseException:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            _remove_file(dest.with_name(dest.name + suffix))
+        raise
+    return dest
+
+
+def _release_snapshot_slot() -> None:
+    global _snapshot_started
+    _snapshot_started = None
+
+
+async def _stream_and_delete(path: Path):
+    """Stream the snapshot, then delete it and free the slot (also on disconnect)."""
+    try:
+        with path.open("rb") as f:
+            while chunk := await asyncio.to_thread(f.read, _SNAPSHOT_CHUNK):
+                yield chunk
+    finally:
+        _remove_file(path)
+        _release_snapshot_slot()
+
+
+@router.get(
+    "/api/system/db-snapshot",
+    summary="Download Database Snapshot",
+    description=(
+        "Streams a transactionally consistent copy of planner_learning.db taken with "
+        "SQLite's online backup API while Darkstar keeps running. One at a time (409)."
+    ),
+)
+async def download_db_snapshot(
+    store: LearningStore = Depends(get_learning_store),
+) -> StreamingResponse:
+    global _snapshot_started
+    now = time.monotonic()
+    if _snapshot_started is not None and now - _snapshot_started < _SNAPSHOT_STALE_S:
+        raise HTTPException(status_code=409, detail="A database snapshot is already in progress")
+    # No await between the check and this claim: atomic on the event loop.
+    _snapshot_started = now
+
+    try:
+        snapshot = await asyncio.to_thread(_snapshot_database_sync, Path(store.db_path))
+    except FileNotFoundError as e:
+        _release_snapshot_slot()
+        raise HTTPException(status_code=404, detail="Database file not found") from e
+    except Exception as e:
+        _release_snapshot_slot()
+        logger.error(f"Database snapshot failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Database snapshot failed: {e}") from e
+    except BaseException:  # cancelled while backing up: free the slot, keep cancelling
+        _release_snapshot_slot()
+        raise
+
+    try:
+        size = snapshot.stat().st_size
+    except OSError:
+        size = None
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    headers = {"Content-Disposition": f'attachment; filename="planner_learning-{stamp}.db"'}
+    if size is not None:
+        headers["Content-Length"] = str(size)
+    return StreamingResponse(
+        _stream_and_delete(snapshot), media_type="application/vnd.sqlite3", headers=headers
     )
