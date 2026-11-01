@@ -144,3 +144,14 @@ class TestFuseRelief:
             ),
         )
         assert _discharge(on) > 0.5
+
+    def test_partial_first_slot_relief_uses_planned_hours(self):
+        """Slot 0 half elapsed: load/pv are already scaled to the remaining 7.5 min
+        (1.5 kWh each), so C's deficit is still ~30 A. The ampere allowance must use
+        the same 0.125 h, or slot 0 gets a full-slot allowance and never binds."""
+        slots = _slots([(2.0, 1.5, 1.5)])
+        on = KeplerSolver().solve(
+            KeplerInput(slots, 8.0, first_slot_remaining_h=0.125),
+            _cfg(phase_aware_enabled=True, phase_load_fractions=HEAVY_C),
+        )
+        assert _discharge(on) > 0.2
