@@ -39,6 +39,8 @@ class PlannerResult:
     error_code: str | None = None
     error_details: dict[str, Any] | None = None
     fix_hint: str | None = None
+    # "kepler" or "fallback" (battery-only plan shipped by planner/plan_guard.py).
+    plan_source: str = "kepler"
 
 
 class PlannerService:
@@ -199,6 +201,7 @@ class PlannerService:
                         success=True,
                         planned_at=planned_at,
                         slot_count=slot_count,
+                        plan_source=self._read_schedule_summary()[1],
                     )
                 else:
                     result = PlannerResult(
@@ -281,14 +284,19 @@ class PlannerService:
 
     def _count_schedule_slots(self) -> int:
         """Count slots in schedule.json for metadata."""
+        return self._read_schedule_summary()[0]
+
+    def _read_schedule_summary(self) -> tuple[int, str]:
+        """(slot count, meta.plan_source) of schedule.json; (0, "kepler") if unreadable."""
         import json
 
         try:
             with Path("data/schedule.json").open() as f:
                 data = json.load(f)
-                return len(data.get("schedule", []))
+            meta = data.get("meta") or {}
+            return len(data.get("schedule", [])), str(meta.get("plan_source") or "kepler")
         except Exception:
-            return 0
+            return 0, "kepler"
 
     async def _notify_success(self, result: PlannerResult) -> None:
         """Invalidate cache and emit WebSocket event on success."""
@@ -301,8 +309,14 @@ class PlannerService:
                     "slot_count": result.slot_count,
                     "duration_ms": result.duration_ms,
                     "status": "success",
+                    "plan_source": result.plan_source,
                 },
             )
+            if result.plan_source != "kepler":
+                logger.warning(
+                    "Planner completed with a %s plan (Kepler failed) — see plan_guard log",
+                    result.plan_source.upper(),
+                )
             logger.info(
                 "Planner completed: %d slots in %.0fms",
                 result.slot_count,

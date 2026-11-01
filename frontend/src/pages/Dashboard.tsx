@@ -18,6 +18,7 @@ import { useToast } from '../lib/useToast'
 type PlannerMeta = {
     planned_at?: string
     planner_version?: string
+    plan_source?: string
     s_index?: PlannerSIndex
 } | null
 
@@ -131,6 +132,7 @@ export default function Dashboard() {
                     setPlannerLocalMeta({
                         planned_at: scheduleData.meta.planned_at as string | undefined,
                         planner_version: scheduleData.meta.planner_version as string | undefined,
+                        plan_source: scheduleData.meta.plan_source as string | undefined,
                         s_index: scheduleData.meta.s_index as PlannerSIndex | undefined,
                     })
                 }
@@ -256,6 +258,7 @@ export default function Dashboard() {
                     setPlannerLocalMeta({
                         planned_at: data.meta.planned_at as string | undefined,
                         planner_version: data.meta.planner_version as string | undefined,
+                        plan_source: data.meta.plan_source as string | undefined,
                         s_index: data.meta.s_index as PlannerSIndex | undefined,
                     })
                 }
