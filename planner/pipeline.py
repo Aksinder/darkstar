@@ -1716,7 +1716,10 @@ class PlannerPipeline:
                         ),
                     )
 
-        run_preflight(input_data, active_config)
+        # Preflight judges price horizon / SoC age against the run's own time
+        # (upstream 846c8710): now_override during replay, wall clock live.
+        # Naive now_override is UTC here too, same rule as now_slot above.
+        run_preflight(input_data, active_config, now=now_override)
 
         solver = KeplerSolver()
         result = await asyncio.to_thread(solver.solve, kepler_input, kepler_config)
