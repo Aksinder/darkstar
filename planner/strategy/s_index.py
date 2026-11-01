@@ -827,6 +827,10 @@ def calculate_safety_floor(
     risk_config = RISK_CONFIG.get(risk_appetite, RISK_CONFIG[3])
     risk_margin = risk_config["margin"]
     min_buffer_kwh = capacity_kwh * risk_config["min_buffer_pct"]
+    # The cap must never suppress the risk level's PROMISED minimum (upstream
+    # be9aa889): Risk 1's 25% min_buffer was silently clipped to the 20% default
+    # cap, which is applied last below.
+    max_buffer_kwh = max(max_buffer_kwh, min_buffer_kwh)
 
     # 3. Determine the look-ahead window (24h beyond price horizon)
     lookahead_start: datetime | pd.Timestamp

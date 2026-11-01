@@ -221,7 +221,11 @@ class TestRiskAppetiteIsInertWhenTheCapBinds:
 
     def test_lowering_the_cap_is_what_actually_frees_the_reserve(self):
         assert self._deficit_heavy(3, cap_pct=10.0) == pytest.approx(3.20)
-        assert self._deficit_heavy(3, cap_pct=0.0) == pytest.approx(1.60)  # == min_soc
+        # The cap is floored at the risk level's promised min_buffer (upstream
+        # be9aa889): at Neutral a 0 % cap still keeps the 10 % minimum...
+        assert self._deficit_heavy(3, cap_pct=0.0) == pytest.approx(3.20)
+        # ...and the away house frees it fully together with risk 5 (0 % minimum).
+        assert self._deficit_heavy(5, cap_pct=0.0) == pytest.approx(1.60)  # == min_soc
 
     def test_the_cap_can_never_push_below_min_soc(self):
         # 0 % cap floors at min_soc, never under it — the battery's own limit stands.
