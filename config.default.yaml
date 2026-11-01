@@ -895,6 +895,33 @@ pricing:
                                        #   the spot only and the fees are added as-is, so you can point
                                        #   grid_transfer_fee_entity / energy_tax_entity straight at those
                                        #   helpers WITHOUT VAT being charged on them twice.
+  # --- Time-of-use grid transfer fee (optional; default OFF = flat fee above, unchanged) ---
+  # When enabled, the transfer fee is chosen PER SLOT from the windows below, matched on the
+  # slot start in LOCAL wall time (timezone above; DST-safe). First matching window wins;
+  # slots outside every window pay default_sek (omit it to fall back to the flat fee).
+  # Fees use the SAME VAT basis as fees_include_vat. Precedence: an enabled + valid schedule
+  # overrides BOTH grid_transfer_fee_sek and grid_transfer_fee_entity (the entity is ignored,
+  # logged once); disabled/absent/invalid -> the flat fee (entity, else literal). An invalid
+  # schedule (bad months/weekdays/hours/fee) logs an error and falls back; it never crashes.
+  #   months: 1-12 · weekdays: 0=Mon..6=Sun · hours: "HH-HH" = [start, end) local, start>end
+  #   wraps midnight · exclude_holidays: Swedish public holidays + Midsommar-/Jul-/Nyårsafton
+  #   never match (they pay default_sek). Omitted months/weekdays/hours = all.
+  #
+  # Preset: GEAB / Gotlands Elnät T4 (tidstariff, 25 A, 2026, incl. VAT -> fees_include_vat: true)
+  # grid_transfer_fee_schedule:
+  #   enabled: true
+  #   default_sek: 0.37                # låglast
+  #   windows:
+  #     - name: hoglast
+  #       fee_sek: 0.65
+  #       months: [1, 2, 3, 11, 12]
+  #       weekdays: [0, 1, 2, 3, 4]
+  #       hours: "06-22"
+  #       exclude_holidays: true
+  #
+  # Preset: GEAB E4 (enkeltariff, 25 A, 2026, incl. VAT) — no schedule needed:
+  #   fees_include_vat: true
+  #   grid_transfer_fee_sek: 0.525     # and leave grid_transfer_fee_schedule disabled/absent
   # --- Export compensation (what you are PAID for exported energy) ---
   # Effective export price = (spot if export_includes_spot) + premium + grid_benefit - fee.
   # Set the literals to your contract, OR point *_entity at an HA sensor/input_number (SEK/kWh)

@@ -24,6 +24,7 @@ import pytz
 from sqlalchemy import create_engine, func, tuple_
 from sqlalchemy.orm import sessionmaker
 
+from backend.core import grid_tariff
 from backend.core.prices import (
     calculate_import_export_prices,
     forecast_value_to_spot_sek_kwh,
@@ -41,6 +42,7 @@ def derive_consumer_prices(
     spot_p50: float,
     spot_p90: float,
     config: dict[str, Any],
+    slot_start: datetime | str | None = None,
 ) -> dict[str, float]:
     """
     Derive import and export prices from spot price forecasts.
@@ -65,6 +67,7 @@ def derive_consumer_prices(
     spot_p50_mwh = forecast_value_to_spot_sek_kwh(spot_p50, config) * 1000.0
     spot_p90_mwh = forecast_value_to_spot_sek_kwh(spot_p90, config) * 1000.0
 
+    config = grid_tariff.config_for_slot(config, slot_start)  # time-of-use transfer fee
     # Calculate import/export prices for each quantile
     import_p10, export_p10 = calculate_import_export_prices(spot_p10_mwh, config)
     import_p50, export_p50 = calculate_import_export_prices(spot_p50_mwh, config)
@@ -542,6 +545,7 @@ async def get_d1_price_forecast_fallback(
                 spot_p50=forecast.get("spot_p50", 0),
                 spot_p90=forecast.get("spot_p90", 0),
                 config=config,
+                slot_start=forecast.get("slot_start"),
             )
             forecast.update(consumer_prices)
 
