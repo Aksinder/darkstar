@@ -165,3 +165,61 @@ def test_flag_does_not_change_solver_input():
     a = planner_to_kepler_input(flagged.copy(), initial_soc_kwh=5.0)
     b = planner_to_kepler_input(unflagged.copy(), initial_soc_kwh=5.0)
     assert a == b
+
+
+# --- forecast units / resolution -------------------------------------------------
+
+_ADDER_CFG = {
+    "timezone": "Europe/Stockholm",
+    "pricing": {
+        "export_premium_sek_kwh": 0.10,
+        "export_grid_benefit_sek_kwh": 0.05,
+        "export_fee_sek_kwh": 0.02,
+        "vat_percent": 25.0,
+        "grid_transfer_fee_sek": 0.25,
+        "energy_tax_sek": 0.44,
+    },
+}
+
+
+def _forecast_rows(p50: float = 0.80) -> list[dict]:
+    tomorrow = TZ.localize(datetime(2026, 4, 29))
+    return [
+        {
+            "slot_start": (tomorrow + timedelta(minutes=15 * i)).isoformat(),
+            "spot_p50": p50 + i / 1000,
+        }
+        for i in range(96)
+    ]
+
+
+def test_forecast_fallback_does_not_double_count_export_adders():
+    """The model predicts the EFFECTIVE export price (its training target). The
+    fallback must reproduce it as the slot's export price, not add the adders again."""
+    entries = P.forecast_fallback_entries(_forecast_rows(), _ADDER_CFG, TZ, 15)
+    slots = P._process_nordpool_data(entries, _ADDER_CFG)
+    first = slots[0]
+    assert first["export_price_sek_kwh"] == pytest.approx(0.80)
+    spot = 0.80 - (0.10 + 0.05 - 0.02)
+    assert first["spot_price_sek_kwh"] == pytest.approx(spot)
+    assert first["import_price_sek_kwh"] == pytest.approx((spot + 0.25 + 0.44) * 1.25)
+
+
+def test_derive_consumer_prices_export_equals_model_output():
+    from ml.price_forecast import derive_consumer_prices
+
+    out = derive_consumer_prices(0.5, 0.8, 1.1, _ADDER_CFG)
+    assert out["export_p10"] == pytest.approx(0.5)
+    assert out["export_p50"] == pytest.approx(0.8)
+    assert out["export_p90"] == pytest.approx(1.1)
+
+
+def test_hourly_resolution_fallback_has_no_overlapping_slots():
+    entries = P.forecast_fallback_entries(
+        _forecast_rows(), {"timezone": "Europe/Stockholm"}, TZ, 60
+    )
+    assert len(entries) == 24
+    for a, b in zip(entries, entries[1:], strict=False):
+        assert a["end"] == b["start"]
+    # Hour 0 = mean of its four quarters (0.800..0.803).
+    assert entries[0]["value"] == pytest.approx(801.5)
