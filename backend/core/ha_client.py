@@ -1285,6 +1285,18 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
         prev_time = None
         cached_unit: str | None = None
 
+        # A cumulative meter cannot plausibly advance this much between two state
+        # changes; a bigger jump is a counter artefact (e.g. a Fronius lifetime
+        # sensor resetting to 0 overnight and coming back), not consumption.
+        _recorder_cfg: Any = config.get("recorder", {})
+        max_meter_delta_kwh = float(
+            (_recorder_cfg if isinstance(_recorder_cfg, dict) else {}).get(
+                "max_meter_delta_kwh", 50.0
+            )
+        )
+        skipped_delta_count = 0
+        largest_skipped_delta = 0.0
+
         for state in states:
             try:
                 # Skip unavailable/unknown/null states silently
@@ -1309,7 +1321,23 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
 
                 if prev_state is not None and prev_time is not None:
                     # Calculate energy delta (ensure positive)
-                    energy_delta = max(0, current_value - prev_state)
+                    raw_delta = current_value - prev_state
+                    energy_delta = max(0, raw_delta)
+
+                    if raw_delta < 0 or energy_delta > max_meter_delta_kwh:
+                        # A counter that went backwards (the drop of a reset) or jumped
+                        # implausibly (the return from it) says nothing about this
+                        # interval's consumption. Skip it entirely -- energy AND its
+                        # seconds, so the slots it spans average over the remaining
+                        # history -- instead of tripping the 500 kWh/day bound and
+                        # discarding the whole profile. Advance the baseline so later
+                        # deltas stay correct.
+                        if energy_delta > max_meter_delta_kwh:
+                            skipped_delta_count += 1
+                            largest_skipped_delta = max(largest_skipped_delta, energy_delta)
+                        prev_state = current_value
+                        prev_time = current_time
+                        continue
 
                     # Distribute across time buckets
                     time_diff = current_time - prev_time
@@ -1343,6 +1371,13 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
             except (ValueError, TypeError, KeyError) as e:
                 print(f"Warning: Skipping invalid state data for {entity_id}: {e}")
                 continue
+
+        if skipped_delta_count:
+            print(
+                f"Warning: Skipped {skipped_delta_count} implausible cumulative-meter "
+                f"delta(s) for {entity_id} (largest {largest_skipped_delta:.1f} kWh, "
+                f"max allowed {max_meter_delta_kwh:.1f} kWh)"
+            )
 
         # Average daily profile: each slot is divided by the number of days that
         # actually contributed to it. Dividing by a fixed 7 understated the whole
