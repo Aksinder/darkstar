@@ -21,7 +21,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -403,6 +403,30 @@ def build_tracked_from_config(
     return appliances, tanks
 
 
+async def fetch_savings_rows(
+    store: Any, config: dict[str, Any], midnight: datetime, now: datetime
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(today_rows, d30_rows) for the savings sensors, cyclic loads attached.
+
+    load_kwh is base load; the recorder also takes cyclic loads (pool pump, filter)
+    out of it. Rows carrying slot_observations.cyclic_kwh say how much; legacy rows
+    (NULL) get it from slot_device_energy (savings.attach_cyclic_kwh). Without this
+    the no-battery baseline house would not run the pumps the real house paid for.
+    """
+    from backend.learning.savings import attach_cyclic_kwh, cyclic_load_ids
+
+    start_iso = (now - timedelta(days=30)).isoformat()
+    today_rows = await store.get_observation_rows_between(midnight.isoformat(), now.isoformat())
+    d30_rows = await store.get_observation_rows_between(start_iso, now.isoformat())
+    cyclic_ids = cyclic_load_ids(config)
+    device_rows: list[dict[str, Any]] = []
+    if cyclic_ids and any(r.get("cyclic_kwh") is None for r in (*today_rows, *d30_rows)):
+        device_rows = await store.get_device_energy_rows_between(start_iso, now.isoformat())
+    attach_cyclic_kwh(today_rows, device_rows, cyclic_ids)
+    attach_cyclic_kwh(d30_rows, device_rows, cyclic_ids)
+    return today_rows, d30_rows
+
+
 async def run_publisher_loop(
     config: dict[str, Any],
     *,
@@ -495,12 +519,7 @@ async def run_publisher_loop(
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         store = LearningStore(db_path, tz)
         try:
-            today_rows = await store.get_observation_rows_between(
-                midnight.isoformat(), now.isoformat()
-            )
-            d30_rows = await store.get_observation_rows_between(
-                (now - timedelta(days=30)).isoformat(), now.isoformat()
-            )
+            today_rows, d30_rows = await fetch_savings_rows(store, config, midnight, now)
         finally:
             await store.close()
 

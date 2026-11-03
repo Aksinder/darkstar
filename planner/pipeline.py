@@ -26,6 +26,7 @@ from planner.coarse_tail import coarsen_slots, expand_result
 from planner.errors import PlannerError, PlannerErrorCode
 from planner.inputs.data_prep import apply_safety_margins, floored_load_margin, prepare_df
 from planner.inputs.learning import load_learning_overlays
+from planner.inputs.pv_intraday import PvCorrection, apply_pv_correction, load_pv_correction
 from planner.inputs.weather import fetch_temperature_forecast
 from planner.output.schedule import SCHEDULE_JSON_PATH, save_schedule_to_json
 from planner.output.soc_target import apply_soc_target_percent
@@ -54,6 +55,7 @@ from planner.water_shortfall import (
     dynamic_floor_kwh,
     hours_to_cheap_window,
 )
+from utils.config_parsing import strict_bool
 
 logger = logging.getLogger("darkstar.planner")
 
@@ -258,6 +260,78 @@ def slots_for_hours(slots: list[Any], hours: float, *, fallback_slot_min: float 
     if slot_min <= 0:
         slot_min = fallback_slot_min
     return max(1, min(len(slots), round(hours * 60.0 / slot_min)))
+
+
+async def _apply_unseen_price_reserve(
+    kepler_config: Any,
+    upr_cfg: dict[str, Any],
+    active_config: dict[str, Any],
+    fine_slots: list[Any],
+    full_forecast_df: pd.DataFrame | None,
+    price_horizon_end: Any,
+) -> None:
+    """Size the unseen-price-day terminal credit and set it on ``kepler_config``.
+
+    The window is the ``window_hours`` after the last priced slot start — the same
+    look-ahead the safety floor uses — priced from the ML forecast (P50, latest
+    issue per slot) and loaded from the extended load/PV forecast. Any missing
+    input leaves the credit empty and logs why; it never raises on bad data.
+    """
+    from planner.strategy.unseen_price_reserve import (
+        build_unseen_slots,
+        load_unseen_prices,
+        size_unseen_reserve,
+    )
+
+    window_hours = float(upr_cfg.get("window_hours", 24.0) or 24.0)
+    window_start = pd.Timestamp(price_horizon_end)
+    window_end = window_start + pd.Timedelta(hours=window_hours)
+    db_path = str(
+        (active_config.get("learning", {}) or {}).get("sqlite_path", "data/planner_learning.db")
+    )
+    prices = await asyncio.to_thread(
+        load_unseen_prices, active_config, db_path, window_start, window_end
+    )
+    slot_hours = (fine_slots[0].end_time - fine_slots[0].start_time).total_seconds() / 3600.0
+    if full_forecast_df is not None and len(full_forecast_df.index) > 1:
+        step = pd.Series(full_forecast_df.index).diff().dropna().median()
+        slot_hours = float(step.total_seconds()) / 3600.0 or slot_hours
+    unseen, why = build_unseen_slots(
+        prices,
+        full_forecast_df,
+        window_start,
+        window_end,
+        slot_hours=slot_hours,
+        min_coverage=float(upr_cfg.get("min_coverage", 0.9)),
+    )
+    if why is not None:
+        logger.info("Unseen-price reserve inactive: %s (%d forecast prices)", why, len(prices))
+        return
+    min_soc_kwh = kepler_config.capacity_kwh * kepler_config.min_soc_percent / 100.0
+    max_soc_kwh = kepler_config.capacity_kwh * kepler_config.max_soc_percent / 100.0
+    result = size_unseen_reserve(
+        unseen,
+        max_charge_kw=kepler_config.max_charge_power_kw,
+        max_discharge_kw=kepler_config.max_discharge_power_kw,
+        charge_eff=kepler_config.charge_efficiency,
+        discharge_eff=kepler_config.discharge_efficiency,
+        wear_cost_sek_per_kwh=kepler_config.wear_cost_sek_per_kwh,
+        threshold_sek_per_kwh=float(upr_cfg.get("threshold_sek_per_kwh", 0.10)),
+        battery_value_sek_per_kwh=kepler_config.battery_value_sek_per_kwh,
+        usable_kwh=max(0.0, max_soc_kwh - min_soc_kwh),
+        max_segments=int(upr_cfg.get("max_segments", 6)),
+    )
+    kepler_config.terminal_value_segments = list(result.segments)
+    logger.info(
+        "Unseen-price reserve: %s, up to %.2f kWh credited (top +%.3f SEK/kWh over "
+        "battery_value) for %s .. %s, %d segment(s)",
+        result.reason,
+        result.total_kwh,
+        result.top_value_sek_per_kwh,
+        window_start.isoformat(),
+        window_end.isoformat(),
+        len(result.segments),
+    )
 
 
 def _apply_water_shortfall_gate(
@@ -900,6 +974,32 @@ class PlannerPipeline:
             real_now = pd.Timestamp.now(tz="UTC")
         now_slot = real_now.floor("15min").tz_convert(tz)
 
+        # Intraday PV bias correction: scale today's upcoming PV forecast by how
+        # today's recently finished slots actually performed vs their forecast,
+        # decaying to 1.0 with lead time (planner/inputs/pv_intraday.py). Raw
+        # forecast stays in the DB; any failure → factor 1.0.
+        pv_correction = PvCorrection(reason="not_applicable")
+        if mode == "full" and has_solar:
+            try:
+                pv_correction = await load_pv_correction(
+                    active_config, real_now.to_pydatetime(), tz
+                )
+                df = apply_pv_correction(df, pv_correction, real_now.to_pydatetime(), tz)
+            except Exception as e:
+                logger.warning("PV intraday correction skipped (%s) — factor 1.0", e)
+                pv_correction = PvCorrection(reason="error")
+            logger.info(
+                "PV intraday correction: factor=%.3f (raw=%s, %s) evidence=%d slots "
+                "actual=%.2f kWh forecast=%.2f kWh half_life=%.1fh",
+                pv_correction.factor,
+                "n/a" if pv_correction.raw_ratio is None else f"{pv_correction.raw_ratio:.3f}",
+                pv_correction.reason,
+                pv_correction.evidence_slots,
+                pv_correction.actual_kwh,
+                pv_correction.forecast_kwh,
+                pv_correction.half_life_hours,
+            )
+
         # Per-device mid-block detection (task 3.1)
         # force_water_by_heater: heater_id → set of timestamps to force ON
         water_heaters_cfg: list[dict[str, Any]] = active_config.get("water_heaters", [])
@@ -1004,6 +1104,9 @@ class PlannerPipeline:
         target_soc_kwh = 0.0
         target_soc_pct = 0.0
         s_index_cfg: dict[str, Any] = {}
+        # Kept for the unseen-price-day reserve below (set in full mode only).
+        full_forecast_df: pd.DataFrame | None = None
+        price_horizon_end: Any = None
 
         if mode == "full":
             # Calculate S-Index / Load Inflation
@@ -1113,6 +1216,10 @@ class PlannerPipeline:
                 input_data.get("extended_forecast_data") or input_data.get("forecast_data") or [],
             )
             full_forecast_df = build_forecast_dataframe(full_forecast_data, timezone_name)
+            if pv_correction.applied:
+                full_forecast_df = apply_pv_correction(
+                    full_forecast_df, pv_correction, real_now.to_pydatetime(), tz
+                )
 
             soc_debug: dict[str, Any] = {}
             target_soc_kwh, soc_debug = calculate_safety_floor(
@@ -1718,6 +1825,35 @@ class PlannerPipeline:
                 _bv_min,
             )
 
+        # Unseen-price-day reserve (opt-in; upstream 894d6596 adapted). Prices the
+        # 24 h AFTER the horizon from the ML price forecast as a concave terminal
+        # credit on top of battery_value (see planner/strategy/unseen_price_reserve.py).
+        # Skipped when the away-mode battery_value switch is off: same buy-back logic.
+        upr_cfg: dict[str, Any] = (
+            cast("dict[str, Any]", active_config.get("kepler", {}) or {}).get(
+                "unseen_price_reserve", {}
+            )
+            or {}
+        )
+        if (
+            mode == "full"
+            and strict_bool(upr_cfg.get("enabled", False))
+            and not _bv_away_off
+            and price_horizon_end is not None
+            and fine_slots
+        ):
+            try:
+                await _apply_unseen_price_reserve(
+                    kepler_config,
+                    upr_cfg,
+                    active_config,
+                    fine_slots,
+                    full_forecast_df,
+                    price_horizon_end,
+                )
+            except Exception as exc:  # never fail a planner run over an optional credit
+                logger.warning("Unseen-price reserve skipped (error): %s", exc)
+
         # Away-mode export floor: the reserve that stops the battery discharging for
         # export exists so a returning household is not met by an empty pack. Away,
         # that reason is suspended — and PV keeps refilling every day. Only ever
@@ -2016,7 +2152,7 @@ class PlannerPipeline:
                 s_index_debug,
                 window_responsibilities,
                 planner_state_debug,
-                extra_meta=plan_meta,
+                extra_meta={**(plan_meta or {}), "pv_correction": pv_correction.as_meta()},
             )
 
             # Rev UI5: Always store plan to slot_plans for performance tracking

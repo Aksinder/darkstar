@@ -323,3 +323,73 @@ def test_stored_delta_basis_fallback_does_not_recurse_past_depth_one():
     )
     assert d.basis_sek_kwh is None
     assert d.value_sek == 0.0
+
+
+# --------------------------------------------------------------------------- cyclic loads
+# The recorder subtracts cyclic loads (pool pump, filter) from load_kwh since
+# 2026-08-21; the money the house paid for them must still be in the baseline house.
+
+from backend.learning.savings import attach_cyclic_kwh, cyclic_load_ids, house_kwh  # noqa: E402
+
+
+def test_baseline_house_runs_the_cyclic_loads():
+    """Night slot, no battery: import 1.0 = base 0.6 + pump 0.4. The baseline house
+    must import the same 1.0, i.e. zero savings — without the add-back it would only
+    import 0.6 and report the pump's cost as a Darkstar LOSS."""
+    row = {**_slot(imp=1.0, pv=0.0, load=0.6), "cyclic_kwh": 0.4}
+    s = compute_savings([row])
+    assert s.baseline_cost_sek == pytest.approx(2.0)
+    assert s.savings_sek == pytest.approx(0.0)
+    assert house_kwh(row) == pytest.approx(1.0)
+
+
+def test_stored_energy_surplus_sees_the_cyclic_loads():
+    """pv 3.0, base 1.0, pump 1.0 -> surplus 1.0. A 2.0 charge is 1.0 from PV (export
+    price) and 1.0 from grid (import price) — not 2.0 from PV."""
+    row = {
+        **_slot(pv=3.0, load=1.0, imp=1.0, p_imp=2.0, p_exp=0.5, batt_charge=2.0, batt_discharge=0.0),
+        "cyclic_kwh": 1.0,
+    }
+    d = compute_stored_energy_delta([row], roundtrip_efficiency=1.0)
+    assert d.basis_sek_kwh == pytest.approx((1.0 * 0.5 + 1.0 * 2.0) / 2.0)
+
+
+def test_missing_cyclic_column_counts_as_zero():
+    assert house_kwh(_slot(load=1.0)) == pytest.approx(1.0)
+    assert house_kwh({**_slot(load=1.0), "cyclic_kwh": None}) == pytest.approx(1.0)
+
+
+def test_cyclic_load_ids_from_config():
+    cfg = {"cyclic_loads": [{"id": "poolpump", "enabled": True}, {"id": "bogfilter", "enabled": False}, {"name": "x"}]}
+    assert cyclic_load_ids(cfg) == {"poolpump", "bogfilter"}
+    assert cyclic_load_ids({}) == set()
+
+
+def _legacy(slot: str, flags: str | None = None, cyclic=None) -> dict:
+    return {"slot_start": slot, "load_kwh": 0.5, "quality_flags": flags, "cyclic_kwh": cyclic}
+
+
+def test_attach_cyclic_kwh_legacy_rows_from_device_store():
+    s1, s2, s3, s4 = (f"2026-10-20T12:{m:02d}:00+02:00" for m in (0, 15, 30, 45))
+    rows = [
+        _legacy(s1),  # normal-path legacy row -> device energy
+        _legacy(s2, flags='{"load_rescued": "energy_balance"}'),  # old rescue: not subtracted
+        _legacy(s3, flags='{"repaired": "statistics_backfill"}'),  # old repair: not subtracted
+        _legacy(s4, cyclic=0.05),  # has the column -> untouched
+    ]
+    dev = [
+        {"slot_start": s1, "device_id": "poolpump", "kwh": 0.065},
+        {"slot_start": s1, "device_id": "bogfilter", "kwh": 0.1},
+        {"slot_start": s1, "device_id": "main_tank", "kwh": 2.0},  # not cyclic
+        {"slot_start": s2, "device_id": "poolpump", "kwh": 0.065},
+        {"slot_start": s3, "device_id": "poolpump", "kwh": 0.065},
+        {"slot_start": s4, "device_id": "poolpump", "kwh": 0.9},
+    ]
+    attach_cyclic_kwh(rows, dev, {"poolpump", "bogfilter"})
+    assert [r["cyclic_kwh"] for r in rows] == pytest.approx([0.165, 0.0, 0.0, 0.05])
+
+
+def test_attach_cyclic_kwh_without_cyclic_loads_is_zero():
+    rows = [_legacy("2026-10-20T12:00:00+02:00"), _legacy("2026-10-20T12:15:00+02:00", cyclic=0.2)]
+    attach_cyclic_kwh(rows, [], set())
+    assert [r["cyclic_kwh"] for r in rows] == [0.0, 0.2]
