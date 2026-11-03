@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -211,7 +212,11 @@ def _start_stock(
     flows: list[tuple[float, float]],
     config: KeplerConfig,
 ) -> float | None:
-    """Stored energy at the start of the day (kWh), or None when undeterminable."""
+    """Stored energy at the start of the day (kWh), or None when undeterminable.
+
+    Uses charge_efficiency for ALL recorded charge: the meter-implied flows carry no
+    DC-PV / grid split (see benchmark_day for why pv_charge_efficiency is off here).
+    """
     cap = config.capacity_kwh
     if previous_row is not None and _finite(previous_row, "soc_end_percent"):
         return float(previous_row["soc_end_percent"]) * cap / 100.0
@@ -231,6 +236,14 @@ def benchmark_day(
     now: datetime,
 ) -> dict[str, Any]:
     """Score one finished local day. ``rows_by_day`` must include the previous day."""
+    # Single charge efficiency on BOTH sides of the comparison. The recorded flows are
+    # meter-implied AC battery flows with no DC-PV / grid split, so the start/terminal
+    # stock below (_start_stock, terminal) can only apply charge_efficiency. Letting
+    # the hindsight solve use pv_charge_efficiency on top would let it hit the same
+    # terminal stock with less charge than the stock accounting assumes — a phantom
+    # hindsight saving. Any pv/grid split of recorded data (e.g. min(ch, hybrid pv))
+    # would be a guess, so the benchmark stays on the legacy single-efficiency model.
+    config = replace(config, pv_charge_efficiency=None)
     record = base_record(day, config)
     raw_rows = rows_by_day.get(day, [])
     reason, record["unverified_slots"] = _check_day(day, raw_rows, tz, now)

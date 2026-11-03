@@ -67,6 +67,15 @@ battery:
   # which is used by the MILP solver. Derives one-way efficiency as sqrt(roundtrip).
   roundtrip_efficiency_percent: 95.0
   charge_efficiency: 0.92             # Charging efficiency (0-1)
+  # pv_charge_efficiency: 0.96        # Optional (0-1]: efficiency for storing PV from the HYBRID
+  #                                   # inverter's own DC strings. That PV goes DC->DC into the
+  #                                   # battery without the inverter's AC->DC stage, so it is
+  #                                   # stored better than grid/AC charging (charge_efficiency).
+  #                                   # Only PV on arrays tagged solar_arrays[].on_battery_inverter
+  #                                   # gets it (untagged => all PV counts, single-inverter site).
+  #                                   # Leave unset (null) for AC-coupled batteries, or when
+  #                                   # unsure: unset = all charging at charge_efficiency.
+  #                                   # Invalid values (<= 0, > 1, non-numbers) are ignored.
 
 battery_economics:
   battery_cycle_cost_kwh: 0.2      # Degradation cost applied per kWh cycled through the battery

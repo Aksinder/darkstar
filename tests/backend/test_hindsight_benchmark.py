@@ -116,6 +116,19 @@ def test_scores_day_and_hindsight_beats_actual():
     assert rec["warnings"] == []
 
 
+def test_pv_charge_efficiency_does_not_change_the_benchmark():
+    # Recorded flows have no DC-PV/grid split, so the benchmark must stay on the
+    # single charge_efficiency on both sides (no phantom hindsight saving).
+    from dataclasses import replace
+
+    rows = _by_day(_day_rows(DAY, battery="arbitrage"))
+    base = benchmark_day(DAY, rows, _config(), TZ, NOW)
+    split_cfg = replace(_config(), pv_charge_efficiency=0.99)
+    split = benchmark_day(DAY, rows, split_cfg, TZ, NOW)
+    for key in ("status", "hindsight_cost_sek", "actual_cost_sek", "stored_change_kwh"):
+        assert split[key] == base[key], key
+
+
 def test_idle_battery_matches_grid_only():
     rec = benchmark_day(DAY, _by_day(_day_rows(DAY)), _config(), TZ, NOW)
     assert rec["status"] == "scored"

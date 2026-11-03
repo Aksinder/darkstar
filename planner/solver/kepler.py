@@ -285,6 +285,24 @@ class KeplerSolver:
         load_shedding: dict[int, Any] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
             "load_shedding_kwh", range(T), lowBound=0.0
         )
+        # DC-coupled PV charging (KeplerConfig.pv_charge_efficiency). charge_pv[t] is
+        # the part of charge[t] that comes from the hybrid inverter's OWN DC strings
+        # and is stored at pv_charge_efficiency; the rest of charge[t] (grid, or AC PV
+        # from a separate inverter) keeps charge_efficiency. charge[t] stays the total
+        # AC-equivalent charge everywhere else (energy balance, power limits, wear,
+        # ramping, phase terms). Only built when it changes the model, so every site
+        # without the setting solves the byte-identical problem as before.
+        pv_split: bool = config.pv_charge_efficiency is not None and (
+            config.pv_charge_efficiency != config.charge_efficiency
+        )
+        pv_charge_eff: float = (
+            config.pv_charge_efficiency
+            if config.pv_charge_efficiency is not None
+            else config.charge_efficiency
+        )
+        charge_pv: dict[int, Any] = {}
+        if pv_split:
+            charge_pv = pulp.LpVariable.dicts("charge_pv_kwh", range(T), lowBound=0.0)  # type: ignore[reportUnknownMemberType]
 
         # Water heating as deferrable load (per-device)
         water_heaters: list[WaterHeaterInput] = config.water_heaters
@@ -811,6 +829,26 @@ class KeplerSolver:
             # negative prices); found by the independent plan validator.
             prob += curtailment[t] <= max(0.0, s.pv_kwh)
 
+            # DC PV charge bounds (pv_split only). Both keep charge_pv = 0 feasible
+            # WITHOUT restricting any other variable, so the split is a pure
+            # relaxation of the legacy model (never a worse plan):
+            #  * part of the total charge;
+            #  * at most the hybrid inverter's share of the PV that is NOT curtailed:
+            #    charge_pv <= frac * (pv - curtailment), i.e. curtailment is assumed
+            #    to hit both inverters pro rata. This implies charge_pv <= frac * pv
+            #    and charge_pv + curtailment <= pv, so curtailed PV is never also
+            #    stored and the DC credit can only ever land on real (uncurtailed)
+            #    PV — never on grid import or battery discharge. (A stricter
+            #    "hybrid strings curtailed first" bound, frac*pv - curtailment, would
+            #    cap curtailment itself at the hybrid share when charge_pv = 0, and
+            #    its max(0, .) form needs a binary per slot.)
+            if pv_split:
+                hybrid_frac = (
+                    config.hybrid_pv_fraction if config.hybrid_pv_fraction is not None else 1.0
+                )
+                prob += charge_pv[t] <= charge[t]
+                prob += charge_pv[t] <= hybrid_frac * (max(0.0, s.pv_kwh) - curtailment[t])
+
             # Per-device block start detection (task 2.7)
             if water_enabled:
                 for heater in water_heaters:
@@ -831,7 +869,11 @@ class KeplerSolver:
                                 prob += water_heat[d][t_idx] == 1
 
             # Battery Dynamics Constraint
-            prob += soc[t + 1] == soc[t] + charge[t] * config.charge_efficiency - discharge[t] / (
+            stored_in: Any = charge[t] * config.charge_efficiency
+            if pv_split:
+                cpv_t: Any = charge_pv[t]
+                stored_in = (charge[t] - cpv_t) * config.charge_efficiency + cpv_t * pv_charge_eff
+            prob += soc[t + 1] == soc[t] + stored_in - discharge[t] / (
                 config.discharge_efficiency if config.discharge_efficiency > 0 else 1.0
             )
 
@@ -879,6 +921,9 @@ class KeplerSolver:
                 hybrid_pv_kwh = s.pv_kwh * (
                     config.hybrid_pv_fraction if config.hybrid_pv_fraction is not None else 1.0
                 )
+                # Conservative when charge_pv > 0: PV stored DC->DC never reaches the
+                # AC bus, so the real headroom is larger. Deliberately left as is (a
+                # charge_pv term here would couple charge and discharge in one slot).
                 prob += discharge[t] <= max(0.0, inverter_ac_kwh - hybrid_pv_kwh)
 
             # Soft Grid Import Limit
@@ -1920,6 +1965,12 @@ class KeplerSolver:
                 i_val: float | None = pulp.value(grid_import[t])  # type: ignore[assignment]
                 e_val: float | None = pulp.value(grid_export[t])  # type: ignore[assignment]
                 soc_val: float | None = pulp.value(soc[t + 1])  # type: ignore[assignment]
+                cpv_raw: float | None = 0.0
+                if pv_split:
+                    cpv_raw = pulp.value(charge_pv[t])  # type: ignore[assignment]
+                cpv_val: float = max(0.0, float(cpv_raw)) if cpv_raw is not None else 0.0
+                if c_val is not None:
+                    cpv_val = min(cpv_val, max(0.0, c_val))  # strip solver noise above charge
 
                 # Per-device water heating results (task 2.10)
                 water_heater_results: dict[str, float] = {}
@@ -1998,6 +2049,7 @@ class KeplerSolver:
                         start_time=s.start_time,
                         end_time=s.end_time,
                         charge_kwh=c_val,  # type: ignore[arg-type]
+                        charge_pv_kwh=cpv_val,
                         discharge_kwh=d_val,  # type: ignore[arg-type]
                         grid_import_kwh=i_val,  # type: ignore[arg-type]
                         grid_export_kwh=e_val,  # type: ignore[arg-type]

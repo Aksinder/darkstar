@@ -102,6 +102,13 @@ def solve_battery_only(
     cap = config.capacity_kwh
     eta_c = config.charge_efficiency if config.charge_efficiency > 0 else 1.0
     eta_d = config.discharge_efficiency if config.discharge_efficiency > 0 else 1.0
+    # DC PV charging split, identical to Kepler's (see kepler.py "DC PV charge
+    # bounds"): only modelled when pv_charge_efficiency changes the model.
+    pv_split = config.pv_charge_efficiency is not None and (
+        config.pv_charge_efficiency != config.charge_efficiency
+    )
+    eta_pv = config.pv_charge_efficiency if config.pv_charge_efficiency is not None else eta_c
+    hybrid_frac = config.hybrid_pv_fraction if config.hybrid_pv_fraction is not None else 1.0
     min_soc = cap * config.min_soc_percent / 100.0
     max_soc = cap * config.max_soc_percent / 100.0
     initial = max(0.0, min(cap, input_data.initial_soc_kwh))
@@ -123,6 +130,9 @@ def solve_battery_only(
     imp: Any = pulp.LpVariable.dicts("imp", R, lowBound=0.0)  # type: ignore[reportUnknownMemberType]
     exp: Any = pulp.LpVariable.dicts("exp", R, lowBound=0.0)  # type: ignore[reportUnknownMemberType]
     curt: Any = pulp.LpVariable.dicts("curt", R, lowBound=0.0)  # type: ignore[reportUnknownMemberType]
+    ch_pv: Any = {}
+    if pv_split:
+        ch_pv = pulp.LpVariable.dicts("ch_pv", R, lowBound=0.0)  # type: ignore[reportUnknownMemberType]
     shed: Any = pulp.LpVariable.dicts("shed", R, lowBound=0.0)  # type: ignore[reportUnknownMemberType]
     soc: Any = pulp.LpVariable.dicts("soc", range(T + 1), lowBound=0.0, upBound=cap)  # type: ignore[reportUnknownMemberType]
     charging: Any = pulp.LpVariable.dicts("charging", R, cat="Binary")  # type: ignore[reportUnknownMemberType]
@@ -148,6 +158,8 @@ def solve_battery_only(
         max_dis = config.max_discharge_power_kw * h
         if config.max_inverter_ac_kw is not None:
             frac = config.hybrid_pv_fraction if config.hybrid_pv_fraction is not None else 1.0
+            # Conservative when ch_pv > 0 (DC-stored PV skips the AC bus); kept as is,
+            # mirroring Kepler.
             max_dis = min(max_dis, max(0.0, config.max_inverter_ac_kw * h - s.pv_kwh * frac))
         grid_cap_imp = (
             config.max_import_power_kw * h if config.max_import_power_kw is not None else None
@@ -164,7 +176,14 @@ def solve_battery_only(
         )
 
         prob += s.load_kwh + ch[t] + exp[t] + curt[t] == s.pv_kwh + dis[t] + imp[t] + shed[t]
-        prob += soc[t + 1] == soc[t] + ch[t] * eta_c - dis[t] / eta_d
+        if pv_split:
+            prob += ch_pv[t] <= ch[t]
+            prob += ch_pv[t] <= hybrid_frac * (max(0.0, s.pv_kwh) - curt[t])
+            prob += soc[t + 1] == (
+                soc[t] + (ch[t] - ch_pv[t]) * eta_c + ch_pv[t] * eta_pv - dis[t] / eta_d
+            )
+        else:
+            prob += soc[t + 1] == soc[t] + ch[t] * eta_c - dis[t] / eta_d
         prob += curt[t] <= s.pv_kwh
         prob += shed[t] <= s.load_kwh
         prob += ch[t] <= max_ch * charging[t]
@@ -249,6 +268,7 @@ def solve_battery_only(
     for t in R:
         s = slots[t]
         c, d, i, e = val(ch[t]), val(dis[t]), val(imp[t]), val(exp[t])
+        c_pv = min(c, val(ch_pv[t])) if pv_split else 0.0
         cost = i * s.import_price_sek_kwh - e * s.export_price_sek_kwh
         cost += (c + d) * config.wear_cost_sek_per_kwh * 0.5
         total += cost
@@ -257,6 +277,7 @@ def solve_battery_only(
                 start_time=s.start_time,
                 end_time=s.end_time,
                 charge_kwh=c,
+                charge_pv_kwh=c_pv,
                 discharge_kwh=d,
                 grid_import_kwh=i,
                 grid_export_kwh=e,
