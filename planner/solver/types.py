@@ -401,6 +401,14 @@ class KeplerConfig:
     # the economic "how much extra to keep" decision continuously. 0 = disabled.
     battery_value_sek_per_kwh: float = 0.0
 
+    # Unseen-price-day reserve (kepler.unseen_price_reserve, opt-in; upstream
+    # 894d6596 adapted). A concave piecewise terminal credit ON TOP of
+    # battery_value: [(stored_kwh, extra_sek_per_kwh), ...] with non-increasing
+    # values, sized from the ML price forecast for the 24 h after the horizon
+    # (planner/strategy/unseen_price_reserve.py). Credits energy above min_soc at
+    # soc[T]; continuous variables only. Empty = disabled.
+    terminal_value_segments: list[tuple[float, float]] = field(default_factory=lambda: [])
+
     # Solver runtime knobs (kepler.solver: block in config.yaml). 0/None = the
     # module defaults (240 s / 0.01), so old dumps and configs are unchanged.
     solver_time_limit_s: float = 0.0

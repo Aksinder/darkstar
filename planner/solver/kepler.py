@@ -1219,6 +1219,24 @@ class KeplerSolver:
         if config.battery_value_sek_per_kwh > 0:
             total_cost.append(-config.battery_value_sek_per_kwh * soc[T])
 
+        # Unseen-price-day reserve: concave piecewise credit for energy above min_soc
+        # at the horizon end (values non-increasing, so the LP fills the most
+        # valuable segment first without binaries). soc_violation[T] keeps the row
+        # feasible when soc[T] dips below min_soc; it costs 1000 SEK/kWh, far above
+        # any segment value, so it is never inflated to earn credit.
+        if config.terminal_value_segments:
+            seg_terms: list[Any] = []
+            seg_vars: list[Any] = []
+            for k, (seg_kwh, seg_value) in enumerate(config.terminal_value_segments):
+                if seg_kwh <= 0 or seg_value <= 0:
+                    continue
+                x = pulp.LpVariable(f"terminal_seg_{k}", lowBound=0.0, upBound=float(seg_kwh))
+                seg_vars.append(x)
+                seg_terms.append(float(seg_value) * x)
+            if seg_vars:
+                prob += pulp.lpSum(seg_vars) + min_soc_kwh <= soc[T] + soc_violation[T]
+                total_cost.append(-pulp.lpSum(seg_terms))
+
         # EV departure targets: each grid kWh still missing at departure costs its penalty.
         for short, penalty in ev_departure_shortfall:
             total_cost.append(penalty * short)

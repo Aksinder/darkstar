@@ -33,28 +33,26 @@ def _slots(prices: list[tuple[float, float]], pv: float = 0.0, load: float = 0.5
 
 
 def _config(**kw) -> KeplerConfig:
-    base = dict(
-        capacity_kwh=16.0,
-        max_charge_power_kw=8.0,
-        max_discharge_power_kw=8.0,
-        charge_efficiency=0.95,
-        discharge_efficiency=0.95,
-        min_soc_percent=10.0,
-        max_soc_percent=100.0,
-        wear_cost_sek_per_kwh=0.2,
-        max_import_power_kw=17.0,
-        max_export_power_kw=17.0,
-        enable_export=True,
-    )
+    base = {
+        "capacity_kwh": 16.0,
+        "max_charge_power_kw": 8.0,
+        "max_discharge_power_kw": 8.0,
+        "charge_efficiency": 0.95,
+        "discharge_efficiency": 0.95,
+        "min_soc_percent": 10.0,
+        "max_soc_percent": 100.0,
+        "wear_cost_sek_per_kwh": 0.2,
+        "max_import_power_kw": 17.0,
+        "max_export_power_kw": 17.0,
+        "enable_export": True,
+    }
     base.update(kw)
     return KeplerConfig(**base)
 
 
 def _overlap_slots(result) -> list[int]:
     return [
-        i
-        for i, s in enumerate(result.slots)
-        if s.grid_import_kwh > TOL and s.grid_export_kwh > TOL
+        i for i, s in enumerate(result.slots) if s.grid_import_kwh > TOL and s.grid_export_kwh > TOL
     ]
 
 

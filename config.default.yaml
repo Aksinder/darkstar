@@ -1065,6 +1065,28 @@ kepler:
   # partial slot 0 commands the right export power.
   partial_first_slot: true
 
+  # Unseen-price-day reserve (upstream 894d6596, adapted; opt-in). The horizon ends
+  # where prices end (end of tomorrow, published or ML-forecast fallback), and nothing
+  # in the objective prices the day AFTER it: the safety floor reserves for its load
+  # deficit and battery_value credits leftover energy at <= the cheapest import of the
+  # next 12 h. So the pack is run to the floor at the horizon end even when the price
+  # forecast says the following evening is expensive and the cheapest refill is now.
+  # When enabled, the ML price forecast (P50) for the window_hours after the horizon is
+  # turned into a concave terminal credit, per stored kWh above min_soc:
+  #   discharge_eff * (min(forecast import, that day's own cheapest refill) - wear/2 - threshold)
+  # minus battery_value (no double counting). Kepler weighs it against the REAL
+  # known-window charging cost (grid price, PV surplus at its export value), so it can
+  # never force grid buying that does not pay. Continuous variables only (<= max_segments).
+  # Needs price_forecast running (D+2 rows come from the post-publication run) and the
+  # extended load/PV forecast; any gap leaves it inactive (logged). Upstream replay:
+  # ~55-82 SEK/month; ~15-20 % of days lose a little on forecast error.
+  unseen_price_reserve:
+    enabled: false
+    threshold_sek_per_kwh: 0.10     # margin per delivered kWh before carrying energy over
+    window_hours: 24                # look-ahead after the last priced slot
+    max_segments: 6                 # piecewise credit resolution (one LP variable each)
+    min_coverage: 0.9               # share of the window that must have price + load forecasts
+
   # Solver runtime knobs. Absent/0 = built-in defaults (240 s budget, 1 % MIP gap).
   # highs_options is forwarded verbatim to HiGHS (setOptionValue) — an ops escape
   # hatch: the 2026-08-26 replay sweep measured heuristic/symmetry/presolve options
