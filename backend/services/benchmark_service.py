@@ -149,7 +149,20 @@ class BenchmarkService:
 
         start = tz.localize(datetime.combine(pending[0] - timedelta(days=1), time()))
         end = tz.localize(datetime.combine(today, time()))
-        by_day = rows_by_local_day(await store.get_slot_observation_rows(start, end), tz)
+        rows = await store.get_slot_observation_rows(start, end)
+        # Legacy rows (cyclic_kwh NULL): recover the cyclic energy the recorder took
+        # out of load_kwh from slot_device_energy (string range padded: DST offsets).
+        from backend.learning.savings import attach_cyclic_kwh, cyclic_load_ids
+
+        cyclic_ids = cyclic_load_ids(config)
+        device_rows: list[dict[str, Any]] = []
+        if cyclic_ids and any(r.get("cyclic_kwh") is None for r in rows):
+            pad = timedelta(days=1)
+            device_rows = await store.get_device_energy_rows_between(
+                (start - pad).isoformat(), (end + pad).isoformat()
+            )
+        attach_cyclic_kwh(rows, device_rows, cyclic_ids)
+        by_day = rows_by_local_day(rows, tz)
         for day in pending:
             await self._wait_for_planner()
             try:

@@ -643,6 +643,12 @@ async def _record_observation(
     # the cumulative counter (then its own power-snapshot terminal) when pv_power is not
     # configured or its history is unavailable.
     pv_kwh: float
+    # Set when PV did NOT come from integrating pv_power history: "snapshot" (one
+    # instantaneous reading x 15 min) or "counter" (pv_power configured but its history
+    # unavailable, e.g. right after an HA restart; the counter may omit an AC-coupled
+    # array). Readers that compare PV against a forecast (planner intraday correction)
+    # must not read such a slot as weather.
+    pv_unmeasured: str | None = None
     pv_power_entity = input_sensors.get("pv_power")
     pv_history_kwh = (
         await get_energy_from_power_history(str(pv_power_entity), slot_start, slot_end)
@@ -656,6 +662,10 @@ async def _record_observation(
         pv_kwh, used_cumulative_pv = await calculate_energy_from_cumulative(
             "total_pv_production", pv_kw, "pv_total"
         )
+        if not used_cumulative_pv:
+            pv_unmeasured = "snapshot"
+        elif pv_power_entity:
+            pv_unmeasured = "counter"
         logger.debug(
             f"PV: {'cumulative' if used_cumulative_pv else 'snapshot'} energy={pv_kwh:.3f} kWh"
         )
@@ -1016,6 +1026,11 @@ async def _record_observation(
         # PV-boost hours to the right tank).
         "water_heater_energy": water_heater_energy if water_heater_energy else None,
         "ev_charging_kwh": ev_charging_kwh,
+        # Cyclic-load energy subtracted from load_kwh above (both the normal isolation
+        # and the balance rescue). Persisted so money consumers (savings, hindsight
+        # benchmark) can add it back to whole-house consumption exactly; load_kwh
+        # itself stays base load for the forecaster.
+        "cyclic_kwh": cyclic_kwh,
         "ev_charger_energy": ev_charger_energy if ev_charger_energy else None,
         "batt_charge_kwh": batt_charge_kwh,
         "batt_discharge_kwh": batt_discharge_kwh,
@@ -1045,8 +1060,8 @@ async def _record_observation(
     # are not monotonic in PV (0.000 / +0.100 / +0.234 / -0.174 / -0.002). PV explains
     # almost none of the variance, so a flat tolerance is the honest form.
     #
-    # NOTE: that calibration was run on a residual WITHOUT cyclic_kwh, which is not
-    # persisted and so cannot be reconstructed from the database. If cyclic loads are
+    # NOTE: that calibration was run on a residual WITHOUT cyclic_kwh, which was not
+    # persisted then (slot_observations.cyclic_kwh exists since 2026-11-03). If cyclic loads are
     # configured and material, re-check the live firing rate before trusting the default.
     balance_tolerance_kwh = float(recorder_cfg.get("balance_tolerance_kwh", 1.5))
     balance_tripped = (
@@ -1094,11 +1109,14 @@ async def _record_observation(
         or soc_stale
         or multi_slot
         or water_unmeasured
+        or pv_unmeasured
         or shadow_exact
     ):
         flags: dict[str, Any] = {}
         if water_unmeasured:
             flags["water_unmeasured"] = water_unmeasured
+        if pv_unmeasured:
+            flags["pv_unmeasured"] = pv_unmeasured
         if shadow_exact:
             # Opt-in diagnostics only; free-form key that no reader interprets
             # (train/hindsight/savings match their own keys). Note it makes every

@@ -21,6 +21,11 @@ class SlotObservation(Base):
     load_kwh: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0"))
     water_kwh: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0"))
     ev_charging_kwh: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0"))
+    # Cyclic-load energy (pool pump, filter) the writer took OUT of load_kwh, which is
+    # base load. NULLABLE with no default ON PURPOSE: NULL = "written before this column
+    # existed", so readers can tell a legacy row (fall back to slot_device_energy, see
+    # backend/learning/savings.py:attach_cyclic_kwh) from a measured 0.0.
+    cyclic_kwh: Mapped[float | None] = mapped_column(Float, nullable=True)
     batt_charge_kwh: Mapped[float | None] = mapped_column(Float)
     batt_discharge_kwh: Mapped[float | None] = mapped_column(Float)
     soc_start_percent: Mapped[float | None] = mapped_column(Float)

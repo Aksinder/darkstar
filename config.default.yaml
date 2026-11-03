@@ -1000,6 +1000,31 @@ forecasting:
                                        # robustness). Slots lacking a p10 keep the scalar.
                                        # NOTE: with weight>0, pv_confidence_percent (and any
                                        # Reflex tuning of it) only affects p10-less slots.
+  # Intraday PV bias correction (planner side). Compares today's recently FINISHED
+  # slots — actual PV (recorder) vs the forecast stored for those slots — and scales
+  # the upcoming PV forecast (p10/p50/p90) by sum(actual)/sum(forecast), decaying to
+  # 1.0 with lead time and never past local midnight (tomorrow untouched). Catches
+  # the "forecast sunny, actually overcast" day before the battery drains.
+  # Fail-safe: too little evidence or any error → factor 1.0. The DB keeps the raw
+  # forecast. Applied before pv_confidence_percent / pv_p10_weight, which still apply.
+  # The factor is logged each plan and published in schedule meta.pv_correction.
+  pv_intraday_correction:
+    enabled: true
+    lookback_hours: 2.0                # finished slots of TODAY within this window
+    half_life_hours: 2.0               # deviation from 1.0 halves every N h of lead time
+    min_factor: 0.2                    # floor: never plan below 20% of the forecast
+    max_factor: 1.3                    # ceiling: upside correction is deliberately tighter
+    upward_gain: 0.5                   # "more sun than forecast" believed only half (1.0 = symmetric)
+    min_slot_forecast_kwh: 0.05        # per 15-min slot; dimmer slots (night/dawn/dusk) ignored
+    min_slots: 4                       # evidence: ≥ this many qualifying slots ...
+    min_forecast_kwh: 1.0              # ... AND ≥ this much forecast energy, else factor 1.0
+                                       # (1 kWh: dawn low-sun slots alone can't set the factor)
+    dead_feed_ratio: 0.05              # slot with actual < 5% of a forecast ≥ the next value
+    dead_feed_min_forecast_kwh: 0.15   # is a dead/stalled PV reading, not clouds: ignored
+    min_nonzero_fraction: 0.75         # ≥ this share of evidence slots must show PV > 0
+    max_soc_percent: 98.0              # slots with battery ≥ this may be PV-throttled: ignored
+                                       # (slots with a negative OR unknown export price are
+                                       # ignored too: export curtailment may have clamped PV)
   load_safety_margin_percent: 117.0    # HARD FLOOR on the S-Index load margin: the planner never
                                        # plans for less load than this % of the forecast, regardless
                                        # of s_index.risk_appetite (which tunes conservatism ABOVE it).
@@ -1073,6 +1098,28 @@ kepler:
   # The executor reads slot export power from grid_export_kw (planner kW), so a
   # partial slot 0 commands the right export power.
   partial_first_slot: true
+
+  # Unseen-price-day reserve (upstream 894d6596, adapted; opt-in). The horizon ends
+  # where prices end (end of tomorrow, published or ML-forecast fallback), and nothing
+  # in the objective prices the day AFTER it: the safety floor reserves for its load
+  # deficit and battery_value credits leftover energy at <= the cheapest import of the
+  # next 12 h. So the pack is run to the floor at the horizon end even when the price
+  # forecast says the following evening is expensive and the cheapest refill is now.
+  # When enabled, the ML price forecast (P50) for the window_hours after the horizon is
+  # turned into a concave terminal credit, per stored kWh above min_soc:
+  #   discharge_eff * (min(forecast import, that day's own cheapest refill) - wear/2 - threshold)
+  # minus battery_value (no double counting). Kepler weighs it against the REAL
+  # known-window charging cost (grid price, PV surplus at its export value), so it can
+  # never force grid buying that does not pay. Continuous variables only (<= max_segments).
+  # Needs price_forecast running (D+2 rows come from the post-publication run) and the
+  # extended load/PV forecast; any gap leaves it inactive (logged). Upstream replay:
+  # ~55-82 SEK/month; ~15-20 % of days lose a little on forecast error.
+  unseen_price_reserve:
+    enabled: false
+    threshold_sek_per_kwh: 0.10     # margin per delivered kWh before carrying energy over
+    window_hours: 24                # look-ahead after the last priced slot
+    max_segments: 6                 # piecewise credit resolution (one LP variable each)
+    min_coverage: 0.9               # share of the window that must have price + load forecasts
 
   # Solver runtime knobs. Absent/0 = built-in defaults (240 s budget, 1 % MIP gap).
   # highs_options is forwarded verbatim to HiGHS (setOptionValue) — an ops escape
@@ -1196,6 +1243,11 @@ executor:
     # Min-SoC floor hysteresis: the floor hold (block discharge) engages at SoC <= battery.min_soc_percent
     # and releases only at min_soc_percent + this many points. 0 = no hysteresis (old behaviour).
     min_soc_release_margin_percent: 2.0
+
+    # PV-driven charge slots (plan charges from forecast PV, no planned discharge) run idle:
+    # PV surplus charges the pack, a PV shortfall comes from the grid, never the battery.
+    # true = old behaviour (self_consumption: battery covers the shortfall).
+    pv_charge_allow_discharge: false
 
   # Water Heater Control
   # The executor controls your water heater by setting a target temperature.

@@ -207,6 +207,10 @@ def compute_slot_record(
         "export_kwh": 0.0,
         "water_kwh": 0.0,
         "ev_charging_kwh": 0.0,
+        # The cyclic energy taken out of the rebuilt load above, in BOTH modes: this
+        # record's load_kwh excludes it, so the row must say so or the savings /
+        # hindsight add-back would miss it. 0.0 when no data (store keeps existing).
+        "cyclic_kwh": round(cyclic or 0.0, 4),
         "batt_charge_kwh": None,
         "batt_discharge_kwh": None,
         "quality_flags": json.dumps({"repaired": "statistics_backfill"}),

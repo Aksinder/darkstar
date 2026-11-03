@@ -1,3 +1,7 @@
+## dev-20261103.1057 — 2026-11-03 10:59
+
+- fix(pv-intraday): don't read a dead PV feed or curtailment as clouds
+
 ## dev-20261101.1757 — 2026-11-01 17:59
 
 - Merge branch 'fix/review-safety' into integrate/round3
