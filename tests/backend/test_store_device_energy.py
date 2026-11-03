@@ -139,3 +139,33 @@ async def test_observation_rows_include_water_and_ev_columns():
         assert rows[0]["ev_charging_kwh"] == 7.0
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cyclic_kwh_column_round_trip_and_upsert_rules():
+    """slot_observations.cyclic_kwh: NULL when the writer does not know the split
+    (legacy / backfill), a recorded value survives a later 0/None write, and a
+    positive value overwrites."""
+    store = await _make_store()
+    try:
+        s1 = TZ.localize(datetime(2026, 11, 3, 12, 0))
+        s2 = s1 + timedelta(minutes=15)
+        await store.store_slot_observations(
+            pd.DataFrame([_obs_record(s1, cyclic_kwh=0.3), _obs_record(s2)])
+        )
+        rows = await store.get_observation_rows_between("2026-11-03", "2026-11-04")
+        assert [r["cyclic_kwh"] for r in rows] == [pytest.approx(0.3), None]
+
+        # A writer without the split (None / NaN) or with 0.0 keeps the recorded value;
+        # a 0.0 fills the NULL legacy cell.
+        await store.store_slot_observations(
+            pd.DataFrame([_obs_record(s1, cyclic_kwh=None), _obs_record(s2, cyclic_kwh=0.0)])
+        )
+        rows = await store.get_observation_rows_between("2026-11-03", "2026-11-04")
+        assert [r["cyclic_kwh"] for r in rows] == [pytest.approx(0.3), 0.0]
+
+        await store.store_slot_observations(pd.DataFrame([_obs_record(s1, cyclic_kwh=0.5)]))
+        rows = await store.get_observation_rows_between("2026-11-03", "2026-11-04")
+        assert rows[0]["cyclic_kwh"] == pytest.approx(0.5)
+    finally:
+        await store.close()
