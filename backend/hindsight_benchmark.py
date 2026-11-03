@@ -3,9 +3,11 @@
 Ported in spirit from upstream ergetie/darkstar 8c4fa6d7 (battery hindsight benchmark)
 and 67bd4717 (grid-only baseline), adapted to this fork's data model:
 
-* Inputs are the recorder's slot_observations. ``load_kwh`` is BASE load (water and
-  EV subtracted), so the whole-house demand is load + water + ev — same as
-  backend/learning/savings.py.
+* Inputs are the recorder's slot_observations. ``load_kwh`` is BASE load (water, EV
+  and cyclic loads subtracted), so the whole-house demand is load + water + ev +
+  cyclic — same as backend/learning/savings.py. ``cyclic_kwh`` is NULL on rows written
+  before the column existed; the service fills it via savings.attach_cyclic_kwh, and
+  a still-missing value counts as 0 (never as an unverified slot).
 * Actual battery moves are the meter-implied flows (import - export + pv - demand),
   so the "actual" cost reconstructs the real grid bill exactly and the three schedules
   below are priced with ONE model. On balance-rescued slots (the norm on sunny
@@ -47,7 +49,9 @@ if TYPE_CHECKING:
 
     from planner.solver.types import KeplerConfig
 
-BENCHMARK_VERSION = 1
+# 2: demand adds cyclic_kwh back (pool pump/filter were missing from v1 demand, which
+# understated grid-only and hindsight costs). The bump rescores the stored window.
+BENCHMARK_VERSION = 2
 STATE_PREFIX = "hindsight_benchmark:"
 SLOT_MINUTES = 15
 MAX_UNVERIFIED_SLOTS = 4
@@ -90,7 +94,12 @@ def slot_unverified(row: Mapping[str, Any]) -> bool:
 
 
 def demand_kwh(row: Mapping[str, Any]) -> float:
-    return float(row["load_kwh"]) + float(row["water_kwh"]) + float(row["ev_charging_kwh"])
+    return (
+        float(row["load_kwh"])
+        + float(row["water_kwh"])
+        + float(row["ev_charging_kwh"])
+        + float(row.get("cyclic_kwh") or 0.0)
+    )
 
 
 def slot_bill(net_grid_kwh: float, import_price: float, export_price: float) -> float:
