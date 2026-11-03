@@ -55,6 +55,7 @@ from planner.water_shortfall import (
     dynamic_floor_kwh,
     hours_to_cheap_window,
 )
+from utils.config_parsing import strict_bool
 
 logger = logging.getLogger("darkstar.planner")
 
@@ -1836,7 +1837,7 @@ class PlannerPipeline:
         )
         if (
             mode == "full"
-            and upr_cfg.get("enabled", False)
+            and strict_bool(upr_cfg.get("enabled", False))
             and not _bv_away_off
             and price_horizon_end is not None
             and fine_slots

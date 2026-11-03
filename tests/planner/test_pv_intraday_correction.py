@@ -29,7 +29,8 @@ def _local(y, m, d, hh, mm=0):
 
 
 def _rows(start_local, n, fc, act, **extra):
-    """n consecutive 15-min rows starting at start_local."""
+    """n consecutive 15-min rows starting at start_local (known, positive export price)."""
+    extra = {"export_price_sek_kwh": 0.5, **extra}
     out = []
     for i in range(n):
         st = start_local + timedelta(minutes=15 * i)
@@ -59,7 +60,7 @@ def test_overcast_midday_gives_low_factor():
 
 def test_clamped_low_and_high():
     now = _local(2026, 6, 1, 13, 0)
-    low = compute_pv_correction(_rows(_local(2026, 6, 1, 11), 8, 1.0, 0.0), now, CFG, TZ)
+    low = compute_pv_correction(_rows(_local(2026, 6, 1, 11), 8, 1.0, 0.1), now, CFG, TZ)
     assert low.factor == pytest.approx(CFG.min_factor)
     high = compute_pv_correction(_rows(_local(2026, 6, 1, 11), 8, 0.5, 2.0), now, CFG, TZ)
     assert high.raw_ratio == pytest.approx(4.0)
@@ -79,9 +80,9 @@ def test_upward_correction_is_damped():
 
 def test_energy_weighted_not_mean_of_ratios():
     now = _local(2026, 6, 1, 13, 0)
-    rows = _rows(_local(2026, 6, 1, 11), 4, 1.0, 1.0) + _rows(_local(2026, 6, 1, 12), 4, 0.1, 0.0)
+    rows = _rows(_local(2026, 6, 1, 11), 4, 1.0, 1.0) + _rows(_local(2026, 6, 1, 12), 4, 0.1, 0.01)
     c = compute_pv_correction(rows, now, CFG, TZ)
-    assert c.factor == pytest.approx(4.0 / 4.4)
+    assert c.factor == pytest.approx(4.04 / 4.4)
 
 
 def test_insufficient_slots_is_noop():
@@ -136,10 +137,10 @@ def test_only_finished_slots_in_lookback_and_today():
 def test_suspect_slots_excluded():
     now = _local(2026, 6, 1, 13, 0)
     good = _rows(_local(2026, 6, 1, 11), 4, 1.0, 0.5)
-    full = _rows(_local(2026, 6, 1, 12), 2, 1.0, 0.0, soc_end_percent=100.0)
-    neg = _rows(_local(2026, 6, 1, 12, 30), 1, 1.0, 0.0, export_price_sek_kwh=-0.2)
+    full = _rows(_local(2026, 6, 1, 12), 2, 1.0, 0.1, soc_end_percent=100.0)
+    neg = _rows(_local(2026, 6, 1, 12, 30), 1, 1.0, 0.1, export_price_sek_kwh=-0.2)
     bad = _rows(
-        _local(2026, 6, 1, 12, 45), 1, 1.0, 0.0, quality_flags=json.dumps({"multi_slot_delta": {}})
+        _local(2026, 6, 1, 12, 45), 1, 1.0, 0.1, quality_flags=json.dumps({"multi_slot_delta": {}})
     )
     c = compute_pv_correction(good + full + neg + bad, now, CFG, TZ)
     assert c.evidence_slots == 4 and c.factor == pytest.approx(0.5)
@@ -285,6 +286,7 @@ async def test_db_to_planner_input_is_scaled(tmp_path):
                 "pv_kwh": (0.2 if 9 <= s.hour < 15 else 0.0),
                 "load_kwh": 0.3,
                 "soc_end_percent": 50.0,
+                "export_price_sek_kwh": 0.5,
             }
             for s in slots
             if s + timedelta(minutes=15) <= now
@@ -344,3 +346,125 @@ async def test_load_broken_db_is_noop(tmp_path):
         {"learning": {"sqlite_path": str(p)}}, _local(2026, 6, 1, 12), TZ
     )
     assert corr.factor == 1.0 and corr.reason == "error"
+
+
+# --- review fixes: dead feed, curtailment proxy, strict config, evidence floor ----
+
+
+def test_dead_feed_slots_are_excluded_not_read_as_clouds():
+    """HA restart → pv_power history missing → ~0 kWh recorded on a sunny day."""
+    now = _local(2026, 6, 1, 13, 0)
+    dead = _rows(_local(2026, 6, 1, 11), 6, 1.0, 0.0)
+    good = _rows(_local(2026, 6, 1, 12, 30), 2, 1.0, 1.0)
+    c = compute_pv_correction(dead + good, now, CFG, TZ)
+    assert c.excluded.get("pv_dead_feed") == 6
+    assert c.factor == 1.0 and not c.applied  # 2 slots left: not enough evidence
+
+
+def test_dead_feed_rule_spares_small_forecasts_and_real_overcast():
+    now = _local(2026, 6, 1, 13, 0)
+    # forecast below the dead-feed floor: a 0 there is plausible, not excluded as dead
+    small = compute_pv_correction(_rows(_local(2026, 6, 1, 11), 8, 0.14, 0.0), now, CFG, TZ)
+    assert "pv_dead_feed" not in small.excluded
+    # heavy overcast (10% of forecast) is weather, still counted
+    grey = compute_pv_correction(_rows(_local(2026, 6, 1, 11), 8, 1.0, 0.1), now, CFG, TZ)
+    assert grey.evidence_slots == 8 and grey.factor == pytest.approx(0.2)
+
+
+def test_mostly_zero_feed_gives_no_correction():
+    now = _local(2026, 6, 1, 13, 0)
+    # forecasts under the dead-feed floor, actual 0 on 6 of 8 slots
+    rows = _rows(_local(2026, 6, 1, 11), 6, 0.14, 0.0) + _rows(
+        _local(2026, 6, 1, 12, 30), 2, 0.14, 0.1
+    )
+    c = compute_pv_correction(rows, now, PvIntradayConfig(min_forecast_kwh=0.5), TZ)
+    assert c.reason == "pv_feed_suspect" and c.factor == 1.0
+
+
+def test_pv_unmeasured_flag_excluded():
+    now = _local(2026, 6, 1, 13, 0)
+    rows = _rows(
+        _local(2026, 6, 1, 11), 8, 1.0, 0.3, quality_flags=json.dumps({"pv_unmeasured": "counter"})
+    )
+    c = compute_pv_correction(rows, now, CFG, TZ)
+    assert c.excluded == {"bad_quality": 8} and c.factor == 1.0
+
+
+def test_unknown_export_price_is_excluded():
+    """C3 curtails on negative export price; NULL price (lookup failed) may hide it."""
+    now = _local(2026, 6, 1, 13, 0)
+    rows = _rows(_local(2026, 6, 1, 11), 8, 1.0, 0.3, export_price_sek_kwh=None)
+    c = compute_pv_correction(rows, now, CFG, TZ)
+    assert c.excluded == {"export_price_unknown": 8} and c.factor == 1.0
+
+
+def test_dawn_slots_alone_cannot_set_factor():
+    """Default min_forecast_kwh 1.0: eight dim dawn slots (0.1 kWh each) are not enough."""
+    assert PvIntradayConfig().min_forecast_kwh == 1.0
+    now = _local(2026, 6, 1, 7, 0)
+    c = compute_pv_correction(_rows(_local(2026, 6, 1, 5), 8, 0.1, 0.03), now, CFG, TZ)
+    assert c.reason == "insufficient_evidence" and c.factor == 1.0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("false", False),
+        ("False", False),
+        ("no", False),
+        ("0", False),
+        (False, False),
+        (0, False),
+        ("true", True),
+        ("on", True),
+        (True, True),
+        (1, True),
+        (None, True),
+        ("garbage", True),
+    ],
+)
+def test_enabled_parsed_strictly(raw, expected):
+    cfg = PvIntradayConfig.from_config(
+        {"forecasting": {"pv_intraday_correction": {"enabled": raw}}}
+    )
+    assert cfg.enabled is expected
+
+
+@pytest.mark.asyncio
+async def test_low_factor_logs_warning(tmp_path, caplog):
+    from backend.learning.models import Base
+    from backend.learning.store import LearningStore
+
+    db = tmp_path / "planner_learning.db"
+    store = LearningStore(str(db), TZ)
+    async with store.async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    now = _local(2026, 11, 1, 13, 5)
+    slots = [_local(2026, 11, 1, 11) + timedelta(minutes=15 * i) for i in range(8)]
+    await store.store_forecasts(
+        [
+            {"slot_start": s.isoformat(), "pv_forecast_kwh": 1.0, "load_forecast_kwh": 0.3}
+            for s in slots
+        ],
+        "aurora",
+    )
+    await store.store_slot_observations(
+        pd.DataFrame(
+            [
+                {
+                    "slot_start": s,
+                    "slot_end": s + timedelta(minutes=15),
+                    "pv_kwh": 0.3,
+                    "load_kwh": 0.3,
+                    "soc_end_percent": 50.0,
+                    "export_price_sek_kwh": 0.5,
+                }
+                for s in slots
+            ]
+        )
+    )
+    await store.close()
+    with caplog.at_level("WARNING", logger="darkstar.planner.inputs.pv_intraday"):
+        corr = await load_pv_correction({"learning": {"sqlite_path": str(db)}}, now, TZ)
+    assert corr.factor == pytest.approx(0.3)
+    assert any("broken PV feed" in r.getMessage() for r in caplog.records)

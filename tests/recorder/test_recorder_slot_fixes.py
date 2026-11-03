@@ -345,7 +345,9 @@ class TestHeaterIdleCutoff:
             config,
             pv_delta=1.25,
             load_delta=3.0,
-            history={"sensor.spa_power": _states((0, 60))},
+            # PV measured too: a pv_power with no history is itself flagged
+            # (pv_unmeasured), which is not what this test is about.
+            history={"sensor.spa_power": _states((0, 60)), "sensor.pv_power": _states((0, 5000))},
         )
         assert "quality_flags" not in record or not _flags(record)
 
@@ -462,3 +464,38 @@ class TestExactSlotShadow:
         )
         assert record["load_kwh"] == pytest.approx(3.0)
         assert "shadow_exact" not in _flags(record)
+
+
+class TestPvUnmeasuredFlag:
+    """PV that did not come from pv_power history is tagged so forecast-vs-actual
+    readers (planner intraday PV correction) don't read a dead feed as clouds."""
+
+    @pytest.mark.asyncio
+    async def test_counter_fallback_is_flagged(self):
+        record = await _run(_base_config(), pv_delta=1.25, load_delta=3.0)
+        assert _flags(record).get("pv_unmeasured") == "counter"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_fallback_is_flagged(self):
+        config = _base_config()
+        config["input_sensors"]["total_pv_production"] = ""
+        record = await _run(config, pv_delta=1.25, load_delta=3.0)
+        assert _flags(record).get("pv_unmeasured") == "snapshot"
+
+    @pytest.mark.asyncio
+    async def test_history_integrated_pv_is_not_flagged(self):
+        record = await _run(
+            _base_config(),
+            pv_delta=1.25,
+            load_delta=3.0,
+            history={"sensor.pv_power": _states((0, 5000))},
+        )
+        assert "pv_unmeasured" not in _flags(record)
+
+    @pytest.mark.asyncio
+    async def test_counter_only_site_is_not_flagged(self):
+        """No pv_power configured: the counter IS the designed measurement."""
+        config = _base_config()
+        del config["input_sensors"]["pv_power"]
+        record = await _run(config, pv_delta=1.25, load_delta=3.0)
+        assert "pv_unmeasured" not in _flags(record)

@@ -1008,8 +1008,14 @@ forecasting:
     upward_gain: 0.5                   # "more sun than forecast" believed only half (1.0 = symmetric)
     min_slot_forecast_kwh: 0.05        # per 15-min slot; dimmer slots (night/dawn/dusk) ignored
     min_slots: 4                       # evidence: ≥ this many qualifying slots ...
-    min_forecast_kwh: 0.5              # ... AND ≥ this much forecast energy, else factor 1.0
+    min_forecast_kwh: 1.0              # ... AND ≥ this much forecast energy, else factor 1.0
+                                       # (1 kWh: dawn low-sun slots alone can't set the factor)
+    dead_feed_ratio: 0.05              # slot with actual < 5% of a forecast ≥ the next value
+    dead_feed_min_forecast_kwh: 0.15   # is a dead/stalled PV reading, not clouds: ignored
+    min_nonzero_fraction: 0.75         # ≥ this share of evidence slots must show PV > 0
     max_soc_percent: 98.0              # slots with battery ≥ this may be PV-throttled: ignored
+                                       # (slots with a negative OR unknown export price are
+                                       # ignored too: export curtailment may have clamped PV)
   load_safety_margin_percent: 117.0    # HARD FLOOR on the S-Index load margin: the planner never
                                        # plans for less load than this % of the forecast, regardless
                                        # of s_index.risk_appetite (which tunes conservatism ABOVE it).

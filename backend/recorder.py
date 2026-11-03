@@ -643,6 +643,12 @@ async def _record_observation(
     # the cumulative counter (then its own power-snapshot terminal) when pv_power is not
     # configured or its history is unavailable.
     pv_kwh: float
+    # Set when PV did NOT come from integrating pv_power history: "snapshot" (one
+    # instantaneous reading x 15 min) or "counter" (pv_power configured but its history
+    # unavailable, e.g. right after an HA restart; the counter may omit an AC-coupled
+    # array). Readers that compare PV against a forecast (planner intraday correction)
+    # must not read such a slot as weather.
+    pv_unmeasured: str | None = None
     pv_power_entity = input_sensors.get("pv_power")
     pv_history_kwh = (
         await get_energy_from_power_history(str(pv_power_entity), slot_start, slot_end)
@@ -656,6 +662,10 @@ async def _record_observation(
         pv_kwh, used_cumulative_pv = await calculate_energy_from_cumulative(
             "total_pv_production", pv_kw, "pv_total"
         )
+        if not used_cumulative_pv:
+            pv_unmeasured = "snapshot"
+        elif pv_power_entity:
+            pv_unmeasured = "counter"
         logger.debug(
             f"PV: {'cumulative' if used_cumulative_pv else 'snapshot'} energy={pv_kwh:.3f} kWh"
         )
@@ -1099,11 +1109,14 @@ async def _record_observation(
         or soc_stale
         or multi_slot
         or water_unmeasured
+        or pv_unmeasured
         or shadow_exact
     ):
         flags: dict[str, Any] = {}
         if water_unmeasured:
             flags["water_unmeasured"] = water_unmeasured
+        if pv_unmeasured:
+            flags["pv_unmeasured"] = pv_unmeasured
         if shadow_exact:
             # Opt-in diagnostics only; free-form key that no reader interprets
             # (train/hindsight/savings match their own keys). Note it makes every
