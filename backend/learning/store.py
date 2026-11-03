@@ -52,6 +52,17 @@ def _slot_is_over(slot_start: str, slot_end: str | None, now: datetime) -> bool:
 OBS_FIX_APPLIED_KEY = "obs_fabrication_fix_at"
 
 
+def _optional_kwh(value: Any) -> float | None:
+    """None/NaN (a pandas-filled missing cell) -> None; anything else -> float."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else f
+
+
 class LearningStore:
     """
     Handles all database interactions for the Learning Engine using SQLAlchemy.
@@ -123,6 +134,7 @@ class LearningStore:
                     "load_kwh": row.load_kwh,
                     "water_kwh": row.water_kwh,  # type: ignore[reportUnknownMemberType]
                     "ev_charging_kwh": row.ev_charging_kwh,  # type: ignore[reportUnknownMemberType]
+                    "cyclic_kwh": row.cyclic_kwh,  # type: ignore[reportUnknownMemberType]
                     "import_price_sek_kwh": row.import_price_sek_kwh,
                     "export_price_sek_kwh": row.export_price_sek_kwh,
                     "batt_charge_kwh": row.batt_charge_kwh,
@@ -289,6 +301,9 @@ class LearningStore:
                     load_kwh=float(record.get("load_kwh", 0.0) or 0.0),
                     water_kwh=float(record.get("water_kwh", 0.0) or 0.0),
                     ev_charging_kwh=float(record.get("ev_charging_kwh", 0.0) or 0.0),
+                    # None stays NULL: a writer that does not know the cyclic split
+                    # (backfill, data_activator) must not claim "0 kWh subtracted".
+                    cyclic_kwh=_optional_kwh(record.get("cyclic_kwh")),  # type: ignore[reportUnknownArgumentType]
                     batt_charge_kwh=record.get("batt_charge_kwh"),
                     batt_discharge_kwh=record.get("batt_discharge_kwh"),
                     soc_start_percent=record.get("soc_start_percent"),
@@ -326,6 +341,15 @@ class LearningStore:
                         "ev_charging_kwh": case(
                             (stmt.excluded.ev_charging_kwh > 0, stmt.excluded.ev_charging_kwh),
                             else_=SlotObservation.ev_charging_kwh,
+                        ),
+                        # Same F35 ">0 overwrites" rule as the other energies, but a
+                        # non-positive/NULL incoming value only fills a NULL (legacy)
+                        # cell -- never wipes a recorded split.
+                        "cyclic_kwh": case(
+                            (stmt.excluded.cyclic_kwh > 0, stmt.excluded.cyclic_kwh),
+                            else_=func.coalesce(
+                                SlotObservation.cyclic_kwh, stmt.excluded.cyclic_kwh
+                            ),
                         ),
                         "batt_charge_kwh": func.coalesce(
                             stmt.excluded.batt_charge_kwh, SlotObservation.batt_charge_kwh
