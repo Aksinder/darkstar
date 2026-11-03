@@ -1,3 +1,7 @@
+## dev-20261103.1250 — 2026-11-03 12:52
+
+- Merge remote-tracking branch 'fork/main' into feat/pv-charge-efficiency
+
 ## dev-20261103.1057 — 2026-11-03 10:59
 
 - fix(pv-intraday): don't read a dead PV feed or curtailment as clouds
