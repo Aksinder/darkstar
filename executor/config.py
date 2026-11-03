@@ -741,6 +741,12 @@ class ControllerConfig:
     # Without it the mode flips idle <-> self_consumption on every one-point sensor
     # step around the floor. 0 = no hysteresis (the old stateless behaviour).
     min_soc_release_margin_percent: float = 2.0
+    # PV-driven charge slots (planned charge from forecast PV, discharge_kw == 0)
+    # run idle: real PV surplus charges the pack, the battery never covers a PV
+    # shortfall (over-forecast PV drained ~8.1 kWh in 8 days as self_consumption).
+    # True restores the old self_consumption behaviour (battery covers transients
+    # and shortfalls in those slots).
+    pv_charge_allow_discharge: bool = False
 
 
 @dataclass
@@ -1737,6 +1743,12 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
         min_soc_release_margin_percent=_non_negative_float(
             ctrl_data.get("min_soc_release_margin_percent"),
             ControllerConfig.min_soc_release_margin_percent,
+        ),
+        # Strict: only a real True / "true" opts back into discharge ("false" as a
+        # string must not be truthy).
+        pv_charge_allow_discharge=(
+            str(ctrl_data.get("pv_charge_allow_discharge", False)).strip().lower()
+            in ("true", "1", "yes", "on")
         ),
     )
 

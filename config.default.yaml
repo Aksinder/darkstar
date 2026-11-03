@@ -1188,6 +1188,11 @@ executor:
     # and releases only at min_soc_percent + this many points. 0 = no hysteresis (old behaviour).
     min_soc_release_margin_percent: 2.0
 
+    # PV-driven charge slots (plan charges from forecast PV, no planned discharge) run idle:
+    # PV surplus charges the pack, a PV shortfall comes from the grid, never the battery.
+    # true = old behaviour (self_consumption: battery covers the shortfall).
+    pv_charge_allow_discharge: false
+
   # Water Heater Control
   # The executor controls your water heater by setting a target temperature.
   # These temps define the operating modes:
