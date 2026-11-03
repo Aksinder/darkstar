@@ -241,8 +241,10 @@ class TestControllerFollowPlan:
 
         decision = controller.decide(slot, state)
 
-        # Should use self_consumption, not export (grid_charging OFF for PV surplus)
-        assert decision.mode_intent == "self_consumption"
+        # Not export, not grid charge: idle (caps discharge only, PV surplus still
+        # charges the pack and exports the rest; no battery discharge to cover a
+        # PV shortfall the plan never priced).
+        assert decision.mode_intent == "idle"
 
     def test_battery_export_uses_export_mode(self, controller):
         """Battery discharge to grid uses export mode."""
@@ -285,7 +287,11 @@ class TestControllerFollowPlan:
 
         decision = controller.decide(slot, state)
 
-        assert decision.mode_intent == "self_consumption"
+        # Never Forced charge. Idle since the PV-drain fix (discharge_kw == 0 in
+        # the plan); pv_charge_allow_discharge restores self_consumption.
+        assert decision.mode_intent == "idle"
+        opt_in = Controller(ControllerConfig(pv_charge_allow_discharge=True), InverterConfig())
+        assert opt_in.decide(slot, state).mode_intent == "self_consumption"
 
     def test_pv_charge_no_export_when_pv_exactly_covers_charge_and_load(self, controller):
         """Boundary: PV exactly equals charge + load (no import needed) -> the
@@ -295,7 +301,7 @@ class TestControllerFollowPlan:
 
         decision = controller.decide(slot, state)
 
-        assert decision.mode_intent == "self_consumption"
+        assert decision.mode_intent == "idle"
 
     def test_idle_when_at_soc_target_no_activity(self, controller):
         """When at SoC target with no charging/discharging, use idle."""
@@ -447,7 +453,7 @@ class TestControllerFollowPlan:
         # 2kW at default 46V ≈ 43.47A -> rounds to 45A with default 5A step
         expected_amps = 45.0
 
-        assert decision.mode_intent == "self_consumption"
+        assert decision.mode_intent == "idle"
         assert decision.charge_value == expected_amps
         assert decision.charge_value < controller.config.max_charge_a
 
