@@ -1281,14 +1281,19 @@ class TestRecorderRetryAndGapEndToEnd:
             side_effect=RuntimeError("database is locked") if fail else None
         )
         db.close = AsyncMock()
+
+        async def power_history(entity, *_a, **_k):
+            # PV measured (0 kWh, a dark quarter) so the only provenance under test is
+            # the counters' own; PV without history is flagged pv_unmeasured.
+            return 0.0 if entity == "sensor.pv_power" else None
+
         with (
             patch("backend.recorder.get_ha_sensor_kw_normalized", side_effect=kw),
             patch("backend.recorder.get_ha_sensor_float", side_effect=soc),
             patch("backend.recorder.get_ha_entity_state", side_effect=entity_state),
             patch(
                 "backend.recorder.get_energy_from_power_history",
-                new_callable=AsyncMock,
-                return_value=None,
+                side_effect=power_history,
             ),
             patch("backend.recorder.get_nordpool_data", return_value=None),
             patch("backend.recorder.LearningStore", return_value=db),

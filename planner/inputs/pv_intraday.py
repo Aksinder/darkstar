@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
+from utils.config_parsing import strict_bool
 from utils.time_utils import dst_safe_localize
 
 if TYPE_CHECKING:
@@ -45,7 +46,9 @@ logger = logging.getLogger("darkstar.planner.inputs.pv_intraday")
 SLOT = timedelta(minutes=15)
 
 # Observation quality flags that make the slot's pv_kwh untrustworthy as a measurement.
-_BAD_PV_FLAGS = ("multi_slot_delta", "no_config")
+# "pv_unmeasured": the recorder fell back to the counter/snapshot (pv_power history
+# unavailable, e.g. after an HA restart) — partial or ~0 PV that is not weather.
+_BAD_PV_FLAGS = ("multi_slot_delta", "no_config", "pv_unmeasured")
 
 PV_COLUMNS = ("pv_forecast_kwh", "pv_p10", "pv_p90")
 
@@ -66,7 +69,14 @@ class PvIntradayConfig:
     min_slot_forecast_kwh: float = 0.05
     # Evidence: at least this many qualifying slots AND this much forecast energy.
     min_slots: int = 4
-    min_forecast_kwh: float = 0.5
+    min_forecast_kwh: float = 1.0
+    # Dead-feed guard: a slot producing < dead_feed_ratio of a forecast of at least
+    # dead_feed_min_forecast_kwh is treated as an unmeasured slot (a broken/stalled PV
+    # reading), not as clouds — heavy overcast still yields ~10-30% of clear-sky.
+    dead_feed_ratio: float = 0.05
+    dead_feed_min_forecast_kwh: float = 0.15
+    # And most evidence slots must show some production at all, else no correction.
+    min_nonzero_fraction: float = 0.75
     # Slots with the battery this full may have had PV throttled (nowhere to put it):
     # actual < forecast there is not weather. Excluded from the evidence.
     max_soc_percent: float = 98.0
@@ -89,7 +99,7 @@ class PvIntradayConfig:
         min_factor = max(0.0, f("min_factor", d.min_factor))
         max_factor = max(min_factor, f("max_factor", d.max_factor))
         return cls(
-            enabled=bool(raw.get("enabled", d.enabled)),
+            enabled=strict_bool(raw.get("enabled", d.enabled), default=d.enabled),
             lookback_hours=max(0.25, f("lookback_hours", d.lookback_hours)),
             half_life_hours=max(0.0, f("half_life_hours", d.half_life_hours)),
             min_factor=min_factor,
@@ -99,6 +109,13 @@ class PvIntradayConfig:
             min_slots=max(1, int(f("min_slots", d.min_slots))),
             min_forecast_kwh=max(0.0, f("min_forecast_kwh", d.min_forecast_kwh)),
             max_soc_percent=f("max_soc_percent", d.max_soc_percent),
+            dead_feed_ratio=max(0.0, f("dead_feed_ratio", d.dead_feed_ratio)),
+            dead_feed_min_forecast_kwh=max(
+                0.0, f("dead_feed_min_forecast_kwh", d.dead_feed_min_forecast_kwh)
+            ),
+            min_nonzero_fraction=min(
+                1.0, max(0.0, f("min_nonzero_fraction", d.min_nonzero_fraction))
+            ),
         )
 
 
@@ -193,6 +210,7 @@ def compute_pv_correction(
     actual_sum = 0.0
     forecast_sum = 0.0
     n = 0
+    nonzero = 0
     for row in rows:
         start = _to_utc(row.get("slot_start"), tz)
         if start is None:
@@ -212,6 +230,9 @@ def compute_pv_correction(
         if fc < cfg.min_slot_forecast_kwh:
             skip("low_forecast")
             continue
+        if fc >= cfg.dead_feed_min_forecast_kwh and act < cfg.dead_feed_ratio * fc:
+            skip("pv_dead_feed")
+            continue
         flags_raw = row.get("quality_flags")
         if flags_raw:
             try:
@@ -229,17 +250,25 @@ def compute_pv_correction(
                     continue
             except (TypeError, ValueError):
                 pass
+        # The executor's export curtailment (C3) clamps PV on negative export prices;
+        # a slot whose price is unknown (recorder lookup failed → NULL) may have been
+        # curtailed just the same, so unknown counts as suspect too.
         exp_price = row.get("export_price_sek_kwh")
-        if exp_price is not None:
-            try:
-                if float(exp_price) < 0:
-                    skip("negative_export_price")
-                    continue
-            except (TypeError, ValueError):
-                pass
+        try:
+            exp_val = float(exp_price)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            exp_val = math.nan
+        if not math.isfinite(exp_val):
+            skip("export_price_unknown")
+            continue
+        if exp_val < 0:
+            skip("negative_export_price")
+            continue
         actual_sum += act
         forecast_sum += fc
         n += 1
+        if act > 0.001:
+            nonzero += 1
 
     corr.evidence_slots = n
     corr.actual_kwh = actual_sum
@@ -248,6 +277,10 @@ def compute_pv_correction(
 
     if n < cfg.min_slots or forecast_sum < cfg.min_forecast_kwh or forecast_sum <= 0:
         corr.reason = "insufficient_evidence"
+        return corr
+    if nonzero < cfg.min_nonzero_fraction * n:
+        # Mostly-zero "production" under a real forecast is a feed problem, not weather.
+        corr.reason = "pv_feed_suspect"
         return corr
 
     ratio = actual_sum / forecast_sum
@@ -348,6 +381,15 @@ async def load_pv_correction(
         finally:
             await store.close()
         corr = compute_pv_correction(rows, now, cfg, tz)
+        if corr.applied and corr.factor <= 0.4:
+            logger.warning(
+                "PV intraday correction: factor %.2f (actual %.2f vs forecast %.2f kWh over "
+                "%d slots) — heavy overcast, or a broken PV feed? Check the pv_power sensor.",
+                corr.factor,
+                corr.actual_kwh,
+                corr.forecast_kwh,
+                corr.evidence_slots,
+            )
     except Exception as e:
         logger.warning("PV intraday correction failed (%s) — using factor 1.0", e)
         return PvCorrection(half_life_hours=2.0, reason="error")
