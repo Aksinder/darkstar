@@ -80,9 +80,10 @@ class TestHoldRatchet:
 
 
 class TestPvDrivenChargeFloor:
-    """charge_kw > 0 with forecast PV covering charge + load -> self_consumption, with
+    """charge_kw > 0 with forecast PV covering charge + load used to self-consume with
     no look at SoC at all. Live 2026-10-04 10:00: slot charge 0.38 kW, forecast PV
-    2.08 kW, load 1.16 kW, SoC 8.8 % -> self_consumption, battery serving the house."""
+    2.08 kW, load 1.16 kW, SoC 8.8 % -> self_consumption, battery serving the house.
+    Since the PV-drain fix it idles at any SoC (pv_charge_allow_discharge opts back)."""
 
     def test_at_floor_holds(self, controller):
         slot = _hold(soc_target=80, charge_kw=0.38, pv_kw=2.08, load_kw=1.16)
@@ -100,7 +101,13 @@ class TestPvDrivenChargeFloor:
     def test_above_floor_unchanged(self, controller):
         slot = _hold(soc_target=80, charge_kw=0.38, pv_kw=2.08, load_kw=1.16)
         d = controller.decide(slot, SystemState(current_soc_percent=11.1))
-        assert d.mode_intent == "self_consumption"
+        assert d.mode_intent == "idle"
+        opt_in = Controller(ControllerConfig(pv_charge_allow_discharge=True), InverterConfig())
+        assert opt_in.decide(slot, SystemState(current_soc_percent=11.1)).mode_intent == (
+            "self_consumption"
+        )
+        # The floor still wins over the opt-in.
+        assert opt_in.decide(slot, SystemState(current_soc_percent=8.8)).mode_intent == "idle"
 
     def test_pv_surplus_with_export_headroom_at_floor_holds(self, controller):
         """Case (a) of the branch: charge + PV export, no battery discharge."""
@@ -111,6 +118,9 @@ class TestPvDrivenChargeFloor:
     def test_unknown_soc_unchanged(self, controller):
         slot = _hold(soc_target=80, charge_kw=0.38, pv_kw=2.08, load_kw=1.16)
         d = controller.decide(slot, SystemState(soc_known=False, min_soc_percent=60.0))
+        assert d.mode_intent == "idle"
+        opt_in = Controller(ControllerConfig(pv_charge_allow_discharge=True), InverterConfig())
+        d = opt_in.decide(slot, SystemState(soc_known=False, min_soc_percent=60.0))
         assert d.mode_intent == "self_consumption"
 
 

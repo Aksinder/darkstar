@@ -150,7 +150,7 @@ class ControllerDecision:
     control_unit: str = "A"  # "A" or "W"
     source: str = "plan"  # "plan" or "override"
     reason: str = ""
-    # True only when THIS idle came from the Hold-slot branch and nothing else
+    # True only when THIS idle came from the Hold-slot (or PV-driven charge) branch and nothing else
     # (min-SoC floor, EV isolation) also wants it idle. The engine may then run the
     # tick as self_consumption while the fuse guard sees a phase at/over budget
     # (apply_hold_fuse_relief) — the battery relieving the fuse beats holding flat.
@@ -390,6 +390,7 @@ class Controller:
         # flapped idle <-> self_consumption on every 1 % step around the floor.
         at_floor = self._at_min_soc_floor(state)
         hold_branch = False
+        pv_charge_branch = False
         if (
             battery_to_grid_kw > HOLD_DISCHARGE_EPS_KW
             and battery_to_grid_kw >= self.config.export_min_battery_kw
@@ -472,8 +473,22 @@ class Controller:
             # battery idle while single-phase/transient loads the balanced PV feed
             # can't cover are pulled from the grid. Use self_consumption so the
             # battery covers those deficits and refills from the surplus PV.
-            # At the floor there is nothing to cover them with: hold, and let the
-            # PV that does arrive charge the pack (see at_floor above).
+            #
+            # Idle, not self_consumption (unless pv_charge_allow_discharge): the
+            # plan has discharge_kw == 0 here, so any discharge is energy it never
+            # priced. self_consumption commands max_discharge, and when real PV
+            # comes in under the forecast (over-forecast, overcast) the pack feeds
+            # the whole house instead of charging — the shortfall the plan meant
+            # the grid to cover. Live 2026-10-25..11-02: ~8.1 kWh drained that way
+            # in PV-charge slots (2026-11-01 overcast the worst). Same reasoning as
+            # the Hold-slot fix (2a90a35c): idle on the Sungrow profile caps
+            # discharge only (max_charge stays at the configured maximum), so real
+            # PV surplus still charges the pack and PV surplus beyond it still
+            # exports; PV < load -> battery rests, grid covers the rest. The
+            # transient/phase argument above costs nothing on a phase-netting
+            # (Swedish) meter. A phase at/over the fuse budget may still release
+            # it for a tick (hold_fuse_relief_ok, engine._apply_hold_fuse_relief).
+            # At the floor it idles regardless (see at_floor above).
             if at_floor:
                 logger.info(
                     "PV-driven charge at the floor: SoC %.1f%% <= min_soc %.0f%% - idle "
@@ -481,8 +496,11 @@ class Controller:
                     state.current_soc_percent, state.min_soc_percent,
                 )
                 mode_intent = "idle"
-            else:
+            elif self.config.pv_charge_allow_discharge:
                 mode_intent = "self_consumption"
+            else:
+                mode_intent = "idle"
+                pv_charge_branch = True
         elif slot.discharge_kw <= HOLD_DISCHARGE_EPS_KW:
             # Hold slot: the plan models no battery discharge (the planner's own
             # "Hold" test is charge and discharge both <= 0.01 kW), so block
@@ -620,7 +638,7 @@ class Controller:
             source="plan",
             reason=reason,
             hold_fuse_relief_ok=(
-                hold_branch
+                (hold_branch or pv_charge_branch)
                 and mode_intent == "idle"
                 and not at_floor
                 and not slot.ev_isolation
