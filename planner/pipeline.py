@@ -26,6 +26,7 @@ from planner.coarse_tail import coarsen_slots, expand_result
 from planner.errors import PlannerError, PlannerErrorCode
 from planner.inputs.data_prep import apply_safety_margins, floored_load_margin, prepare_df
 from planner.inputs.learning import load_learning_overlays
+from planner.inputs.pv_intraday import PvCorrection, apply_pv_correction, load_pv_correction
 from planner.inputs.weather import fetch_temperature_forecast
 from planner.output.schedule import SCHEDULE_JSON_PATH, save_schedule_to_json
 from planner.output.soc_target import apply_soc_target_percent
@@ -900,6 +901,32 @@ class PlannerPipeline:
             real_now = pd.Timestamp.now(tz="UTC")
         now_slot = real_now.floor("15min").tz_convert(tz)
 
+        # Intraday PV bias correction: scale today's upcoming PV forecast by how
+        # today's recently finished slots actually performed vs their forecast,
+        # decaying to 1.0 with lead time (planner/inputs/pv_intraday.py). Raw
+        # forecast stays in the DB; any failure → factor 1.0.
+        pv_correction = PvCorrection(reason="not_applicable")
+        if mode == "full" and has_solar:
+            try:
+                pv_correction = await load_pv_correction(
+                    active_config, real_now.to_pydatetime(), tz
+                )
+                df = apply_pv_correction(df, pv_correction, real_now.to_pydatetime(), tz)
+            except Exception as e:
+                logger.warning("PV intraday correction skipped (%s) — factor 1.0", e)
+                pv_correction = PvCorrection(reason="error")
+            logger.info(
+                "PV intraday correction: factor=%.3f (raw=%s, %s) evidence=%d slots "
+                "actual=%.2f kWh forecast=%.2f kWh half_life=%.1fh",
+                pv_correction.factor,
+                "n/a" if pv_correction.raw_ratio is None else f"{pv_correction.raw_ratio:.3f}",
+                pv_correction.reason,
+                pv_correction.evidence_slots,
+                pv_correction.actual_kwh,
+                pv_correction.forecast_kwh,
+                pv_correction.half_life_hours,
+            )
+
         # Per-device mid-block detection (task 3.1)
         # force_water_by_heater: heater_id → set of timestamps to force ON
         water_heaters_cfg: list[dict[str, Any]] = active_config.get("water_heaters", [])
@@ -1113,6 +1140,10 @@ class PlannerPipeline:
                 input_data.get("extended_forecast_data") or input_data.get("forecast_data") or [],
             )
             full_forecast_df = build_forecast_dataframe(full_forecast_data, timezone_name)
+            if pv_correction.applied:
+                full_forecast_df = apply_pv_correction(
+                    full_forecast_df, pv_correction, real_now.to_pydatetime(), tz
+                )
 
             soc_debug: dict[str, Any] = {}
             target_soc_kwh, soc_debug = calculate_safety_floor(
@@ -2016,7 +2047,7 @@ class PlannerPipeline:
                 s_index_debug,
                 window_responsibilities,
                 planner_state_debug,
-                extra_meta=plan_meta,
+                extra_meta={**(plan_meta or {}), "pv_correction": pv_correction.as_meta()},
             )
 
             # Rev UI5: Always store plan to slot_plans for performance tracking
