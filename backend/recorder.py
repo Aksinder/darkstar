@@ -1016,6 +1016,11 @@ async def _record_observation(
         # PV-boost hours to the right tank).
         "water_heater_energy": water_heater_energy if water_heater_energy else None,
         "ev_charging_kwh": ev_charging_kwh,
+        # Cyclic-load energy subtracted from load_kwh above (both the normal isolation
+        # and the balance rescue). Persisted so money consumers (savings, hindsight
+        # benchmark) can add it back to whole-house consumption exactly; load_kwh
+        # itself stays base load for the forecaster.
+        "cyclic_kwh": cyclic_kwh,
         "ev_charger_energy": ev_charger_energy if ev_charger_energy else None,
         "batt_charge_kwh": batt_charge_kwh,
         "batt_discharge_kwh": batt_discharge_kwh,
@@ -1045,8 +1050,8 @@ async def _record_observation(
     # are not monotonic in PV (0.000 / +0.100 / +0.234 / -0.174 / -0.002). PV explains
     # almost none of the variance, so a flat tolerance is the honest form.
     #
-    # NOTE: that calibration was run on a residual WITHOUT cyclic_kwh, which is not
-    # persisted and so cannot be reconstructed from the database. If cyclic loads are
+    # NOTE: that calibration was run on a residual WITHOUT cyclic_kwh, which was not
+    # persisted then (slot_observations.cyclic_kwh exists since 2026-11-03). If cyclic loads are
     # configured and material, re-check the live firing rate before trusting the default.
     balance_tolerance_kwh = float(recorder_cfg.get("balance_tolerance_kwh", 1.5))
     balance_tripped = (

@@ -123,6 +123,22 @@ def test_idle_battery_matches_grid_only():
     assert rec["stored_change_kwh"] == pytest.approx(0.0, abs=1e-6)
 
 
+def test_cyclic_loads_are_part_of_demand():
+    """The recorder takes the pool pump out of load_kwh; the meter still paid for it.
+    Idle battery: base 0.3 + pump 0.1 = the 0.4 the meter imported, so actual must
+    still equal grid-only with no phantom battery flow. A missing (legacy, unfilled)
+    cyclic_kwh counts as 0 and is NOT an unverified slot."""
+    rows = _day_rows(DAY)
+    for r in rows:
+        r["load_kwh"] = 0.3
+        r["cyclic_kwh"] = 0.1
+    rec = benchmark_day(DAY, _by_day(rows), _config(), TZ, NOW)
+    assert rec["status"] == "scored" and rec["unverified_slots"] == 0
+    assert rec["actual_cost_sek"] == pytest.approx(rec["grid_only_cost_sek"], abs=1e-6)
+    assert rec["grid_only_cost_sek"] == pytest.approx(rec["metered_cost_sek"], abs=1e-6)
+    assert rec["stored_change_kwh"] == pytest.approx(0.0, abs=1e-6)
+
+
 def test_load_rescued_is_clean_but_grid_unmeasured_counts():
     rescued = {key: {"load_rescued": "energy_balance"} for key in range(96)}
     rec = benchmark_day(DAY, _by_day(_day_rows(DAY, flags=rescued)), _config(), TZ, NOW)
@@ -257,6 +273,33 @@ def test_service_scores_pending_days_once_and_waits_for_planner():
     assert sleeps, "waited for the busy planner"
     rec = json.loads(store.state[state_key(date(2026, 10, 20))])
     assert rec["status"] == "scored"
+
+
+def test_service_fills_legacy_cyclic_from_device_store():
+    """Rows without the cyclic_kwh column get the pump energy from slot_device_energy,
+    so the scored grid-only cost matches the meter on an idle-battery day."""
+    rows = []
+    for k in range(4, 0, -1):
+        rows += _day_rows(date(2026, 10, 22) - timedelta(days=k))
+    dev = []
+    for r in rows:
+        r["load_kwh"] = 0.3  # recorder took the 0.1 pump out
+        dev.append({"slot_start": r["slot_start"], "device_id": "poolpump", "kwh": 0.1})
+    store = _FakeStore(rows)
+
+    async def get_dev(start_iso: str, end_iso: str) -> list[dict[str, Any]]:
+        return dev
+
+    store.get_device_energy_rows_between = get_dev  # type: ignore[attr-defined]
+    cfg = _service_config()
+    cfg["cyclic_loads"] = [{"id": "poolpump", "enabled": True}]
+    svc = BenchmarkService(
+        config_loader=lambda: cfg, now=lambda: NOW.astimezone(UTC), planner_busy=lambda: False
+    )
+    asyncio.run(svc.run_once(store))  # type: ignore[arg-type]
+    rec = json.loads(store.state[state_key(date(2026, 10, 20))])
+    assert rec["status"] == "scored"
+    assert rec["grid_only_cost_sek"] == pytest.approx(rec["metered_cost_sek"], abs=1e-6)
 
 
 def test_service_disabled_does_nothing():

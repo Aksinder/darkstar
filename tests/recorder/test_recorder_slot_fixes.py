@@ -253,6 +253,22 @@ class TestRescueSubtractsCyclic:
         assert "load_rescued" not in _flags(measured)
         assert measured["load_kwh"] == pytest.approx(rescued["load_kwh"], abs=1e-6)
 
+    @pytest.mark.asyncio
+    async def test_subtracted_cyclic_energy_is_persisted_on_the_row(self):
+        """Both paths record the cyclic energy they took out of load_kwh, so money
+        consumers can add it back: base + cyclic == whole house (3.0)."""
+        config = _base_config(cyclic_loads=[POOL])
+        hist = {"sensor.pool_power": _states((0, 1200))}
+        for load_delta in (3.0, 0.0):  # measured, rescued
+            record = await _run(config, pv_delta=1.25, load_delta=load_delta, history=hist)
+            assert record["cyclic_kwh"] == pytest.approx(0.3, abs=1e-6)
+            assert record["load_kwh"] + record["cyclic_kwh"] == pytest.approx(3.0, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_no_cyclic_loads_records_zero(self):
+        record = await _run(_base_config(), pv_delta=1.25, load_delta=3.0, history={})
+        assert record["cyclic_kwh"] == 0.0
+
 
 SPA = {"id": "spa", "enabled": True, "sensor": "sensor.spa_power"}
 

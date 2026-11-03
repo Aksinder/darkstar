@@ -75,6 +75,11 @@ def test_compute_slot_record_subtracts_cyclic_loads():
     assert rec is not None
     # 0.75 without cyclic, minus 1.0 / 4
     assert rec["load_kwh"] == pytest.approx(0.5)
+    # ...and the row says how much it took out, so savings can add it back.
+    assert rec["cyclic_kwh"] == pytest.approx(0.25)
+    # Update mode too: its load_kwh excludes the cyclic energy just the same.
+    upd = compute_slot_record(HOUR + timedelta(minutes=15), hourly, full=False)
+    assert upd is not None and upd["cyclic_kwh"] == pytest.approx(0.25)
 
 
 def test_compute_slot_record_clamps_negative_load_and_needs_data():

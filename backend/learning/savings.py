@@ -4,14 +4,16 @@ For every recorded slot we compare what the house ACTUALLY paid on the grid with
 the SAME house would have paid with the battery layer switched off:
 
     actual   = import_kwh * import_price - export_kwh * export_price
-    house    = load_kwh + water_kwh + ev_charging_kwh
+    house    = load_kwh + water_kwh + ev_charging_kwh + cyclic_kwh
     baseline = max(house - pv, 0) * import_price - max(pv - house, 0) * export_price
 
 i.e. the baseline is a plain PV house: PV serves load first, any surplus exports, any
 deficit imports — no battery arbitrage, no stored-solar time shifting. Note that
 ``SlotObservation.load_kwh`` is BASE load (the recorder subtracts water-heater and EV
 energy before storing), so the counterfactual house must add those columns back to
-consume the same whole-house energy the real house did.
+consume the same whole-house energy the real house did. Since 2026-08-21 the recorder
+also subtracts cyclic loads (pool pump, filter: config ``cyclic_loads``), so they are
+added back too -- see ``house_kwh`` and ``attach_cyclic_kwh``.
 
 Honesty notes (what this measures and what it does not):
 - It measures the value of the BATTERY layer (arbitrage + stored-solar self-consumption)
@@ -85,6 +87,75 @@ class StoredEnergyDelta:
         return self.n_battery_slots / self.n_slots if self.n_slots else 0.0
 
 
+def house_kwh(row: Mapping[str, Any]) -> float:
+    """Whole-house consumption of one observation row.
+
+    load_kwh is BASE load: the recorder subtracts water heaters, EV and (since
+    2026-08-21) cyclic loads, because the planner models each of them separately.
+    Money is paid on all of it, so every money consumer must add them back. Missing
+    values count as 0 -- for cyclic_kwh run ``attach_cyclic_kwh`` first so legacy
+    rows (column NULL) get their stored per-device value instead.
+    """
+    return (
+        float(row.get("load_kwh") or 0.0)
+        + float(row.get("water_kwh") or 0.0)
+        + float(row.get("ev_charging_kwh") or 0.0)
+        + float(row.get("cyclic_kwh") or 0.0)
+    )
+
+
+def cyclic_load_ids(config: Mapping[str, Any]) -> set[str]:
+    """Device ids under which the recorder stores cyclic-load energy (enabled or not:
+    a load disabled today may still have been recorded in the window)."""
+    out: set[str] = set()
+    for item in config.get("cyclic_loads", []) or []:
+        if isinstance(item, dict) and item.get("id"):
+            out.add(str(item["id"]))  # type: ignore[reportUnknownArgumentType]
+    return out
+
+
+# Writers that rebuilt load_kwh WITHOUT subtracting cyclic loads before
+# slot_observations.cyclic_kwh existed: the balance rescue (until 05573b01,
+# 2026-11-01) and the statistics repair (until bc8e7313, 2026-11-01).
+_LEGACY_NO_CYCLIC_SUBTRACTION = ('"load_rescued"', '"repaired"')
+
+
+def attach_cyclic_kwh(
+    rows: Sequence[dict[str, Any]],
+    device_rows: Sequence[Mapping[str, Any]],
+    cyclic_ids: set[str],
+) -> None:
+    """Fill ``cyclic_kwh`` IN PLACE on legacy rows (column NULL) from slot_device_energy.
+
+    Rows that carry the column are left alone -- it records exactly what the writer
+    subtracted. A legacy row's cyclic energy is taken from the recorder's per-device
+    rows (same slot_start string, written in the same transaction), but ONLY when
+    the row's load came from the recorder's normal isolation path, which has
+    subtracted cyclic loads since 2026-08-21. Rescued or repaired legacy rows get 0:
+    those writers did not subtract it then, so adding it back would double-count.
+    Known residual: a row rescued between the 2026-11-01 rescue fix and this column
+    shipping did subtract it and is under-counted by the pump energy of that slot.
+    """
+    if not cyclic_ids:
+        for row in rows:
+            if row.get("cyclic_kwh") is None:
+                row["cyclic_kwh"] = 0.0
+        return
+    per_slot: dict[str, float] = {}
+    for dev in device_rows:
+        if str(dev.get("device_id")) in cyclic_ids:
+            key = str(dev.get("slot_start"))
+            per_slot[key] = per_slot.get(key, 0.0) + float(dev.get("kwh") or 0.0)
+    for row in rows:
+        if row.get("cyclic_kwh") is not None:
+            continue
+        flags = row.get("quality_flags")
+        if isinstance(flags, str) and any(k in flags for k in _LEGACY_NO_CYCLIC_SUBTRACTION):
+            row["cyclic_kwh"] = 0.0
+            continue
+        row["cyclic_kwh"] = per_slot.get(str(row.get("slot_start")), 0.0)
+
+
 def _grid_unmeasured(row: Mapping[str, Any]) -> bool:
     """True for a row the recorder wrote while the grid meter was unreadable."""
     flags = row.get("quality_flags")
@@ -97,8 +168,8 @@ def compute_savings(rows: Sequence[Mapping[str, Any]]) -> SavingsSummary:
     Rows need: import_kwh, export_kwh, pv_kwh, load_kwh, import_price_sek_kwh
     (export_price_sek_kwh optional, treated as 0 when absent — conservative for
     the baseline's export revenue and the actual's alike). load_kwh is BASE load,
-    so water_kwh and ev_charging_kwh (0 when absent) are added back to reconstruct
-    the whole-house load the baseline house must serve.
+    so water_kwh, ev_charging_kwh and cyclic_kwh (0 when absent) are added back to
+    reconstruct the whole-house load the baseline house must serve.
     """
     actual = 0.0
     baseline = 0.0
@@ -114,12 +185,8 @@ def compute_savings(rows: Sequence[Mapping[str, Any]]) -> SavingsSummary:
         imp = float(row.get("import_kwh") or 0.0)
         exp = float(row.get("export_kwh") or 0.0)
         pv = float(row.get("pv_kwh") or 0.0)
-        # Whole-house load: load_kwh is base load (recorder subtracts water + EV).
-        load = (
-            float(row.get("load_kwh") or 0.0)
-            + float(row.get("water_kwh") or 0.0)
-            + float(row.get("ev_charging_kwh") or 0.0)
-        )
+        # Whole-house load: load_kwh is base load (recorder subtracts water, EV, cyclic).
+        load = house_kwh(row)
 
         actual += imp * p_imp - exp * p_exp
         net = load - pv
@@ -212,11 +279,7 @@ def compute_stored_energy_delta(
         else:
             continue
 
-        house = (
-            float(row.get("load_kwh") or 0.0)
-            + float(row.get("water_kwh") or 0.0)
-            + float(row.get("ev_charging_kwh") or 0.0)
-        )
+        house = house_kwh(row)
         surplus = max(float(row.get("pv_kwh") or 0.0) - house, 0.0)
         from_pv = min(inflow, surplus)
         from_grid = inflow - from_pv
