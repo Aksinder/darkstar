@@ -1178,6 +1178,35 @@ class LearningStore:
             result = await session.execute(stmt)
             return [row._asdict() for row in result.all()]  # type: ignore
 
+    async def get_pv_forecast_vs_actual(
+        self, start_iso: str, version: str = "aurora"
+    ) -> list[dict[str, Any]]:
+        """Finished slots with both an observed PV and the stored PV forecast.
+
+        Feeds the planner's intraday PV correction. ``start_iso`` is a coarse
+        lexicographic lower bound; callers filter precisely on parsed timestamps.
+        """
+        async with self.AsyncSession() as session:
+            stmt = (
+                select(
+                    SlotObservation.slot_start,
+                    SlotObservation.pv_kwh,
+                    SlotObservation.quality_flags,
+                    SlotObservation.soc_end_percent,
+                    SlotObservation.export_price_sek_kwh,
+                    SlotForecast.pv_forecast_kwh,
+                )
+                .join(
+                    SlotForecast,
+                    (SlotObservation.slot_start == SlotForecast.slot_start)
+                    & (SlotForecast.forecast_version == version),
+                )
+                .where(SlotObservation.slot_start >= start_iso)
+                .order_by(SlotObservation.slot_start.asc())
+            )
+            result = await session.execute(stmt)
+            return [row._asdict() for row in result.all()]  # type: ignore
+
     async def get_executions_range(self, start: datetime) -> list[dict[str, Any]]:
         """Get execution history from execution_log table, grouped by slot_start."""
         start_iso = start.isoformat()

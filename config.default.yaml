@@ -991,6 +991,25 @@ forecasting:
                                        # robustness). Slots lacking a p10 keep the scalar.
                                        # NOTE: with weight>0, pv_confidence_percent (and any
                                        # Reflex tuning of it) only affects p10-less slots.
+  # Intraday PV bias correction (planner side). Compares today's recently FINISHED
+  # slots — actual PV (recorder) vs the forecast stored for those slots — and scales
+  # the upcoming PV forecast (p10/p50/p90) by sum(actual)/sum(forecast), decaying to
+  # 1.0 with lead time and never past local midnight (tomorrow untouched). Catches
+  # the "forecast sunny, actually overcast" day before the battery drains.
+  # Fail-safe: too little evidence or any error → factor 1.0. The DB keeps the raw
+  # forecast. Applied before pv_confidence_percent / pv_p10_weight, which still apply.
+  # The factor is logged each plan and published in schedule meta.pv_correction.
+  pv_intraday_correction:
+    enabled: true
+    lookback_hours: 2.0                # finished slots of TODAY within this window
+    half_life_hours: 2.0               # deviation from 1.0 halves every N h of lead time
+    min_factor: 0.2                    # floor: never plan below 20% of the forecast
+    max_factor: 1.3                    # ceiling: upside correction is deliberately tighter
+    upward_gain: 0.5                   # "more sun than forecast" believed only half (1.0 = symmetric)
+    min_slot_forecast_kwh: 0.05        # per 15-min slot; dimmer slots (night/dawn/dusk) ignored
+    min_slots: 4                       # evidence: ≥ this many qualifying slots ...
+    min_forecast_kwh: 0.5              # ... AND ≥ this much forecast energy, else factor 1.0
+    max_soc_percent: 98.0              # slots with battery ≥ this may be PV-throttled: ignored
   load_safety_margin_percent: 117.0    # HARD FLOOR on the S-Index load margin: the planner never
                                        # plans for less load than this % of the forecast, regardless
                                        # of s_index.risk_appetite (which tunes conservatism ABOVE it).
