@@ -144,6 +144,7 @@ def _split_slot(
                 start_time=orig.start_time,
                 end_time=orig.end_time,
                 charge_kwh=coarse.charge_kwh * share,
+                charge_pv_kwh=coarse.charge_pv_kwh * share,
                 discharge_kwh=coarse.discharge_kwh * share,
                 grid_import_kwh=coarse.grid_import_kwh * share,
                 grid_export_kwh=coarse.grid_export_kwh * share,

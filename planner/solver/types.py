@@ -247,6 +247,14 @@ class KeplerConfig:
     # AC-coupled inverter (e.g. Fronius) does not. None => treat all PV as on the hybrid
     # inverter (legacy single-inverter behaviour).
     hybrid_pv_fraction: float | None = None
+    # Efficiency (0..1] for storing PV from the hybrid inverter's OWN DC strings. That
+    # energy goes DC->DC into the battery without the inverter's AC->DC stage, so it
+    # is stored more efficiently than grid/AC charging (charge_efficiency). When set
+    # (and different from charge_efficiency) Kepler splits each slot's charge into a
+    # DC-PV part (charge_pv, bounded by the hybrid share of PV, see hybrid_pv_fraction)
+    # charged at this efficiency and the remainder at charge_efficiency. None =>
+    # legacy single-efficiency model (all charge at charge_efficiency).
+    pv_charge_efficiency: float | None = None
     target_soc_kwh: float | None = None  # Minimum SoC at end of horizon
     target_soc_penalty_sek: float = 0.0  # Set by pipeline (Safety Floor penalty)
     curtailment_penalty_sek: float = 0.0  # Penalty for wasting available solar power
@@ -470,6 +478,10 @@ class KeplerResultSlot:
     grid_export_kwh: float
     soc_kwh: float
     cost_sek: float
+    # Part of charge_kwh that is the hybrid inverter's own DC PV, stored at
+    # KeplerConfig.pv_charge_efficiency (the rest at charge_efficiency). Always
+    # 0.0 when the split is not modelled (pv_charge_efficiency unset).
+    charge_pv_kwh: float = 0.0
     import_price_sek_kwh: float = 0.0
     export_price_sek_kwh: float = 0.0
     water_heat_kw: float = 0.0  # Aggregate water heating power (backward compat)

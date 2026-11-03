@@ -11,8 +11,13 @@ ERRORS (physically impossible or internally inconsistent — enforce mode reject
   * non-finite numbers, slot-count mismatch
   * SoC outside [0, capacity]
   * SoC trajectory not following charge/discharge with the configured efficiencies
+    (DC PV charge ``charge_pv_kwh`` at pv_charge_efficiency, the rest at
+    charge_efficiency)
+  * DC PV charge negative, above the total charge, or above the hybrid inverter's
+    share of PV
   * per-slot energy balance not closing: supply - demand must lie in
-    [0, pv] (the gap is curtailment); a deficit means unserved load
+    [0, pv] (the gap is curtailment); a deficit means unserved load; DC PV
+    charge plus curtailment above PV (curtailed PV credited as stored)
   * hard power limits: battery charge/discharge, inverter AC headroom, grid
     import/export caps, export while export is disabled
   * reported cost (per slot and total) differing from a recomputation
@@ -128,6 +133,14 @@ def validate_plan(
     cap = config.capacity_kwh
     eta_c = config.charge_efficiency if config.charge_efficiency > 0 else 1.0
     eta_d = config.discharge_efficiency if config.discharge_efficiency > 0 else 1.0
+    # DC PV charging (pv_charge_efficiency): None => everything at eta_c, exactly the
+    # legacy check (charge_pv_kwh is then 0.0 and the split term vanishes).
+    eta_pv = (
+        config.pv_charge_efficiency
+        if config.pv_charge_efficiency is not None and config.pv_charge_efficiency > 0
+        else eta_c
+    )
+    hybrid_frac = config.hybrid_pv_fraction if config.hybrid_pv_fraction is not None else 1.0
     # Same per-slot basis as the solver (a partial slot 0 has only its remainder).
     hours = planned_slot_hours(slots, getattr(input_data, "first_slot_remaining_h", None))
     initial = max(0.0, min(cap, input_data.initial_soc_kwh))
@@ -157,7 +170,18 @@ def validate_plan(
         # SoC bounds and trajectory.
         if soc < -SOC_TOL_KWH or soc > cap + SOC_TOL_KWH:
             c.error(f"{label}: SoC {soc:.3f} kWh outside [0, {cap:.2f}]")
-        expected = prev_soc + ch * eta_c - dis / eta_d
+        ch_pv = getattr(r, "charge_pv_kwh", 0.0) or 0.0
+        if not _finite(ch_pv):
+            c.error(f"{label}: non-finite DC PV charge")
+            ch_pv = 0.0
+        if ch_pv < -ENERGY_TOL_KWH:
+            c.error(f"{label}: negative DC PV charge {ch_pv:.3f} kWh")
+        if ch_pv > ch + ENERGY_TOL_KWH:
+            c.error(f"{label}: DC PV charge {ch_pv:.3f} kWh > total charge {ch:.3f}")
+        hybrid_pv = max(0.0, s.pv_kwh) * hybrid_frac
+        if ch_pv > hybrid_pv + ENERGY_TOL_KWH:
+            c.error(f"{label}: DC PV charge {ch_pv:.3f} kWh > hybrid-inverter PV {hybrid_pv:.3f}")
+        expected = prev_soc + (ch - ch_pv) * eta_c + ch_pv * eta_pv - dis / eta_d
         if abs(soc - expected) > SOC_TOL_KWH:
             c.error(f"{label}: SoC {soc:.3f} kWh does not follow flows (expected {expected:.3f})")
         if soc < floors[t + 1] - SOC_TOL_KWH:
@@ -180,6 +204,11 @@ def validate_plan(
             c.error(
                 f"{label}: energy balance surplus {residual:.3f} kWh exceeds PV "
                 f"{s.pv_kwh:.3f} (energy from nowhere)"
+            )
+        elif ch_pv > ENERGY_TOL_KWH and ch_pv + max(0.0, residual) > max(0.0, s.pv_kwh) + tol:
+            c.error(
+                f"{label}: DC PV charge {ch_pv:.3f} + curtailment {residual:.3f} kWh "
+                f"exceeds PV {s.pv_kwh:.3f} (curtailed PV credited as stored)"
             )
 
         # Hard power limits.

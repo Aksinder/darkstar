@@ -1021,6 +1021,41 @@ def _excess_pv_price_ceiling(planner_config: dict[str, Any]) -> float | None:
         return None
 
 
+def parse_pv_charge_efficiency(raw: Any) -> float | None:
+    """``battery.pv_charge_efficiency`` -> a number in (0, 1], or None (feature off).
+
+    Unset/null is the normal case (legacy single-efficiency model). Anything else
+    that is not a finite number in (0, 1] — 0, > 1, NaN, a non-numeric string, a bool — is a
+    config mistake: warn and fall back to None rather than plan with a nonsense
+    efficiency (a value > 1 would let the solver create energy from PV).
+    """
+    if raw is None:
+        return None
+    # Same coercion as charge_efficiency (float(), so numeric strings from a UI
+    # save work); bools are rejected explicitly (float(True) == 1.0).
+    value: float | None = None
+    if not isinstance(raw, bool):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = None
+    if value is None:
+        logger.warning(
+            "battery.pv_charge_efficiency=%r is not a number; ignoring it "
+            "(DC PV charging uses charge_efficiency)",
+            raw,
+        )
+        return None
+    if not math.isfinite(value) or value <= 0.0 or value > 1.0:
+        logger.warning(
+            "battery.pv_charge_efficiency=%r outside (0, 1]; ignoring it "
+            "(DC PV charging uses charge_efficiency)",
+            raw,
+        )
+        return None
+    return value
+
+
 def config_to_kepler_config(
     planner_config: dict[str, Any],
     overrides: dict[str, Any] | None = None,
@@ -1127,6 +1162,17 @@ def config_to_kepler_config(
         if _total_kwp > 0.0:
             hybrid_pv_fraction = _hybrid_kwp / _total_kwp
 
+    pv_charge_eff = parse_pv_charge_efficiency(battery.get("pv_charge_efficiency"))
+    if pv_charge_eff is not None and pv_charge_eff < charge_eff:
+        # Legal but physically odd (DC->DC skips a conversion stage). The split is an
+        # optional path for the solver, so it can still store PV at charge_efficiency.
+        logger.warning(
+            "battery.pv_charge_efficiency=%.3f is below charge_efficiency=%.3f; "
+            "DC PV charging is normally the MORE efficient path",
+            pv_charge_eff,
+            charge_eff,
+        )
+
     # Top-level grid section: soft import cap (opt-in via enforce_import_limit so the
     # long-shipped import_limit_kw default doesn't suddenly activate for existing
     # configs) + effekttariff peak-demand-charge settings.
@@ -1181,6 +1227,7 @@ def config_to_kepler_config(
             else None
         ),
         hybrid_pv_fraction=hybrid_pv_fraction,
+        pv_charge_efficiency=pv_charge_eff,
         grid_import_limit_kw=grid_import_limit_kw,
         peak_power_cost_sek_per_kw=float(_grid_cfg.get("peak_power_cost_sek_per_kw", 0.0) or 0.0),
         peak_power_baseline_kw=resolved_peak_baseline_kw,
