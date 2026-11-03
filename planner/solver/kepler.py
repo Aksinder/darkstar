@@ -49,6 +49,22 @@ MIN_SOC_RECOVERY_HOURS = 6.0
 MIN_SOC_RECOVERY_MAX_DEFICIT_PERCENT = 5.0
 _RECOVERY_EPS = 1e-6
 
+# Simultaneous import + export (flagged by planner/plan_validator.py). A meter nets
+# one slot's flows, so importing and exporting in the same slot is physically
+# meaningless and confuses the executor. Two cases:
+#  * Tie (effective export price == import price, e.g. the adapter's
+#    export=import fallback when no export column exists): the LP is indifferent.
+#    A tiny cost on GROSS grid flow breaks the tie with no new variables. 1e-4
+#    SEK/kWh = 0.01 öre: ~0.01 SEK on a day with 100 kWh of grid flow.
+#  * Inverted (effective export price > import price): a real but fictional
+#    arbitrage loop (import X, export X). Happens only at deep negative spot (VAT
+#    is applied to import spot but not export spot, so 0.25*spot eats the ~1 SEK
+#    fee spread below roughly -4 SEK/kWh), with export_includes_spot false at
+#    negative spot, or with a large export premium. The epsilon cannot stop a
+#    strictly profitable loop, so ONLY those slots get a grid-direction binary.
+#    Prices are constants at build time, so normally zero binaries are added.
+GRID_FLOW_EPSILON_SEK_PER_KWH = 1e-4
+
 
 def min_soc_floor_kwh(
     slot_hours: list[float],
@@ -682,6 +698,7 @@ class KeplerSolver:
         curtailment_penalty = config.curtailment_penalty_sek
         LOAD_SHEDDING_PENALTY = 10000.0
         IMPORT_BREACH_PENALTY = 5000.0
+        inverted_grid_slots = 0
 
         for t in range(T):
             s: Any = slots[t]
@@ -889,6 +906,28 @@ class KeplerSolver:
             # Rev E4: Strict Export Toggle
             if not config.enable_export:
                 prob += grid_export[t] == 0
+            elif (
+                s.import_price_sek_kwh
+                - (s.export_price_sek_kwh - config.export_threshold_sek_per_kwh)
+                + 2.0 * GRID_FLOW_EPSILON_SEK_PER_KWH
+                <= 0.0
+            ):
+                # Inverted slot: an import->export loop would be profitable, so the
+                # epsilon below cannot prevent it. Pick one grid direction.
+                grid_dir_export: Any = pulp.LpVariable(f"grid_dir_export_{t}", cat="Binary")
+                m_exp = (
+                    config.max_export_power_kw * h
+                    if config.max_export_power_kw is not None
+                    else max(0.0, s.pv_kwh) + max_dis_kwh
+                )
+                m_imp = (
+                    config.max_import_power_kw * h
+                    if config.max_import_power_kw is not None
+                    else 1000.0 * h
+                )
+                prob += grid_export[t] <= m_exp * grid_dir_export
+                prob += grid_import[t] <= m_imp * (1 - grid_dir_export)
+                inverted_grid_slots += 1
 
             # Export floor SoC constraint (big-M formulation)
             if export_floor_active:
@@ -925,6 +964,11 @@ class KeplerSolver:
                 s.export_price_sek_kwh - config.export_threshold_sek_per_kwh
             )
             slot_export_revenue: Any = grid_export[t] * effective_export_price
+            # Tie-breaker against simultaneous import+export (see
+            # GRID_FLOW_EPSILON_SEK_PER_KWH). Objective only: reported cost unchanged.
+            slot_grid_flow_cost: Any = (
+                grid_import[t] + grid_export[t]
+            ) * GRID_FLOW_EPSILON_SEK_PER_KWH
             slot_ramping_cost: Any = (ramp_up[t] + ramp_down[t]) * config.ramping_cost_sek_per_kw
             slot_curtailment_cost: Any = curtailment[t] * curtailment_penalty
             slot_shedding_cost: Any = load_shedding[t] * LOAD_SHEDDING_PENALTY
@@ -940,6 +984,7 @@ class KeplerSolver:
             total_cost.append(
                 slot_import_cost
                 - slot_export_revenue
+                + slot_grid_flow_cost
                 + slot_wear_cost
                 + slot_ramping_cost
                 + slot_curtailment_cost
@@ -951,6 +996,13 @@ class KeplerSolver:
             # Soft Min/Max SoC Constraints
             prob += soc[t] >= floor_kwh[t] - soc_violation[t]
             prob += soc[t] <= max_soc_kwh + soc_overshoot[t]
+
+        if inverted_grid_slots:
+            logger.info(
+                "Kepler: %d slot(s) with export price >= import price; grid-direction "
+                "binary added to stop a fictional import->export loop",
+                inverted_grid_slots,
+            )
 
         # Terminal constraints
         prob += soc[T] >= floor_kwh[T] - soc_violation[T]
