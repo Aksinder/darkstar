@@ -393,3 +393,67 @@ def test_attach_cyclic_kwh_without_cyclic_loads_is_zero():
     rows = [_legacy("2026-10-20T12:00:00+02:00"), _legacy("2026-10-20T12:15:00+02:00", cyclic=0.2)]
     attach_cyclic_kwh(rows, [], set())
     assert [r["cyclic_kwh"] for r in rows] == [0.0, 0.2]
+
+
+# --- reason codes ---------------------------------------------------------------
+
+
+def test_excluded_slots_are_counted_per_reason():
+    """priced_coverage alone could not tell a missing price from a grid outage."""
+    unpriced = _slot(imp=1.0, load=1.0, p_imp=None)
+    outage = {**_slot(load=1.0), "quality_flags": '{"grid_unmeasured": true}'}
+    both = {**_slot(load=1.0, p_imp=None), "quality_flags": '{"grid_unmeasured": true}'}
+    s = compute_savings([_slot(imp=1.0, load=1.0), unpriced, outage, both])
+    assert s.n_slots == 4 and s.n_priced_slots == 1
+    # First failing check wins, in evaluation order: no price before grid_unmeasured.
+    assert s.n_unpriced_slots == 2 and s.n_grid_unmeasured_slots == 1
+    assert s.excluded_by_reason == {"unpriced": 2, "grid_unmeasured": 1}
+    assert s.n_priced_slots + sum(s.excluded_by_reason.values()) == s.n_slots
+
+    clean = compute_savings([_slot(imp=1.0, load=1.0)])
+    assert clean.excluded_by_reason == {} and clean.degraded_by_flag == {}
+
+
+def test_flagged_slots_are_counted_but_valued_exactly_as_before():
+    """ev_unmeasured (like water/pv_unmeasured), base_load_clamped and
+    load_spike_zeroed do not change one ore; they are reported next to the result."""
+    base = [_slot(imp=0.5, pv=1.0, load=1.5, ev=0.5), _slot(exp=1.0, pv=2.0, load=1.0)]
+    flag_sets = (
+        '{"ev_unmeasured": {"easee": "unavailable"}, "water_unmeasured": {"spa": "snapshot"}}',
+        '{"base_load_clamped": true, "load_spike_zeroed": ["pv_kwh"], "pv_unmeasured": "counter"}',
+    )
+    flagged = [{**row, "quality_flags": f} for row, f in zip(base, flag_sets, strict=True)]
+    s = compute_savings(flagged)
+    plain = compute_savings(base)
+    assert (s.actual_cost_sek, s.baseline_cost_sek, s.savings_sek, s.n_priced_slots) == (
+        plain.actual_cost_sek,
+        plain.baseline_cost_sek,
+        plain.savings_sek,
+        plain.n_priced_slots,
+    )
+    assert s.degraded_by_flag == {
+        "ev_unmeasured": 1,
+        "water_unmeasured": 1,
+        "base_load_clamped": 1,
+        "load_spike_zeroed": 1,
+        "pv_unmeasured": 1,
+    }
+    # An excluded slot is not also reported as degraded.
+    outage = {**base[0], "quality_flags": '{"grid_unmeasured": true, "ev_unmeasured": {"e": "x"}}'}
+    assert compute_savings([outage]).degraded_by_flag == {}
+
+
+def test_savings_sensors_publish_the_reason_codes():
+    from backend.learning.cycle_publisher import build_savings_sensors
+
+    rows = [
+        _slot(imp=1.0, load=1.0),
+        _slot(load=1.0, p_imp=None),
+        {**_slot(imp=1.0, load=1.0), "quality_flags": '{"ev_unmeasured": {"easee": "snapshot"}}'},
+    ]
+    today, month = build_savings_sensors(compute_savings(rows), compute_savings(rows[:1]))
+    assert today.attributes["priced_coverage"] == pytest.approx(0.667)
+    assert today.attributes["excluded_by_reason"] == {"unpriced": 1}
+    assert today.attributes["degraded_by_flag"] == {"ev_unmeasured": 1}
+    assert month.attributes["excluded_by_reason"] == {}
+    assert month.attributes["degraded_by_flag"] == {}

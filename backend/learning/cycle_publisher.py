@@ -96,7 +96,9 @@ def build_savings_sensors(
     minus actual: positive = the battery layer earned money). The full breakdown rides
     in attributes so a dashboard can show actual-vs-baseline, and ``priced_coverage``
     exposes how much of the window could actually be valued — a thin/unpriced window
-    is visible instead of masquerading as a result.
+    is visible instead of masquerading as a result. ``excluded_by_reason`` splits the
+    unvalued slots by cause and ``degraded_by_flag`` counts valued slots carrying a
+    recorder data-quality flag (both empty on a clean window).
 
     The TODAY sensor's state additionally carries the value of energy still held in the
     battery at the cut (``StoredEnergyDelta``), because the today window is a partial,
@@ -130,6 +132,8 @@ def build_savings_sensors(
             "baseline_cost_sek": round(float(summary.baseline_cost_sek), 2),
             "n_slots": int(summary.n_slots),
             "priced_coverage": round(float(summary.coverage), 3),
+            "excluded_by_reason": dict(getattr(summary, "excluded_by_reason", None) or {}),
+            "degraded_by_flag": dict(getattr(summary, "degraded_by_flag", None) or {}),
             "baseline": "PV house without battery layer (no arbitrage, "
             "no stored-solar shifting); load-shift value not included",
         }
