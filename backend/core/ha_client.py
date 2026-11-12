@@ -382,7 +382,14 @@ async def get_energy_from_power_history(
         if not data or not data[0]:
             return None
 
-        return integrate_power_history_kwh(data[0], start, end, idle_kw=idle_kw)
+        return integrate_power_history_kwh(
+            data[0],
+            start,
+            end,
+            idle_kw=idle_kw,
+            fallback_unit=await _current_unit_if_series_has_none(entity_id, data[0]),
+            entity_id=entity_id,
+        )
 
     except Exception as exc:
         logger.warning("get_energy_from_power_history(%s): %s", entity_id, exc)
@@ -431,23 +438,82 @@ async def get_power_history_batch(
         entity = str(series[0].get("entity_id", "")) if isinstance(series[0], dict) else ""
         if entity:
             result[entity] = series
+    # A series with no unit anywhere gets the entity's current unit written into (a copy
+    # of) its first state, so callers that integrate the raw states need no extra plumbing.
+    for entity, series in list(result.items()):
+        unit = await _current_unit_if_series_has_none(entity, series)
+        if unit:
+            first = dict(series[0])
+            first["attributes"] = {**(first.get("attributes") or {}), "unit_of_measurement": unit}
+            result[entity] = [first, *series[1:]]
     return result
+
+
+# Entities already warned about for a missing/unknown power unit (once per process).
+_power_unit_warned: set[str] = set()
+
+
+def _state_unit(state: Any) -> str | None:
+    """The non-empty ``unit_of_measurement`` an HA state carries, else None."""
+    if not isinstance(state, dict):
+        return None
+    attributes = cast("dict[str, Any]", state).get("attributes")
+    if not isinstance(attributes, dict):
+        return None
+    unit = str(cast("dict[str, Any]", attributes).get("unit_of_measurement") or "").strip()
+    return unit or None
+
+
+def _power_kw_factor(unit: str | None) -> float | None:
+    """Multiplier taking a power value in ``unit`` to kW; None for an unrecognised unit.
+
+    HA spells milliwatt "mW" and megawatt "MW", so those two match case-sensitively
+    first; everything else (W, kW, MW, GW) is case-insensitive.
+    """
+    if not unit:
+        return None
+    if unit == "mW":
+        return 1e-6
+    return {"W": 1e-3, "KW": 1.0, "MW": 1e3, "GW": 1e6}.get(unit.upper())
 
 
 def _parse_power_samples(
     states: list[dict[str, Any]],
+    *,
+    fallback_unit: str | None = None,
+    entity_id: str | None = None,
 ) -> tuple[list[tuple[datetime, float]], list[float]]:
     """HA power-sensor states -> (time-sorted (timestamp, kW) points, untimed kW values).
 
     unknown/unavailable/unparsable AND non-finite values are skipped: "nan"/"inf"
     parse as floats and a single one poisons the whole integral (nan) or makes it
-    infinite. The unit is taken from the first numeric sample (W / kW / MW).
+    infinite.
+
+    Unit resolution, per sample (mW / W / kW / MW / GW):
+
+    1. the unit the sample itself carries;
+    2. else the unit of the nearest earlier state that carries one, INCLUDING
+       unknown/unavailable states. HA's history API answers with a minimal response
+       (the ``minimal_response`` key enables it by mere presence), so only the first
+       state of a series has attributes -- and when that state is ``unavailable`` it
+       is the only place the unit lives;
+    3. else the first unit found anywhere later in the series;
+    4. else ``fallback_unit`` (the entity's current state, resolved by the caller);
+    5. else kW, with a warning once per entity.
+
+    The unit used to be read once, from the first NUMERIC sample. A W sensor that was
+    unavailable at the start of the window was then read as kW: 1000x too high (a
+    water heater idling at ~1 W became 1 kW of phantom heating).
     """
     points: list[tuple[datetime, float]] = []
     bare_kw: list[float] = []
+    first_unit = next((u for u in map(_state_unit, states) if u), None) or fallback_unit
     unit: str | None = None
 
     for state in states:
+        # Learn the unit BEFORE the value can be skipped.
+        unit = _state_unit(state) or unit
+
         state_val = state.get("state", "")
         if state_val in ("unknown", "unavailable", "", None):
             continue
@@ -458,15 +524,19 @@ def _parse_power_samples(
         if not math.isfinite(value):
             continue
 
-        if unit is None:
-            attributes = state.get("attributes", {})
-            unit = str(attributes.get("unit_of_measurement", "")).upper()
-        if unit == "W":
-            kw = value / 1000.0
-        elif unit == "MW":
-            kw = value * 1000.0
-        else:
-            kw = value  # Assume kW
+        sample_unit = unit or first_unit
+        factor = _power_kw_factor(sample_unit)
+        if factor is None:
+            key = entity_id or "<unknown entity>"
+            if key not in _power_unit_warned:
+                _power_unit_warned.add(key)
+                logger.warning(
+                    "Power history for %s has %s; assuming kW",
+                    key,
+                    f"unrecognised unit {sample_unit!r}" if sample_unit else "no unit",
+                )
+            factor = 1.0  # Assume kW
+        kw = value * factor
 
         raw_ts = state.get("last_changed") or state.get("last_updated")
         ts: datetime | None = None
@@ -490,12 +560,30 @@ def _parse_power_samples(
     return points, bare_kw
 
 
+async def _current_unit_if_series_has_none(
+    entity_id: str, states: list[dict[str, Any]]
+) -> str | None:
+    """The entity's current unit when ``states`` is non-empty yet carries none at all.
+
+    One extra state read, only in that (rare) case; None when the series already has a
+    unit or the lookup fails.
+    """
+    if not states or any(_state_unit(s) for s in states):
+        return None
+    try:
+        return _state_unit(await get_ha_entity_state(entity_id))
+    except Exception:
+        return None
+
+
 def integrate_power_history_kwh(
     states: list[dict[str, Any]],
     start: datetime,
     end: datetime,
     *,
     idle_kw: float | None = None,
+    fallback_unit: str | None = None,
+    entity_id: str | None = None,
 ) -> float | None:
     """Time-weighted integral of a power-sensor history over [start, end], in kWh.
 
@@ -519,9 +607,11 @@ def integrate_power_history_kwh(
 
     Samples without a parsable timestamp fall back to the legacy mean-times-
     duration estimate, so callers that only have bare values still get an answer.
+
+    ``fallback_unit`` / ``entity_id``: see :func:`_parse_power_samples`.
     Returns None when no numeric samples exist at all.
     """
-    points, bare_kw = _parse_power_samples(states)
+    points, bare_kw = _parse_power_samples(states, fallback_unit=fallback_unit, entity_id=entity_id)
     if idle_kw is not None:
         points = [(ts, 0.0 if kw <= idle_kw else kw) for ts, kw in points]
         bare_kw = [0.0 if kw <= idle_kw else kw for kw in bare_kw]
@@ -1476,7 +1566,10 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
         slot_seconds = [0.0] * 96
         prev_state = None
         prev_time = None
-        cached_unit: str | None = None
+        # Seeded from the entity's current state when the history carries no unit at all.
+        cached_unit: str | None = await _current_unit_if_series_has_none(
+            str(entity_id), states
+        )
 
         # A cumulative meter cannot plausibly advance this much between two state
         # changes; a bigger jump is a counter artefact (e.g. a Fronius lifetime
@@ -1492,6 +1585,10 @@ async def get_load_profile_from_ha(config: dict[str, Any]) -> list[float]:
 
         for state in states:
             try:
+                # Learn the unit BEFORE skipping: with HA's minimal history response only
+                # the first state carries attributes, and it may be an unavailable one.
+                cached_unit = _state_unit(state) or cached_unit
+
                 # Skip unavailable/unknown/null states silently
                 state_val = state.get("state", "")
                 if state_val in ("unavailable", "unknown", "null", "", None):
