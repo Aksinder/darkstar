@@ -82,6 +82,16 @@ _MISSED_DEPARTURE_TOLERANCE_PCT = 2.0
 # continuity — the car may have left and come back unseen. The gap exceeds the
 # store's SAVE_MIN_INTERVAL_S (the on-disk last-seen may lag by that) plus a restart.
 _PRESENCE_GAP_S = 900.0
+# ...unless the gap was a BLACKOUT the servo itself sat through (ticks ran, the
+# plug/home entities were unreadable and held): charger/cloud outages around the
+# departure are what the grace exists for. The run is bridged when the first fresh
+# reading after it is plugged + home and a fresh SoC has not dropped by more than
+# this since before the blackout (a drop means the car drove).
+_PRESENCE_SOC_DROP_PCT = 1.0
+# An ACTIVE grace keeps its urgent deadline through this long without a fresh
+# plug/home reading (3 ticks at the 60 s cadence), so a flapping sensor does not
+# start/stop the charger; a longer blackout pauses it.
+_MISSED_DEPARTURE_STALE_HOLD_S = 180.0
 _MISSED_DEPARTURE_PRESENCE_SLACK_S = 180.0
 # Namespace of this controller's holds in backend/core/ev_hold_store.py.
 _HOLD_NAMESPACE = "servo"
@@ -731,6 +741,13 @@ class EVSurplusController:
         # target met, SoC unknown) per charger, and which chargers are in grace now.
         self._missed_dep_done: dict[str, float] = {}
         self._missed_dep_active: set[str] = set()
+        self._missed_dep_paused: set[str] = set()
+        # Blackout bookkeeping for the presence run (in-memory: a restart inside a
+        # blackout falls back to "not seen", i.e. no grace). Per charger: the
+        # (first, last) tick of the current run of HELD plug/home readings, and the
+        # SoC at the last fresh plugged-at-home reading.
+        self._presence_dark: dict[str, tuple[float, float]] = {}
+        self._present_soc: dict[str, float] = {}
         # Per charger: (since, last_seen) of the current CONTINUOUS plugged-at-home
         # observation run. Both this and _missed_dep_done are persisted with the holds,
         # so a restart neither re-arms an ended grace nor forgets a car that never left.
@@ -1234,11 +1251,14 @@ class EVSurplusController:
         within ``missed_departure_tolerance_percent`` of it — ends it too; a NEW
         departure timestamp starts fresh.
 
-        ``presence_fresh`` is False when the plug/home answer is a HELD last-good
-        value (entity unreadable this tick). A held "plugged at home" is not an
-        observation: it pauses the grace (full power is not commanded at a car that
-        may have left during the blackout) and does not extend ``_present_run``, so
-        a blackout longer than _PRESENCE_GAP_S breaks the continuity like a restart.
+        ``presence_fresh`` is False when nobody observed the car this tick: the
+        plug/home answer is a HELD last-good value (entity unreadable), or a long
+        blackout just ended and there is no fresh SoC yet to judge it by (see
+        ``_note_presence``). A held "plugged at home" is not an observation. An
+        active grace rides through _MISSED_DEPARTURE_STALE_HOLD_S of that (a
+        flapping sensor must not start/stop the charger); beyond it the grace is
+        PAUSED — full power is not commanded at a car that may have left — but
+        never ended by the blackout alone.
 
         The car must have been OBSERVED plugged in at home at the departure and
         continuously since (``_present_run``): a car that left at or after the
@@ -1248,6 +1268,8 @@ class EVSurplusController:
         """
         missed_s = now_ts - dep_ts
         if missed_s < 0.0 or missed_s > _MISSED_DEPARTURE_GRACE_S:
+            self._missed_dep_active.discard(cid)
+            self._missed_dep_paused.discard(cid)
             if self._missed_dep_done.pop(cid, None) is not None:
                 self._persist_holds(now_ts)
             return False
@@ -1263,26 +1285,39 @@ class EVSurplusController:
             # Unknown SoC: cannot tell met from unmet, and the floors are off anyway.
             # Not terminal — a returning reading resumes the (still bounded) grace.
             return False
-        if not presence_fresh:
-            # Held plug/home reading: nobody has seen the car this tick. Not terminal
-            # — a fresh reading within _PRESENCE_GAP_S resumes the grace, a later one
-            # starts a new presence run after the departure and ends it.
-            if cid in self._missed_dep_active:
-                self._missed_dep_active.discard(cid)
+        tolerance = max(0.0, self.cfg.missed_departure_tolerance_percent)
+        met = trip_floor is None or soc >= trip_floor - tolerance
+        if not presence_fresh and not met:
+            # Nobody has seen the car this tick. Never terminal on its own: what
+            # the blackout hid is judged by the first fresh reading after it.
+            if (
+                cid in self._missed_dep_active
+                and cid not in self._missed_dep_paused
+                and run is not None
+                and 0.0 <= now_ts - run[1] <= _MISSED_DEPARTURE_STALE_HOLD_S
+            ):
+                return True
+            if cid in self._missed_dep_active and cid not in self._missed_dep_paused:
+                self._missed_dep_paused.add(cid)
                 logger.info(
-                    "EV surplus: %s missed-departure grace paused — plug/home "
-                    "unreadable (held reading is not an observation)", cid,
+                    "EV surplus: %s missed-departure grace paused — plug/home not "
+                    "observed for over %.0f s (a held reading is not an observation)",
+                    cid, _MISSED_DEPARTURE_STALE_HOLD_S,
                 )
             return False
-        tolerance = max(0.0, self.cfg.missed_departure_tolerance_percent)
-        if not present or trip_floor is None or soc >= trip_floor - tolerance:
+        if not present or met:
             self._missed_dep_done[cid] = dep_ts
             self._persist_holds(now_ts)
+            self._missed_dep_paused.discard(cid)
             if cid in self._missed_dep_active:
                 self._missed_dep_active.discard(cid)
                 logger.info("EV surplus: %s missed-departure grace ended", cid)
             return False
+        if cid in self._missed_dep_paused:
+            self._missed_dep_paused.discard(cid)
+            logger.info("EV surplus: %s missed-departure grace resumed", cid)
         if cid not in self._missed_dep_active:
+            # Once per grace episode (a pause/resume is the same episode).
             self._missed_dep_active.add(cid)
             logger.warning(
                 "EV surplus: %s missed its one-off departure %.0f min ago at %.0f %% "
@@ -1293,27 +1328,83 @@ class EVSurplusController:
         return True
 
     def _note_presence(
-        self, cid: str, present: bool, now_ts: float, fresh: bool = True
-    ) -> None:
+        self,
+        cid: str,
+        present: bool,
+        now_ts: float,
+        fresh: bool = True,
+        soc: float | None = None,
+        soc_fresh: bool = False,
+    ) -> bool:
         """Track the continuous plugged-at-home run the missed-departure grace needs.
 
-        Only FRESH readings count: a held last-good value (``fresh`` False) neither
-        extends the run nor ends it — the tick is simply unobserved, exactly like a
-        tick that never ran.
+        Returns True when this tick is an OBSERVATION of the car the grace may act
+        on. Only fresh readings count: a held last-good value (``fresh`` False)
+        neither extends the run nor ends it.
+
+        A gap longer than _PRESENCE_GAP_S normally restarts the run (restart,
+        stalled loop: the car may have left and come back unseen). A gap the servo
+        sat through with held readings — a blackout — is bridged instead when the
+        first fresh reading after it is plugged + home and a FRESH SoC is not more
+        than _PRESENCE_SOC_DROP_PCT below the SoC before it: a car that drove comes
+        back lower. Until a fresh SoC is there to judge by, the tick stays
+        unobserved (False) and the run is left alone.
         """
-        if not fresh:
-            return
         run = self._present_run.get(cid)
+        if not fresh:
+            dark = self._presence_dark.get(cid)
+            if dark is None or not 0.0 <= now_ts - dark[1] <= _PRESENCE_GAP_S:
+                self._presence_dark[cid] = (now_ts, now_ts)
+            else:
+                self._presence_dark[cid] = (dark[0], now_ts)
+            return False
         if not present:
+            self._presence_dark.pop(cid, None)
+            self._present_soc.pop(cid, None)
             if self._present_run.pop(cid, None) is not None:
                 self._persist_holds(now_ts)
-            return
-        if run is None or now_ts - run[1] > _PRESENCE_GAP_S or now_ts < run[1]:
-            # New run, or an unobserved gap: the car may have left and come back.
+            return True
+        if run is None or now_ts < run[1]:
             self._present_run[cid] = (now_ts, now_ts)
-        else:
+        elif now_ts - run[1] <= _PRESENCE_GAP_S:
             self._present_run[cid] = (run[0], now_ts)
+        else:
+            dark = self._presence_dark.get(cid)
+            blackout = (
+                dark is not None
+                and dark[0] - run[1] <= _PRESENCE_GAP_S
+                and 0.0 <= now_ts - dark[1] <= _PRESENCE_GAP_S
+            )
+            if blackout and dark is not None and not soc_fresh:
+                # Back in sight, but no fresh SoC yet to tell "sat here" from
+                # "drove and returned". Keep waiting; the grace stays paused.
+                self._presence_dark[cid] = (dark[0], now_ts)
+                return False
+            before = self._present_soc.get(cid)
+            if (
+                blackout
+                and before is not None
+                and soc is not None
+                and soc >= before - _PRESENCE_SOC_DROP_PCT
+            ):
+                logger.info(
+                    "EV surplus: %s plug/home readable again after %.0f min — still "
+                    "plugged in at home and SoC %.0f %% (was %.0f %%): presence "
+                    "bridged across the blackout",
+                    cid, (now_ts - run[1]) / 60.0, soc, before,
+                )
+                self._present_run[cid] = (run[0], now_ts)
+            else:
+                # Unobserved gap, or the SoC dropped: the car may have left and
+                # come back.
+                self._present_run[cid] = (now_ts, now_ts)
+        self._presence_dark.pop(cid, None)
+        if soc is not None:
+            self._present_soc[cid] = soc
+        else:
+            self._present_soc.pop(cid, None)
         self._persist_holds(now_ts)
+        return True
 
     def _clear_held_soc_roll(self, cid: str) -> None:
         self._held_soc_kwh.pop(cid, None)
@@ -1692,7 +1783,10 @@ class EVSurplusController:
                 (c.home_entity, self._last_good_home),
             )
         )
-        self._note_presence(c.id, plugged and at_home, now_ts, presence_fresh)
+        presence_fresh = self._note_presence(
+            c.id, plugged and at_home, now_ts, presence_fresh,
+            soc, soc is not None and c.id not in self._soc_held,
+        )
         if dep_future and dep_ts is not None:
             pairs.append(((dep_ts - now_ts) / 3600.0, one_off_floor))
         elif dep_ts is not None and self._missed_departure_grace(

@@ -286,7 +286,7 @@ class TestProfilePathClamp:
         ts, attrs = client._number_attributes[CHARGE]
         client._number_attributes[CHARGE] = (ts - 3600.0, attrs)
         assert client.cached_attributes(CHARGE) is None
-        assert disp._clamp_to_entity(CHARGE, 0) == 0
+        assert await disp._clamp_to_entity(CHARGE, 0) == 0
 
     @pytest.mark.asyncio
     async def test_a_read_without_attributes_forgets_the_old_ones(self):
@@ -304,10 +304,11 @@ class TestProfilePathClamp:
         assert client.cached_attributes("select.ems_mode") is None
 
     @pytest.mark.parametrize("ha", [MagicMock(), AsyncMock(), MagicMock(spec=HAClient), object()])
-    def test_a_client_without_usable_attributes_means_no_clamp(self, ha):
+    @pytest.mark.asyncio
+    async def test_a_client_without_usable_attributes_means_no_clamp(self, ha):
         disp = ActionDispatcher(ha, ExecutorConfig())
-        assert disp._clamp_to_entity(CHARGE, 0) == 0
-        assert disp._clamp_to_entity(CHARGE, 99999) == 99999
+        assert await disp._clamp_to_entity(CHARGE, 0) == 0
+        assert await disp._clamp_to_entity(CHARGE, 99999) == 99999
 
 
 class TestOtherWritePathsClamp:
@@ -375,6 +376,148 @@ class TestOtherWritePathsClamp:
         assert result.verification_success is True
 
 
+class TestLoudClamp:
+    """A max-side (or material) clamp used to be an HTTP 400 and a "failed 3 ticks"
+    notice. It must stay audible: one error notification per episode, while the
+    write itself succeeds."""
+
+    @pytest.mark.asyncio
+    async def test_max_side_clamp_notifies_once_and_still_succeeds(self):
+        client, session = _client(
+            {CHARGE: {"state": "100", "attributes": {"min": 10, "max": 5000}}}
+        )
+        disp = _dispatcher(client)
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        for _ in range(4):
+            result = await _run_action(disp, 9500)
+            assert result.success is True
+        assert _writes(session) == [5000.0]
+        assert disp.notify_error.await_count == 1
+        msg = disp.notify_error.await_args.args[0]
+        assert CHARGE in msg
+        assert "9500" in msg and "5000" in msg
+        assert "min 10" in msg and "max 5000" in msg
+
+    @pytest.mark.asyncio
+    async def test_a_request_back_in_range_ends_the_episode(self):
+        client, _ = _client({CHARGE: {"state": "100", "attributes": {"min": 10, "max": 5000}}})
+        disp = _dispatcher(client)
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        await _run_action(disp, 9500)
+        await _run_action(disp, 9500)
+        assert disp.notify_error.await_count == 1
+        await _run_action(disp, 4000)
+        await _run_action(disp, 9500)
+        assert disp.notify_error.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_device_that_ignores_the_write_still_gets_one_notice(self):
+        """Every tick writes (the state never moves), so every tick also runs the
+        defensive clamp inside _write_entity — that must not re-arm the notice."""
+        client, session = _client(
+            {CHARGE: {"state": "100", "attributes": {"min": 10, "max": 5000}}}
+        )
+        real_post = session.post
+
+        def _post(url, json=None, **kw):
+            resp = real_post(url, json=json, **kw)
+            session.states[CHARGE]["state"] = "100"
+            return resp
+
+        session.post = _post  # type: ignore[method-assign]
+        disp = _dispatcher(client)
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        for _ in range(3):
+            await _run_action(disp, 9500)
+        assert _writes(session) == [5000.0, 5000.0, 5000.0]
+        assert disp.notify_error.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_min_side_nudge_stays_quiet(self):
+        client, _ = _client({CHARGE: {"state": "5000", "attributes": dict(SUNGROW)}})
+        disp = _dispatcher(client)
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        for _ in range(3):
+            await _run_action(disp, 0)
+        disp.notify_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_material_min_side_clamp_is_loud(self):
+        """OFF temperature 40 against a helper with min 45: the tank is told 45."""
+        entity = "input_number.vvb_target"
+        client, session = _client(
+            {entity: {"state": "60", "attributes": {"min": 45, "max": 70, "step": 1}}}
+        )
+        disp = ActionDispatcher(client, ExecutorConfig())
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        for _ in range(3):
+            await disp.set_water_temp(40, entity)
+        assert _writes(session) == [45.0]
+        assert disp.notify_error.await_count == 1
+        assert "requested 40" in disp.notify_error.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_min_side_without_a_known_max_stays_quiet(self):
+        client, _ = _client({CHARGE: {"state": "5000", "attributes": {"min": 10}}})
+        disp = _dispatcher(client)
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        await _run_action(disp, 0)
+        disp.notify_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_notification_does_not_fail_the_write(self):
+        client, session = _client(
+            {CHARGE: {"state": "100", "attributes": {"min": 10, "max": 5000}}}
+        )
+        disp = _dispatcher(client)
+        disp.notify_error = AsyncMock(side_effect=RuntimeError("notify down"))  # type: ignore[method-assign]
+        result = await _run_action(disp, 9500)
+        assert result.success is True
+        assert _writes(session) == [5000.0]
+
+
+class TestWaterTempClampDetails:
+    @pytest.mark.asyncio
+    async def test_fractional_helper_bound_is_not_rewritten_every_tick(self):
+        entity = "input_number.vvb_target"
+        client, session = _client(
+            {entity: {"state": "50", "attributes": {"min": 20, "max": 62.5, "step": 0.5}}}
+        )
+        disp = ActionDispatcher(client, ExecutorConfig())
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        first = await disp.set_water_temp(70, entity)
+        assert first.new_value == 62.5 and first.verification_success is True
+        for _ in range(3):
+            assert (await disp.set_water_temp(70, entity)).skipped is True
+        assert _writes(session) == [62.5]
+
+    @pytest.mark.asyncio
+    async def test_off_temperature_clamped_up_is_still_a_stop(self):
+        entity = "input_number.vvb_target"
+        client, _ = _client(
+            {entity: {"state": "60", "attributes": {"min": 45, "max": 70, "step": 1}}}
+        )
+        disp = ActionDispatcher(client, ExecutorConfig())
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        disp._maybe_notify = AsyncMock()  # type: ignore[method-assign]
+        off = disp.config.water_heater.temp_off
+        assert off < 45
+        await disp.set_water_temp(off, entity)
+        assert disp._maybe_notify.await_args.args[0] == "water_heat_stop"
+
+    @pytest.mark.asyncio
+    async def test_heat_temperature_clamped_down_is_still_a_start(self):
+        entity = "input_number.vvb_target"
+        client, _ = _client(
+            {entity: {"state": "30", "attributes": {"min": 20, "max": 38, "step": 1}}}
+        )
+        disp = ActionDispatcher(client, ExecutorConfig())
+        disp.notify_error = AsyncMock()  # type: ignore[method-assign]
+        disp._maybe_notify = AsyncMock()  # type: ignore[method-assign]
+        await disp.set_water_temp(70, entity)
+        assert disp._maybe_notify.await_args.args[0] == "water_heat_start"
+
+
 # --------------------------------------------------------------------------- #
 # HA's own error text reaches the result and the notification
 # --------------------------------------------------------------------------- #
@@ -403,6 +546,37 @@ class TestHaErrorText:
         with pytest.raises(HACallError) as exc:
             await client.call_service("number", "set_value", CHARGE, {"value": 1.0})
         assert len(exc.value.response_body or "") == 300
+
+    @pytest.mark.asyncio
+    async def test_the_token_is_redacted_from_the_body(self):
+        client, _ = _client({}, reject={CHARGE: (400, "boom Bearer token rest")})
+        assert client.token == "token"
+        with pytest.raises(HACallError) as exc:
+            await client.call_service("number", "set_value", CHARGE, {"value": 1.0})
+        assert exc.value.response_body == "boom Bearer [redacted] rest"
+        assert "token" not in str(exc.value).replace("[redacted]", "")
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_error_body_is_abandoned_quickly(self, monkeypatch):
+        import time as _time
+
+        import executor.actions as actions_mod
+
+        monkeypatch.setattr(actions_mod, "HA_ERROR_BODY_TIMEOUT_S", 0.05)
+        client, session = _client({})
+
+        class _Stalled(_Resp):
+            async def text(self) -> str:
+                await asyncio.sleep(30)
+                return "never"
+
+        session.post = lambda url, json=None, **kw: _Stalled(400)  # type: ignore[method-assign]
+        started = _time.monotonic()
+        with pytest.raises(HACallError) as exc:
+            await client.call_service("number", "set_value", CHARGE, {"value": 1.0})
+        assert _time.monotonic() - started < 2.0
+        assert exc.value.status_code == 400
+        assert exc.value.response_body == "Bad Request"  # falls back to the reason
 
     @pytest.mark.asyncio
     async def test_retry_count_is_unchanged_and_the_body_survives_exhaustion(self, monkeypatch):
