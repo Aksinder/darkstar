@@ -21,18 +21,9 @@ import pandas as pd
 
 from backend.learning import LearningEngine, get_learning_engine
 from backend.validation import get_max_energy_per_slot
+from ml.cleaning import DERIVED_LOAD_FLAG_KEYS, clean_training_rows
 from ml.context_features import get_alarm_armed_series, get_vacation_mode_series
 from ml.weather import calculate_physics_pv, get_weather_series
-
-# quality_flags keys marking a row whose load_kwh was DERIVED from the energy-balance
-# identity instead of read from a load meter:
-#   "load_rescued"  backend/recorder.py — load register glitched/froze, so
-#                   load = pv + import - export + discharge - charge - EV - water.
-#   "repaired"      backend/learning/repair.py — statistics backfill, the same
-#                   identity on hourly sums spread flat over the four quarters.
-# Such a value folds every metering error and conversion loss of the other channels
-# into "load", and it cannot be cross-checked (the balance tripwire abstains on it).
-DERIVED_LOAD_FLAG_KEYS: tuple[str, ...] = ("load_rescued", "repaired")
 
 # Sample-weight multiplier for derived-load rows in LOAD training (PV untouched).
 # Down-weight, not exclude: on the reference site the rescue fires on 28.6% of all quarters
@@ -377,6 +368,7 @@ def train_models(
         "pv_samples": 0,
         "pv_rows_dropped_no_physics": 0,
         "load_derived_rows": 0,
+        "cleaning": {},
         "min_date": min_date.isoformat() if min_date else None,
         "pv_training_min_date": None,
         "error": None,
@@ -520,6 +512,9 @@ def train_models(
 
     # --- Train Load Models ---
     load_df = observations[observations["load_kwh"] > 0.001].copy()
+    # Drop rows the recorder flagged as not a measured base load (ml/cleaning.py).
+    load_df, load_cleaning = clean_training_rows(load_df, "load", min_rows=cfg.min_samples)
+    result["cleaning"]["load"] = load_cleaning.as_dict()
     if not load_df.empty:
         X_load = load_df[feature_cols]
         y_load = load_df["load_kwh"].astype(float)
@@ -594,6 +589,12 @@ def train_models(
         filtered_count = pre_sunup_count - len(pv_df)
         if filtered_count > 0:
             print(f"Filtered {filtered_count} nighttime/zero-production slots from PV training")
+
+    # Drop rows whose pv_kwh is a snapshot/counter fallback, not a measurement
+    # (ml/cleaning.py). After the sun-up filter so the starvation guard judges the
+    # rows that would actually train.
+    pv_df, pv_cleaning = clean_training_rows(pv_df, "pv", min_rows=cfg.min_samples)
+    result["cleaning"]["pv"] = pv_cleaning.as_dict()
 
     if not pv_df.empty:
         # Calculate physics PV for each slot
@@ -725,6 +726,7 @@ def train_models(
             "load_samples": result["load_samples"],
             "pv_samples": result["pv_samples"],
             "pv_rows_dropped_no_physics": result["pv_rows_dropped_no_physics"],
+            "cleaning": result["cleaning"],
         }
         # Record the training window for auditability: which data a model was
         # trained on must be reconstructable from learning_runs.
