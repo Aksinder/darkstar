@@ -22,7 +22,10 @@ Honesty notes (what this measures and what it does not):
   load-shifting is NOT captured here — this is a floor, not the full story
   (see backend/learning/savings_loadshift.py for the load-shift streams).
 - Slots without a recorded import price cannot be valued and are skipped; the summary
-  reports coverage so a thin day can't masquerade as a bad day.
+  reports coverage so a thin day can't masquerade as a bad day, and
+  ``excluded_by_reason`` says how many slots each cause (``unpriced``,
+  ``grid_unmeasured``) cost. ``degraded_by_flag`` counts the VALUED slots that carry
+  a recorder data-quality flag (see ``DEGRADED_FLAGS``); those are still valued.
 - It values grid CASH only. Energy still sitting in the battery at a window edge is not
   valued at all, so a partial window cut mid-cycle understates a charging day and
   overstates a draining one. ``compute_stored_energy_delta`` quantifies exactly that
@@ -41,7 +44,7 @@ inventory term lives in its own function, applied by the publisher to one window
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -57,11 +60,25 @@ class SavingsSummary:
     savings_sek: float  # baseline - actual (positive = Darkstar saved money)
     n_slots: int  # observations considered
     n_priced_slots: int  # observations that carried an import price (valued)
+    n_unpriced_slots: int = 0  # skipped: no import price
+    n_grid_unmeasured_slots: int = 0  # skipped: priced, but the grid meter was unread
+    # Valued slots per recorder quality flag (DEGRADED_FLAGS); a slot with two flags
+    # counts under both.
+    degraded_by_flag: dict[str, int] = field(default_factory=lambda: dict[str, int]())
 
     @property
     def coverage(self) -> float:
         """Fraction of slots that could be valued (0..1)."""
         return self.n_priced_slots / self.n_slots if self.n_slots else 0.0
+
+    @property
+    def excluded_by_reason(self) -> dict[str, int]:
+        """Why slots were not valued: reason code -> slots (zero counts omitted)."""
+        counts = {
+            "unpriced": self.n_unpriced_slots,
+            "grid_unmeasured": self.n_grid_unmeasured_slots,
+        }
+        return {reason: n for reason, n in counts.items() if n}
 
 
 @dataclass(frozen=True)
@@ -162,6 +179,26 @@ def _grid_unmeasured(row: Mapping[str, Any]) -> bool:
     return isinstance(flags, str) and '"grid_unmeasured": true' in flags
 
 
+# Recorder flags that leave a slot VALUED but mark one of its inputs as not a slot
+# measurement. The *_unmeasured device flags keep the whole-house total intact (the
+# device's energy stays in load_kwh); base_load_clamped means house_kwh exceeds the
+# metered load, load_spike_zeroed that an energy column was zeroed as a spike.
+DEGRADED_FLAGS = (
+    "water_unmeasured",
+    "pv_unmeasured",
+    "ev_unmeasured",
+    "base_load_clamped",
+    "load_spike_zeroed",
+)
+
+
+def _degraded_flags(row: Mapping[str, Any]) -> list[str]:
+    flags = row.get("quality_flags")
+    if not isinstance(flags, str):
+        return []
+    return [key for key in DEGRADED_FLAGS if f'"{key}":' in flags]
+
+
 def compute_savings(rows: Sequence[Mapping[str, Any]]) -> SavingsSummary:
     """Compute the no-battery counterfactual over observation rows.
 
@@ -174,12 +211,19 @@ def compute_savings(rows: Sequence[Mapping[str, Any]]) -> SavingsSummary:
     actual = 0.0
     baseline = 0.0
     n_priced = 0
+    n_unpriced = 0
+    n_grid_unmeasured = 0
+    degraded: dict[str, int] = {}
     for row in rows:
         import_price = row.get("import_price_sek_kwh")
         if import_price is None:
+            n_unpriced += 1
             continue
         if _grid_unmeasured(row):
+            n_grid_unmeasured += 1
             continue  # zero import here means "not read", not "bought nothing"
+        for flag in _degraded_flags(row):
+            degraded[flag] = degraded.get(flag, 0) + 1
         p_imp = float(import_price)
         p_exp = float(row.get("export_price_sek_kwh") or 0.0)
         imp = float(row.get("import_kwh") or 0.0)
@@ -199,6 +243,9 @@ def compute_savings(rows: Sequence[Mapping[str, Any]]) -> SavingsSummary:
         savings_sek=round(baseline - actual, 4),
         n_slots=len(rows),
         n_priced_slots=n_priced,
+        n_unpriced_slots=n_unpriced,
+        n_grid_unmeasured_slots=n_grid_unmeasured,
+        degraded_by_flag=degraded,
     )
 
 

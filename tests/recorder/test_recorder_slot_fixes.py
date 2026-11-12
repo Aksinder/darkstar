@@ -499,3 +499,160 @@ class TestPvUnmeasuredFlag:
         del config["input_sensors"]["pv_power"]
         record = await _run(config, pv_delta=1.25, load_delta=3.0)
         assert "pv_unmeasured" not in _flags(record)
+
+
+# ------------------------------------------------------------- r6 data-quality flags
+
+EASEE = {"id": "easee", "enabled": True, "sensor": "sensor.ev_power"}
+PV_MEASURED = {"sensor.pv_power": _states((0, 5000))}
+
+
+def _ev_config(**extra: Any) -> dict[str, Any]:
+    config = _base_config(ev_chargers=[EASEE], **extra)
+    config["system"] = {**config["system"], "has_ev_charger": True}
+    return config
+
+
+class TestEvUnmeasuredFlag:
+    """The charger gets the heaters' vocabulary: a slot energy that is not a history
+    measurement is flagged, and the recorded values stay exactly what they were."""
+
+    @pytest.mark.asyncio
+    async def test_unavailable_charger_is_flagged_and_stays_in_base_load(self):
+        record = await _run(
+            _ev_config(),
+            pv_delta=1.25,
+            load_delta=3.0,
+            history=PV_MEASURED,
+            snapshots={"sensor.ev_power": None},
+        )
+        assert _flags(record) == {"ev_unmeasured": {"easee": "unavailable"}}
+        assert record["ev_charging_kwh"] == 0.0
+        assert record["load_kwh"] == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_snapshot_fallback_is_flagged_with_unchanged_values(self):
+        record = await _run(
+            _ev_config(),
+            pv_delta=1.25,
+            load_delta=3.0,
+            history=PV_MEASURED,
+            snapshots={"sensor.ev_power": 4.0},
+        )
+        assert _flags(record) == {"ev_unmeasured": {"easee": "snapshot"}}
+        assert record["ev_charging_kwh"] == pytest.approx(1.0)
+        assert record["load_kwh"] == pytest.approx(2.0)
+        assert not record.get("ev_charger_energy")  # snapshot: aggregate only
+
+    @pytest.mark.asyncio
+    async def test_charger_without_id_is_keyed_by_sensor(self):
+        config = _ev_config()
+        config["ev_chargers"] = [{"enabled": True, "sensor": "sensor.ev_power"}]
+        record = await _run(
+            config,
+            pv_delta=1.25,
+            load_delta=3.0,
+            history=PV_MEASURED,
+            snapshots={"sensor.ev_power": None},
+        )
+        assert _flags(record)["ev_unmeasured"] == {"sensor.ev_power": "unavailable"}
+
+    @pytest.mark.asyncio
+    async def test_measured_charger_adds_no_flag(self):
+        record = await _run(
+            _ev_config(),
+            pv_delta=1.25,
+            load_delta=3.0,
+            history={**PV_MEASURED, "sensor.ev_power": _states((0, 4000))},
+        )
+        assert not _flags(record)
+        assert record["ev_charging_kwh"] == pytest.approx(1.0)
+        assert record["ev_charger_energy"] == {"easee": pytest.approx(1.0)}
+
+    @pytest.mark.asyncio
+    async def test_no_charger_configured_adds_no_flag(self):
+        record = await _run(_base_config(), pv_delta=1.25, load_delta=3.0, history=PV_MEASURED)
+        assert "ev_unmeasured" not in _flags(record)
+
+
+class TestBaseLoadClampedFlag:
+    @pytest.mark.asyncio
+    async def test_clamped_base_load_is_flagged(self):
+        """Counter saw 0.3 kWh, the spa alone drew 0.6: base load -0.3 -> stored 0.0.
+        The balance (0.5 PV, no grid) cannot rescue it, so the 0.0 is what is stored."""
+        record = await _run(
+            _base_config(water_heaters=[SPA]),
+            pv_delta=0.5,
+            load_delta=0.3,
+            grid_kw=0.0,
+            history={"sensor.pv_power": _states((0, 2000)), "sensor.spa_power": _states((0, 2400))},
+        )
+        assert _flags(record) == {"base_load_clamped": True}
+        assert record["load_kwh"] == 0.0
+        assert record["water_kwh"] == pytest.approx(0.6)
+
+    @pytest.mark.asyncio
+    async def test_clamp_replaced_by_the_balance_rescue_is_not_flagged(self):
+        """Same clamp, but the balance (1.25 PV + 1.75 import - 0.6 spa) gives a real
+        base load: the row holds 2.4, tagged load_rescued, not a clamped zero."""
+        record = await _run(
+            _base_config(water_heaters=[SPA]),
+            pv_delta=1.25,
+            load_delta=0.3,
+            history={**PV_MEASURED, "sensor.spa_power": _states((0, 2400))},
+        )
+        assert _flags(record) == {"load_rescued": "energy_balance"}
+        assert record["load_kwh"] == pytest.approx(2.4)
+
+    @pytest.mark.asyncio
+    async def test_positive_base_load_adds_no_flag(self):
+        record = await _run(
+            _base_config(water_heaters=[SPA]),
+            pv_delta=1.25,
+            load_delta=3.0,
+            history={**PV_MEASURED, "sensor.spa_power": _states((0, 2400))},
+        )
+        assert not _flags(record)
+        assert record["load_kwh"] == pytest.approx(2.4)
+
+
+class TestLoadSpikeZeroedFlag:
+    @staticmethod
+    def _config(max_power_kw: float, **extra: Any) -> dict[str, Any]:
+        config = _base_config(**extra)
+        config["system"] = {**config["system"], "grid": {"max_power_kw": max_power_kw}}
+        return config
+
+    @pytest.mark.asyncio
+    async def test_zeroed_columns_are_named(self):
+        """2 kW fuse -> 1.0 kWh/slot ceiling: PV 1.25, load 3.0 and import 1.75 are all
+        zeroed by validation, exactly as before — now the row says so."""
+        record = await _run(self._config(2.0), pv_delta=1.25, load_delta=3.0, history=PV_MEASURED)
+        assert _flags(record) == {"load_spike_zeroed": ["import_kwh", "load_kwh", "pv_kwh"]}
+        assert record["pv_kwh"] == 0.0
+        assert record["load_kwh"] == 0.0
+        assert record["import_kwh"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_only_the_spiking_column_is_named_and_other_flags_survive(self):
+        """5 kW -> 2.5 kWh ceiling: only load (3.0) spikes; the heater flag is kept."""
+        record = await _run(
+            self._config(5.0, water_heaters=[SPA]),
+            pv_delta=1.25,
+            load_delta=3.0,
+            history=PV_MEASURED,
+            snapshots={"sensor.spa_power": None},
+        )
+        assert _flags(record) == {
+            "water_unmeasured": {"spa": "unavailable"},
+            "load_spike_zeroed": ["load_kwh"],
+        }
+        assert record["load_kwh"] == 0.0
+        assert record["pv_kwh"] == pytest.approx(1.25)
+        assert record["import_kwh"] == pytest.approx(1.75)
+
+    @pytest.mark.asyncio
+    async def test_values_inside_the_ceiling_add_no_flag(self):
+        record = await _run(self._config(25.0), pv_delta=1.25, load_delta=3.0, history=PV_MEASURED)
+        assert not _flags(record)
+        assert record["load_kwh"] == pytest.approx(3.0)
