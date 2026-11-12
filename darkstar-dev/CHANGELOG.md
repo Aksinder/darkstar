@@ -1,3 +1,7 @@
+## dev-20261112.1915 — 2026-11-12 19:17
+
+- fix(planner): bound the dump count, stricter dump retention, no symlinks in the dump API
+
 ## dev-20261103.1250 — 2026-11-03 12:52
 
 - Merge remote-tracking branch 'fork/main' into feat/pv-charge-efficiency
