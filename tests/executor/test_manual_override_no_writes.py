@@ -542,3 +542,42 @@ async def test_unreadable_manual_hold_is_capped_then_dropped_with_notice(eng_ha)
     states[MANUAL] = "on"
     await eng.run_once()  # readable ON again re-enters manual
     assert eng.dispatcher.execute.await_count == 2
+
+
+# --- window-mode cyclic load (room heater) under manual override ----------------------
+
+
+@pytest.mark.asyncio
+async def test_manual_override_leaves_a_window_mode_heater_alone(eng_ha):
+    """The heater's live gate says ON (calendar event active, plug off), but a human
+    on manual owns the hardware: no switch write and no status publish. Control
+    resumes on the first tick after manual ends."""
+    from executor.config import CyclicLoadConfig
+
+    eng, ha, states = eng_ha
+    eng.config.cyclic_loads.append(
+        CyclicLoadConfig(
+            id="kim_heater",
+            name="Kims element",
+            switch_entity="switch.kims_uttag",
+            mode="window",
+            window_entities=["input_boolean.kim_here"],
+        )
+    )
+    states.update({"input_boolean.kim_here": "on", "switch.kims_uttag": "off"})
+
+    def heater_calls() -> list[tuple]:
+        return [c.args for c in ha.call_service.await_args_list if "switch.kims_uttag" in c.args]
+
+    def status_publishes() -> list[tuple]:
+        return [c.args for c in ha.set_state.await_args_list if "heating_state" in c.args[0]]
+
+    with patch("executor.actions.VERIFY_MAX_WAIT_MS", 0):
+        await eng.run_once()
+        await eng.run_once()
+        assert heater_calls() == [] and status_publishes() == []
+
+        states[MANUAL] = "off"
+        await eng.run_once()
+    assert heater_calls() == [("switch", "turn_on", "switch.kims_uttag")]
+    assert status_publishes()[-1][1] == "on"

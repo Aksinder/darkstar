@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -78,6 +79,16 @@ STATE_FUSE_SHED = "fuse_shed"
 STATE_GATE_UNKNOWN = "gate_unknown"
 STATE_EARLY_START = "early_start"
 STATE_PEAK_OFF = "peak_off"
+STATE_DWELL_HOLD = "dwell_hold"
+STATE_PAUSE_UNKNOWN = "pause_unknown"
+
+PAUSE_PAUSED = "paused"
+PAUSE_HOLD = "hold"
+PAUSE_CLEAR = "clear"
+
+# A room temperature outside this range is a glitch, not a room.
+TEMP_PLAUSIBLE_C = (-30.0, 50.0)
+_UNREADABLE = ("", "none", "unknown", "unavailable")
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,8 @@ class Decision:
     price_now: float | None = None
     early_threshold: float | None = None
     peak_threshold: float | None = None
+    # Something a human should hear about once: ("alert" | "recovered", text).
+    notice: tuple[str, str] | None = None
 
 
 def gate_from_windows(windows: list[Window], now: datetime, preheat_minutes: float) -> Gate:
@@ -135,11 +148,15 @@ def thermostat_wants_heat(
 
 
 def _slug(text: str) -> str:
-    return "".join(ch if ch.isalnum() else "_" for ch in text.strip().lower())
+    """An HA object-id fragment: [a-z0-9_] only, underscores collapsed. HA rejects
+    anything else (non-ASCII letters, double underscores) on every publish."""
+    return re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_") or "load"
 
 
 def status_entity_id(load_id: str) -> str:
-    return f"sensor.darkstar_{_slug(load_id)}_state"
+    # "_heating_state", not "_state": the deferrable appliances publish
+    # sensor.darkstar_<id>_state and an id shared between the two must not collide.
+    return f"sensor.darkstar_{_slug(load_id)}_heating_state"
 
 
 class WindowLoadRuntime:
@@ -163,6 +180,15 @@ class WindowLoadRuntime:
         # Price rules: the early-start latch and the peak-off clocks, per load. In
         # memory only — see _seed_rule_state for what a fresh process does instead.
         self._rule_state: dict[str, RuleState] = {}
+        # load id -> was the window open at the last reading (to confirm a close).
+        self._raw_in_window: dict[str, bool] = {}
+        # Thermostat: (last decision, for the comfort side?) and when its reading
+        # first went stale.
+        self._thermo_last: dict[str, tuple[bool, bool]] = {}
+        self._thermo_stale_since: dict[str, float] = {}
+        # load id -> when its pause helper first could not be read (this episode).
+        self._pause_unknown_since: dict[str, float] = {}
+        self._pause_unknown_logged: set[str] = set()
         self._price_memo: dict[str, tuple[tuple[int, float], float, list[float]]] = {}
         self._published: dict[str, tuple[float, str, dict[str, Any]]] = {}
 
@@ -243,23 +269,78 @@ class WindowLoadRuntime:
             nxt.window_end if nxt else None,
         )
 
-    async def _fresh_temp(self, ha: Any, load: Any, now_ts: float) -> float | None:
-        """The room temperature, or None when missing, unparsable or too old."""
+    async def _read_temp(
+        self, ha: Any, load: Any, now_ts: float
+    ) -> tuple[float | None, bool]:
+        """(room temperature in C, is it fresh). (None, False) when there is no
+        usable reading at all: missing, unparsable, implausible, or undated.
+
+        Freshness is the age of HA's last REPORT (last_reported, falling back to
+        last_updated/last_changed on an old HA): a Zigbee sensor in a steady room
+        reports the same value for hours, which moves last_reported but not
+        last_updated. Fahrenheit is converted; a value outside TEMP_PLAUSIBLE_C is a
+        glitch and must not start setback heating or stop a heater.
+        """
         state = await ha.get_state(load.temp_sensor)
         if not isinstance(state, Mapping):
-            return None
+            return None, False
         try:
             temp = float(state.get("state"))  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            return None
+            return None, False
         if not math.isfinite(temp):
-            return None
+            return None, False
+        attrs = state.get("attributes")
+        unit = str(attrs.get("unit_of_measurement") or "") if isinstance(attrs, Mapping) else ""
+        if unit.strip().upper().lstrip("°").strip() in ("F", "℉"):
+            temp = (temp - 32.0) * 5.0 / 9.0
+        if not TEMP_PLAUSIBLE_C[0] <= temp <= TEMP_PLAUSIBLE_C[1]:
+            return None, False
         stamp = reading_timestamp(state)
         if stamp is None:
-            return None  # freshness cannot be shown, so it is not assumed
-        if now_ts - stamp.timestamp() > load.temp_max_age_minutes * 60.0:
-            return None
-        return temp
+            return None, False  # freshness cannot be shown, so it is not assumed
+        return temp, now_ts - stamp.timestamp() <= load.temp_max_age_minutes * 60.0
+
+    async def pause_state(self, ha: Any, load: Any, now_ts: float) -> tuple[str, str]:
+        """Is this load control-paused? (PAUSE_PAUSED | PAUSE_HOLD | PAUSE_CLEAR, why).
+
+        Everywhere else an unreadable pause helper reads as NOT paused. For a room
+        heater that is the wrong way round: with the pause on and the plug set by
+        hand, one tick where the helper reads "unavailable" would let the gate
+        switch the plug. So here an unreadable helper HOLDS — no write this tick —
+        for at most GATE_HOLD_S, after which it counts as not paused (logged once),
+        so a helper that is gone for good cannot park the heater for ever.
+        """
+        unreadable: list[str] = []
+        for entity in load.control_pause_entities:
+            raw = await ha.get_state_value(entity)
+            value = str(raw).strip().lower() if raw is not None else ""
+            if value == "on":
+                self._pause_unknown_since.pop(load.id, None)
+                self._pause_unknown_logged.discard(load.id)
+                return PAUSE_PAUSED, entity
+            if value in _UNREADABLE:
+                unreadable.append(entity)
+        if not unreadable:
+            self._pause_unknown_since.pop(load.id, None)
+            self._pause_unknown_logged.discard(load.id)
+            return PAUSE_CLEAR, ""
+        since = self._pause_unknown_since.setdefault(load.id, now_ts)
+        detail = f"pause helper {', '.join(unreadable)} unreadable"
+        if now_ts - since < GATE_HOLD_S:
+            if since == now_ts:
+                logger.warning(
+                    "Window load %s: %s — leaving the plug alone for up to %.0f min",
+                    load.id, detail, GATE_HOLD_S / 60.0,
+                )
+            return PAUSE_HOLD, f"{detail} — leaving the plug alone"
+        if load.id not in self._pause_unknown_logged:
+            self._pause_unknown_logged.add(load.id)
+            logger.warning(
+                "Window load %s: %s for over %.0f min — treating it as NOT paused",
+                load.id, detail, GATE_HOLD_S / 60.0,
+            )
+        return PAUSE_CLEAR, ""
 
     async def decide(
         self,
@@ -293,6 +374,18 @@ class WindowLoadRuntime:
                 )
             first = load.id not in self._fallback_logged
             self._fallback_logged.add(load.id)
+            # Said ONCE to a human as well: from here on the heater runs on a plan
+            # slot or not at all, which nobody would notice from the log.
+            notice = (
+                (
+                    "alert",
+                    f"{load.name or load.id}: {gate.detail} i över "
+                    f"{GATE_HOLD_S / 60.0:.0f} min — elementet styrs inte längre av "
+                    "kalendern.",
+                )
+                if first
+                else None
+            )
             if load.id not in plans:
                 if first:
                     logger.warning(
@@ -304,6 +397,7 @@ class WindowLoadRuntime:
                     None,
                     STATE_GATE_UNKNOWN,
                     f"{gate.detail} — and not in the current plan, leaving it alone",
+                    notice=notice,
                 )
             want = float(plans.get(load.id) or 0.0) > 0.0
             if first:
@@ -315,27 +409,42 @@ class WindowLoadRuntime:
             want, reason = self._dwell(
                 load.id, want, f"{gate.detail} — following the plan slot", now_ts
             )
-            return Decision(want, STATE_ON if want else STATE_OFF, reason)
+            return Decision(want, STATE_ON if want else STATE_OFF, reason, notice=notice)
 
+        notice = None
         if self._unknown_since.pop(load.id, None) is not None:
             logger.info("Window load %s: gate readable again", load.id)
+            if load.id in self._fallback_logged:
+                notice = (
+                    "recovered",
+                    f"{load.name or load.id}: kalendern/grinden går att läsa igen.",
+                )
         self._fallback_logged.discard(load.id)
 
-        in_window = bool(gate.active or gate.preheat)
+        # A window that CLOSES is confirmed on the next tick before the plug is
+        # switched off: a calendar coming back from "unavailable" can read "off"
+        # for one tick, and that tick would cost five minutes of heat (the dwell).
+        # Opening is immediate, and a fresh process has nothing to confirm.
+        raw_in_window = bool(gate.active or gate.preheat)
+        closing = not raw_in_window and self._raw_in_window.get(load.id) is True
+        self._raw_in_window[load.id] = raw_in_window
+        in_window = raw_in_window or closing
         if gate.active:
             reason = "window active"
         elif gate.preheat:
             reason = f"preheating {load.preheat_minutes:.0f} min before the window"
+        elif closing:
+            reason = "window closed — confirming on the next tick"
         else:
             reason = "no window active"
 
         # The room temperature is read at most once, and only when something below
         # needs it.
-        temp_memo: list[float | None] = []
+        temp_memo: list[tuple[float | None, bool]] = []
 
-        async def room_temp() -> float | None:
+        async def room_temp() -> tuple[float | None, bool]:
             if not temp_memo:
-                temp_memo.append(await self._fresh_temp(ha, load, now_ts))
+                temp_memo.append(await self._read_temp(ha, load, now_ts))
             return temp_memo[0]
 
         # Price rules: cheap early start before the window, off at price peaks.
@@ -362,8 +471,8 @@ class WindowLoadRuntime:
                 and load.target_temp_c is not None
                 and (in_window or state.early_latched)
             ):
-                room = await room_temp()
-                keep_warm = room is not None and room < (
+                room, room_fresh = await room_temp()
+                keep_warm = room is not None and room_fresh and room < (
                     load.target_temp_c - load.hysteresis_c - rules.peak_off_temp_margin_c
                 )
             state, verdict = step(
@@ -390,25 +499,46 @@ class WindowLoadRuntime:
         # (if any) otherwise. Without a fresh reading the window alone decides.
         target = load.target_temp_c if heat else load.setback_temp_c
         temp: float | None = None
+        thermostat_on = False
         if load.temp_sensor and target is not None:
-            temp = await room_temp()
-            if temp is None:
-                reason += "; room temperature missing or stale — window only"
-                target = None
-            else:
+            temp, fresh = await room_temp()
+            side = "target" if heat else "setback"
+            if temp is not None and fresh:
                 heating = self._last_want.get(load.id)
                 if heating is None:
                     # Fresh process: take the relay's own word for the dead band.
                     heating = on_off_state(await ha.get_state_value(load.switch_entity))
                 want = thermostat_wants_heat(temp, target, load.hysteresis_c, heating)
-                reason = (
-                    f"{reason}; room {temp:.1f} C, "
-                    f"{'target' if heat else 'setback'} {target:.1f} C"
-                )
+                thermostat_on = want
+                self._thermo_last[load.id] = (want, heat)
+                self._thermo_stale_since.pop(load.id, None)
+                reason = f"{reason}; room {temp:.1f} C, {side} {target:.1f} C"
+            else:
+                # No fresh reading. A sensor in a steady room can simply be quiet,
+                # so the last thermostat decision stands for one more max-age
+                # period before the window alone decides.
+                last = self._thermo_last.get(load.id)
+                stale_since = self._thermo_stale_since.setdefault(load.id, now_ts)
+                if (
+                    last is not None
+                    and last[1] == heat
+                    and now_ts - stale_since <= load.temp_max_age_minutes * 60.0
+                ):
+                    want = last[0]
+                    thermostat_on = want
+                    reason += (
+                        "; room temperature missing or stale — holding the last "
+                        f"thermostat decision ({'on' if want else 'off'})"
+                    )
+                else:
+                    self._thermo_last.pop(load.id, None)
+                    reason += "; room temperature missing or stale — window only"
+                    temp = None
+                    target = None
         else:
             target = None
-        thermostat_on = want and temp is not None
 
+        wanted = want
         want, reason = self._dwell(load.id, want, reason, now_ts)
         if want:
             if phase == PHASE_PEAK_OFF:
@@ -426,6 +556,10 @@ class WindowLoadRuntime:
             state_label = STATE_PEAK_OFF
         else:
             state_label = STATE_TEMP_HOLD if heat else STATE_OFF
+        if want != wanted:
+            # The dwell overruled the decision: say so, instead of a state that
+            # blames the thermostat or claims a window.
+            state_label = STATE_DWELL_HOLD
         return Decision(
             want,
             state_label,
@@ -435,6 +569,7 @@ class WindowLoadRuntime:
             price if rules.enabled else None,
             early_thr,
             peak_thr,
+            notice,
         )
 
     async def _seed_rule_state(
@@ -518,17 +653,25 @@ class WindowLoadRuntime:
         self._fallback_logged.discard(load_id)
         self._last_gate.pop(load_id, None)
         self._rule_state.pop(load_id, None)
+        self._raw_in_window.pop(load_id, None)
+        self._thermo_last.pop(load_id, None)
+        self._thermo_stale_since.pop(load_id, None)
 
     def note_write(
         self, load_id: str, want_on: bool, result: Any, now_ts: float, *, gate_driven: bool
     ) -> None:
-        """Remember a command that went out. Only a gate-driven write that really
-        switched the relay starts the dwell clock — a human's override must not make
-        the next automatic switch wait."""
+        """Remember a command. ``_last_want`` follows what the plug is known to be
+        doing (already there, or switched and read back). The dwell clock starts only
+        on a gate-driven write that VERIFIABLY switched the relay: a human's override
+        must not make the next automatic switch wait, and neither must a write to an
+        unreachable plug that switched nothing."""
         if not getattr(result, "success", False):
             return
-        self._last_want[load_id] = want_on
-        if gate_driven and not getattr(result, "skipped", False):
+        skipped = bool(getattr(result, "skipped", False))
+        switched = not skipped and getattr(result, "verification_success", None) is True
+        if skipped or switched:
+            self._last_want[load_id] = want_on
+        if gate_driven and switched:
             self._last_switch_ts[load_id] = now_ts
 
     async def publish(

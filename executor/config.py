@@ -514,7 +514,8 @@ class CyclicLoadConfig:
     temp_sensor: str | None = None
     target_temp_c: float | None = None
     hysteresis_c: float = 0.5
-    temp_max_age_minutes: float = 30.0
+    # Generous on purpose: a Zigbee sensor in a steady room reports rarely.
+    temp_max_age_minutes: float = 180.0
     # Outside a window keep the room at least this warm. Unset = off outside.
     setback_temp_c: float | None = None
     # Window mode only: cheap early start and peak off (executor/window_price.py).

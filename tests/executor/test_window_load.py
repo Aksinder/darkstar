@@ -30,7 +30,7 @@ CAL = "calendar.kim"
 PAUSE = "input_boolean.kim_heater_paused"
 OVERRIDE = "input_select.kim_heater_override"
 TEMP = "sensor.kims_rum_temperature"
-STATUS = "sensor.darkstar_kim_heater_state"
+STATUS = "sensor.darkstar_kim_heater_heating_state"
 MIN = 60.0
 
 # Friday 2026-11-13 12:00 UTC (13:00 in Stockholm).
@@ -179,7 +179,9 @@ class TestLiveGate:
         await rig.tick(1)
         assert len(rig.writes) == 1  # already on: no second write
         rig.ha.states[CAL] = "off"
-        await rig.tick(10)
+        await rig.tick(10)  # a close is confirmed on the next tick
+        assert rig.plug == "on" and "confirming" in rig.ha.status[1]["reason"]
+        await rig.tick(11)
         assert rig.writes[-1] == ("switch", "turn_off", PLUG)
         assert rig.ha.status[0] == "off"
 
@@ -215,7 +217,40 @@ class TestLiveGate:
         assert rig.fetches == []  # no calendar, no event list
         rig.ha.states[gate] = "off"
         await rig.tick(10)
+        await rig.tick(11)
         assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_a_transient_off_inside_a_window_costs_no_heat(self, tmp_path):
+        """Calendar: on -> unavailable -> off for ONE tick -> on (an integration
+        reload). Switching off on that tick would cost 5 min of heat: the dwell."""
+        rig = Rig(tmp_path, _load(), {CAL: "on"})
+        await rig.tick(0)
+        for minute, state in ((1, "unavailable"), (2, "off"), (3, "on"), (4, "on")):
+            rig.ha.states[CAL] = state
+            await rig.tick(minute)
+            assert rig.plug == "on"
+        assert rig.writes == [("switch", "turn_on", PLUG)]
+
+    @pytest.mark.asyncio
+    async def test_a_real_window_end_is_delayed_by_one_tick_only(self, tmp_path):
+        rig = Rig(tmp_path, _load(window_event_match="kim"), {},
+                  events=[(_at(-60), _at(10))])
+        await rig.tick(0)
+        await rig.tick(9)
+        assert rig.plug == "on"
+        await rig.tick(10)  # the event ended this minute
+        assert rig.plug == "on"
+        await rig.tick(11)
+        assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_opening_is_immediate(self, tmp_path):
+        rig = Rig(tmp_path, _load(), {CAL: "off"})
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        await rig.tick(1)
+        assert rig.plug == "on"
 
     @pytest.mark.asyncio
     async def test_any_of_several_gates_opens_the_window(self, tmp_path):
@@ -342,6 +377,51 @@ class TestUnknownGate:
         assert rig.ha.status[0] == "gate_unknown"
 
     @pytest.mark.asyncio
+    async def test_a_gate_unknown_for_30_min_is_told_to_a_human_once(self, tmp_path):
+        """Absent from the plan the plug would otherwise stay as it is for ever,
+        with two log lines nobody reads."""
+        rig = Rig(tmp_path, _load(), {CAL: "unavailable", PLUG: "on"})
+        notify = AsyncMock()
+        rig.engine.dispatcher._send_notification = notify  # type: ignore[method-assign]
+        for minute in (0, 15, 29):
+            await rig.tick(minute, plan={})
+        notify.assert_not_awaited()
+        for minute in (30, 31, 90, 600):
+            await rig.tick(minute, plan={})
+        assert notify.await_count == 1
+        text = notify.await_args.args[0]
+        assert "Kims element" in text and CAL in text
+        rig.ha.states[CAL] = "off"
+        await rig.tick(601)
+        await rig.tick(602)
+        assert notify.await_count == 2
+        assert "igen" in notify.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_the_notice_is_also_sent_when_the_plan_takes_over(self, tmp_path):
+        rig = Rig(tmp_path, _load(), {CAL: "unavailable"})
+        notify = AsyncMock()
+        rig.engine.dispatcher._send_notification = notify  # type: ignore[method-assign]
+        await rig.tick(0, plan={"kim_heater": 0.5})
+        await rig.tick(30, plan={"kim_heater": 0.5})
+        assert rig.plug == "on" and notify.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_short_outage_notifies_nobody(self, tmp_path):
+        rig = Rig(tmp_path, _load(), {CAL: "unavailable"})
+        notify = AsyncMock()
+        rig.engine.dispatcher._send_notification = notify  # type: ignore[method-assign]
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        await rig.tick(10)
+        notify.assert_not_awaited()
+        rig.engine.config.notifications.on_error = False
+        rig.ha.states[CAL] = "unavailable"
+        await rig.tick(11)
+        await rig.tick(45)
+        notify.assert_not_awaited()  # and the on_error switch is respected
+
+    @pytest.mark.asyncio
     async def test_the_gate_coming_back_ends_the_episode(self, tmp_path):
         rig = Rig(tmp_path, _load(), {CAL: "unavailable", PLUG: "on"})
         await rig.tick(0)
@@ -412,10 +492,65 @@ class TestPrecedence:
         assert rig.plug == "on" and len(rig.writes) == 2
 
     @pytest.mark.asyncio
-    async def test_an_unreadable_pause_helper_is_not_a_pause(self, tmp_path):
+    async def test_un_pausing_does_not_wait_for_a_replan(self, tmp_path):
+        """A paused load is left OUT of the plan. A classic load is then "not in
+        the plan, left alone" until the next replan; a heater is gated live at once."""
+        rig = Rig(tmp_path, _load(), {CAL: "on", PAUSE: "on"})
+        await rig.tick(0, plan={})
+        assert rig.writes == []
+        rig.ha.states[PAUSE] = "off"
+        await rig.tick(1, plan={})  # still the plan from while it was paused
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["unavailable", "unknown", None, RuntimeError("HA down")])
+    async def test_an_unreadable_pause_helper_holds_a_paused_plug(self, tmp_path, bad):
+        """Paused, the plug switched ON by hand, the calendar off. One tick where
+        the helper cannot be read must not let the gate switch the plug off."""
+        rig = Rig(tmp_path, _load(), {PAUSE: "on", CAL: "off", PLUG: "on"})
+        await rig.tick(0)
+        rig.ha.states[PAUSE] = bad
+        for minute in (1, 2, 29):
+            await rig.tick(minute)
+        assert rig.writes == [] and rig.plug == "on"
+        state, attrs = rig.ha.status
+        assert state == "pause_unknown" and PAUSE in attrs["reason"]
+        assert PLUG not in rig.ha.reads and CAL not in rig.ha.reads
+        rig.ha.states[PAUSE] = "on"
+        await rig.tick(30)
+        assert rig.writes == [] and rig.ha.status[0] == "paused"
+
+    @pytest.mark.asyncio
+    async def test_a_pause_helper_gone_for_good_stops_holding_after_30_min(
+        self, tmp_path, caplog
+    ):
         rig = Rig(tmp_path, _load(), {PAUSE: "unavailable", CAL: "on"})
         await rig.tick(0)
+        await rig.tick(29)
+        assert rig.writes == []
+        with caplog.at_level("WARNING"):
+            await rig.tick(30)
+            await rig.tick(31)
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+        assert sum("treating it as NOT paused" in r.message for r in caplog.records) == 1
+        # A helper that answers again and later drops out gets a full hold again.
+        rig.ha.states[PAUSE] = "off"
+        await rig.tick(40)
+        rig.ha.states.update({PAUSE: "unavailable", CAL: "off"})
+        await rig.tick(41)
+        await rig.tick(42)
+        assert rig.plug == "on" and rig.ha.status[0] == "pause_unknown"
+
+    @pytest.mark.asyncio
+    async def test_only_an_unreadable_helper_holds_any_other_state_is_not_paused(
+        self, tmp_path
+    ):
+        rig = Rig(tmp_path, _load(), {PAUSE: "off", CAL: "on"})
+        await rig.tick(0)
         assert rig.plug == "on"
+        rig2 = Rig(tmp_path, _load(control_pause_entities=[]), {CAL: "on"})
+        await rig2.tick(0)
+        assert rig2.plug == "on"
 
     @pytest.mark.asyncio
     async def test_fuse_shed_outranks_the_window_and_force_on(self, tmp_path):
@@ -548,18 +683,92 @@ class TestThermostat:
         assert rig.ha.status[1]["room_temp"] is None
         rig.ha.states[CAL] = "off"
         await rig.tick(10)
+        await rig.tick(11)
         assert rig.plug == "off" and rig.ha.status[0] == "off"
 
     @pytest.mark.asyncio
-    async def test_a_stale_reading_is_a_missing_reading(self, tmp_path):
+    async def test_a_quiet_sensor_in_a_steady_room_is_not_stale(self, tmp_path):
+        """Zigbee sensors report on change. A room sitting at 20.3 for two hours has
+        an old last_updated; that must not read as "sensor dead, plug on"."""
+        assert CyclicLoadConfig(id="x").temp_max_age_minutes == 180.0
+        rig = Rig(tmp_path, _load(**THERMO), {CAL: "on", PLUG: "on"})
+        _temp(rig, "20.6", age_min=1)
+        await rig.tick(0)
+        assert rig.plug == "off"
+        _temp(rig, "20.3", age_min=170, minutes=200)  # last report 170 min ago
+        await rig.tick(200)
+        assert rig.plug == "off" and rig.ha.status[0] == "temp_hold"
+
+    @pytest.mark.asyncio
+    async def test_freshness_is_the_last_report_not_the_last_change(self, tmp_path):
+        rig = Rig(tmp_path, _load(**THERMO, temp_max_age_minutes=30), {CAL: "on", PLUG: "on"})
+        rig.ha.states[TEMP] = "20.6"
+        rig.ha.attrs[TEMP] = {
+            "last_changed": _at(-300).isoformat(),
+            "last_updated": _at(-300).isoformat(),
+            "last_reported": _at(-2).isoformat(),
+        }
+        await rig.tick(0)
+        assert rig.plug == "off" and rig.ha.status[1]["room_temp"] == 20.6
+
+    @pytest.mark.asyncio
+    async def test_a_stale_reading_holds_the_last_decision_then_falls_back(self, tmp_path):
         rig = Rig(tmp_path, _load(**THERMO, temp_max_age_minutes=30), {CAL: "on", PLUG: "on"})
         _temp(rig, "23.0", age_min=29)
         await rig.tick(0)
         assert rig.plug == "off"  # fresh and too warm
-        _temp(rig, "23.0", age_min=31, minutes=10)
+        _temp(rig, "23.0", age_min=31, minutes=2)  # stale from here on
+        await rig.tick(2)
+        assert rig.plug == "off"
+        assert "holding the last thermostat decision (off)" in rig.ha.status[1]["reason"]
+        await rig.tick(32)  # one further max-age period
+        assert rig.plug == "off"
+        await rig.tick(33)
+        assert rig.plug == "on" and rig.ha.status[0] == "on"  # the window decides
+        assert "window only" in rig.ha.status[1]["reason"]
+        assert rig.ha.status[1]["room_temp"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_sensor_that_vanishes_also_holds_the_last_decision(self, tmp_path):
+        rig = Rig(tmp_path, _load(**THERMO, temp_max_age_minutes=30), {CAL: "on"})
+        _temp(rig, "18.0")
+        await rig.tick(0)
+        assert rig.plug == "on"
+        rig.ha.states[TEMP] = "unavailable"
+        await rig.tick(20)
+        assert rig.plug == "on" and "holding" in rig.ha.status[1]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_process_with_a_stale_reading_has_nothing_to_hold(self, tmp_path):
+        rig = Rig(tmp_path, _load(**THERMO, temp_max_age_minutes=30), {CAL: "on"})
+        _temp(rig, "23.0", age_min=31)
+        await rig.tick(0)
+        assert rig.plug == "on" and "window only" in rig.ha.status[1]["reason"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("glitch", ["-127.0", "85.0", "-30.1", "50.1", "6553.5"])
+    async def test_an_implausible_reading_is_a_missing_reading(self, tmp_path, glitch):
+        """A sensor glitch must neither start setback heating nor stop a heater."""
+        rig = Rig(tmp_path, _load(**THERMO, setback_temp_c=15.0), {CAL: "off"})
+        _temp(rig, glitch)
+        await rig.tick(0)
+        assert rig.plug == "off" and rig.ha.status[1]["room_temp"] is None
+        rig.ha.states[CAL] = "on"
+        _temp(rig, glitch, minutes=1)
+        await rig.tick(1)
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+
+    @pytest.mark.asyncio
+    async def test_fahrenheit_is_converted(self, tmp_path):
+        rig = Rig(tmp_path, _load(**THERMO), {CAL: "on", PLUG: "on"})
+        _temp(rig, "70.0")  # 21.1 C: too warm
+        rig.ha.attrs[TEMP]["attributes"] = {"unit_of_measurement": "°F"}
+        await rig.tick(0)
+        assert rig.plug == "off" and rig.ha.status[1]["room_temp"] == 21.1
+        _temp(rig, "60.0", minutes=10)  # 15.6 C
+        rig.ha.attrs[TEMP]["attributes"] = {"unit_of_measurement": "°F"}
         await rig.tick(10)
-        assert rig.plug == "on"  # stale: the window decides
-        assert "stale" in rig.ha.status[1]["reason"]
+        assert rig.plug == "on"
 
     @pytest.mark.asyncio
     async def test_a_reading_without_any_timestamp_is_not_trusted(self, tmp_path):
@@ -576,6 +785,36 @@ class TestThermostat:
         # on at 0, off at 5 (the first "too warm" reading 5 min later), on at 10.
         assert [c[1] for c in rig.writes] == ["turn_on", "turn_off", "turn_on"]
         assert "switched under 5 min ago" in rig.ha.published[1][2]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_a_dwell_held_plug_says_so(self, tmp_path):
+        """No thermostat: "temp_hold" would blame a sensor that does not exist."""
+        rig = Rig(tmp_path, _load(), {CAL: "off", OVERRIDE: "force_on"})
+        await rig.tick(0)
+        rig.ha.states.update({OVERRIDE: "auto"})
+        await rig.tick(1)  # gate-driven off: the dwell clock starts
+        assert rig.plug == "off"
+        rig.ha.states[CAL] = "on"
+        await rig.tick(2)
+        assert rig.plug == "off" and rig.ha.status[0] == "dwell_hold"
+        assert "switched under 5 min ago" in rig.ha.status[1]["reason"]
+        await rig.tick(6)
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+
+    @pytest.mark.asyncio
+    async def test_a_write_that_switched_nothing_does_not_start_the_dwell(self, tmp_path):
+        """An unreachable plug in a window: every tick's write is accepted by HA and
+        changes nothing. That must not keep restarting the dwell clock."""
+        rig = Rig(tmp_path, _load(), {CAL: "on"})
+        rig.ha.plug_obeys = False
+        for minute in range(3):
+            await rig.tick(minute)
+        rig.ha.plug_obeys = True
+        rig.ha.states[PLUG] = "on"  # it came back, on
+        rig.ha.states[CAL] = "off"
+        await rig.tick(3)  # closing: confirmed next tick
+        await rig.tick(4)
+        assert rig.plug == "off"  # not held on by a dwell from the failed writes
 
     @pytest.mark.asyncio
     async def test_dwell_also_spares_the_relay_from_a_flapping_gate(self, tmp_path):
@@ -729,7 +968,18 @@ class TestStatusSensor:
         }
 
     def test_ids_are_slugged(self):
-        assert wl.status_entity_id("Kim's heater") == "sensor.darkstar_kim_s_heater_state"
+        import re
+
+        assert wl.status_entity_id("Kim's heater") == (
+            "sensor.darkstar_kim_s_heater_heating_state"
+        )
+        for load_id in ("Östra  rummet", "a__b", "--x--", "Åäö", "kim_heater"):
+            entity = wl.status_entity_id(load_id)
+            # What HA accepts as an entity id, and never a double underscore.
+            assert re.fullmatch(r"sensor\.[a-z0-9]+(_[a-z0-9]+)*", entity), entity
+        assert wl.status_entity_id("Åäö") == "sensor.darkstar_load_heating_state"
+        # Not the deferrable appliances' sensor.darkstar_<id>_state.
+        assert wl.status_entity_id("diskmaskin") != "sensor.darkstar_diskmaskin_state"
 
 
 EARLY = {"early_start_hours": 14}
@@ -1095,7 +1345,7 @@ class TestConfig:
         assert load.power_entity == "sensor.kims_uttag_power"
         assert (load.window_event_match, load.preheat_minutes) == (None, 0.0)
         assert (load.temp_sensor, load.target_temp_c, load.setback_temp_c) == (None, None, None)
-        assert (load.hysteresis_c, load.temp_max_age_minutes) == (0.5, 30.0)
+        assert (load.hysteresis_c, load.temp_max_age_minutes) == (0.5, 180.0)
 
     def test_every_window_key_round_trips(self, tmp_path):
         (load,) = self._load(tmp_path, [{

@@ -74,9 +74,12 @@ from .water_hold import (
     should_hold_off_write,
 )
 from .window_load import (
+    PAUSE_HOLD,
+    PAUSE_PAUSED,
     STATE_FUSE_SHED,
     STATE_OVERRIDE_OFF,
     STATE_OVERRIDE_ON,
+    STATE_PAUSE_UNKNOWN,
     STATE_PAUSED,
     WindowLoadRuntime,
 )
@@ -4269,12 +4272,21 @@ class ExecutorEngine:
             runtime.note_write(load.id, want_on, result, now, gate_driven=gate_driven)
             await self._note_window_write_verified(load, want_on, result)
 
-        # Hands-off: never command a paused device on OR off.
-        if await self._device_control_paused(
-            load.control_pause_entities, f"cyclic:{load.id}", load.id, pause_cache
-        ):
+        # Hands-off: never command a paused device on OR off. Unlike the other
+        # loads, an UNREADABLE pause helper holds too (see pause_state).
+        paused, pause_why = await runtime.pause_state(self.ha_client, load, now)
+        if paused == PAUSE_PAUSED:
+            # The shared helper only for its once-per-episode log line; the answer
+            # is already known, so it reads nothing.
+            await self._device_control_paused(
+                [pause_why], f"cyclic:{load.id}", load.id, {pause_why: True}
+            )
             runtime.forget(load.id)
             await _status(STATE_PAUSED, "control pause — leaving the plug alone")
+            return
+        self._control_pause_logged.pop(f"cyclic:{load.id}", None)
+        if paused == PAUSE_HOLD:
+            await _status(STATE_PAUSE_UNKNOWN, pause_why)
             return
 
         # Fuse relief outranks the window and the human alike.
@@ -4320,6 +4332,16 @@ class ExecutorEngine:
         if prev_state.get(load.id) != decision.state:
             prev_state[load.id] = decision.state
             logger.info("Window load %s: %s (%s)", load.id, decision.state, decision.reason)
+        if decision.notice is not None and self.config.notifications.on_error:
+            kind, text = decision.notice
+            await self.dispatcher._send_notification(  # type: ignore[protected-access]
+                text,
+                title=(
+                    "⚠️ Darkstar: element utan kalender"
+                    if kind == "alert"
+                    else "Darkstar: element styrs av kalendern igen"
+                ),
+            )
         if decision.want_on is not None:
             await _write(decision.want_on, gate_driven=True)
         await _status(

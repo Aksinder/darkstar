@@ -192,7 +192,7 @@ water_heating:
 #   # so a calendar edit takes effect within minutes even if the plan is older. If
 #   # the gate cannot be read it HOLDS the plug as it is for 30 min, then follows
 #   # the plan slot. The planner only books the consumption, as fixed load, in the
-#   # slots that overlap a window. Status: sensor.darkstar_<id>_state.
+#   # slots that overlap a window. Status: sensor.darkstar_<id>_heating_state.
 #   - id: kim_heater
 #     name: "Kims element"
 #     enabled: true
@@ -211,7 +211,9 @@ water_heating:
 #                                  # summary contains this text (case-insensitive), so
 #                                  # one shared calendar can serve several rooms
 #     preheat_minutes: 0           # switch on this long before a calendar event starts
-#     control_pause_entities: [input_boolean.kim_heater_paused]  # on = hands off
+#     control_pause_entities: [input_boolean.kim_heater_paused]  # on = hands off.
+#                                  # For a heater an UNREADABLE helper also means
+#                                  # hands off, for up to 30 min (then: not paused)
 #     override_entity:             # input_select auto / force_on / force_off
 #     override_timeout_minutes: 0
 #     fuse_shed: false
@@ -222,7 +224,9 @@ water_heating:
 #     target_temp_c:               # inside a window: on at target - hysteresis,
 #                                  # off at target + hysteresis
 #     hysteresis_c: 0.5
-#     temp_max_age_minutes: 30     # an older reading counts as missing
+#     temp_max_age_minutes: 180    # an older reading counts as stale: the last
+#                                  # thermostat decision is held for one more such
+#                                  # period, then the window alone decides
 #     setback_temp_c:              # outside a window keep at least this warm
 #                                  # (unset = off outside the window)
 #     # Price rules, both off unless set. Decided live by the executor from the
