@@ -102,23 +102,59 @@ async def test_unplug_after_departure_ends_grace_for_good():
 
 
 @pytest.mark.asyncio
-async def test_plug_unavailable_pauses_grace_and_a_fresh_reading_resumes_it():
-    # A held "plugged" is not an observation: no full power at a car nobody can
-    # see. Not terminal — the reading returns within the presence gap.
+async def test_short_plug_dropout_holds_the_grace_then_pauses_then_resumes():
+    # A held "plugged" is not an observation, but one unreadable tick must not
+    # stop the charger: the active grace rides through 180 s, pauses beyond that
+    # (no full power at a car nobody can see) and is never ended by it.
     ctl, ccfg = _ctl()
     dep = SAT_05 - 3600
     _seen_since(ctl, SAT_05 - 7200, SAT_05 - 60)
     assert (await _read(ctl, ccfg, SAT_05, dep)).deadline_hours == pytest.approx(0.25)
-    st = await _read(ctl, ccfg, SAT_05 + 60, dep, **{"binary_sensor.tesla_plug": "unavailable"})
+    dark = {"binary_sensor.tesla_plug": "unavailable"}
+    for dt in (60, 120, 180):
+        st = await _read(ctl, ccfg, SAT_05 + dt, dep, **dark)
+        assert st.deadline_hours == pytest.approx(0.25), dt
+    st = await _read(ctl, ccfg, SAT_05 + 240, dep, **dark)
     assert st.deadline_hours != pytest.approx(0.25)
     assert st.plugged is True  # the hold itself is unchanged: the car stays in the fleet
     assert "tesla" not in ctl._missed_dep_done
-    st = await _read(ctl, ccfg, SAT_05 + 120, dep)
+    st = await _read(ctl, ccfg, SAT_05 + 300, dep)
     assert st.deadline_hours == pytest.approx(0.25)
 
 
 @pytest.mark.asyncio
-async def test_home_unavailable_pauses_grace_too():
+async def test_flapping_plug_sensor_does_not_churn_and_warns_once(caplog):
+    ctl, ccfg = _ctl()
+    dep = SAT_05 - 3600
+    _seen_since(ctl, SAT_05 - 7200, SAT_05 - 60)
+    with caplog.at_level("INFO", logger="darkstar.ev_surplus"):
+        for i in range(20):
+            over = {"binary_sensor.tesla_plug": "unavailable"} if i % 2 else {}
+            st = await _read(ctl, ccfg, SAT_05 + 60 * i, dep, **over)
+            assert st.deadline_hours == pytest.approx(0.25), i
+    armed = [r for r in caplog.records if "missed its one-off departure" in r.getMessage()]
+    assert len(armed) == 1
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_is_one_episode_one_warning(caplog):
+    ctl, ccfg = _ctl()
+    dep = SAT_05 - 3600
+    _seen_since(ctl, SAT_05 - 7200, SAT_05 - 60)
+    with caplog.at_level("INFO", logger="darkstar.ev_surplus"):
+        await _read(ctl, ccfg, SAT_05, dep)
+        await _ticks(ctl, ccfg, SAT_05 + 60, SAT_05 + 600, dep, step=60,
+                     **{"binary_sensor.tesla_plug": "unavailable"})
+        st = await _read(ctl, ccfg, SAT_05 + 660, dep)
+    assert st.deadline_hours == pytest.approx(0.25)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("missed its one-off departure" in m for m in msgs) == 1
+    assert sum("grace paused" in m for m in msgs) == 1
+    assert sum("grace resumed" in m for m in msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_home_unavailable_counts_as_unobserved_too():
     raw = _cfg_dict()
     tesla = next(c for c in raw["ev_surplus"]["chargers"] if c["id"] == "tesla")
     tesla["home_entity"] = "device_tracker.tesla"
@@ -130,9 +166,10 @@ async def test_home_unavailable_pauses_grace_too():
     home = {"device_tracker.tesla": "home"}
     await _ticks(ctl, ccfg, dep - 1200, SAT_05, dep, **home)
     assert ctl._missed_dep_active == {"tesla"}
-    st = await _read(ctl, ccfg, SAT_05 + 60, dep, **{"device_tracker.tesla": "unknown"})
+    st = await _ticks(ctl, ccfg, SAT_05 + 60, SAT_05 + 300, dep, step=60,
+                      **{"device_tracker.tesla": "unknown"})
     assert st.deadline_hours != pytest.approx(0.25)
-    st = await _read(ctl, ccfg, SAT_05 + 120, dep, **home)
+    st = await _read(ctl, ccfg, SAT_05 + 360, dep, **home)
     assert st.deadline_hours == pytest.approx(0.25)
 
 
@@ -164,19 +201,131 @@ async def test_car_left_during_a_blackout_across_the_departure_never_arms():
     assert ctl._missed_dep_done.get("tesla") == t0730
 
 
+DARK = {"binary_sensor.tesla_plug": "unavailable"}
+
+
 @pytest.mark.asyncio
-async def test_long_blackout_breaks_continuity_like_a_restart():
-    # Dark from 07:40 to 09:00 with the car plugged in again afterwards: it may
-    # have left and come back unseen, so the grace ends (fails toward no grace).
+async def test_outage_straddling_the_departure_still_gets_the_grace():
+    # Reviewer scenario A: plug entity dark from 20 min before to 20 min after the
+    # departure, the car plugged in the whole time. Charger/cloud outages around
+    # the departure are what the grace is for.
+    ctl, ccfg = _ctl()
+    dep = SAT_05 + 3600
+    await _ticks(ctl, ccfg, SAT_05, dep - 1200, dep, step=60)
+    st = await _ticks(ctl, ccfg, dep - 1140, dep + 1200, dep, step=60, **DARK)
+    assert st.deadline_hours != pytest.approx(0.25)  # not at a car nobody can see
+    assert ctl._missed_dep_done == {}
+    st = await _read(ctl, ccfg, dep + 1260, dep)
+    assert st.deadline_hours == pytest.approx(0.25)
+    assert ctl._missed_dep_done == {}
+
+
+@pytest.mark.asyncio
+async def test_outage_during_an_active_grace_does_not_end_it():
+    # Reviewer scenario B: 16-min outage in the middle of an active grace.
+    ctl, ccfg = _ctl()
+    dep = SAT_05 + 3600
+    await _ticks(ctl, ccfg, SAT_05, dep + 600, dep, step=60)
+    assert ctl._missed_dep_active == {"tesla"}
+    st = await _ticks(ctl, ccfg, dep + 660, dep + 1560, dep, step=60, **DARK)
+    assert st.deadline_hours != pytest.approx(0.25)  # paused past the 180 s hold
+    assert ctl._missed_dep_done == {}
+    st = await _read(ctl, ccfg, dep + 1620, dep)
+    assert st.deadline_hours == pytest.approx(0.25)
+    assert ctl._missed_dep_done == {}
+
+
+@pytest.mark.asyncio
+async def test_long_blackout_is_bridged_when_the_soc_did_not_drop():
+    # Dark 07:40-09:00, then plugged + home with the SoC where it was (or higher:
+    # the car may have charged meanwhile).
+    for soc_after in ("30", "29", "35"):
+        ctl, ccfg = _ctl()
+        t0730 = SAT_05 + 2.5 * 3600
+        await _ticks(ctl, ccfg, SAT_05, t0730 + 600, t0730)
+        await _ticks(ctl, ccfg, t0730 + 900, t0730 + 5100, t0730, **DARK)
+        st = await _read(ctl, ccfg, t0730 + 5400, t0730, **{"sensor.tesla_soc": soc_after})
+        assert st.deadline_hours == pytest.approx(0.25), soc_after
+        assert ctl._present_run["tesla"][0] == SAT_05
+
+
+@pytest.mark.asyncio
+async def test_left_and_came_back_with_lower_soc_gets_no_grace():
+    # Same blackout, but the car comes back 5 points lower: it drove. No grace,
+    # and for good.
     ctl, ccfg = _ctl()
     t0730 = SAT_05 + 2.5 * 3600
     await _ticks(ctl, ccfg, SAT_05, t0730 + 600, t0730)
-    assert ctl._missed_dep_active == {"tesla"}
-    await _ticks(ctl, ccfg, t0730 + 900, t0730 + 5100, t0730,
-                 **{"binary_sensor.tesla_plug": "unavailable"})
-    st = await _read(ctl, ccfg, t0730 + 5400, t0730)
+    await _ticks(ctl, ccfg, t0730 + 900, t0730 + 5100, t0730, **DARK)
+    st = await _read(ctl, ccfg, t0730 + 5400, t0730, **{"sensor.tesla_soc": "25"})
     assert st.deadline_hours != pytest.approx(0.25)
     assert ctl._missed_dep_done.get("tesla") == t0730
+    st = await _read(ctl, ccfg, t0730 + 5700, t0730, **{"sensor.tesla_soc": "25"})
+    assert st.deadline_hours != pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_left_before_the_departure_during_a_blackout_and_returned_lower():
+    ctl, ccfg = _ctl()
+    dep = SAT_05 + 3600
+    await _ticks(ctl, ccfg, SAT_05, dep - 1200, dep, step=60)
+    await _ticks(ctl, ccfg, dep - 1140, dep + 1200, dep, step=60, **DARK)
+    st = await _read(ctl, ccfg, dep + 1260, dep, **{"sensor.tesla_soc": "22"})
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_done.get("tesla") == dep
+
+
+@pytest.mark.asyncio
+async def test_no_bridge_without_a_fresh_soc_but_not_terminal_either():
+    # Plug readable again while the car's SoC is still a held value: there is
+    # nothing to judge the blackout by yet. Stay paused; decide on a fresh SoC.
+    ctl, ccfg = _ctl()
+    t0730 = SAT_05 + 2.5 * 3600
+    await _ticks(ctl, ccfg, SAT_05, t0730 + 600, t0730)
+    await _ticks(ctl, ccfg, t0730 + 900, t0730 + 5100, t0730, **DARK)
+    st = await _ticks(ctl, ccfg, t0730 + 5400, t0730 + 6600, t0730,
+                      **{"sensor.tesla_soc": "unavailable"})
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_done == {}
+    st = await _read(ctl, ccfg, t0730 + 6900, t0730)
+    assert st.deadline_hours == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_no_bridge_without_a_fresh_soc_then_lower_soc_ends_it():
+    ctl, ccfg = _ctl()
+    t0730 = SAT_05 + 2.5 * 3600
+    await _ticks(ctl, ccfg, SAT_05, t0730 + 600, t0730)
+    await _ticks(ctl, ccfg, t0730 + 900, t0730 + 5100, t0730, **DARK)
+    await _ticks(ctl, ccfg, t0730 + 5400, t0730 + 6600, t0730,
+                 **{"sensor.tesla_soc": "unavailable"})
+    st = await _read(ctl, ccfg, t0730 + 6900, t0730, **{"sensor.tesla_soc": "20"})
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_done.get("tesla") == t0730
+
+
+@pytest.mark.asyncio
+async def test_unplugged_reading_inside_a_blackout_still_ends_the_grace():
+    # Dark, one fresh "unplugged", dark again, then plugged with the same SoC.
+    ctl, ccfg = _ctl()
+    t0730 = SAT_05 + 2.5 * 3600
+    await _ticks(ctl, ccfg, SAT_05, t0730 + 600, t0730)
+    await _ticks(ctl, ccfg, t0730 + 900, t0730 + 1800, t0730, **DARK)
+    await _read(ctl, ccfg, t0730 + 2100, t0730, **{"binary_sensor.tesla_plug": "off"})
+    await _ticks(ctl, ccfg, t0730 + 2400, t0730 + 3600, t0730, **DARK)
+    st = await _read(ctl, ccfg, t0730 + 3900, t0730)
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_done.get("tesla") == t0730
+
+
+@pytest.mark.asyncio
+async def test_blackout_does_not_extend_the_four_hour_window():
+    ctl, ccfg = _ctl()
+    t0730 = SAT_05 + 2.5 * 3600
+    await _ticks(ctl, ccfg, SAT_05, t0730 + 600, t0730)
+    await _ticks(ctl, ccfg, t0730 + 900, t0730 + 4 * 3600, t0730, **DARK)
+    st = await _read(ctl, ccfg, t0730 + 4 * 3600 + 300, t0730)
+    assert st.deadline_hours != pytest.approx(0.25)
 
 
 # --- near-target tolerance (post-departure grace only) ---------------------
