@@ -19,11 +19,13 @@ import pytz
 import yaml
 
 import backend.health as health
+import backend.learning.baseline as baseline_mod
 from backend.api.routers.config import _validate_config_for_save
 from backend.config_migration import remove_deprecated_keys, template_aware_merge
 from backend.learning.baseline import resolve_load_blend_weight
 from tests.ml.test_load_fallback_tiers import (
     ALL_KEYS,
+    FIXED_NOW,
     LOAD_MODELS,
     _engine,
     _forward,
@@ -37,6 +39,7 @@ MEANS = [0.2 + 0.1 * i for i in range(8)]
 
 @pytest.fixture(autouse=True)
 def _reset_health():
+    baseline_mod._warned_blend_weights.clear()
     yield
     health.clear_load_forecast_status()
     health.set_load_forecast_tier("")
@@ -75,6 +78,17 @@ def test_weight_out_of_range_is_rejected_not_clamped(raw, caplog):
     assert "blend disabled" in caplog.text
 
 
+def test_invalid_weight_is_logged_once_per_value_not_per_forecast_run(caplog):
+    cfg = {"forecasting": {"load_blend_slot_mean_weight": 40}}
+    with caplog.at_level(logging.WARNING, logger="darkstar.learning.baseline"):
+        assert [resolve_load_blend_weight(cfg) for _ in range(5)] == [0.0] * 5
+        assert caplog.text.count("blend disabled") == 1
+        cfg["forecasting"]["load_blend_slot_mean_weight"] = 60  # a changed value warns again
+        resolve_load_blend_weight(cfg)
+        resolve_load_blend_weight(cfg)
+        assert caplog.text.count("blend disabled") == 2
+
+
 def test_config_save_rejects_out_of_range_weight():
     def errors(value: Any) -> list[str]:
         cfg = {"forecasting": {"load_blend_slot_mean_weight": value}}
@@ -99,6 +113,9 @@ def test_default_config_ships_both_options_off_and_keeps_the_load_floor():
     forecasting = default_cfg["forecasting"]
     assert forecasting["load_blend_slot_mean_weight"] == 0.0
     assert forecasting["pv_training_weather_source"] == "forecast_past_days"
+    # kill switches ship ON (= the new default behaviour)
+    assert forecasting["training_data_cleaning_enabled"] is True
+    assert forecasting["load_slot_mean_fallback_enabled"] is True
     # this site's live load floor: must never be removed or changed by this work
     assert forecasting["load_safety_margin_percent"] == 117.0
     assert default_cfg["learning"]["max_daily_param_change"]["load_safety_margin_percent"] == 1.0
@@ -117,6 +134,8 @@ def test_new_keys_survive_migration_and_merge():
     merged = ruamel.load((REPO / "config.default.yaml").read_text(encoding="utf-8"))
     template_aware_merge(merged, old_user)
     assert merged["forecasting"]["load_blend_slot_mean_weight"] == 0.0
+    assert merged["forecasting"]["training_data_cleaning_enabled"] is True
+    assert merged["forecasting"]["load_slot_mean_fallback_enabled"] is True
     assert merged["forecasting"]["pv_training_weather_source"] == "forecast_past_days"
     assert merged["forecasting"]["load_safety_margin_percent"] == 117.0
 
@@ -124,6 +143,8 @@ def test_new_keys_survive_migration_and_merge():
     user: dict[str, Any] = {
         "forecasting": {
             "load_blend_slot_mean_weight": 0.4,
+            "training_data_cleaning_enabled": False,
+            "load_slot_mean_fallback_enabled": False,
             "pv_training_weather_source": "historical_forecast",
             "load_safety_margin_percent": 109.0,
         }
@@ -131,6 +152,8 @@ def test_new_keys_survive_migration_and_merge():
     user, _ = remove_deprecated_keys(user)
     template_aware_merge(default_cfg, user)
     assert default_cfg["forecasting"]["load_blend_slot_mean_weight"] == 0.4
+    assert default_cfg["forecasting"]["training_data_cleaning_enabled"] is False
+    assert default_cfg["forecasting"]["load_slot_mean_fallback_enabled"] is False
     assert default_cfg["forecasting"]["pv_training_weather_source"] == "historical_forecast"
     assert default_cfg["forecasting"]["load_safety_margin_percent"] == 109.0
 
@@ -180,16 +203,64 @@ async def test_blend_weight_one_is_the_slot_mean():
 
 
 @pytest.mark.asyncio
-async def test_blend_keeps_pure_model_where_there_is_no_slot_mean():
+async def test_blend_on_under_half_the_slots_is_a_warning_and_visible(caplog):
     partial = {key: value for i, (key, value) in enumerate(ALL_KEYS.items()) if i < 3}
-    _, forecasts = await _run(0.5, history=_history(partial))
+    with caplog.at_level(logging.INFO, logger="darkstar.ml.forward"):
+        _, forecasts = await _run(0.5, history=_history(partial))
     loads = [f["load_forecast_kwh"] for f in forecasts]
     assert loads[:3] == pytest.approx([0.35, 0.4, 0.45])
-    assert loads[3:] == [MODEL["load_p50"]] * 5
+    assert loads[3:] == [MODEL["load_p50"]] * 5  # no slot mean -> pure model
 
-    _, forecasts = await _run(0.5, history=[])
+    (record,) = [r for r in caplog.records if "Load forecast blend" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert "on 3/8 slots" in record.getMessage() and "ENABLED" in record.getMessage()
+    assert health.get_load_forecast_status()["tier"] == "model+slot_mean_7d_partial"
+    checker = health.HealthChecker.__new__(health.HealthChecker)
+    (issue,) = checker.check_load_forecast()
+    assert issue.severity == "warning"
+    assert issue.message == "Load forecast blend applied to fewer than half the slots"
+
+
+@pytest.mark.asyncio
+async def test_enabled_blend_that_reaches_no_slot_is_not_a_silent_noop(caplog):
+    with caplog.at_level(logging.INFO, logger="darkstar.ml.forward"):
+        _, forecasts = await _run(0.5, history=[])
     assert [f["load_forecast_kwh"] for f in forecasts] == [MODEL["load_p50"]] * 8
-    assert health.get_load_forecast_status()["tier"] == "model"
+
+    (record,) = [r for r in caplog.records if "Load forecast blend" in r.getMessage()]
+    assert record.levelno == logging.WARNING and "on 0/8 slots" in record.getMessage()
+    assert health.get_load_forecast_status()["tier"] == "model_blend_inactive"
+    checker = health.HealthChecker.__new__(health.HealthChecker)
+    (issue,) = checker.check_load_forecast()
+    assert issue.message == "Load forecast blend is enabled but not applied to any slot"
+
+
+@pytest.mark.asyncio
+async def test_blend_on_half_or_more_of_the_slots_stays_info_and_raises_no_issue(caplog):
+    half = {key: value for i, (key, value) in enumerate(ALL_KEYS.items()) if i < 4}
+    with caplog.at_level(logging.INFO, logger="darkstar.ml.forward"):
+        await _run(0.5, history=_history(half))
+    (record,) = [r for r in caplog.records if "Load forecast blend" in r.getMessage()]
+    assert record.levelno == logging.INFO
+    assert health.get_load_forecast_status()["tier"] == "model+slot_mean_7d"
+    assert health.HealthChecker.__new__(health.HealthChecker).check_load_forecast() == []
+
+
+@pytest.mark.asyncio
+async def test_blend_still_works_through_a_week_of_an_offline_device():
+    """The reviewer's case: every slot of the week flagged 'unavailable' for one heater."""
+    offline = '{"water_unmeasured": {"spa": "unavailable"}}'
+    rows = [
+        {
+            "slot_start": (FIXED_NOW - timedelta(days=7) + timedelta(minutes=15 * i)).isoformat(),
+            "load_kwh": 0.8,
+            "quality_flags": offline,
+        }
+        for i in range(7 * 96)
+    ]
+    _, forecasts = await _run(0.5, history=rows)
+    assert [f["load_forecast_kwh"] for f in forecasts] == pytest.approx([0.65] * 8)
+    assert health.get_load_forecast_status()["tier"] == "model+slot_mean_7d"
 
 
 # --- scripts/compare_load_forecasts.py ----------------------------------------------------
@@ -281,5 +352,43 @@ def test_compare_load_script_main_is_read_only_and_prints_all_tables(load_db, ca
         assert heading in out
     assert "blend 0.4" in out and "blend 0.6" in out and "Mon" in out and "Sun" in out
     assert load_db.read_bytes() == before
-    with script.open_readonly(str(load_db)) as conn, pytest.raises(sqlite3.OperationalError):
-        conn.execute("DELETE FROM slot_forecasts")
+    assert "'aurora' is the stored forecast, not always the pure model" in out
+    conn = script.open_readonly(str(load_db))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("DELETE FROM slot_forecasts")
+    finally:
+        conn.close()
+
+
+def test_scripts_close_the_db_and_immutable_leaves_no_sidecar_files(load_db, tmp_path, capsys):
+    """A WAL-mode COPY opened with --immutable gets no -shm/-wal beside it."""
+    import shutil
+
+    copy = tmp_path / "copy.db"
+    shutil.copy(load_db, copy)
+    with sqlite3.connect(copy) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()
+    for leftover in tmp_path.glob("copy.db-*"):
+        leftover.unlink()
+    before = copy.read_bytes()
+
+    script = _load_script()
+    opened: list[sqlite3.Connection] = []
+    real_open = script.open_readonly
+
+    def _tracking_open(path: str, immutable: bool = False) -> sqlite3.Connection:
+        opened.append(real_open(path, immutable))
+        return opened[-1]
+
+    script.open_readonly = _tracking_open
+    assert script.main(["--db", str(copy), "--immutable"]) == 0
+    capsys.readouterr()
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["copy.db"]
+    assert copy.read_bytes() == before
+    assert opened
+    for conn in opened:  # closed: any use now raises
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")

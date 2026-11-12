@@ -7,6 +7,7 @@ Supports hybrid PV forecasting: physics base + ML residual + corrector.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -19,6 +20,7 @@ from backend.health import (
     set_load_forecast_tier,
 )
 from backend.learning import LearningEngine, get_learning_engine
+from ml.cleaning import CLEANING_ENABLED_KEY, SLOT_MEAN_FALLBACK_ENABLED_KEY, forecasting_switch
 from ml.context_features import get_alarm_armed_series, get_vacation_mode_series
 from ml.train import _build_time_features  # type: ignore[reportPrivateUsage]
 from ml.weather import (
@@ -194,6 +196,9 @@ def pv_model_weather_source(models_dir: str = "data/ml/models") -> str | None:
     return None
 
 
+_warned_pv_source_mismatch: set[tuple[str, str]] = set()
+
+
 def warn_on_pv_weather_source_mismatch(
     config: dict[str, Any], models_dir: str = "data/ml/models"
 ) -> bool:
@@ -202,7 +207,8 @@ def warn_on_pv_weather_source_mismatch(
     The two sources differ by 8-18 % in radiation, so a model trained on one is not
     interchangeable with a model trained on the other; after changing
     forecasting.pv_training_weather_source the old model stays live until the next
-    retrain. Returns True when a mismatch was reported.
+    retrain. Returns True on a mismatch; it is logged once per process for each
+    (trained, configured) pair.
     """
     trained = pv_model_weather_source(models_dir)
     if trained is None:
@@ -210,6 +216,10 @@ def warn_on_pv_weather_source_mismatch(
     configured = resolve_pv_training_weather_source(config)
     if trained == configured:
         return False
+    # Called on every forecast run: log once per (trained, configured) pair.
+    if (trained, configured) in _warned_pv_source_mismatch:
+        return True
+    _warned_pv_source_mismatch.add((trained, configured))
     logger.warning(
         "⚠️ PV residual model was trained on weather source '%s' but "
         "forecasting.pv_training_weather_source is '%s'. The model stays in use; "
@@ -379,6 +389,8 @@ async def generate_forward_slots(
 
     # --- LOAD INFERENCE (or fallback) ---
     load_model_ok = has_load_models
+    load_failure = ""  # why a present model was not used (shown in health)
+    slot_mean_cleaning = forecasting_switch(engine.config, CLEANING_ENABLED_KEY)
     if has_load_models:
         try:
             model_preds: dict[str, pd.Series] = {}
@@ -386,14 +398,25 @@ async def generate_forward_slots(
                 model_key = f"load_{q}"
                 if model_key in models:
                     raw_pred: Any = models[model_key].predict(X)  # type: ignore[reportUnknownMemberType]
+                    # NaN/inf would pass the guardrails below as 0.01 and look healthy.
+                    n_bad = sum(1 for x in raw_pred if not math.isfinite(float(x)))
+                    if n_bad:
+                        raise ValueError(
+                            f"{model_key} returned {n_bad}/{len(raw_pred)} non-finite values"
+                        )
                     # Apply guardrails (same for all bands)
                     # Floor at 0.01, Ceiling at 16kW
                     cleaned = [max(0.01, min(float(x), 16.0)) for x in raw_pred]
                     model_preds[model_key] = pd.Series(cleaned, index=df.index)
         except Exception as exc:
             # A model that loads but cannot predict is as absent as a missing one.
-            logger.error("❌ Load model inference failed (%s); using the fallback tiers", exc)
+            logger.error(
+                "❌ Load model inference failed (%s: %s); using the fallback tiers",
+                type(exc).__name__,
+                exc,
+            )
             load_model_ok = False
+            load_failure = f"{type(exc).__name__}: {exc}"[:200]
         else:
             predictions.update(model_preds)
             # REV F65 Phase 5b: Clear degraded status when ML models working
@@ -415,7 +438,9 @@ async def generate_forward_slots(
             blend_weight = resolve_load_blend_weight(engine.config)
             if blend_weight > 0.0 and "load_p50" in predictions and "load_p50" in models:
                 try:
-                    blend_means = await get_load_slot_means_7d(engine.store, slot_start)
+                    blend_means = await get_load_slot_means_7d(
+                        engine.store, slot_start, apply_cleaning=slot_mean_cleaning
+                    )
                 except Exception as exc:
                     logger.warning("7-day load slot means unavailable: %s", exc)
                     blend_means = {}
@@ -431,15 +456,28 @@ async def generate_forward_slots(
                             lower=0.01, upper=16.0
                         )
                 blended = int(slot_mean.notna().sum())
-                set_load_forecast_tier("model+slot_mean_7d" if blended else "model")
-                logger.info(
+                # An enabled blend that reaches under half the slots is not the
+                # forecast the owner configured: say so loudly and in the tier.
+                blend_short = blended * 2 < len(df)
+                if blended == 0:
+                    set_load_forecast_tier("model_blend_inactive")
+                elif blend_short:
+                    set_load_forecast_tier("model+slot_mean_7d_partial")
+                else:
+                    set_load_forecast_tier("model+slot_mean_7d")
+                logger.log(
+                    logging.WARNING if blend_short else logging.INFO,
                     "Load forecast blend: %.0f%% 7-day slot mean / %.0f%% model on %d/%d slots "
-                    "(mean shift %+.3f kWh/slot)",
+                    "(mean shift %+.3f kWh/slot)%s",
                     blend_weight * 100,
                     (1 - blend_weight) * 100,
                     blended,
                     len(df),
                     float(delta.mean()),
+                    " — blend is ENABLED but most slots have no 7-day mean and keep the "
+                    "pure model value"
+                    if blend_short
+                    else "",
                 )
 
     if not load_model_ok:
@@ -451,11 +489,20 @@ async def generate_forward_slots(
         #   3. and the flat 0.5 kWh demo profile only when that HA fetch fails too.
         from backend.learning.baseline import get_load_slot_means_7d, time_of_day_key
 
-        try:
-            slot_means = await get_load_slot_means_7d(engine.store, slot_start)
-        except Exception as exc:  # no store at all: same as "no recorded data"
-            logger.warning("7-day load slot means unavailable: %s", exc)
-            slot_means = {}
+        slot_means: dict[str, float] = {}
+        if not forecasting_switch(engine.config, SLOT_MEAN_FALLBACK_ENABLED_KEY):
+            # Kill switch: behave as before the slot-mean tier existed (store 0.0).
+            logger.warning(
+                "7-day slot-mean fallback is DISABLED (forecasting.%s: false)",
+                SLOT_MEAN_FALLBACK_ENABLED_KEY,
+            )
+        else:
+            try:
+                slot_means = await get_load_slot_means_7d(
+                    engine.store, slot_start, apply_cleaning=slot_mean_cleaning
+                )
+            except Exception as exc:  # no store at all: same as "no recorded data"
+                logger.warning("7-day load slot means unavailable: %s", exc)
         fallback_load = pd.Series(
             [float(slot_means.get(time_of_day_key(ts), 0.0)) for ts in df["slot_start"]],
             index=df.index,
@@ -469,9 +516,10 @@ async def generate_forward_slots(
             load_tier = "ha_profile"
         set_load_forecast_tier(load_tier)
         logger.warning(
-            "⚠️ Load models not available. Load forecast source: %s (%d/%d slots from the "
+            "⚠️ Load models %s. Load forecast source: %s (%d/%d slots from the "
             "7-day per-slot mean; the rest stored as 0.0 so the planner applies the HA "
             "profile, or the demo profile if HA has no history)",
+            "failed to predict" if load_failure else "not available",
             load_tier,
             covered,
             len(df),
@@ -479,7 +527,10 @@ async def generate_forward_slots(
 
         # REV F65 Phase 5e: Distinguish new setup vs ML failure
         level, _, _ = determine_graduation_level(engine)
-        if level == 0:
+        if load_failure:
+            # Models exist but could not be used: not the same as "not trained".
+            set_load_forecast_status("degraded", "predict_failed", load_failure)
+        elif level == 0:
             # New setup (< 4 days) - expected state, info level
             set_load_forecast_status("degraded", "baseline")
         else:

@@ -10,6 +10,7 @@ the data must not starve training.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,7 @@ import pytz
 import ml.train as train_mod
 from backend.learning import LearningEngine
 from ml.cleaning import (
+    CLEANING_ENABLED_KEY,
     DERIVED_FROM_UNMEASURED_PV,
     DERIVED_FROM_ZEROED_COLUMN,
     LOAD_BAD_FLAGS,
@@ -28,6 +30,7 @@ from ml.cleaning import (
     PV_SPIKE_ZEROED,
     bad_row_mask,
     clean_training_rows,
+    forecasting_switch,
     has_flag,
     spike_zeroed_column,
 )
@@ -177,11 +180,12 @@ def test_absent_flags_are_an_exact_noop():
     assert out is no_col
 
 
-def test_starvation_guard_majority_removed_falls_back_unfiltered():
+def test_starvation_guard_majority_removed_falls_back_unfiltered(caplog):
     bad = json.dumps({"pv_unmeasured": "counter"})
     df = _frame([bad] * 60 + [None] * 40)
-    logged: list[str] = []
-    out, report = clean_training_rows(df, "pv", log=logged.append)
+    with caplog.at_level(logging.WARNING, logger="darkstar.ml.cleaning"):
+        out, report = clean_training_rows(df, "pv", log=_silent)
+    logged = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert out is df
     assert report.starved
     assert report.rows_out == 100
@@ -200,6 +204,107 @@ def test_starvation_guard_below_min_rows_falls_back_unfiltered():
     assert len(out) == 90 and not report.starved
 
 
+# --- offline devices (per-device "unavailable" runs) -------------------------------
+
+
+def _unavailable(*devices: str, flag: str = "water_unmeasured") -> str:
+    return json.dumps({flag: dict.fromkeys(devices, "unavailable")})
+
+
+def test_device_offline_for_weeks_keeps_the_newest_rows():
+    """Winterised spa: 'unavailable' on every slot of the 44 newest days of 90."""
+    flags: list[object] = [None] * (46 * 96) + [_unavailable("spa")] * (44 * 96)
+    df = _frame(flags)
+    logged: list[str] = []
+
+    out, report = clean_training_rows(df, "load", min_rows=100, log=logged.append)
+
+    assert out is df  # nothing dropped at all
+    assert report.dropped_by_rule == {}
+    assert report.kept_offline_device == {"water_unmeasured:spa": 44 * 96}
+    assert not report.starved
+    assert any("offline devices" in line and "water_unmeasured:spa=4224" in line for line in logged)
+    assert not bad_row_mask(df, "load").any()
+
+
+def test_short_unavailable_gap_is_still_dropped():
+    flags: list[object] = [None] * 400
+    flags[100:108] = [_unavailable("spa")] * 8  # 2 hours
+    out, report = clean_training_rows(_frame(flags), "load", log=_silent)
+
+    assert len(out) == 392
+    assert report.dropped_by_rule == {"water_unmeasured": 8}
+    assert report.kept_offline_device == {}
+
+
+def test_run_just_under_a_day_is_a_gap_and_a_full_day_is_offline():
+    almost = [None] * 10 + [_unavailable("spa")] * 95 + [None] * 10
+    _, report = clean_training_rows(_frame(almost), "load", log=_silent)
+    assert report.dropped_by_rule == {"water_unmeasured": 95}
+
+    full = [None] * 10 + [_unavailable("spa")] * 96 + [None] * 10
+    out, report = clean_training_rows(_frame(full), "load", log=_silent)
+    assert len(out) == 116 and report.kept_offline_device == {"water_unmeasured:spa": 96}
+
+
+def test_a_measured_slot_in_between_splits_the_run():
+    """Two 20 h outages separated by one measured slot are two gaps, not one day."""
+    flags = [None] * 200 + [_unavailable("spa")] * 80 + [None] + [_unavailable("spa")] * 80
+    out, report = clean_training_rows(_frame(flags), "load", log=_silent)
+    assert report.kept_offline_device == {}
+    assert report.dropped_by_rule == {"water_unmeasured": 160}
+    assert len(out) == 201
+
+
+def test_two_devices_only_the_short_gap_slots_are_dropped():
+    """Spa offline all day; the caravan heater has a 1-hour gap inside that day."""
+    flags: list[object] = [None] * 96 + [_unavailable("spa")] * 96 + [None] * 96
+    gap = range(96 + 40, 96 + 44)
+    for i in gap:
+        flags[i] = _unavailable("spa", "villavagn")
+    df = _frame(flags)
+
+    out, report = clean_training_rows(df, "load", log=_silent)
+
+    dropped = df.index.difference(out.index)
+    assert list(dropped) == list(gap)
+    assert report.dropped_by_rule == {"water_unmeasured": 4}
+    assert report.kept_offline_device == {"water_unmeasured:spa": 96}
+
+
+def test_snapshot_and_unknown_values_never_count_as_offline():
+    snapshot = json.dumps({"ev_unmeasured": {"easee": "snapshot"}})
+    legacy = json.dumps({"ev_unmeasured": True})
+    for value in (snapshot, legacy):
+        flags = [None] * 150 + [value] * 100  # 25 h, but not "unavailable"
+        _, report = clean_training_rows(_frame(flags), "load", log=_silent)
+        assert report.dropped_by_rule == {"ev_unmeasured": 100}
+        assert report.kept_offline_device == {}
+
+
+def test_offline_device_does_not_shield_other_rules():
+    offline_and_clamped = json.dumps(
+        {"ev_unmeasured": {"easee": "unavailable"}, "base_load_clamped": True}
+    )
+    flags = [None] * 100 + [_unavailable("easee", flag="ev_unmeasured")] * 100
+    flags[150] = offline_and_clamped
+    out, report = clean_training_rows(_frame(flags), "load", log=_silent)
+    assert len(out) == 199
+    assert report.dropped_by_rule == {"base_load_clamped": 1}
+    assert report.kept_offline_device == {"ev_unmeasured:easee": 100}
+
+
+def test_offline_rule_works_on_iso_string_slot_starts_and_unsorted_rows():
+    """The slot-mean path passes store rows: ISO strings, any order."""
+    df = _frame([_unavailable("spa")] * 200 + [None] * 50)
+    df["slot_start"] = df["slot_start"].map(lambda ts: ts.isoformat())
+    shuffled = df.sample(frac=1.0, random_state=1)
+    assert not bad_row_mask(shuffled, "load").any()
+
+    no_time = df.drop(columns=["slot_start"])  # cannot measure a run -> conservative
+    assert bad_row_mask(no_time, "load").sum() == 200
+
+
 def test_unknown_target_raises():
     with pytest.raises(ValueError):
         clean_training_rows(_frame([None]), "price", log=_silent)
@@ -208,15 +313,15 @@ def test_unknown_target_raises():
 # --- wiring into ml.train.train_models -------------------------------------------
 
 
-def _engine() -> MagicMock:
+def _engine(config: dict | None = None) -> MagicMock:
     engine = MagicMock(spec=LearningEngine)
     engine.timezone = TZ
     engine.db_path = ":memory:"
-    engine.config = {}
+    engine.config = config or {}
     return engine
 
 
-def _run(obs: pd.DataFrame) -> tuple[dict, list[dict]]:
+def _run(obs: pd.DataFrame, config: dict | None = None) -> tuple[dict, list[dict]]:
     calls: list[dict] = []
 
     def _regressor(features, target, min_samples, alpha=0.5, sample_weight=None):
@@ -224,7 +329,7 @@ def _run(obs: pd.DataFrame) -> tuple[dict, list[dict]]:
         return None
 
     with (
-        patch("ml.train.get_learning_engine", return_value=_engine()),
+        patch("ml.train.get_learning_engine", return_value=_engine(config)),
         patch("ml.train._load_slot_observations", return_value=obs.copy()),
         patch("ml.train.get_weather_series", return_value=pd.DataFrame()),
         patch("ml.train.get_vacation_mode_series", return_value=pd.Series(dtype=float)),
@@ -266,3 +371,64 @@ def test_train_models_unflagged_history_trains_on_every_row():
     assert [c["n"] for c in calls] == [400] * 6
     assert result["cleaning"]["load"]["dropped_by_rule"] == {}
     assert result["cleaning"]["pv"]["dropped_by_rule"] == {}
+
+
+# --- kill switch: forecasting.training_data_cleaning_enabled -------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, True),
+        (True, True),
+        ("true", True),
+        ("on", True),
+        (1, True),
+        ("garbage", True),  # unreadable -> default
+        (False, False),
+        ("false", False),
+        ("Off", False),
+        ("no", False),
+        (0, False),
+    ],
+)
+def test_forecasting_switch_parsing(raw, expected):
+    cfg = {"forecasting": {CLEANING_ENABLED_KEY: raw}}
+    assert forecasting_switch(cfg, CLEANING_ENABLED_KEY) is expected
+    assert forecasting_switch({}, CLEANING_ENABLED_KEY) is True
+    assert forecasting_switch({"forecasting": None}, CLEANING_ENABLED_KEY) is True
+    assert forecasting_switch(None, CLEANING_ENABLED_KEY, default=False) is False
+
+
+def _mixed_flags() -> list[str | None]:
+    return [
+        [
+            None,
+            json.dumps({"pv_unmeasured": "snapshot"}),
+            json.dumps({"water_unmeasured": {"main": "snapshot"}}),
+            json.dumps({"load_spike_zeroed": ["load_kwh", "pv_kwh"]}),
+        ][i % 4]
+        for i in range(400)
+    ]
+
+
+def test_cleaning_disabled_trains_on_exactly_the_rows_of_unflagged_history():
+    """Off = the pre-cleaning trainer: every row, same weights, nothing recorded."""
+    off = {"forecasting": {CLEANING_ENABLED_KEY: False}}
+    flagged_result, flagged_calls = _run(_frame(_mixed_flags()), off)
+    plain_result, plain_calls = _run(_frame([None] * 400), off)
+
+    assert [c["n"] for c in flagged_calls] == [400] * 6
+    assert flagged_result["cleaning"] == {}
+    assert flagged_result["load_samples"] == flagged_result["pv_samples"] == 400
+    for with_flags, without in zip(flagged_calls, plain_calls, strict=True):
+        assert with_flags["n"] == without["n"]
+        assert np.array_equal(with_flags["w"], without["w"])
+    assert plain_result["cleaning"] == {}
+
+
+def test_cleaning_enabled_by_default_on_the_same_data():
+    result, calls = _run(_frame(_mixed_flags()))
+    # load loses the water and the zeroed-load rows; PV the unmeasured and zeroed-PV rows
+    assert [c["n"] for c in calls] == [200] * 6
+    assert set(result["cleaning"]) == {"load", "pv"}

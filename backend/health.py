@@ -32,11 +32,15 @@ _forecast_lock: threading.Lock = threading.Lock()
 _load_forecast_status: str = "ok"  # "ok", "degraded"
 _load_forecast_reason: str = ""  # "ml", "baseline", "demo", ""
 # Which source the STORED load forecast came from (set by ml/forward.py):
-# "model", "model+slot_mean_7d" (opt-in blend), "slot_mean_7d",
-# "slot_mean_7d+ha_profile", "ha_profile", or "" (unknown).
+# "model", "model+slot_mean_7d" (opt-in blend), "model+slot_mean_7d_partial" (blend
+# reached fewer than half the slots), "model_blend_inactive" (blend enabled but no
+# slot had a 7-day mean), "slot_mean_7d", "slot_mean_7d+ha_profile", "ha_profile",
+# or "" (unknown).
 # "ha_profile" means 0.0 was stored and the planner substitutes the HA profile, or
 # the flat demo profile when that fetch fails too (reason "demo").
 _load_forecast_tier: str = ""
+# Free-text detail for the reason (e.g. the exception class of a failed predict()).
+_load_forecast_detail: str = ""
 _load_forecast_lock: threading.Lock = threading.Lock()
 
 
@@ -91,18 +95,22 @@ def get_forecast_status() -> dict[str, Any]:
         }
 
 
-def set_load_forecast_status(status: str, reason: str = "") -> None:
+def set_load_forecast_status(status: str, reason: str = "", detail: str = "") -> None:
     """Set load forecast status for health monitoring.
 
     Args:
         status: "ok" or "degraded"
         reason: "ml" (ML models working), "baseline" (using baseline avg),
-                "demo" (using demo data), "no_ml" (ML unavailable but data exists)
+                "demo" (using demo data), "no_ml" (ML unavailable but data exists),
+                "predict_failed" (models exist but predict() raised or returned
+                non-finite values; ``detail`` says which)
+        detail: optional free text shown with the reason
     """
-    global _load_forecast_status, _load_forecast_reason
+    global _load_forecast_status, _load_forecast_reason, _load_forecast_detail
     with _load_forecast_lock:
         _load_forecast_status = status
         _load_forecast_reason = reason
+        _load_forecast_detail = detail
 
     if status == "degraded":
         logger.warning(f"⚠️ Load forecast degraded: {reason}")
@@ -122,15 +130,17 @@ def get_load_forecast_status() -> dict[str, Any]:
             "status": _load_forecast_status,
             "reason": _load_forecast_reason,
             "tier": _load_forecast_tier,
+            "detail": _load_forecast_detail,
         }
 
 
 def clear_load_forecast_status() -> None:
     """Clear load forecast degraded status (called after successful ML forecast)."""
-    global _load_forecast_status, _load_forecast_reason
+    global _load_forecast_status, _load_forecast_reason, _load_forecast_detail
     with _load_forecast_lock:
         _load_forecast_status = "ok"
         _load_forecast_reason = ""
+        _load_forecast_detail = ""
 
 
 @dataclass
@@ -1153,8 +1163,51 @@ class HealthChecker:
                     )
                 )
 
+            elif reason == "predict_failed":
+                issues.append(
+                    HealthIssue(
+                        category="forecast",
+                        severity="warning",
+                        message=(
+                            "Load forecast model failed to predict"
+                            + (f" ({load_info['detail']})" if load_info.get("detail") else "")
+                        ),
+                        guidance=(
+                            "The load models are present but could not produce a usable "
+                            "forecast this run (see the log for the error). Retrain the "
+                            "models if it persists. "
+                            + _LOAD_TIER_GUIDANCE.get(
+                                str(load_info.get("tier", "")),
+                                "Current forecast uses HA historical profile.",
+                            )
+                        ),
+                    )
+                )
+
+        blend_tier = str(load_info.get("tier", ""))
+        if blend_tier in _LOAD_BLEND_TIER_ISSUES:
+            issues.append(
+                HealthIssue(
+                    category="forecast",
+                    severity="warning",
+                    message=_LOAD_BLEND_TIER_ISSUES[blend_tier],
+                    guidance=(
+                        "forecasting.load_blend_slot_mean_weight is set, but the 7-day "
+                        "per-slot mean of recorded load is missing for most times of day "
+                        "(too few usable observations in the last week), so the stored "
+                        "forecast is mostly or entirely the pure model. Check the "
+                        "recorder's load data and quality flags."
+                    ),
+                )
+            )
+
         return issues
 
+
+_LOAD_BLEND_TIER_ISSUES: dict[str, str] = {
+    "model+slot_mean_7d_partial": "Load forecast blend applied to fewer than half the slots",
+    "model_blend_inactive": "Load forecast blend is enabled but not applied to any slot",
+}
 
 # What the stored load forecast is made of while no model is usable (by tier).
 _LOAD_TIER_GUIDANCE: dict[str, str] = {

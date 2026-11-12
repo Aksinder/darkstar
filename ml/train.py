@@ -21,7 +21,12 @@ import pandas as pd
 
 from backend.learning import LearningEngine, get_learning_engine
 from backend.validation import get_max_energy_per_slot
-from ml.cleaning import DERIVED_LOAD_FLAG_KEYS, clean_training_rows
+from ml.cleaning import (
+    CLEANING_ENABLED_KEY,
+    DERIVED_LOAD_FLAG_KEYS,
+    clean_training_rows,
+    forecasting_switch,
+)
 from ml.context_features import get_alarm_armed_series, get_vacation_mode_series
 from ml.weather import (
     PV_WEATHER_SOURCE_HISTORICAL,
@@ -540,8 +545,16 @@ def train_models(
     # --- Train Load Models ---
     load_df = observations[observations["load_kwh"] > 0.001].copy()
     # Drop rows the recorder flagged as not a measured base load (ml/cleaning.py).
-    load_df, load_cleaning = clean_training_rows(load_df, "load", min_rows=cfg.min_samples)
-    result["cleaning"]["load"] = load_cleaning.as_dict()
+    # forecasting.training_data_cleaning_enabled: false skips it (PV below too).
+    cleaning_enabled = forecasting_switch(engine.config, CLEANING_ENABLED_KEY)
+    if not cleaning_enabled:
+        print(
+            "Training-data cleaning is DISABLED "
+            f"(forecasting.{CLEANING_ENABLED_KEY}: false): flagged rows are trained on."
+        )
+    if cleaning_enabled:
+        load_df, load_cleaning = clean_training_rows(load_df, "load", min_rows=cfg.min_samples)
+        result["cleaning"]["load"] = load_cleaning.as_dict()
     if not load_df.empty:
         X_load = load_df[feature_cols]
         y_load = load_df["load_kwh"].astype(float)
@@ -647,8 +660,9 @@ def train_models(
     # Drop rows whose pv_kwh is a snapshot/counter fallback, not a measurement
     # (ml/cleaning.py). After the sun-up filter so the starvation guard judges the
     # rows that would actually train.
-    pv_df, pv_cleaning = clean_training_rows(pv_df, "pv", min_rows=cfg.min_samples)
-    result["cleaning"]["pv"] = pv_cleaning.as_dict()
+    if cleaning_enabled:
+        pv_df, pv_cleaning = clean_training_rows(pv_df, "pv", min_rows=cfg.min_samples)
+        result["cleaning"]["pv"] = pv_cleaning.as_dict()
 
     if not pv_df.empty:
         # Calculate physics PV for each slot

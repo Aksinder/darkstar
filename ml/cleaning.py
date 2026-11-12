@@ -15,6 +15,7 @@ no-op: nothing matches, nothing is dropped.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,8 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+logger = logging.getLogger("darkstar.ml.cleaning")
 
 # quality_flags keys marking a row whose load_kwh was DERIVED from the energy-balance
 # identity instead of read from a load meter:
@@ -65,6 +68,27 @@ LOAD_BAD_FLAGS: tuple[str, ...] = (
     SPIKE_ZEROED_FLAG,
 )
 
+# Per-device flags (value = {device: "unavailable" | "snapshot"}).
+DEVICE_FLAGS: tuple[str, ...] = ("water_unmeasured", "ev_unmeasured")
+
+# OFFLINE-DEVICE RULE. The recorder writes "unavailable" for every slot in which a
+# device's power sensor has no numeric state. For a short gap that means the device may
+# have been running unseen, so the base load is suspect. But a device that is switched
+# off for weeks (winterised spa, a caravan heater unplugged for the season) is
+# "unavailable" the whole time while drawing nothing: its base load is CORRECT, and
+# dropping those rows would remove the newest, highest-weighted data.
+#   A device counts as OFFLINE for an uninterrupted run of "unavailable" slots — no
+#   slot in between where that device was measured or snapshot-read — that spans at
+#   least OFFLINE_MIN_HOURS from its first to its last slot and holds at least
+#   OFFLINE_MIN_ROWS rows. Rows of such a run are not dropped on that device's
+#   account. Shorter "unavailable" runs, every "snapshot", and any other device in
+#   the same row still drop it.
+# A run is judged as a whole, so an outage that started less than 24 h ago is still a
+# gap (dropped) and becomes "offline" (kept, retroactively) once it has lasted a day.
+OFFLINE_STATE = "unavailable"
+OFFLINE_MIN_HOURS: float = 24.0
+OFFLINE_MIN_ROWS: int = 48
+
 # Cross-channel rules for a balance-DERIVED load (load = pv + import - export + ...):
 # it inherits the error of an unmeasured PV value, and of any zeroed energy column.
 DERIVED_FROM_UNMEASURED_PV = "pv_unmeasured+derived_load"
@@ -75,6 +99,31 @@ DERIVED_FROM_ZEROED_COLUMN = "load_spike_zeroed+derived_load"
 MAX_DROP_FRACTION: float = 0.5
 # ... or leave fewer rows than the trainer needs although the unfiltered set had
 # enough (min_rows is passed by the caller, normally TrainingConfig.min_samples).
+
+
+# Kill switches under forecasting: (both default true = the behaviour described here).
+CLEANING_ENABLED_KEY = "training_data_cleaning_enabled"
+SLOT_MEAN_FALLBACK_ENABLED_KEY = "load_slot_mean_fallback_enabled"
+
+
+def forecasting_switch(config: dict[str, Any] | None, key: str, default: bool = True) -> bool:
+    """Read a boolean switch under ``forecasting``; unset/unreadable -> ``default``.
+
+    Accepts real booleans and the usual spellings (false/off/no/0, true/on/yes/1).
+    """
+    forecasting_cfg: Any = (config or {}).get("forecasting")
+    raw: Any = forecasting_cfg.get(key) if isinstance(forecasting_cfg, dict) else None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int | float):
+        return raw != 0
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in ("false", "off", "no", "0"):
+            return False
+        if text in ("true", "on", "yes", "1"):
+            return True
+    return default
 
 
 def parse_flags(raw: Any) -> dict[str, Any] | None:
@@ -157,6 +206,67 @@ def spike_zeroed_mask(df: pd.DataFrame, column: str) -> pd.Series:
     return df["quality_flags"].map(lambda raw: spike_zeroed_column(raw, column)).astype(bool)
 
 
+def device_states(raw: Any, token: str) -> dict[str, str]:
+    """{device: state} for one per-device flag (water_unmeasured / ev_unmeasured).
+
+    A fired value that is not a dict (legacy ``true``, a bare string, malformed JSON
+    containing the quoted token) names no device: it is returned as {"?": "unknown"},
+    which can never qualify as an offline device and therefore always drops the row.
+    """
+    flags = parse_flags(raw)
+    if flags is None:
+        return {"?": "unknown"} if f'"{token}"' in str(raw) else {}
+    value = flags.get(token)
+    if not _fired(value):
+        return {}
+    if isinstance(value, dict):
+        return {str(device): str(state) for device, state in value.items()}
+    return {"?": "unknown"}
+
+
+def device_flag_masks(df: pd.DataFrame, token: str) -> tuple[pd.Series, dict[str, int]]:
+    """(rows to drop for ``token``, {device: rows kept as offline device}).
+
+    Applies the OFFLINE-DEVICE RULE above per device. Needs a slot_start column to
+    order the rows and measure a run; without one nothing is exempted.
+    """
+    drop = pd.Series(False, index=df.index)
+    kept: dict[str, int] = {}
+    if "quality_flags" not in df.columns or df.empty:
+        return drop, kept
+    states = df["quality_flags"].map(lambda raw: device_states(raw, token))
+    flagged = states.map(bool)
+    if not flagged.any():
+        return drop, kept
+    if "slot_start" not in df.columns:
+        return flagged.astype(bool), kept
+
+    when = df["slot_start"]
+    if not pd.api.types.is_datetime64_any_dtype(when):
+        when = pd.to_datetime(when, format="ISO8601", utc=True, errors="coerce")
+    order = when.sort_values(kind="stable").index
+    devices = sorted({device for row in states[flagged] for device in row})
+    for device in devices:
+        state = states.loc[order].map(lambda row, d=device: row.get(d))
+        unavailable = state == OFFLINE_STATE
+        offline = pd.Series(False, index=order)
+        if unavailable.any():
+            run_id = (~unavailable).cumsum()[unavailable]
+            times = when.loc[order][unavailable]
+            span_h = (
+                times.groupby(run_id).transform("max") - times.groupby(run_id).transform("min")
+            ).dt.total_seconds() / 3600.0 + 0.25
+            rows = times.groupby(run_id).transform("size")
+            offline.loc[span_h.index] = (
+                (span_h >= OFFLINE_MIN_HOURS) & (rows >= OFFLINE_MIN_ROWS)
+            ).to_numpy()
+        n_offline = int(offline.sum())
+        if n_offline:
+            kept[device] = n_offline
+        drop |= (state.notna() & ~offline).reindex(df.index)
+    return drop.astype(bool), kept
+
+
 @dataclass
 class CleaningReport:
     """What the cleaning did for one target."""
@@ -166,6 +276,9 @@ class CleaningReport:
     rows_out: int = 0
     # rule name -> rows matched by that rule (a row can match several rules)
     dropped_by_rule: dict[str, int] = field(default_factory=dict)
+    # "flag:device" -> rows NOT dropped on that device's account because it was
+    # offline (see OFFLINE-DEVICE RULE); they may still be dropped by another rule
+    kept_offline_device: dict[str, int] = field(default_factory=dict)
     # True when the starvation guard discarded the cleaning (rows_out == rows_in)
     starved: bool = False
 
@@ -178,20 +291,29 @@ class CleaningReport:
             "rows_in": self.rows_in,
             "rows_out": self.rows_out,
             "dropped_by_rule": dict(self.dropped_by_rule),
+            "kept_offline_device": dict(self.kept_offline_device),
             "starved": self.starved,
         }
 
 
-def _rule_masks(df: pd.DataFrame, target: str) -> dict[str, pd.Series]:
+def _rule_masks(
+    df: pd.DataFrame, target: str, kept_offline: dict[str, int] | None = None
+) -> dict[str, pd.Series]:
     if target == "pv":
         masks = {token: flag_mask(df, (token,)) for token in PV_BAD_FLAGS}
         masks[PV_SPIKE_ZEROED] = spike_zeroed_mask(df, "pv_kwh")
         return masks
     if target == "load":
-        masks = {
-            token: flag_mask(df, (token,)) for token in LOAD_BAD_FLAGS if token != SPIKE_ZEROED_FLAG
-        }
-        masks[SPIKE_ZEROED_FLAG] = spike_zeroed_mask(df, "load_kwh")
+        masks: dict[str, pd.Series] = {}
+        for token in LOAD_BAD_FLAGS:
+            if token == SPIKE_ZEROED_FLAG:
+                masks[token] = spike_zeroed_mask(df, "load_kwh")
+            elif token in DEVICE_FLAGS:
+                masks[token], offline = device_flag_masks(df, token)
+                if kept_offline is not None:
+                    kept_offline.update({f"{token}:{dev}": n for dev, n in offline.items()})
+            else:
+                masks[token] = flag_mask(df, (token,))
         derived = flag_mask(df, DERIVED_LOAD_FLAG_KEYS)
         masks[DERIVED_FROM_UNMEASURED_PV] = derived & flag_mask(df, PV_BAD_FLAGS)
         masks[DERIVED_FROM_ZEROED_COLUMN] = derived & flag_mask(df, (SPIKE_ZEROED_FLAG,))
@@ -222,7 +344,7 @@ def clean_training_rows(
     Starvation guard: if the rules together would remove more than
     ``MAX_DROP_FRACTION`` of the rows, or leave fewer than ``min_rows`` when the
     unfiltered frame had at least that many, the unfiltered frame is returned with
-    ``report.starved`` set and a warning logged — a model trained on tagged rows
+    ``report.starved`` set and a WARNING logged (logger, not ``log``) — a model trained on tagged rows
     beats no model, and a rule matching most of the data points at the recorder,
     not at the weather.
     """
@@ -231,11 +353,18 @@ def clean_training_rows(
         return df, report
 
     bad = pd.Series(False, index=df.index)
-    for name, mask in _rule_masks(df, target).items():
+    for name, mask in _rule_masks(df, target, report.kept_offline_device).items():
         hits = int(mask.sum())
         if hits:
             report.dropped_by_rule[name] = hits
             bad |= mask
+
+    if report.kept_offline_device:
+        offline = ", ".join(f"{name}={n}" for name, n in report.kept_offline_device.items())
+        log(
+            f"{target} training-data cleaning: kept rows of offline devices "
+            f"('unavailable' for >= {OFFLINE_MIN_HOURS:g} h, base load unaffected): {offline}"
+        )
 
     n_bad = int(bad.sum())
     if n_bad == 0:
@@ -246,10 +375,15 @@ def clean_training_rows(
     starved = n_bad / len(df) > MAX_DROP_FRACTION or (kept < min_rows <= len(df))
     if starved:
         report.starved = True
-        log(
-            f"Warning: {target} training-data cleaning would remove {n_bad}/{len(df)} "
-            f"rows ({rules}), leaving {kept} — starvation guard: training on the "
-            "UNFILTERED rows instead. Check the recorder's measurement sources."
+        logger.warning(
+            "%s training-data cleaning would remove %d/%d rows (%s), leaving %d — "
+            "starvation guard: training on the UNFILTERED rows instead. Check the "
+            "recorder's measurement sources.",
+            target,
+            n_bad,
+            len(df),
+            rules,
+            kept,
         )
         return df, report
 
