@@ -9,7 +9,7 @@ this script answers "does a model trained on the archive forecast better?" on th
 site's own data before the option is enabled.
 
 What it does, for each source on the SAME rows:
-  1. reads slot_observations from the learning DB (opened READ-ONLY, mode=ro),
+  1. reads slot_observations from the learning DB (opened read-only, mode=ro),
   2. fetches that source's weather for the window, computes the physics baseline,
      applies the trainer's sun-up filter and quality-flag cleaning,
   3. trains the p50 residual model on everything before the held-out tail,
@@ -21,6 +21,7 @@ and per hour, next to the physics-only baseline.
 Usage:
     compare_pv_training_sources.py --db data/planner_learning.db
         [--config config.yaml] [--days 92] [--holdout-days 14] [--min-samples 100]
+        [--immutable]
 
 Limits (read them before deciding):
   - The forecast endpoint's hindcast is a proxy for the forecast that was actually
@@ -30,8 +31,11 @@ Limits (read them before deciding):
   - Rows are compared only where BOTH sources have a physics baseline. With the
     default 92 days the archive's extra history is not used; the last line shows a
     third variant trained on all archive history since forecasting.pv_training_min_date.
-  - Needs network access to Open-Meteo (two or three requests). Writes nothing:
-    no models, no DB rows.
+  - Needs network access to Open-Meteo (two or three requests).
+  - Writes no models and no DB rows; the DB contents are never modified and the
+    connection is closed. But mode=ro on a WAL-mode database still makes SQLite create
+    -shm/-wal files beside it. To avoid even that, run against a COPY of the DB with
+    --immutable (never use --immutable on the live DB).
   - Nothing here addresses the known winter PV over-forecast (the weather model
     calling an overcast day sunny); a tail in a dark month mostly measures that.
 """
@@ -39,6 +43,7 @@ Limits (read them before deciding):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sqlite3
 import sys
 from datetime import datetime, timedelta
@@ -78,14 +83,27 @@ BASE_FEATURES = [
 PV_FEATURES = [*BASE_FEATURES, "physics_forecast_kwh"]
 
 
-def open_readonly(db_path: str) -> sqlite3.Connection:
-    """Open the learning DB so that no statement can modify it."""
+def open_readonly(db_path: str, immutable: bool = False) -> sqlite3.Connection:
+    """Open the learning DB so that no statement can modify its contents.
+
+    mode=ro forbids every write to the database, but on a WAL-mode database SQLite
+    still creates (and may leave) ``-shm``/``-wal`` files beside it. ``immutable``
+    adds immutable=1: no locks, no sidecar files at all. That is only safe on a COPY
+    nobody else writes to — on the live DB it can return inconsistent data — and it
+    ignores an un-checkpointed ``-wal`` file. The caller must close the connection.
+    """
     uri = f"file:{Path(db_path).resolve()}?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
     return sqlite3.connect(uri, uri=True, timeout=30.0)
 
 
 def load_pv_observations(
-    db_path: str, tz: Any, start: datetime | None, max_kwh: float | None
+    db_path: str,
+    tz: Any,
+    start: datetime | None,
+    max_kwh: float | None,
+    immutable: bool = False,
 ) -> pd.DataFrame:
     """Read the rows ml/train.py would consider for PV (same SQL filters)."""
     query = (
@@ -96,7 +114,7 @@ def load_pv_observations(
     if max_kwh is not None:
         query += " AND load_kwh <= ? AND pv_kwh <= ?"
         params += [max_kwh, max_kwh]
-    with open_readonly(db_path) as conn:
+    with contextlib.closing(open_readonly(db_path, immutable)) as conn:
         df = pd.read_sql_query(query, conn, params=params)
     if df.empty:
         return df
@@ -273,6 +291,12 @@ def _parse_min_date(config: dict[str, Any], tz: Any) -> datetime | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--db", required=True, help="Path to the learning SQLite DB (read-only)")
+    parser.add_argument(
+        "--immutable",
+        action="store_true",
+        help="Open with immutable=1 (no -shm/-wal files created beside the DB). ONLY for "
+        "a COPY of the database that nothing else is writing to; never the live DB.",
+    )
     parser.add_argument("--config", default="config.yaml", help="Config with location + arrays")
     parser.add_argument("--days", type=int, default=92, help="Comparison window (max 92)")
     parser.add_argument("--holdout-days", type=int, default=14, help="Held-out tail length")
@@ -291,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
         max_kwh = None
 
     floor = _parse_min_date(config, tz)
-    all_obs = load_pv_observations(args.db, tz, floor, max_kwh)
+    all_obs = load_pv_observations(args.db, tz, floor, max_kwh, args.immutable)
     if all_obs.empty:
         print("No usable PV observations in the DB.")
         return 1

@@ -93,12 +93,32 @@ def dataset(tmp_path_factory):
 
 
 def test_db_is_opened_read_only(dataset):
-    with script.open_readonly(str(dataset["db"])) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM slot_observations").fetchone()[0] == 30 * 96
-        with pytest.raises(sqlite3.OperationalError):
-            conn.execute("DELETE FROM slot_observations")
-        with pytest.raises(sqlite3.OperationalError):
-            conn.execute("CREATE TABLE x (a)")
+    for immutable in (False, True):
+        conn = script.open_readonly(str(dataset["db"]), immutable)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM slot_observations").fetchone()[0]
+            assert count == 30 * 96
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("DELETE FROM slot_observations")
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("CREATE TABLE x (a)")
+        finally:
+            conn.close()
+
+
+def test_loader_closes_its_connection(dataset, monkeypatch):
+    opened: list[sqlite3.Connection] = []
+    real_open = script.open_readonly
+
+    def _tracking_open(path: str, immutable: bool = False) -> sqlite3.Connection:
+        opened.append(real_open(path, immutable))
+        return opened[-1]
+
+    monkeypatch.setattr(script, "open_readonly", _tracking_open)
+    script.load_pv_observations(str(dataset["db"]), TZ, None, None, immutable=True)
+    (conn,) = opened
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
 
 
 def test_load_pv_observations_applies_trainer_filters(dataset):
