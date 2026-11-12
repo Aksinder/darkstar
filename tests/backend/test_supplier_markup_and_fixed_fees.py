@@ -278,3 +278,14 @@ class TestPricingValidation:
         ):
             issues = self._pricing_issues(pricing)
             assert [i["severity"] for i in issues] == ["error"], pricing
+
+
+@pytest.mark.parametrize("bad", ["0,02", "abc", float("nan"), float("inf"), True, [], {}])
+def test_unusable_markup_counts_as_zero_and_never_raises(bad):
+    """A hand-edited YAML value must not raise out of the price fetch or poison prices."""
+    from backend.core import prices
+
+    assert prices._supplier_markup_sek({"supplier_markup_sek_kwh": bad}) == 0.0
+    assert prices._nordpool_cache_key({"supplier_markup_sek_kwh": bad}) == (
+        prices._nordpool_cache_key({})
+    )

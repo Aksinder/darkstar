@@ -644,7 +644,12 @@ def integrate_power_history_split_kwh(
     difference. Same sample rules as :func:`integrate_power_history_kwh`;
     untimed samples are not supported here (None). None when nothing is numeric.
     """
-    points, _ = _parse_power_samples(states)
+    # Only the first state of a minimal history response names its entity.
+    entity_id = next(
+        (str(s["entity_id"]) for s in states if isinstance(s, dict) and s.get("entity_id")),
+        None,
+    )
+    points, _ = _parse_power_samples(states, entity_id=entity_id)
     if not points:
         return None
     positive = 0.0

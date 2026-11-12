@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,26 @@ from backend.core import grid_tariff
 from backend.core.cache import cache_sync
 
 logger = logging.getLogger("darkstar.core.prices")
+
+
+def _supplier_markup_sek(pricing_config: dict[str, Any]) -> float:
+    """pricing.supplier_markup_sek_kwh as a finite float; anything else counts as 0.
+
+    Config save rejects a non-number, but a hand-edited YAML (``0,02`` parses as a
+    string, ``.nan`` as NaN) must degrade to "no markup" instead of raising out of
+    every price fetch before the stale-price fail-safe, or poisoning every slot.
+    """
+    raw = pricing_config.get("supplier_markup_sek_kwh", 0.0)
+    if raw is None or raw == "" or isinstance(raw, bool):
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value):
+        logger.warning("pricing.supplier_markup_sek_kwh=%r is not a number; using 0", raw)
+        return 0.0
+    return value
 
 # Price-component entity overrides, resolved into the matching ``pricing.*_sek_kwh`` literals.
 # Single source for BOTH resolvers (prices._resolve_pricing_overrides and the forecasts.py
@@ -79,7 +100,7 @@ def _nordpool_cache_key(pricing_config: dict[str, Any]) -> str:
         grid_tariff.cache_token(_pc),
         _pc.get("vat_percent", 25.0),
         bool(_pc.get("fees_include_vat", False)),
-        float(_pc.get("supplier_markup_sek_kwh", 0.0) or 0.0),
+        _supplier_markup_sek(_pc),
     )
 
 
@@ -464,7 +485,7 @@ def calculate_import_export_prices(
         config.get("timezone", "Europe/Stockholm"),
     )
     energy_tax_sek = pricing_config.get("energy_tax_sek", 0.439)
-    supplier_markup_sek = float(pricing_config.get("supplier_markup_sek_kwh", 0.0) or 0.0)
+    supplier_markup_sek = _supplier_markup_sek(pricing_config)
 
     spot_price_sek_kwh = spot_price_mwh / 1000.0
 
