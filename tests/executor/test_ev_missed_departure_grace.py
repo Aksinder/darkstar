@@ -102,13 +102,168 @@ async def test_unplug_after_departure_ends_grace_for_good():
 
 
 @pytest.mark.asyncio
-async def test_plug_unavailable_holds_and_keeps_grace():
+async def test_plug_unavailable_pauses_grace_and_a_fresh_reading_resumes_it():
+    # A held "plugged" is not an observation: no full power at a car nobody can
+    # see. Not terminal — the reading returns within the presence gap.
     ctl, ccfg = _ctl()
     dep = SAT_05 - 3600
     _seen_since(ctl, SAT_05 - 7200, SAT_05 - 60)
-    await _read(ctl, ccfg, SAT_05, dep)
+    assert (await _read(ctl, ccfg, SAT_05, dep)).deadline_hours == pytest.approx(0.25)
     st = await _read(ctl, ccfg, SAT_05 + 60, dep, **{"binary_sensor.tesla_plug": "unavailable"})
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert st.plugged is True  # the hold itself is unchanged: the car stays in the fleet
+    assert "tesla" not in ctl._missed_dep_done
+    st = await _read(ctl, ccfg, SAT_05 + 120, dep)
     assert st.deadline_hours == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_home_unavailable_pauses_grace_too():
+    raw = _cfg_dict()
+    tesla = next(c for c in raw["ev_surplus"]["chargers"] if c["id"] == "tesla")
+    tesla["home_entity"] = "device_tracker.tesla"
+    cfg = parse_ev_surplus_config(raw)
+    assert cfg is not None
+    ctl = EVSurplusController(cfg)
+    ccfg = next(c for c in cfg.chargers if c.id == "tesla")
+    dep = SAT_05 - 3600
+    home = {"device_tracker.tesla": "home"}
+    await _ticks(ctl, ccfg, dep - 1200, SAT_05, dep, **home)
+    assert ctl._missed_dep_active == {"tesla"}
+    st = await _read(ctl, ccfg, SAT_05 + 60, dep, **{"device_tracker.tesla": "unknown"})
+    assert st.deadline_hours != pytest.approx(0.25)
+    st = await _read(ctl, ccfg, SAT_05 + 120, dep, **home)
+    assert st.deadline_hours == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_held_presence_does_not_extend_the_observed_run():
+    ctl, ccfg = _ctl()
+    dep = SAT_05 + 3600
+    await _ticks(ctl, ccfg, SAT_05 - 600, SAT_05, dep)
+    assert ctl._present_run["tesla"] == (SAT_05 - 600, SAT_05)
+    await _ticks(ctl, ccfg, SAT_05 + 300, SAT_05 + 1800, dep,
+                 **{"binary_sensor.tesla_plug": "unavailable"})
+    assert ctl._present_run["tesla"] == (SAT_05 - 600, SAT_05)
+
+
+@pytest.mark.asyncio
+async def test_car_left_during_a_blackout_across_the_departure_never_arms():
+    # Plug entity goes dark at 06:30 holding "plugged"; the car leaves unseen and
+    # the 07:30 departure passes. The held reading must not arm the grace, and the
+    # first fresh reading (unplugged) ends it.
+    ctl, ccfg = _ctl()
+    t0730 = SAT_05 + 2.5 * 3600
+    dark = {"binary_sensor.tesla_plug": "unavailable"}
+    await _ticks(ctl, ccfg, SAT_05, t0730 - 3600, t0730)  # seen until 06:30
+    st = await _ticks(ctl, ccfg, t0730 - 3300, t0730 + 3600, t0730, **dark)
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_active == set()
+    st = await _read(ctl, ccfg, t0730 + 3900, t0730, **{"binary_sensor.tesla_plug": "off"})
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_done.get("tesla") == t0730
+
+
+@pytest.mark.asyncio
+async def test_long_blackout_breaks_continuity_like_a_restart():
+    # Dark from 07:40 to 09:00 with the car plugged in again afterwards: it may
+    # have left and come back unseen, so the grace ends (fails toward no grace).
+    ctl, ccfg = _ctl()
+    t0730 = SAT_05 + 2.5 * 3600
+    await _ticks(ctl, ccfg, SAT_05, t0730 + 600, t0730)
+    assert ctl._missed_dep_active == {"tesla"}
+    await _ticks(ctl, ccfg, t0730 + 900, t0730 + 5100, t0730,
+                 **{"binary_sensor.tesla_plug": "unavailable"})
+    st = await _read(ctl, ccfg, t0730 + 5400, t0730)
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_done.get("tesla") == t0730
+
+
+# --- near-target tolerance (post-departure grace only) ---------------------
+
+
+def _ctl_tol(tolerance, trip_target: bool = False):
+    raw = _cfg_dict()
+    if tolerance is not None:
+        raw["ev_surplus"]["missed_departure_tolerance_percent"] = tolerance
+    if trip_target:
+        tesla = next(c for c in raw["ev_surplus"]["chargers"] if c["id"] == "tesla")
+        tesla["departure_target_entity"] = "input_number.trip"
+    cfg = parse_ev_surplus_config(raw)
+    assert cfg is not None
+    return EVSurplusController(cfg), next(c for c in cfg.chargers if c.id == "tesla")
+
+
+@pytest.mark.parametrize(
+    ("tolerance", "soc", "grace"),
+    [
+        (None, "37", True),     # default 2: 3 points short -> catch up
+        (None, "37.9", True),
+        (None, "38", False),    # exactly at target - tolerance -> no grace
+        (None, "39", False),    # the 1-2 points-under car
+        (None, "40", False),
+        (0, "39.9", True),      # 0 = legacy: only at/above the target
+        (0, "40", False),
+        (5, "34.9", True),
+        (5, "35", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_near_target_tolerance_boundary(tolerance, soc, grace):
+    ctl, ccfg = _ctl_tol(tolerance)
+    _seen_since(ctl, SAT_05 - 7200, SAT_05 - 60)
+    st = await _read(ctl, ccfg, SAT_05, SAT_05 - 3600, **{"sensor.tesla_soc": soc})
+    assert (st.deadline_hours == pytest.approx(0.25)) is grace
+
+
+@pytest.mark.asyncio
+async def test_tolerance_applies_to_the_trip_target():
+    ctl, ccfg = _ctl_tol(None, trip_target=True)
+    _seen_since(ctl, SAT_05 - 7200, SAT_05 - 60)
+    over = {"sensor.tesla_soc": "78", "input_number.trip": "80"}
+    st = await _read(ctl, ccfg, SAT_05, SAT_05 - 3600, **over)
+    assert st.deadline_hours != pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_within_tolerance_ends_the_grace_for_good():
+    ctl, ccfg = _ctl_tol(None)
+    dep = SAT_05 - 3600
+    _seen_since(ctl, SAT_05 - 7200, SAT_05 - 60)
+    assert (await _read(ctl, ccfg, SAT_05, dep)).deadline_hours == pytest.approx(0.25)
+    st = await _read(ctl, ccfg, SAT_05 + 60, dep, **{"sensor.tesla_soc": "38"})
+    assert st.deadline_hours != pytest.approx(0.25)
+    assert ctl._missed_dep_done.get("tesla") == dep
+    st = await _read(ctl, ccfg, SAT_05 + 120, dep, **{"sensor.tesla_soc": "36"})
+    assert st.deadline_hours != pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("tolerance", [None, 0, 5, 50])
+@pytest.mark.asyncio
+async def test_tolerance_never_touches_a_future_departure(tolerance):
+    # Departure always wins BEFORE the deadline: one point short is still pursued
+    # all the way to the target.
+    ctl, ccfg = _ctl_tol(tolerance)
+    st = await _read(ctl, ccfg, SAT_05, SAT_05 + 1800, **{"sensor.tesla_soc": "39"})
+    assert st.deadline_hours == pytest.approx(0.5)
+    assert st.floor_soc_percent == 40.0
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("absent", 2.0), (None, 2.0), ("", 2.0), ("abc", 2.0), (-1, 2.0),
+        (float("nan"), 2.0), (float("inf"), 2.0),
+        (0, 0.0), ("3", 3.0), (5, 5.0), (1.5, 1.5),
+    ],
+)
+def test_tolerance_config_parsing(raw_value, expected):
+    raw = _cfg_dict()
+    if raw_value != "absent":
+        raw["ev_surplus"]["missed_departure_tolerance_percent"] = raw_value
+    cfg = parse_ev_surplus_config(raw)
+    assert cfg is not None
+    assert cfg.missed_departure_tolerance_percent == expected
 
 
 @pytest.mark.asyncio

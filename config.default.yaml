@@ -1437,6 +1437,12 @@ executor:
       #                      never alerts, and a historical departure disables the alert. Requires
       #                      notify_service.
       #   notify_service     (ev_surplus level) notify service for EV alerts, e.g. notify.notify_owner
+      #   missed_departure_tolerance_percent  (ev_surplus level, default 2) a one-off departure that
+      #                      passed with the car still plugged in and short of its trip target is
+      #                      charged for at full power for up to 4 h. Not when the car is within this
+      #                      many SoC points of the target (a car resting 1-2 points under its charge
+      #                      limit). Only the catch-up AFTER the departure; before it the full target
+      #                      is always pursued. 0 = catch up all the way to the target.
       #   priority_attendant (ev_surplus level) daily confirmation of a non-auto priority select:
       #                        enabled: true | ask_time: "20:00" | timeout_minutes: 60
       #                      Asks via an actionable notification; a tap on "Behåll prioriteten" keeps

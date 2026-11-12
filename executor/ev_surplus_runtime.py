@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, cast
@@ -69,6 +70,12 @@ _HELD_SOC_BLIND_DRAW_S = 1800.0
 # power) for up to _MISSED_DEPARTURE_GRACE_S after it, then is dropped.
 _MISSED_DEPARTURE_GRACE_S = 4 * 3600.0
 _MISSED_DEPARTURE_URGENT_H = 0.25
+# ...unless it is within this many SoC points of that target: the urgent floor
+# sizes ANY gap against 0.25 h, so a car resting a point or two under its own
+# charge limit (rounding, settle-back, a dead-reckoned SoC) would be held at full
+# power for the whole grace. Default of executor.ev_surplus.
+# missed_departure_tolerance_percent; applies to the post-departure grace ONLY.
+_MISSED_DEPARTURE_TOLERANCE_PCT = 2.0
 # The grace only arms for a departure the car was OBSERVED plugged in at home for
 # (continuously since at or before the departure, within one tick of slack). An
 # observation gap longer than _PRESENCE_GAP_S (restart, stalled loop) breaks the
@@ -282,6 +289,9 @@ class EVSurplusRuntimeConfig:
     # Local timezone for recurring deadlines (wall-clock "07:30" must survive DST — the
     # naive-datetime trap class; never compare naive local against epoch).
     timezone: str = "Europe/Stockholm"
+    # Missed one-off departure grace: no catch-up charging when the car is within
+    # this many SoC points of its trip target (0 = only at/above the target).
+    missed_departure_tolerance_percent: float = _MISSED_DEPARTURE_TOLERANCE_PCT
     # --- 25 A/phase main-fuse guard ---
     # phase_entities maps phase name -> grid meter current sensor (|A|, the actual
     # fuse current). Stale/unreadable readings (age > stale_after_s, or unavailable)
@@ -607,6 +617,15 @@ def parse_ev_surplus_config(
                     "otherwise). Add penalty_levels to the planner entry.",
                     _cc.id,
                 )
+    tolerance = _f(raw.get("missed_departure_tolerance_percent"))
+    if tolerance is None or not math.isfinite(tolerance) or tolerance < 0.0:
+        if raw.get("missed_departure_tolerance_percent") is not None:
+            logger.warning(
+                "EV surplus: invalid missed_departure_tolerance_percent %r — using %.0f",
+                raw.get("missed_departure_tolerance_percent"),
+                _MISSED_DEPARTURE_TOLERANCE_PCT,
+            )
+        tolerance = _MISSED_DEPARTURE_TOLERANCE_PCT
     return EVSurplusRuntimeConfig(
         enabled=bool(raw.get("enabled", False)),
         pv_power_entity=raw.get("pv_power_entity") or None,
@@ -627,6 +646,7 @@ def parse_ev_surplus_config(
             if isinstance(v, list)
         },
         timezone=str(timezone or executor_data.get("timezone") or "Europe/Stockholm"),
+        missed_departure_tolerance_percent=tolerance,
         fuse_guard_enabled=fuse_enabled,
         fuse_limit_a=float(fg.get("limit_a", 25.0)),
         fuse_margin_a=float(fg.get("margin_a", 2.0)),
@@ -1203,14 +1223,22 @@ class EVSurplusController:
         present: bool,
         soc: float | None,
         trip_floor: float | None,
+        presence_fresh: bool = True,
     ) -> bool:
         """True while a PAST one-off departure should still be charged for.
 
         Up to _MISSED_DEPARTURE_GRACE_S after the departure, only while the car has
         stayed plugged in at home since it passed (one unplugged/away tick ends it
         for good — the trip happened), and only while the SoC is known and below
-        the trip floor (an unknown SoC pauses it). Reaching the floor ends it too; a
-        NEW departure timestamp starts fresh.
+        the trip floor (an unknown SoC pauses it). Reaching the floor — or coming
+        within ``missed_departure_tolerance_percent`` of it — ends it too; a NEW
+        departure timestamp starts fresh.
+
+        ``presence_fresh`` is False when the plug/home answer is a HELD last-good
+        value (entity unreadable this tick). A held "plugged at home" is not an
+        observation: it pauses the grace (full power is not commanded at a car that
+        may have left during the blackout) and does not extend ``_present_run``, so
+        a blackout longer than _PRESENCE_GAP_S breaks the continuity like a restart.
 
         The car must have been OBSERVED plugged in at home at the departure and
         continuously since (``_present_run``): a car that left at or after the
@@ -1235,7 +1263,19 @@ class EVSurplusController:
             # Unknown SoC: cannot tell met from unmet, and the floors are off anyway.
             # Not terminal — a returning reading resumes the (still bounded) grace.
             return False
-        if not present or trip_floor is None or soc >= trip_floor:
+        if not presence_fresh:
+            # Held plug/home reading: nobody has seen the car this tick. Not terminal
+            # — a fresh reading within _PRESENCE_GAP_S resumes the grace, a later one
+            # starts a new presence run after the departure and ends it.
+            if cid in self._missed_dep_active:
+                self._missed_dep_active.discard(cid)
+                logger.info(
+                    "EV surplus: %s missed-departure grace paused — plug/home "
+                    "unreadable (held reading is not an observation)", cid,
+                )
+            return False
+        tolerance = max(0.0, self.cfg.missed_departure_tolerance_percent)
+        if not present or trip_floor is None or soc >= trip_floor - tolerance:
             self._missed_dep_done[cid] = dep_ts
             self._persist_holds(now_ts)
             if cid in self._missed_dep_active:
@@ -1252,8 +1292,17 @@ class EVSurplusController:
             )
         return True
 
-    def _note_presence(self, cid: str, present: bool, now_ts: float) -> None:
-        """Track the continuous plugged-at-home run the missed-departure grace needs."""
+    def _note_presence(
+        self, cid: str, present: bool, now_ts: float, fresh: bool = True
+    ) -> None:
+        """Track the continuous plugged-at-home run the missed-departure grace needs.
+
+        Only FRESH readings count: a held last-good value (``fresh`` False) neither
+        extends the run nor ends it — the tick is simply unobserved, exactly like a
+        tick that never ran.
+        """
+        if not fresh:
+            return
         run = self._present_run.get(cid)
         if not present:
             if self._present_run.pop(cid, None) is not None:
@@ -1633,15 +1682,25 @@ class EVSurplusController:
             and (base_floor is None or trip_target > base_floor)
             else base_floor
         )
-        self._note_presence(c.id, plugged and at_home, now_ts)
+        # Fresh = both configured presence entities answered THIS tick (a hold stamps
+        # its memory only on a readable answer). An unconfigured entity has nothing
+        # to be stale about.
+        presence_fresh = all(
+            not ent or mem.get(c.id, (False, -1.0))[1] == now_ts
+            for ent, mem in (
+                (c.plug_entity, self._last_good_plug),
+                (c.home_entity, self._last_good_home),
+            )
+        )
+        self._note_presence(c.id, plugged and at_home, now_ts, presence_fresh)
         if dep_future and dep_ts is not None:
             pairs.append(((dep_ts - now_ts) / 3600.0, one_off_floor))
         elif dep_ts is not None and self._missed_departure_grace(
-            c.id, dep_ts, now_ts, plugged and at_home, soc, one_off_floor
+            c.id, dep_ts, now_ts, plugged and at_home, soc, one_off_floor, presence_fresh
         ):
-            # MISSED one-off departure (charger/cloud outage, a late plug-in): the
-            # car is still here, still plugged and still short of its trip target,
-            # so the trip has not happened yet. Keep pursuing it as URGENT for a
+            # MISSED one-off departure (charger/cloud outage): the car was seen
+            # plugged in at home when the departure passed, is still here and still
+            # short of its trip target, so the trip has not happened yet. Keep pursuing it as URGENT for a
             # bounded grace window instead of silently dropping it the minute the
             # timestamp passes (upstream 5440027b, the 2026-09-24 go-e incident).
             # Recurring deadlines are untouched: they roll to the next occurrence.
