@@ -15,6 +15,7 @@ Key Features:
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -33,6 +34,62 @@ logger = logging.getLogger(__name__)
 # profile does not declare its own settle_ms.
 VERIFY_MAX_WAIT_MS = 2000
 VERIFY_POLL_INTERVAL_MS = 400
+
+NUMBER_DOMAINS = ("number", "input_number")
+# How long a number entity's attributes (min/max) from a state read stay usable for
+# the write clamp. Every write path reads the entity right before writing, so in
+# practice they are seconds old; past this age the clamp is simply not applied.
+ATTR_CACHE_MAX_AGE_S = 300.0
+# A clamp is logged at WARNING once per entity per hour (DEBUG otherwise): the clamp
+# runs before the skip check, i.e. every tick for as long as the request is out of
+# range.
+CLAMP_WARN_INTERVAL_S = 3600.0
+# Cap on the HA error body kept in an HACallError (HA answers a refused service
+# call with a short JSON message; a proxy error page can be long).
+HA_ERROR_BODY_MAX_CHARS = 300
+
+
+def _finite_float(raw: Any) -> float | None:
+    """Parse a number or numeric string to a finite float, else None."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _clamp_to_entity_range(value: Any, attributes: Any) -> Any:
+    """Clamp a numeric write to the entity's ``min``/``max`` attributes.
+
+    Returns the ORIGINAL object when nothing changes (so callers keep its type).
+    Anything unusable means "no clamp", never a different value: attributes that are
+    not a dict, a missing / non-numeric / non-finite ``min`` or ``max`` (each bound
+    is judged on its own), ``min`` above ``max``, or a non-numeric value.
+
+    Deliberately NO ``step`` snapping. HA anchors the step grid at ``min``, and the
+    Sungrow numbers have min 10 / step 100, so a snap moves every round setpoint
+    (9500 -> 9510, 100 -> 110) and turns a 10 W forced charge into 0.
+    """
+    if isinstance(value, bool) or not isinstance(attributes, dict):
+        return value
+    requested = _finite_float(value)
+    if requested is None:
+        return value
+    attrs = cast("dict[str, Any]", attributes)
+    low = _finite_float(attrs.get("min"))
+    high = _finite_float(attrs.get("max"))
+    if low is not None and high is not None and low > high:
+        return value
+    result = requested
+    if high is not None and result > high:
+        result = high
+    if low is not None and result < low:
+        result = low
+    if result == requested:
+        return value
+    return int(result) if result.is_integer() else result
 
 
 # A state that says the device is not answering. HA still ACCEPTS a service call
@@ -280,6 +337,10 @@ class HAClient:
         # entity_id -> HTTP statuses already reported, so a missing entity logs once.
         self._read_http_errors_logged: dict[str, set[int]] = {}
         self._http_seconds = 0.0
+        # number/input_number entity_id -> (monotonic time, attributes) from the last
+        # successful state read. Lets the dispatcher clamp a write to the entity's
+        # min/max without a second HA round trip (see cached_attributes).
+        self._number_attributes: dict[str, tuple[float, dict[str, Any]]] = {}
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -358,9 +419,11 @@ class HAClient:
         try:
             # Three attempts, not four. The deadline doubled, so the retry BUDGET has to
             # shrink or one wedged entity could eat 37 s of a 60 s tick.
-            return await _retry_with_backoff(
+            state = await _retry_with_backoff(
                 _fetch, max_retries=2, base_delay=1.0, what=f"HA read {entity_id}"
             )
+            self._remember_attributes(entity_id, state)
+            return state
         except HACallError:
             # All retries exhausted, return None for graceful degradation
             return None
@@ -379,6 +442,29 @@ class HAClient:
                     e.status,
                 )
             return None
+
+    def _remember_attributes(self, entity_id: str, state: Any) -> None:
+        """Keep a number entity's attributes from a state read (see cached_attributes)."""
+        if not entity_id.startswith(("number.", "input_number.")):
+            return
+        attributes = state.get("attributes") if isinstance(state, dict) else None
+        if isinstance(attributes, dict):
+            self._number_attributes[entity_id] = (time.monotonic(), attributes)
+        else:
+            self._number_attributes.pop(entity_id, None)
+
+    def cached_attributes(
+        self, entity_id: str, max_age_s: float = ATTR_CACHE_MAX_AGE_S
+    ) -> dict[str, Any] | None:
+        """Attributes of a number entity from its last successful state read.
+
+        None when the entity was never read, the read carried no attributes, or the
+        read is older than ``max_age_s``. Never does I/O.
+        """
+        cached = self._number_attributes.get(entity_id)
+        if cached is None or time.monotonic() - cached[0] > max_age_s:
+            return None
+        return cached[1]
 
     async def get_state_value(self, entity_id: str) -> str | None:
         """Get just the state value of an entity."""
@@ -454,7 +540,13 @@ class HAClient:
             "HA call_service: %s.%s on %s with payload: %s", domain, service, entity_id, payload
         )
 
+        # HA says WHY it refused a call in the response body ("Value 0.0 for
+        # number.x is outside valid range 10 - 9900"); raise_for_status() keeps only
+        # the HTTP reason ("Bad Request"). Keep the body of the last failed attempt.
+        error_body: list[str] = []
+
         async def _post() -> None:
+            error_body.clear()
             session = await self._get_session()
             started = time.monotonic()
             try:
@@ -462,6 +554,12 @@ class HAClient:
                     f"{self.base_url}/api/services/{domain}/{service}",
                     json=payload,
                 ) as response:
+                    status = getattr(response, "status", None)
+                    if isinstance(status, int) and status >= 400:
+                        with contextlib.suppress(Exception):
+                            text = await response.text()
+                            if isinstance(text, str) and text.strip():
+                                error_body[:] = [text.strip()[:HA_ERROR_BODY_MAX_CHARS]]
                     response.raise_for_status()
             finally:
                 self._http_calls += 1
@@ -479,7 +577,7 @@ class HAClient:
             raise HACallError(
                 message=f"Failed to call service {domain}.{service} on {entity_id}",
                 status_code=e.status,
-                response_body=str(e.message),
+                response_body=error_body[0] if error_body else str(e.message),
                 exception_type=type(e).__name__,
             ) from e
         except (aiohttp.ClientError, TimeoutError) as e:
@@ -487,6 +585,19 @@ class HAClient:
                 message=f"Failed to call service {domain}.{service} on {entity_id}",
                 exception_type=type(e).__name__,
             ) from e
+        except HACallError as e:
+            # Retries exhausted (5xx / 429 every time): _retry_with_backoff raises a
+            # bare HACallError. Re-raise it carrying HA's last answer, if there was one.
+            if not error_body or e.response_body:
+                raise
+            cause = e.__cause__
+            status = getattr(cause, "status", None)
+            raise HACallError(
+                message=e.message,
+                status_code=status if isinstance(status, int) else None,
+                response_body=error_body[0],
+                exception_type=e.exception_type,
+            ) from cause
 
     def _get_safe_domain(self, entity_id: str, allowed_domains: set[str]) -> str | None:
         """
@@ -664,6 +775,8 @@ class ActionDispatcher:
         # (over-heat guard). In-memory: an add-on restart forgets an active commit
         # (bounded downside — min_on still bounds the block).
         self._water_commit_until: dict[str, float] = {}
+        # Entity-range clamp warnings, rate limited per entity (monotonic seconds).
+        self._clamp_log_at: dict[str, float] = {}
 
     def water_claims_supply(self, entity_id: str | None) -> bool:
         """Has this heater been TOLD to draw, whatever it happens to be drawing now?
@@ -784,11 +897,53 @@ class ActionDispatcher:
             return getattr(decision, field_name)
         return value
 
+    def _clamp_to_entity(self, entity_id: str, value: Any) -> Any:
+        """Clamp a number write to the entity's min/max, if we know them.
+
+        The attributes come from the state read every write path makes right before
+        writing (HAClient.cached_attributes) — no extra HA round trip. Unknown,
+        stale or garbage attributes mean the value is returned untouched. Callers
+        use the result for the skip check, the write AND the read-back, so an
+        entity limit shows up neither as a failed/unverified write nor as a rewrite
+        every tick.
+        """
+        getter = getattr(self.ha, "cached_attributes", None)
+        if not callable(getter):
+            return value
+        try:
+            attributes = getter(entity_id)
+        except Exception:
+            return value
+        if asyncio.iscoroutine(attributes):  # an all-async test double
+            attributes.close()
+            return value
+        clamped = _clamp_to_entity_range(value, attributes)
+        if clamped is value:
+            return value
+        now = time.monotonic()
+        last = self._clamp_log_at.get(entity_id)
+        if last is None or now - last >= CLAMP_WARN_INTERVAL_S:
+            self._clamp_log_at[entity_id] = now
+            log = logger.warning
+        else:
+            log = logger.debug
+        log(
+            "Clamped write to %s: %s → %s (entity range min=%s max=%s)",
+            entity_id,
+            value,
+            clamped,
+            attributes.get("min"),
+            attributes.get("max"),
+        )
+        return clamped
+
     async def _write_entity(
         self,
         entity_id: str,
         value: Any,
         domain: str,
+        *,
+        raise_errors: bool = False,
     ) -> bool:
         """
         Write value to HA entity using appropriate service call.
@@ -797,12 +952,15 @@ class ActionDispatcher:
             entity_id: The HA entity ID to write to
             value: The value to write
             domain: The HA domain (select, number, switch, input_number)
+            raise_errors: Re-raise an HACallError (after logging it) instead of
+                returning False, so the caller can put HA's reason in its result
 
         Returns:
             True if successful
         """
         try:
-            if domain in ("number", "input_number"):
+            if domain in NUMBER_DOMAINS:
+                value = self._clamp_to_entity(entity_id, value)
                 return await self.ha.set_number(entity_id, float(value))
             elif domain == "select":
                 return await self.ha.set_select_option(entity_id, str(value))
@@ -817,6 +975,8 @@ class ActionDispatcher:
         # error escaping and aborting the whole actuation pass.
         except (HACallError, ValueError, TypeError) as e:
             logger.error("Failed to write to %s: %s", entity_id, e)
+            if raise_errors and isinstance(e, HACallError):
+                raise
             return False
 
     def _values_match(self, current: str | None, target: Any) -> bool:
@@ -1031,6 +1191,11 @@ class ActionDispatcher:
         if not self.shadow_mode:
             await self._note_reachable(action.entity, entity_id)
 
+        # Clamp before the skip check so an entity already at its limit is not
+        # rewritten every tick (attributes come from the read just above).
+        if entity_def.domain in NUMBER_DOMAINS:
+            resolved_value = self._clamp_to_entity(entity_id, resolved_value)
+
         if self._values_match(previous_value, resolved_value):
             return ActionResult(
                 action_type=action.entity,
@@ -1065,7 +1230,14 @@ class ActionDispatcher:
                 duration_ms=int((time.time() - start_time) * 1000),
             )
 
-        success = await self._write_entity(entity_id, resolved_value, entity_def.domain)
+        error_details = None
+        try:
+            success = await self._write_entity(
+                entity_id, resolved_value, entity_def.domain, raise_errors=True
+            )
+        except HACallError as e:
+            success = False
+            error_details = str(e)
 
         verified_value = None
         verification_success = None
@@ -1095,6 +1267,8 @@ class ActionDispatcher:
             success=success,
             message=f"{previous_value} → {resolved_value}"
             if success
+            else f"Failed to set {action.entity}: {error_details}"
+            if error_details
             else f"Failed to set {action.entity}",
             previous_value=previous_value,
             new_value=resolved_value,
@@ -1104,6 +1278,7 @@ class ActionDispatcher:
             requested_mode=mode_intent,
             applied_mode=mode_intent,
             duration_ms=duration_ms,
+            error_details=error_details,
         )
 
     async def force_heater_climate_mode(
@@ -1490,6 +1665,9 @@ class ActionDispatcher:
         except (ValueError, TypeError):
             current_val = None
 
+        # Number helper: keep the target inside the helper's own min/max.
+        target = self._clamp_to_entity(entity, target)
+
         if current_val == target:
             return ActionResult(
                 action_type="water_temp",
@@ -1639,6 +1817,9 @@ class ActionDispatcher:
 
         current = await self.ha.get_state_value(entity)
 
+        if domain in NUMBER_DOMAINS:
+            value = write_value = self._clamp_to_entity(entity, value)
+
         if self._values_match(current, value):
             return ActionResult(
                 action_type=f"sink:{cfg.id}",
@@ -1672,7 +1853,7 @@ class ActionDispatcher:
 
         error_details = None
         try:
-            success = await self._write_entity(entity, write_value, domain)
+            success = await self._write_entity(entity, write_value, domain, raise_errors=True)
         except HACallError as e:
             success = False
             error_details = str(e)
@@ -1952,6 +2133,8 @@ class ActionDispatcher:
             current_val = float(current) if current else None
         except (ValueError, TypeError):
             current_val = None
+
+        watts = self._clamp_to_entity(entity, watts)
 
         if current_val is not None:
             change = abs(watts - current_val)
