@@ -289,6 +289,43 @@ system:
         template_aware_merge(template_cfg, user_cfg)
         assert template_cfg["system"]["id"] == "user_id"
 
+    def test_cyclic_loads_survive_the_real_template_verbatim(self):
+        """cyclic_loads has no ARRAY_UNIQUE_KEYS entry and the template ships it
+        commented out, so the user's list is taken as it stands: every key of a
+        ``mode: window`` room heater (and of the pump next to it) is kept, none is
+        defaulted, and the order is unchanged."""
+        from pathlib import Path
+
+        from ruamel.yaml import YAML
+
+        from backend.config_migration import template_aware_merge, validate_config_for_write
+
+        heater = {
+            "id": "kim_heater",
+            "mode": "window",
+            "switch_entity": "switch.kims_uttag",
+            "power_sensor": "sensor.kims_uttag_power",
+            "power_kw": 1.0,
+            "planned_power_factor": 0.5,
+            "window_entities": ["calendar.kim"],
+            "window_event_match": "Kim",
+            "preheat_minutes": 30,
+            "control_pause_entities": ["input_boolean.kim_heater_paused"],
+            "temp_sensor": None,
+            "target_temp_c": 20,
+            "hysteresis_c": 0.5,
+            "temp_max_age_minutes": 30,
+            "setback_temp_c": None,
+        }
+        pump = {"id": "poolpump", "switch_entity": "switch.poolpump", "min_kwh_per_day": 0.78}
+        template = YAML().load(
+            (Path(__file__).parents[2] / "config.default.yaml").read_text(encoding="utf-8")
+        )
+        assert "cyclic_loads" not in template  # the example block is comments only
+        template_aware_merge(template, {"cyclic_loads": [dict(pump), dict(heater)]})
+        assert [dict(c) for c in template["cyclic_loads"]] == [pump, heater]
+        assert validate_config_for_write(template, strict=False)
+
 
 class TestFullMigrationFlow:
     """Test the complete migration pipeline."""
