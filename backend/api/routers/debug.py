@@ -6,12 +6,14 @@ Provides debug endpoints for logs, history, and diagnostics.
 
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import pytz
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 
 from backend.core.ha_client import get_dummy_load_profile, get_load_profile_from_ha
 from backend.core.logging import get_ring_buffer
@@ -65,6 +67,58 @@ async def debug_logs() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("Failed to fetch debug logs")
         raise HTTPException(500, str(exc)) from exc
+
+
+# Solver instance dumps (planner/solver/kepler.py): failed solves always, successful
+# ones when kepler.solver.dump_all_instances > 0. Read-only, so they can be pulled
+# off the box through the add-on's ingress and replayed with
+# scripts/replay_solver_dump.py. The name is matched against the writer's exact
+# pattern — no separators, no dots beyond ".json" — so it cannot leave the directory.
+_SOLVER_DUMP_NAME = re.compile(r"kepler_(?:fail|ok)_\d{8}T\d{6}\.json")
+
+
+@router.get(
+    "/api/debug/solver_dumps",
+    summary="List Solver Dumps",
+    description="List the solver instance dumps available for offline replay.",
+)
+async def list_solver_dumps() -> dict[str, Any]:
+    """List solver instance dumps, newest first."""
+    from planner.solver.kepler import solver_dump_dir
+
+    dump_dir = solver_dump_dir()
+    dumps: list[dict[str, Any]] = []
+    if dump_dir.is_dir():
+        for path in dump_dir.iterdir():
+            if not _SOLVER_DUMP_NAME.fullmatch(path.name) or not path.is_file():
+                continue
+            stat = path.stat()
+            dumps.append(
+                {
+                    "name": path.name,
+                    "size_bytes": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                }
+            )
+    dumps.sort(key=lambda d: (d["name"].split("_", 2)[2], d["name"]), reverse=True)
+    return {"dumps": dumps, "count": len(dumps)}
+
+
+@router.get(
+    "/api/debug/solver_dumps/{name}",
+    summary="Get Solver Dump",
+    description="Return one solver instance dump (the exact solver input and outcome).",
+)
+async def get_solver_dump(name: str) -> FileResponse:
+    """Return one solver instance dump by file name."""
+    from planner.solver.kepler import solver_dump_dir
+
+    if not _SOLVER_DUMP_NAME.fullmatch(name):
+        raise HTTPException(404, "No such solver dump")
+    path = solver_dump_dir() / name
+    if not path.is_file():
+        raise HTTPException(404, "No such solver dump")
+    return FileResponse(path, media_type="application/json", filename=name)
 
 
 from sqlalchemy import select  # noqa: E402
