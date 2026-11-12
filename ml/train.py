@@ -23,7 +23,13 @@ from backend.learning import LearningEngine, get_learning_engine
 from backend.validation import get_max_energy_per_slot
 from ml.cleaning import DERIVED_LOAD_FLAG_KEYS, clean_training_rows
 from ml.context_features import get_alarm_armed_series, get_vacation_mode_series
-from ml.weather import calculate_physics_pv, get_weather_series
+from ml.weather import (
+    PV_WEATHER_SOURCE_HISTORICAL,
+    calculate_physics_pv,
+    get_historical_weather_series,
+    get_weather_series,
+    resolve_pv_training_weather_source,
+)
 
 # Sample-weight multiplier for derived-load rows in LOAD training (PV untouched).
 # Down-weight, not exclude: on the reference site the rescue fires on 28.6% of all quarters
@@ -309,6 +315,23 @@ def _save_model(
     print(f"Saved model to {path}")
 
 
+def _annotate_model_sidecar(path: Path, metadata: dict[str, Any]) -> None:
+    """Merge ``metadata`` into a saved model's .features.json sidecar.
+
+    Used to record facts about HOW a model was trained (e.g. the weather source of a
+    PV model, read back by ml/forward.py). No sidecar -> nothing to annotate.
+    """
+    sidecar = path.with_suffix(".features.json")
+    if not sidecar.exists():
+        return
+    try:
+        stored: Any = json.loads(sidecar.read_text())
+    except ValueError:
+        return
+    if isinstance(stored, dict):
+        sidecar.write_text(json.dumps({**stored, **metadata}))
+
+
 def _resolve_pv_training_min_date(engine: LearningEngine) -> datetime | None:
     """Read the persistent PV clean-data floor from config.
 
@@ -371,6 +394,7 @@ def train_models(
         "cleaning": {},
         "min_date": min_date.isoformat() if min_date else None,
         "pv_training_min_date": None,
+        "pv_weather_source": None,
         "error": None,
     }
 
@@ -394,6 +418,9 @@ def train_models(
             f"Invalid forecasting.pv_training_min_date in config: {exc}"
         ) from exc
     result["pv_training_min_date"] = pv_min_date.isoformat() if pv_min_date else None
+
+    pv_weather_source = resolve_pv_training_weather_source(engine.config)
+    result["pv_weather_source"] = pv_weather_source
 
     now = datetime.now(engine.timezone)
 
@@ -580,6 +607,33 @@ def train_models(
                 "(load models keep the full window)"
             )
 
+    # Opt-in training weather source (forecasting.pv_training_weather_source). The PV
+    # rows get their weather — ML features AND physics inputs — from the historical-
+    # forecast archive instead of the forecast endpoint's hindcast merged above. Load
+    # training keeps the hindcast. If the archive returns nothing, PV training is
+    # skipped for this run (existing PV models stay): substituting the other source
+    # would train one model on two different radiation scales.
+    if pv_weather_source == PV_WEATHER_SOURCE_HISTORICAL and not pv_df.empty:
+        hist_df = get_historical_weather_series(
+            pv_df["slot_start"].min(), now, config=engine.config
+        )
+        if hist_df.empty:
+            print(
+                "Error: historical-forecast weather unavailable; skipping PV training "
+                "this run (existing PV models are kept, sources are never mixed)."
+            )
+            result["error"] = "PV training skipped: historical weather unavailable"
+            pv_df = pv_df.iloc[0:0].copy()
+        else:
+            pv_df = pv_df.drop(
+                columns=[c for c in hist_df.columns if c in pv_df.columns]
+            ).merge(hist_df, left_on="slot_start", right_index=True, how="left")
+            print(
+                f"PV training weather: historical-forecast archive "
+                f"({int(pv_df['shortwave_radiation_w_m2'].notna().sum())}/{len(pv_df)} "
+                "rows with radiation)"
+            )
+
     # Apply sun-up filter: only train on slots with radiation > 10 OR actual PV > 0.01
     # This excludes nighttime slots (radiation=0, pv=0) which provide no learning signal
     if "shortwave_radiation_w_m2" in pv_df.columns:
@@ -687,6 +741,9 @@ def train_models(
         pv_weights = sample_weights.loc[pv_df.index].to_numpy()
         result["pv_samples"] = len(X_pv)
         print(f"Training PV models on {len(X_pv)} samples (residual mode)...")
+        # Recorded in the sidecar so inference can tell which weather source the
+        # residual was learned against (ml/forward.py warns on a config mismatch).
+        pv_metadata = {"weather_source": pv_weather_source}
 
         for q_name, alpha in quantiles.items():
             print(f"  > Training PV {q_name} (alpha={alpha})...")
@@ -697,12 +754,14 @@ def train_models(
                 suffix = f"_{q_name}"
                 filename = cfg.pv_model_name.replace(".lgb", f"{suffix}.lgb")
                 _save_model(model, cfg.models_dir / filename, feature_names=pv_feature_cols)
+                _annotate_model_sidecar(cfg.models_dir / filename, pv_metadata)
                 result["models_saved"].append(filename)
 
                 if q_name == "p50":
                     _save_model(
                         model, cfg.models_dir / cfg.pv_model_name, feature_names=pv_feature_cols
                     )
+                    _annotate_model_sidecar(cfg.models_dir / cfg.pv_model_name, pv_metadata)
                     result["models_saved"].append(cfg.pv_model_name)
     else:
         print("Warning: No non-null pv_kwh samples found; skipping PV models.")
@@ -735,6 +794,7 @@ def train_models(
             "min_samples": cfg.min_samples,
             "min_date": result["min_date"],
             "pv_training_min_date": result["pv_training_min_date"],
+            "pv_weather_source": result["pv_weather_source"],
         }
 
         with sqlite3.connect(engine.db_path) as conn:

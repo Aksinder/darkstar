@@ -991,7 +991,24 @@ forecasting:
                                        # than a dirty PV retrain) — check the training history if
                                        # models stop refreshing. (3) Training weather comes from the
                                        # Open-Meteo forecast API (max 92 past days), so PV training
-                                       # is effectively a 92-day sliding window regardless of floor.
+                                       # is effectively a 92-day sliding window regardless of floor
+                                       # (unless pv_training_weather_source is historical_forecast).
+  pv_training_weather_source: "forecast_past_days"
+                                       # Where PV residual TRAINING takes its weather history from
+                                       # (inference always uses the forecast endpoint):
+                                       #   forecast_past_days  (default) the forecast endpoint's
+                                       #     hindcast — max 92 days back, oldest weeks may be empty.
+                                       #   historical_forecast Open-Meteo's historical-forecast
+                                       #     archive — explicit date range, no 92-day cliff, gaps
+                                       #     of a missing hour or more are left empty (never
+                                       #     interpolated across).
+                                       # The archive has been measured to give 8-18 % HIGHER
+                                       # radiation than the hindcast, which shifts the physics
+                                       # baseline the residual is learned against. Compare first:
+                                       #   python scripts/compare_pv_training_sources.py --db <learning db>
+                                       # Takes effect at the next retrain; until then the forecast
+                                       # log warns that model and config disagree. Load models are
+                                       # not affected. Unknown value = forecast_past_days.
   pv_confidence_percent: 83.0          # PV forecast scaling (100 = trust forecast fully)
   pv_p10_weight: 0.0                   # 0 = legacy scalar haircut above. >0 (e.g. 0.3-0.5):
                                        # blend each slot toward Aurora's own pessimistic p10

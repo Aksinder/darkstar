@@ -17,7 +17,12 @@ from backend.health import clear_load_forecast_status, set_load_forecast_status
 from backend.learning import LearningEngine, get_learning_engine
 from ml.context_features import get_alarm_armed_series, get_vacation_mode_series
 from ml.train import _build_time_features  # type: ignore[reportPrivateUsage]
-from ml.weather import async_get_weather_series, calculate_physics_pv
+from ml.weather import (
+    PV_WEATHER_SOURCE_FORECAST,
+    async_get_weather_series,
+    calculate_physics_pv,
+    resolve_pv_training_weather_source,
+)
 from utils.time_utils import dst_safe_date_range
 
 
@@ -159,6 +164,57 @@ def _load_models(models_dir: str = "data/ml/models") -> dict[str, lgb.Booster]:
         logger.info(f"✅ Loaded {len(models)} ML models from {models_dir}")
 
     return models
+
+
+def pv_model_weather_source(models_dir: str = "data/ml/models") -> str | None:
+    """Weather source the stored PV residual model was trained on.
+
+    Read from the model's .features.json sidecar (written by ml/train.py). A model
+    without the entry predates the option and was trained on the forecast endpoint's
+    hindcast. Returns None when there is no PV model sidecar at all.
+    """
+    import json
+    from pathlib import Path as _Path
+
+    for name in ("pv_model_p50", "pv_model"):
+        sidecar = _Path(models_dir) / f"{name}.features.json"
+        if not sidecar.exists():
+            continue
+        try:
+            stored = json.loads(sidecar.read_text())
+        except Exception:
+            continue
+        if not isinstance(stored, dict):
+            continue
+        return str(stored.get("weather_source") or PV_WEATHER_SOURCE_FORECAST)
+    return None
+
+
+def warn_on_pv_weather_source_mismatch(
+    config: dict[str, Any], models_dir: str = "data/ml/models"
+) -> bool:
+    """Warn when the PV model's training weather source differs from the config.
+
+    The two sources differ by 8-18 % in radiation, so a model trained on one is not
+    interchangeable with a model trained on the other; after changing
+    forecasting.pv_training_weather_source the old model stays live until the next
+    retrain. Returns True when a mismatch was reported.
+    """
+    trained = pv_model_weather_source(models_dir)
+    if trained is None:
+        return False
+    configured = resolve_pv_training_weather_source(config)
+    if trained == configured:
+        return False
+    logger.warning(
+        "⚠️ PV residual model was trained on weather source '%s' but "
+        "forecasting.pv_training_weather_source is '%s'. The model stays in use; "
+        "retrain to switch source, or set the config back to '%s'.",
+        trained,
+        configured,
+        trained,
+    )
+    return True
 
 
 async def generate_forward_slots(
@@ -313,6 +369,9 @@ async def generate_forward_slots(
         )
         has_pv_models = False
         pv_forced_physics_only = True
+
+    if has_pv_models:
+        warn_on_pv_weather_source_mismatch(engine.config)
 
     # --- LOAD INFERENCE (or fallback) ---
     if has_load_models:
