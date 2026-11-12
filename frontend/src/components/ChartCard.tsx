@@ -970,7 +970,8 @@ export default function ChartCard({
                 if (config.pricing) {
                     const p = config.pricing
                     const vat = p.vat_percent ?? 25
-                    const fees = (p.grid_transfer_fee_sek ?? 0) + (p.energy_tax_sek ?? 0)
+                    const fees =
+                        (p.grid_transfer_fee_sek ?? 0) + (p.energy_tax_sek ?? 0) + (p.supplier_markup_sek_kwh ?? 0)
                     setPricingConfig({ vat, fees })
                 }
 

@@ -5,6 +5,7 @@ from typing import Any, cast
 from fastapi import APIRouter, Depends
 
 from backend.api.deps import get_learning_store
+from backend.core.fixed_fees import fixed_fees_for_range
 from backend.core.secrets import load_yaml
 from backend.learning.store import LearningStore
 
@@ -239,6 +240,10 @@ async def get_energy_range(
         slot_count = int(row[12] or 0)
 
         net_cost = import_cost - export_rev
+        # Fixed fees (grid subscription, supplier yearly fee) are reported in fields of
+        # their own; net_cost_sek stays the energy-only figure it has always been, and
+        # comparisons, benchmarks and learning stay energy-only too.
+        fixed_fees_sek = fixed_fees_for_range(query_start, query_end, config)
 
         # NOTE: No longer overlaying HA sensor values - using DB-only data
         # This ensures consistency with the recorder's isolation logic
@@ -260,6 +265,8 @@ async def get_energy_range(
             "grid_charge_cost_sek": round(grid_charge_cost, 2),
             "self_consumption_savings_sek": round(self_cons_savings, 2),
             "net_cost_sek": round(net_cost, 2),
+            "fixed_fees_sek": round(fixed_fees_sek, 2),
+            "net_cost_incl_fixed_fees_sek": round(net_cost + fixed_fees_sek, 2),
             "slot_count": slot_count,
         }
     except Exception as e:
@@ -281,6 +288,8 @@ async def get_energy_range(
             "grid_charge_cost_sek": 0.0,
             "self_consumption_savings_sek": 0.0,
             "net_cost_sek": 0.0,
+            "fixed_fees_sek": 0.0,
+            "net_cost_incl_fixed_fees_sek": 0.0,
             "slot_count": 0,
             "error": str(e),
         }

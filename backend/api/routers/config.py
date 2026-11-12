@@ -395,6 +395,30 @@ def _validate_config_for_save(
                 }
             )
 
+    # Pricing: the supplier markup feeds the import-price formula on every price fetch and
+    # the fixed fees feed the cost report, so a non-number must not be saved. The markup may
+    # be negative (a per-kWh discount); the fixed fees may not.
+    pricing_any: Any = config.get("pricing")
+    pricing_cfg = cast("dict[str, Any]", pricing_any) if isinstance(pricing_any, dict) else {}
+    for key, allow_negative in (
+        ("supplier_markup_sek_kwh", True),
+        ("subscription_fee_sek_per_month", False),
+        ("supplier_fee_sek_per_year", False),
+    ):
+        value: Any = pricing_cfg.get(key)
+        if value is None or value == "":
+            continue
+        is_number = isinstance(value, int | float) and not isinstance(value, bool)
+        if not is_number or (not allow_negative and value < 0):
+            issues.append(
+                {
+                    "severity": "error",
+                    "message": f"pricing.{key} must be a "
+                    f"{'number' if allow_negative else 'non-negative number'}",
+                    "guidance": f"Set pricing.{key} to a number (0 disables it).",
+                }
+            )
+
     # Inverter: WARNING if AC power not configured
     inverter_cfg = system_cfg.get("inverter", {})
     if (

@@ -323,3 +323,171 @@ class TestTimeWeightedIntegration:
 
         states = [{"state": "unavailable", "attributes": {}}]
         assert integrate_power_history_kwh(states, START, END) is None
+
+
+class TestPowerHistoryUnitResolution:
+    """The unit must survive HA's minimal history response (attributes on the first
+    state only) even when that first state is unavailable -- else W is read as kW."""
+
+    def _ts(self, minutes: float) -> str:
+        return (START + timedelta(minutes=minutes)).isoformat()
+
+    def _state(self, val: str, minutes: float, unit: str | None = None) -> dict:
+        state: dict = {"state": val, "last_changed": self._ts(minutes)}
+        if unit is not None:
+            state["attributes"] = {"unit_of_measurement": unit}
+        return state
+
+    def test_unavailable_first_w_series_is_not_read_as_kw(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        # Minimal response: only the first state has attributes, and it is unavailable.
+        states = [
+            self._state("unavailable", -5.0, unit="W"),
+            self._state("1.0", 0.0),
+            self._state("1.0", 7.5),
+        ]
+        kwh = integrate_power_history_kwh(states, START, END)
+        # 1 W idle for 15 min = 0.00025 kWh (was 0.25 kWh of phantom heating).
+        assert kwh == pytest.approx(0.00025, abs=1e-7)
+
+    def test_unit_on_a_later_state_reaches_earlier_samples(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [self._state("2000", 0.0), self._state("2000", 7.5, unit="W")]
+        assert integrate_power_history_kwh(states, START, END) == pytest.approx(0.5)
+
+    def test_mixed_units_are_applied_per_sample(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [
+            self._state("2000", 0.0, unit="W"),
+            self._state("4", 5.0, unit="kW"),
+            self._state("3", 10.0),  # no unit: inherits the nearest earlier one (kW)
+        ]
+        kwh = integrate_power_history_kwh(states, START, END)
+        assert kwh == pytest.approx((2.0 + 4.0 + 3.0) * 5 / 60)
+
+    @pytest.mark.parametrize(
+        ("unit", "factor"),
+        [("w", 1e-3), ("W", 1e-3), ("kw", 1.0), ("KW", 1.0), ("MW", 1e3), ("mW", 1e-6)],
+    )
+    def test_units_are_case_insensitive_except_milli_vs_mega(self, unit, factor):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [self._state("4", 0.0, unit=unit)]
+        assert integrate_power_history_kwh(states, START, END) == pytest.approx(4 * factor / 4)
+
+    def test_no_unit_anywhere_uses_the_fallback_unit(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        states = [self._state("2000", 0.0)]
+        kwh = integrate_power_history_kwh(states, START, END, fallback_unit="W")
+        assert kwh == pytest.approx(0.5)
+
+    def test_no_unit_and_no_fallback_assumes_kw_and_warns_once(self, caplog):
+        from backend.core import ha_client
+
+        ha_client._power_unit_warned.discard("sensor.unitless")
+        states = [self._state("2", 0.0), self._state("2", 5.0)]
+        with caplog.at_level("WARNING", logger=ha_client.logger.name):
+            for _ in range(2):
+                kwh = ha_client.integrate_power_history_kwh(
+                    states, START, END, entity_id="sensor.unitless"
+                )
+        assert kwh == pytest.approx(0.5)
+        assert sum("sensor.unitless" in r.getMessage() for r in caplog.records) == 1
+
+    def test_kw_series_is_unchanged(self):
+        from backend.core.ha_client import integrate_power_history_kwh
+
+        full = [self._state("3.5", 0.0, unit="kW"), self._state("0.0", 7.5, unit="kW")]
+        minimal = [self._state("3.5", 0.0, unit="kW"), self._state("0.0", 7.5)]
+        expected = 3.5 * 7.5 / 60
+        assert integrate_power_history_kwh(full, START, END) == pytest.approx(expected)
+        assert integrate_power_history_kwh(minimal, START, END) == pytest.approx(expected)
+
+    def test_split_integral_honours_the_unit_of_an_unavailable_first_state(self):
+        from backend.core.ha_client import integrate_power_history_split_kwh
+
+        states = [
+            self._state("unknown", -1.0, unit="W"),
+            self._state("4000", 0.0),
+            self._state("-2000", 7.5),
+        ]
+        pos, neg = integrate_power_history_split_kwh(states, START, END)
+        assert pos == pytest.approx(0.5)
+        assert neg == pytest.approx(0.25)
+
+    @staticmethod
+    def _client(history: list, current_state: object) -> AsyncMock:
+        def _get(url: str, **_kwargs: object) -> MagicMock:
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            response.json.return_value = current_state if "/api/states/" in url else history
+            return response
+
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=_get)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_fetch_falls_back_to_the_current_state_unit(self):
+        history = [[self._state("2000", 0.0)]]
+        current = {"state": "unavailable", "attributes": {"unit_of_measurement": "W"}}
+        with (
+            patch(
+                "backend.core.ha_client.secrets.load_home_assistant_config",
+                return_value=_make_ha_config(),
+            ),
+            patch("backend.core.ha_client.httpx.AsyncClient") as mock_client_cls,
+        ):
+            client = self._client(history, current)
+            mock_client_cls.return_value = client
+            result = await get_energy_from_power_history("sensor.vvb_power", START, END)
+
+        assert result == pytest.approx(0.5)
+        assert client.get.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_does_not_look_up_the_state_when_history_has_a_unit(self):
+        history = [[self._state("unavailable", -5.0, unit="W"), self._state("2000", 0.0)]]
+        with (
+            patch(
+                "backend.core.ha_client.secrets.load_home_assistant_config",
+                return_value=_make_ha_config(),
+            ),
+            patch("backend.core.ha_client.httpx.AsyncClient") as mock_client_cls,
+        ):
+            client = self._client(history, None)
+            mock_client_cls.return_value = client
+            result = await get_energy_from_power_history("sensor.vvb_power", START, END)
+
+        assert result == pytest.approx(0.5)
+        assert client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_stamps_the_current_unit_into_a_unitless_series(self):
+        from backend.core.ha_client import (
+            get_power_history_batch,
+            integrate_power_history_split_kwh,
+        )
+
+        series = [{**self._state("4000", 0.0), "entity_id": "sensor.grid_power"}]
+        current = {"state": "4000", "attributes": {"unit_of_measurement": "W"}}
+        with (
+            patch(
+                "backend.core.ha_client.secrets.load_home_assistant_config",
+                return_value=_make_ha_config(),
+            ),
+            patch("backend.core.ha_client.httpx.AsyncClient") as mock_client_cls,
+        ):
+            mock_client_cls.return_value = self._client([series], current)
+            result = await get_power_history_batch(["sensor.grid_power"], START, END)
+
+        assert result is not None
+        states = result["sensor.grid_power"]
+        assert "attributes" not in series[0]  # the fetched state is not mutated
+        assert integrate_power_history_split_kwh(states, START, END) == pytest.approx((1.0, 0.0))
