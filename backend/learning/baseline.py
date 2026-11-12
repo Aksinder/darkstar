@@ -21,6 +21,10 @@ logger = logging.getLogger("darkstar.learning.baseline")
 
 BASELINE_VERSION = "baseline_7_day_avg"
 
+# A slot mean used for PLANNING (model fallback / blend) needs at least this many
+# usable observations of that time-of-day in the trailing week.
+MIN_SLOT_MEAN_OBSERVATIONS = 3
+
 
 def _time_of_day_key(iso_ts: str) -> str | None:
     try:
@@ -79,6 +83,64 @@ async def store_baseline_forecasts(store: LearningStore, slot_starts: list[str])
     except Exception as exc:
         logger.warning("Baseline forecast write skipped: %s", exc)
         return 0
+
+
+def time_of_day_key(ts: datetime) -> str:
+    """Slot-of-day key ("HH:MM", local wall clock) matching load_slot_means()."""
+    return f"{ts.hour:02d}:{ts.minute:02d}"
+
+
+def load_slot_means(
+    rows: list[dict[str, Any]], min_observations: int = MIN_SLOT_MEAN_OBSERVATIONS
+) -> dict[str, float]:
+    """Mean observed BASE load per time-of-day ("HH:MM") from observation rows.
+
+    Unlike the stored baseline_7_day_avg rows (an eval comparator that counts a
+    NULL/zero load as 0.0), this is fit to plan on: only slots with a real load
+    (> 0.001 kWh, the trainer's own filter) that the recorder did not flag as
+    unmeasured for the load target (ml/cleaning.py) are averaged, and a time-of-day
+    with fewer than ``min_observations`` such slots gets no value.
+    """
+    if not rows:
+        return {}
+    import pandas as pd
+
+    from ml.cleaning import bad_row_mask
+
+    frame = pd.DataFrame(rows)
+    if "load_kwh" not in frame.columns or "slot_start" not in frame.columns:
+        return {}
+    frame["load_kwh"] = pd.to_numeric(frame["load_kwh"], errors="coerce")
+    frame = frame[frame["load_kwh"] > 0.001]
+    if frame.empty:
+        return {}
+    frame = frame[~bad_row_mask(frame, "load")]
+
+    buckets: dict[str, list[float]] = {}
+    for slot_start, load_kwh in zip(frame["slot_start"], frame["load_kwh"], strict=True):
+        key = _time_of_day_key(str(slot_start))
+        if key is not None:
+            buckets.setdefault(key, []).append(float(load_kwh))
+    return {
+        key: sum(values) / len(values)
+        for key, values in buckets.items()
+        if len(values) >= min_observations
+    }
+
+
+async def get_load_slot_means_7d(store: LearningStore, before: datetime) -> dict[str, float]:
+    """load_slot_means() over the 7 days of observations before ``before``.
+
+    Never raises: any failure yields {} so callers fall through to their next tier.
+    """
+    try:
+        history = await store.get_observation_rows_between(
+            (before - timedelta(days=7)).isoformat(), before.isoformat()
+        )
+        return load_slot_means(history)
+    except Exception as exc:
+        logger.warning("7-day load slot means unavailable: %s", exc)
+        return {}
 
 
 def _parse(iso_ts: str) -> datetime | None:
