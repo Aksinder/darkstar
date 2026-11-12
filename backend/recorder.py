@@ -728,6 +728,10 @@ async def _record_observation(
     # Calculate EV charging energy using power history API
     ev_charging_kwh = 0.0
     ev_charger_energy: dict[str, float] = {}  # Task 8.1: per-device recording
+    # Chargers whose slot energy is NOT a history measurement, same vocabulary as
+    # water_unmeasured below: "snapshot" (one power read x 15 min) or "unavailable"
+    # (no read at all, booked as 0 — the charger's real energy then stays in base load).
+    ev_unmeasured: dict[str, str] = {}
     if config.get("system", {}).get("has_ev_charger", False):
         ev_chargers = config.get("ev_chargers", [])
         for ev_charger in ev_chargers:
@@ -742,9 +746,13 @@ async def _record_observation(
                             ev_charger_energy[charger_id] = energy
                         logger.debug(f"EV {charger_id}: history energy={energy:.3f} kWh")
                     else:
-                        charger_power = power_results.get(f"ev_{sensor}") or 0.0
+                        snapshot_kw = power_results.get(f"ev_{sensor}")
+                        charger_power = snapshot_kw or 0.0
                         device_kwh = charger_power * 0.25
                         ev_charging_kwh += device_kwh
+                        ev_unmeasured[charger_id or str(sensor)] = (
+                            "unavailable" if snapshot_kw is None else "snapshot"
+                        )
                         # A snapshot is not a slot measurement: keep the aggregate
                         # contribution but do NOT record it per-device — the store's
                         # device upsert is last-write-wins, so a fallback re-record
@@ -821,11 +829,15 @@ async def _record_observation(
     # Isolate base load: subtract known deferrable loads from total load.
     # Apply when load represents total consumption (cumulative sensor, or power snapshot without
     # disaggregator). Skip when disaggregator already provided base-load-only power_kw.
+    # True when the subtraction below went negative and was clamped: the devices
+    # claim more energy than the load meter saw, so base load is a floor, not a value.
+    base_load_clamped = False
     if (used_cumulative_load or not disaggregator) and (
         ev_charging_kwh > 0 or water_kwh > 0 or cyclic_kwh > 0
     ):
         base_load_kwh = load_kwh - ev_charging_kwh - water_kwh - cyclic_kwh
         if base_load_kwh < 0:
+            base_load_clamped = True
             logger.warning(
                 f"Negative base load: total={load_kwh:.3f}kWh, EV={ev_charging_kwh:.3f}kWh, "
                 f"water={water_kwh:.3f}kWh, cyclic={cyclic_kwh:.3f}kWh. Clamping to 0."
@@ -898,6 +910,8 @@ async def _record_observation(
         )
         load_kwh = balance_base_kwh
         load_rescued = True
+        # The clamped 0 was replaced by the balance value (flagged load_rescued).
+        base_load_clamped = False
 
     # B1 shadow (opt-in, recorder.exact_slot_power_shadow): grid and battery energy
     # integrated from POWER history over exactly [slot_start, slot_end), next to the
@@ -1109,12 +1123,18 @@ async def _record_observation(
         or soc_stale
         or multi_slot
         or water_unmeasured
+        or ev_unmeasured
+        or base_load_clamped
         or pv_unmeasured
         or shadow_exact
     ):
         flags: dict[str, Any] = {}
         if water_unmeasured:
             flags["water_unmeasured"] = water_unmeasured
+        if ev_unmeasured:
+            flags["ev_unmeasured"] = ev_unmeasured
+        if base_load_clamped:
+            flags["base_load_clamped"] = True
         if pv_unmeasured:
             flags["pv_unmeasured"] = pv_unmeasured
         if shadow_exact:
@@ -1166,26 +1186,44 @@ async def _record_observation(
     # TAGGED, so "never measured" cannot masquerade as "measured 0.0 kWh".
     try:
         max_kwh = get_max_energy_per_slot(config)
-        record = validate_energy_values(record, max_kwh)
+        validated = validate_energy_values(record, max_kwh)
+        # validate_energy_values replaces a spike (or a non-finite value) with 0.0.
+        # Name the columns it touched: a zeroed value is "unknown", and without the
+        # flag the row reads as a measured quiet quarter.
+        zeroed = sorted(
+            key
+            for key, value in validated.items()
+            if key.endswith("_kwh") and value == 0.0 and record.get(key) != 0.0
+        )
+        record = validated
+        if zeroed:
+            _add_quality_flag(record, "load_spike_zeroed", zeroed)
     except ValueError as e:
         logger.warning(
             "Could not validate energy values: %s. Configuration looks absent — "
             "tagging this observation as unmeasured rather than storing zeros as fact.",
             e,
         )
-        _flags: dict[str, Any] = {}
-        if record.get("quality_flags"):
-            try:
-                _flags = json.loads(str(record["quality_flags"]))
-            except (ValueError, TypeError):
-                _flags = {}
-        _flags["no_config"] = True
-        record["quality_flags"] = json.dumps(_flags)
+        _add_quality_flag(record, "no_config", True)
 
     # Store
     df = pd.DataFrame([record])
     await store.store_slot_observations(df)
     await store.close()  # Clean up async engine connections
+
+
+def _add_quality_flag(record: dict[str, Any], key: str, value: Any) -> None:
+    """Add one flag to a record whose quality_flags may already be serialized."""
+    flags: Any = {}
+    if record.get("quality_flags"):
+        try:
+            flags = json.loads(str(record["quality_flags"]))
+        except (ValueError, TypeError):
+            flags = {}
+    if not isinstance(flags, dict):
+        flags = {}
+    flags[key] = value
+    record["quality_flags"] = json.dumps(flags)
 
 
 async def _sleep_until_next_quarter() -> None:
