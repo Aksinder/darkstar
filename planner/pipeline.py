@@ -733,6 +733,48 @@ def calculate_ev_deadline(
     return None  # unreachable with a valid day set; defensive
 
 
+def book_cyclic_fixed_load(
+    slots: list[Any],
+    cyclic_plan: dict[str, dict[int, float]],
+    cyclic_phases: dict[str, list[str]],
+) -> None:
+    """Add the pre-scheduled cyclic loads to the solver slots IN PLACE, as fixed load.
+
+    ``cyclic_plan`` is ``{load_id: {slot_index: kw}}``; kW x slot hours is booked on
+    ``load_kwh`` and, for a load with a phase_map, split evenly over its phases.
+    """
+    for lid, by_slot in cyclic_plan.items():
+        phs = cyclic_phases.get(lid) or []
+        for t, kw in by_slot.items():
+            if 0 <= t < len(slots):
+                sl = slots[t]
+                e_kwh = kw * ((sl.end_time - sl.start_time).total_seconds() / 3600.0)
+                sl.load_kwh += e_kwh
+                if phs:
+                    known = dict(sl.phased_load_kwh or {})
+                    for ph in phs:
+                        known[ph] = known.get(ph, 0.0) + e_kwh / len(phs)
+                    sl.phased_load_kwh = known
+
+
+def merge_cyclic_into_schedule(
+    water_heaters: list[Any], cyclic_plan: dict[str, dict[int, float]]
+) -> list[dict[str, float]]:
+    """Per-slot ``water_heaters`` maps with every planned cyclic load written in.
+
+    Every load in ``cyclic_plan`` gets a value in EVERY slot (0.0 where off); a load
+    that is not in the plan stays absent — the executor's "absent = hands off,
+    explicit 0 = off" contract.
+    """
+    merged: list[dict[str, float]] = []
+    for pos, base in enumerate(water_heaters):
+        entry: dict[str, float] = dict(base) if isinstance(base, dict) else {}
+        for load_id, by_slot in cyclic_plan.items():
+            entry[load_id] = float(by_slot.get(pos, 0.0))
+        merged.append(entry)
+    return merged
+
+
 class PlannerPipeline:
     """
     Orchestrator for the modular planner pipeline.
@@ -819,12 +861,20 @@ class PlannerPipeline:
 
         ``states`` (from get_initial_state) carries per-load heated_today_kwh — measured,
         so a replan deducts what already ran instead of re-demanding the whole day —
-        and last_run_end, which anchors the max-gap rule at the last real run.
+        and last_run_end, which anchors the max-gap rule at the last real run. It also
+        carries ``control_paused`` and, for ``mode: window`` loads, their ``windows``.
         """
+        from backend.core.load_windows import (
+            MODE_DAILY,
+            MODE_WINDOW,
+            load_mode,
+            windows_from_iso,
+        )
         from planner.cyclic_preschedule import (
             CyclicSpec,
             PriceSlot,
             preschedule_cyclic_loads,
+            window_slot_kw,
         )
 
         by_id: dict[str, dict[str, Any]] = {
@@ -832,11 +882,57 @@ class PlannerPipeline:
         }
         raw = cast("list[dict[str, Any]]", config.get("cyclic_loads", []) or [])
         specs: list[CyclicSpec] = []
+        # mode: window loads (room heaters) — fixed load inside their windows, no
+        # daily need to place. See planner/cyclic_preschedule.py:window_slot_kw.
+        window_plan: dict[str, dict[int, float]] = {}
         for c in raw:
             if not isinstance(c, dict) or not c.get("id"):
                 continue
+            load_id = str(c["id"])
+            st = by_id.get(load_id, {})
+            # CONTROL PAUSE reaches the planner here, as it does for the tanks: the
+            # executor will not touch a paused load, so booking its energy reserves
+            # PV or import for a device that cannot draw. Left OUT of the plan
+            # entirely (absent = hands off), not written as an explicit 0.
+            if st.get("control_paused"):
+                logger.info(
+                    "Cyclic %s: control paused via %s — left out of the plan",
+                    load_id,
+                    st.get("control_paused_via"),
+                )
+                continue
+            mode = load_mode(c)
+            if mode == MODE_WINDOW:
+                if not c.get("enabled", True):
+                    continue
+                windows = windows_from_iso(st.get("windows"))
+                if windows is None:
+                    # Unknown (calendar unreadable, warned about where it was
+                    # read): book nothing and leave the load out of the schedule —
+                    # an explicit 0 would read as "off on purpose".
+                    continue
+                try:
+                    factor = float(c.get("planned_power_factor", 0.5))
+                except (TypeError, ValueError):
+                    factor = 0.5
+                kw = float(c.get("power_kw", 0.0) or 0.0) * min(1.0, max(0.0, factor))
+                if kw <= 0:
+                    logger.warning(
+                        "Window load %s: power_kw x planned_power_factor is 0 — "
+                        "left out of the plan",
+                        load_id,
+                    )
+                    continue
+                window_plan[load_id] = window_slot_kw(
+                    [(s.start_time, s.end_time) for s in slots], windows, kw
+                )
+                continue
+            if mode != MODE_DAILY:
+                logger.warning(
+                    "Cyclic %s: unknown mode %r — left out of the plan", load_id, c.get("mode")
+                )
+                continue
             gap = c.get("max_hours_between")
-            st = by_id.get(str(c["id"]), {})
             last_run_end: datetime | None = None
             raw_end = st.get("last_run_end")
             if raw_end:
@@ -844,7 +940,7 @@ class PlannerPipeline:
                     last_run_end = datetime.fromisoformat(str(raw_end).replace("Z", "+00:00"))
             specs.append(
                 CyclicSpec(
-                    id=str(c["id"]),
+                    id=load_id,
                     power_kw=float(c.get("power_kw", 0.0) or 0.0),
                     min_kwh_per_day=float(c.get("min_kwh_per_day", 0.0) or 0.0),
                     max_hours_between=float(gap) if gap is not None else None,
@@ -854,13 +950,15 @@ class PlannerPipeline:
                 )
             )
         if not specs:
-            return {}
+            return window_plan
         wh_cfg = cast("dict[str, Any]", config.get("water_heating", {}) or {})
-        return preschedule_cyclic_loads(
+        plan = preschedule_cyclic_loads(
             specs,
             [PriceSlot(s.start_time, float(s.import_price_sek_kwh)) for s in slots],
             defer_up_to_hours=float(wh_cfg.get("defer_up_to_hours", 0.0) or 0.0),
         )
+        plan.update(window_plan)
+        return plan
 
     def _apply_overrides(self, config: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
         """Apply configuration overrides recursively."""
@@ -1411,18 +1509,7 @@ class PlannerPipeline:
             for c in cast("list[Any]", active_config.get("cyclic_loads", []) or [])
             if isinstance(c, dict) and c.get("id")
         }
-        for lid, by_slot in cyclic_plan.items():
-            phs = cyclic_phases.get(lid) or []
-            for t, kw in by_slot.items():
-                if 0 <= t < len(kepler_input.slots):
-                    sl = kepler_input.slots[t]
-                    e_kwh = kw * ((sl.end_time - sl.start_time).total_seconds() / 3600.0)
-                    sl.load_kwh += e_kwh
-                    if phs:
-                        known = dict(sl.phased_load_kwh or {})
-                        for ph in phs:
-                            known[ph] = known.get(ph, 0.0) + e_kwh / len(phs)
-                        sl.phased_load_kwh = known
+        book_cyclic_fixed_load(kepler_input.slots, cyclic_plan, cyclic_phases)
         if cyclic_plan:
             logger.info(
                 "Cyclic loads pre-scheduled (fixed load, outside the MILP): %s",
@@ -2030,14 +2117,9 @@ class PlannerPipeline:
         # executor treats a missing key as "no plan for this load, hands off", and
         # an explicit 0.0 as "off on purpose". Both must be expressible.
         if cyclic_plan and "water_heaters" in final_df.columns:
-            merged: list[dict[str, float]] = []
-            for pos, (_idx, row) in enumerate(final_df.iterrows()):
-                base = row["water_heaters"]
-                entry: dict[str, float] = dict(base) if isinstance(base, dict) else {}
-                for load_id, by_slot in cyclic_plan.items():
-                    entry[load_id] = float(by_slot.get(pos, 0.0))
-                merged.append(entry)
-            final_df["water_heaters"] = merged
+            final_df["water_heaters"] = merge_cyclic_into_schedule(
+                list(final_df["water_heaters"]), cyclic_plan
+            )
 
         # 6. Manual Plan
         final_df = apply_manual_plan(final_df, active_config)

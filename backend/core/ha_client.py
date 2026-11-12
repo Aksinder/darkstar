@@ -24,6 +24,12 @@ from backend.core.ev_arrival import (
 )
 from backend.core.ev_presence import ev_is_home, haversine_km
 from backend.core.ha_timestamps import reading_timestamp
+from backend.core.load_windows import (
+    MODE_WINDOW,
+    load_mode,
+    plan_windows_for_load,
+    windows_to_iso,
+)
 from backend.health import set_load_forecast_status
 
 logger = logging.getLogger("darkstar.core.ha_client")
@@ -686,6 +692,29 @@ async def get_ha_bool_or_none(entity_id: str) -> bool | None:
     return raw in _TRUE_STATES
 
 
+async def _control_paused_via(entities: Any) -> str | None:
+    """The first control-pause entity that reads ``on``, else None.
+
+    The planner-side twin of the executor's control_pause_entity, with the same
+    fail-safe direction: an unreadable helper is NOT a pause, or one HA hiccup would
+    silently drop a device out of the plan.
+    """
+    for ent_any in cast("list[Any]", entities or []):
+        ent = str(ent_any or "")
+        if not ent:
+            continue
+        try:
+            raw = await get_ha_entity_state(ent)
+        except Exception as exc:
+            logger.warning(
+                "control_pause read failed for %s (%s) - treating as NOT paused", ent, exc
+            )
+            continue
+        if raw and str(raw.get("state", "")).strip().lower() == "on":
+            return ent
+    return None
+
+
 async def get_ha_bool(entity_id: str) -> bool:
     """Return True if entity is 'on', 'true', 'armed', etc."""
     state = await get_ha_entity_state(entity_id)
@@ -748,9 +777,12 @@ async def get_water_heated_today_by_tank(config: dict[str, Any]) -> dict[str, fl
         # per-slot energy under their id, and the pre-scheduler deducts it from
         # today's need exactly as kepler does for a tank. Same clamp, same
         # zero-on-uncertainty direction (over-run a filter, never under-run it).
+        # mode: window loads (room heaters) have no daily need to credit against.
         water_heaters = water_heaters + [
             c for c in (config.get("cyclic_loads", []) or [])
-            if isinstance(c, dict) and c.get("enabled", True)
+            if isinstance(c, dict)
+            and c.get("enabled", True)
+            and load_mode(c) != MODE_WINDOW
         ]
         if not water_heaters:
             return {}
@@ -1076,6 +1108,30 @@ async def get_initial_state(
         for st in water_heater_states:
             if st.get("id") == cid:
                 entry_c["heated_today_kwh"] = float(st.get("heated_today_kwh", 0.0) or 0.0)
+        # Control pause reaches the planner for cyclic loads too (it used to be read
+        # for the tanks only, so a paused pump or heater was still booked as fixed
+        # load). Same fail-safe direction: only a definite "on" pauses.
+        paused_via_c = await _control_paused_via(cyclic.get("control_pause_entities"))
+        if paused_via_c is not None:
+            entry_c["control_paused"] = True
+            entry_c["control_paused_via"] = paused_via_c
+            cyclic_load_states.append(entry_c)
+            continue
+        if load_mode(cyclic) == MODE_WINDOW:
+            # A room heater: ON while a window (calendar event) is active. No gap
+            # anchor to read — hand the planner the windows of its horizon instead.
+            # None = unknown, and the planner then books nothing for it.
+            try:
+                tz_w = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+                found_w = await plan_windows_for_load(
+                    cyclic, datetime.now(tz_w), tz_w, get_state=get_ha_entity_state
+                )
+            except Exception as exc:
+                logger.warning("window load %s: window read failed (%s)", cid, exc)
+                found_w = None
+            entry_c["windows"] = None if found_w is None else windows_to_iso(found_w)
+            cyclic_load_states.append(entry_c)
+            continue
         try:
             raw = await get_ha_entity_state(str(sw))
             if raw:

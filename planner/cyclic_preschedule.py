@@ -159,3 +159,44 @@ def preschedule_cyclic_loads(
             i: spec.power_kw for h in chosen for i in hour_slots[h]
         }
     return out
+
+
+def window_slot_kw(
+    slot_bounds: list[tuple[datetime, datetime]],
+    windows: list[tuple[datetime, datetime]],
+    power_kw: float,
+) -> dict[int, float]:
+    """Fixed load of a ``mode: window`` load (a room heater): ``{slot_index: kw}``.
+
+    Such a load has no daily need to place — it is simply ON while one of its
+    windows (calendar events) is active — so there is nothing to optimise: every
+    slot overlapping a window carries ``power_kw``, pro-rated by the share of the
+    slot the window covers (the slot's AVERAGE kW, so kW x slot hours is the energy
+    booked). Slots outside every window are absent from the result; the pipeline
+    writes them as an explicit 0.0.
+
+    ``windows`` must be timezone-aware. Slots may be aware or naive, as in
+    :func:`preschedule_cyclic_loads`.
+    """
+    out: dict[int, float] = {}
+    if power_kw <= 0 or not slot_bounds or not windows:
+        return out
+    reference = slot_bounds[0][0]
+    spans: list[tuple[datetime, datetime]] = []
+    for w_start, w_end in windows:
+        a = _as_naive_like(w_start, reference)
+        b = _as_naive_like(w_end, reference)
+        if a is not None and b is not None and b > a:
+            spans.append((a, b))
+    for i, (s_start, s_end) in enumerate(slot_bounds):
+        length = (s_end - s_start).total_seconds()
+        if length <= 0:
+            continue
+        covered = 0.0
+        for a, b in spans:
+            overlap = (min(b, s_end) - max(a, s_start)).total_seconds()
+            if overlap > 0:
+                covered += overlap
+        if covered > 0:
+            out[i] = power_kw * min(1.0, covered / length)
+    return out
