@@ -1060,6 +1060,22 @@ forecasting:
     max_soc_percent: 98.0              # slots with battery ≥ this may be PV-throttled: ignored
                                        # (slots with a negative OR unknown export price are
                                        # ignored too: export curtailment may have clamped PV)
+  training_data_cleaning_enabled: true # true (default): PV and load training, and the 7-day slot
+                                       # means below, skip slots the recorder flagged as not
+                                       # measured (pv_unmeasured, water_unmeasured, ev_unmeasured,
+                                       # base_load_clamped, load_spike_zeroed). A device whose
+                                       # sensor is "unavailable" for 24 h or more without a break
+                                       # counts as switched off, and its rows are kept.
+                                       # false: kill switch — train on every row, as before the
+                                       # cleaning existed. Takes effect at the next retrain /
+                                       # forecast run.
+  load_slot_mean_fallback_enabled: true
+                                       # true (default): when the load model is missing or fails
+                                       # to predict, store the 7-day per-slot mean of recorded base
+                                       # load; only times of day without enough data fall through
+                                       # to the HA profile (then the flat demo profile).
+                                       # false: kill switch — store 0.0 as before, so the planner
+                                       # goes straight to the HA profile / demo profile.
   load_blend_slot_mean_weight: 0.0     # 0 = off (stored load forecast = pure model output).
                                        # >0 (0..1): blend the model with the mean RECORDED base
                                        # load of the same quarter-hour over the last 7 days:

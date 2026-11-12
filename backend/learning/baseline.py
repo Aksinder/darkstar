@@ -27,6 +27,7 @@ MIN_SLOT_MEAN_OBSERVATIONS = 3
 
 
 LOAD_BLEND_WEIGHT_KEY = "load_blend_slot_mean_weight"
+_warned_blend_weights: set[str] = set()
 
 
 def load_blend_weight_issue(raw: Any) -> str | None:
@@ -56,7 +57,12 @@ def resolve_load_blend_weight(config: dict[str, Any]) -> float:
     raw: Any = forecasting_cfg.get(LOAD_BLEND_WEIGHT_KEY)
     issue = load_blend_weight_issue(raw)
     if issue is not None:
-        logger.warning("Ignoring forecasting.%s: %s; blend disabled", LOAD_BLEND_WEIGHT_KEY, issue)
+        # Read on every forecast run: warn once per distinct bad value, not per run.
+        if repr(raw) not in _warned_blend_weights:
+            _warned_blend_weights.add(repr(raw))
+            logger.warning(
+                "Ignoring forecasting.%s: %s; blend disabled", LOAD_BLEND_WEIGHT_KEY, issue
+            )
         return 0.0
     return float(raw) if raw is not None else 0.0
 
@@ -126,7 +132,9 @@ def time_of_day_key(ts: datetime) -> str:
 
 
 def load_slot_means(
-    rows: list[dict[str, Any]], min_observations: int = MIN_SLOT_MEAN_OBSERVATIONS
+    rows: list[dict[str, Any]],
+    min_observations: int = MIN_SLOT_MEAN_OBSERVATIONS,
+    apply_cleaning: bool = True,
 ) -> dict[str, float]:
     """Mean observed BASE load per time-of-day ("HH:MM") from observation rows.
 
@@ -135,21 +143,30 @@ def load_slot_means(
     (> 0.001 kWh, the trainer's own filter) that the recorder did not flag as
     unmeasured for the load target (ml/cleaning.py) are averaged, and a time-of-day
     with fewer than ``min_observations`` such slots gets no value.
+
+    The flag rules are the trainer's, including its offline-device exemption and its
+    starvation guard: if they would remove more than half of the week, the unfiltered
+    rows are averaged instead (with a warning) rather than leaving no mean at all.
+    ``apply_cleaning=False`` (forecasting.training_data_cleaning_enabled: false)
+    skips the flag rules.
     """
     if not rows:
         return {}
     import pandas as pd
 
-    from ml.cleaning import bad_row_mask
+    from ml.cleaning import clean_training_rows
 
     frame = pd.DataFrame(rows)
     if "load_kwh" not in frame.columns or "slot_start" not in frame.columns:
         return {}
     frame["load_kwh"] = pd.to_numeric(frame["load_kwh"], errors="coerce")
+    if apply_cleaning:
+        # On the whole window (before the load filter) so device outages are judged
+        # on every slot that was recorded.
+        frame, _ = clean_training_rows(frame, "load", log=logger.debug)
     frame = frame[frame["load_kwh"] > 0.001]
     if frame.empty:
         return {}
-    frame = frame[~bad_row_mask(frame, "load")]
 
     buckets: dict[str, list[float]] = {}
     for slot_start, load_kwh in zip(frame["slot_start"], frame["load_kwh"], strict=True):
@@ -163,7 +180,9 @@ def load_slot_means(
     }
 
 
-async def get_load_slot_means_7d(store: LearningStore, before: datetime) -> dict[str, float]:
+async def get_load_slot_means_7d(
+    store: LearningStore, before: datetime, apply_cleaning: bool = True
+) -> dict[str, float]:
     """load_slot_means() over the 7 days of observations before ``before``.
 
     Never raises: any failure yields {} so callers fall through to their next tier.
@@ -172,7 +191,7 @@ async def get_load_slot_means_7d(store: LearningStore, before: datetime) -> dict
         history = await store.get_observation_rows_between(
             (before - timedelta(days=7)).isoformat(), before.isoformat()
         )
-        return load_slot_means(history)
+        return load_slot_means(history, apply_cleaning=apply_cleaning)
     except Exception as exc:
         logger.warning("7-day load slot means unavailable: %s", exc)
         return {}

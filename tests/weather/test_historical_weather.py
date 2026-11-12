@@ -43,6 +43,7 @@ CONFIG: dict[str, Any] = {
 @pytest.fixture(autouse=True)
 def _clear_cache():
     weather_mod._weather_cache.clear()
+    forward_mod._warned_pv_source_mismatch.clear()
     yield
     weather_mod._weather_cache.clear()
 
@@ -382,6 +383,26 @@ def test_inference_warns_on_weather_source_mismatch(
 
     assert mismatch is expect_warning
     assert ("trained on weather source" in caplog.text) is expect_warning
+
+
+def test_mismatch_is_logged_once_per_process_not_per_forecast_run(tmp_path, caplog):
+    _write_sidecar(tmp_path, {"feature_names": ["hour"]})
+    cfg = {"forecasting": {"pv_training_weather_source": PV_WEATHER_SOURCE_HISTORICAL}}
+
+    with caplog.at_level(logging.WARNING, logger="darkstar.ml.forward"):
+        results = [
+            forward_mod.warn_on_pv_weather_source_mismatch(cfg, str(tmp_path)) for _ in range(5)
+        ]
+        assert results == [True] * 5  # still reported to the caller every time
+        assert caplog.text.count("trained on weather source") == 1
+
+        # a different pair (model retrained on the archive, config reverted) logs again
+        _write_sidecar(
+            tmp_path, {"feature_names": ["hour"], "weather_source": "historical_forecast"}
+        )
+        forward_mod.warn_on_pv_weather_source_mismatch({}, str(tmp_path))
+        forward_mod.warn_on_pv_weather_source_mismatch({}, str(tmp_path))
+        assert caplog.text.count("trained on weather source") == 2
 
 
 def test_no_pv_model_no_warning(tmp_path, caplog):

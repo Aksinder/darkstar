@@ -189,7 +189,12 @@ async def test_missing_model_uses_db_slot_means_before_ha_profile(caplog):
     assert all(f["load_forecast_kwh"] > 0.001 for f in forecasts)
 
     status = health.get_load_forecast_status()
-    assert status == {"status": "degraded", "reason": "no_ml", "tier": "slot_mean_7d"}
+    assert status == {
+        "status": "degraded",
+        "reason": "no_ml",
+        "tier": "slot_mean_7d",
+        "detail": "",
+    }
     assert "Load forecast source: slot_mean_7d (8/8 slots" in caplog.text
 
 
@@ -225,8 +230,117 @@ async def test_model_that_fails_to_predict_falls_back_instead_of_aborting(caplog
     assert [f["load_forecast_kwh"] for f in forecasts] == pytest.approx(expected)
     # no half-applied model output: the bands come from the fallback too
     assert [f["load_p10"] for f in forecasts] == pytest.approx([0.7 * v for v in expected])
-    assert "Load model inference failed" in caplog.text
-    assert health.get_load_forecast_status()["tier"] == "slot_mean_7d"
+    assert "Load model inference failed (ValueError: feature count mismatch)" in caplog.text
+    assert "Load models failed to predict" in caplog.text
+    status = health.get_load_forecast_status()
+    assert status["tier"] == "slot_mean_7d"
+    # not reported as "models not trained": the reason and the exception class are kept
+    assert status["reason"] == "predict_failed"
+    assert status["detail"] == "ValueError: feature count mismatch"
+    checker = health.HealthChecker.__new__(health.HealthChecker)
+    (issue,) = checker.check_load_forecast()
+    assert issue.message == (
+        "Load forecast model failed to predict (ValueError: feature count mismatch)"
+    )
+    assert "not trained" not in issue.guidance
+    assert "7-day per-slot mean of recorded load" in issue.guidance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+async def test_non_finite_model_output_is_a_predict_failure_not_a_healthy_001(bad_value, caplog):
+    """NaN used to pass the guardrails as 0.01 kWh with status ok / tier model."""
+    models = {**LOAD_MODELS, "load_p50": _Booster(bad_value)}
+    with caplog.at_level(logging.WARNING, logger="darkstar.ml.forward"):
+        forecasts = await _forward(_engine(_history(ALL_KEYS)), models)
+
+    expected = [0.2 + 0.1 * i for i in range(8)]
+    assert [f["load_forecast_kwh"] for f in forecasts] == pytest.approx(expected)
+    assert [f["load_p90"] for f in forecasts] == pytest.approx([1.3 * v for v in expected])
+    status = health.get_load_forecast_status()
+    assert status["status"] == "degraded" and status["reason"] == "predict_failed"
+    assert status["tier"] == "slot_mean_7d"
+    assert "load_p50 returned 8/8 non-finite values" in status["detail"]
+    assert "Load model inference failed (ValueError" in caplog.text
+
+
+# --- kill switch: forecasting.load_slot_mean_fallback_enabled ------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("models", [{}, {**LOAD_MODELS, "load_p50": _Booster(ValueError("x"))}])
+async def test_fallback_disabled_stores_zero_exactly_like_before(models, caplog):
+    engine = _engine(_history(ALL_KEYS))  # the DB HAS usable slot means
+    engine.config["forecasting"] = {"load_slot_mean_fallback_enabled": False}
+    with caplog.at_level(logging.WARNING, logger="darkstar.ml.forward"):
+        forecasts = await _forward(engine, models)
+
+    no_history = await _forward(_engine([]), {})  # == the pre-change output
+    assert [{k: f[k] for k in f if k.startswith(("load", "base_load"))} for f in forecasts] == [
+        {k: f[k] for k in f if k.startswith(("load", "base_load"))} for f in no_history
+    ]
+    for f in forecasts:
+        assert f["load_forecast_kwh"] == 0.0 and f["load_p10"] == 0.0 and f["load_p90"] == 0.0
+    engine.store.get_observation_rows_between.assert_not_awaited()
+    assert "7-day slot-mean fallback is DISABLED" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fallback_disabled_reports_ha_profile_tier():
+    engine = _engine(_history(ALL_KEYS))
+    engine.config["forecasting"] = {"load_slot_mean_fallback_enabled": "false"}
+    await _forward(engine, {})
+    assert health.get_load_forecast_status()["tier"] == "ha_profile"
+
+
+# --- flags in the slot-mean path -----------------------------------------------------
+
+
+def test_slot_means_survive_a_week_of_an_offline_device():
+    """Winterised heater 'unavailable' on every slot: the base load is still right."""
+    offline = json.dumps({"water_unmeasured": {"spa": "unavailable"}})
+    rows = [
+        {
+            "slot_start": (FIXED_NOW - timedelta(days=7) + timedelta(minutes=15 * i)).isoformat(),
+            "load_kwh": 0.4,
+            "quality_flags": offline,
+        }
+        for i in range(7 * 96)
+    ]
+    means = load_slot_means(rows)
+    assert len(means) == 96 and all(v == pytest.approx(0.4) for v in means.values())
+
+
+def test_slot_means_drop_a_short_gap_but_not_the_rest():
+    gap = json.dumps({"ev_unmeasured": {"easee": "unavailable"}})
+    rows = _history({"12:00": 0.4, "12:15": 0.4})
+    for row in rows:
+        if row["slot_start"].endswith("12:15:00+00:00"):
+            continue
+        row["quality_flags"] = gap  # 12:00 flagged on all 7 days: 7 isolated slots
+    assert load_slot_means(rows) == {"12:15": pytest.approx(0.4)}
+
+
+def test_slot_means_have_the_starvation_guard(caplog):
+    """A whole week flagged by a NON-device rule must not leave zero means."""
+    rows = _history({"12:00": 0.4, "12:15": 0.6}, flags=json.dumps({"base_load_clamped": True}))
+    with caplog.at_level(logging.WARNING, logger="darkstar.ml.cleaning"):
+        means = load_slot_means(rows)
+    assert means == {"12:00": pytest.approx(0.4), "12:15": pytest.approx(0.6)}
+    assert "starvation guard" in caplog.text
+
+
+def test_slot_means_without_cleaning_average_flagged_rows_too():
+    rows = _history({"12:00": 0.4})
+    rows.append(
+        {
+            "slot_start": rows[0]["slot_start"],
+            "load_kwh": 1.2,
+            "quality_flags": json.dumps({"ev_unmeasured": {"easee": "snapshot"}}),
+        }
+    )
+    assert load_slot_means(rows)["12:00"] == pytest.approx(0.4)
+    assert load_slot_means(rows, apply_cleaning=False)["12:00"] == pytest.approx(0.5)
 
 
 def test_health_issue_names_the_tier_in_use():

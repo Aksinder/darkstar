@@ -22,11 +22,19 @@ never plans for less than floor % of the forecast.
 Usage:
     compare_load_forecasts.py --db data/planner_learning.db
         [--config config.yaml] [--days 60] [--floor 117] [--weights 0.2,0.4,0.6,0.8]
-        [--timezone Europe/Stockholm]
+        [--timezone Europe/Stockholm] [--immutable]
 
-The DB is opened READ-ONLY (mode=ro); nothing is written anywhere.
+The DB is opened read-only (mode=ro) and closed again; its contents are never
+modified and no other file is written by this script. But mode=ro on a WAL-mode
+database still makes SQLite create -shm/-wal files beside it. To avoid even that, run
+against a COPY of the DB with --immutable (never use --immutable on the live DB).
 
 Limits:
+  - 'aurora' rows are whatever the forecaster STORED, which is not always the pure
+    model: while the load model was unusable they hold the 7-day slot mean (fallback
+    tier), and once load_blend_slot_mean_weight is > 0 they hold the BLENDED value. So
+    run this BEFORE enabling the blend; afterwards "aurora" already contains the slot
+    mean and the "blend w" columns blend it a second time.
   - 'aurora' rows are the LAST forecast stored for a slot (minutes old), not the
     day-ahead one the plan was built on; real planning error is larger.
   - slot_mean is recomputed per calendar day, the live blend per forecast run.
@@ -39,6 +47,7 @@ Limits:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sqlite3
 import sys
 from datetime import timedelta
@@ -56,9 +65,18 @@ from ml.cleaning import DERIVED_LOAD_FLAG_KEYS, bad_row_mask, flag_mask
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
-def open_readonly(db_path: str) -> sqlite3.Connection:
-    """Open the learning DB so that no statement can modify it."""
+def open_readonly(db_path: str, immutable: bool = False) -> sqlite3.Connection:
+    """Open the learning DB so that no statement can modify its contents.
+
+    mode=ro forbids every write to the database, but on a WAL-mode database SQLite
+    still creates (and may leave) ``-shm``/``-wal`` files beside it. ``immutable``
+    adds immutable=1: no locks, no sidecar files at all. That is only safe on a COPY
+    nobody else writes to — on the live DB it can return inconsistent data — and it
+    ignores an un-checkpointed ``-wal`` file. The caller must close the connection.
+    """
     uri = f"file:{Path(db_path).resolve()}?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
     return sqlite3.connect(uri, uri=True, timeout=30.0)
 
 
@@ -67,9 +85,11 @@ def _to_local(series: pd.Series, tz: str) -> pd.Series:
     return parsed.dt.tz_convert(tz)
 
 
-def load_frames(db_path: str, tz: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_frames(
+    db_path: str, tz: str, immutable: bool = False
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (observations, forecasts-wide) with tz-aware local slot_start."""
-    with open_readonly(db_path) as conn:
+    with contextlib.closing(open_readonly(db_path, immutable)) as conn:
         obs = pd.read_sql_query(
             "SELECT slot_start, load_kwh, quality_flags FROM slot_observations", conn
         )
@@ -226,6 +246,12 @@ def bucket_table(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--db", required=True, help="Path to the learning SQLite DB (read-only)")
+    parser.add_argument(
+        "--immutable",
+        action="store_true",
+        help="Open with immutable=1 (no -shm/-wal files created beside the DB). ONLY for "
+        "a COPY of the database that nothing else is writing to; never the live DB.",
+    )
     parser.add_argument("--config", default=None, help="Optional config for timezone and floor")
     parser.add_argument("--days", type=int, default=60, help="Score the last N days (0 = all)")
     parser.add_argument(
@@ -251,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     if any(not 0.0 <= w <= 1.0 for w in weights):
         parser.error("--weights must be between 0 and 1")
 
-    obs, forecasts = load_frames(args.db, tz)
+    obs, forecasts = load_frames(args.db, tz, args.immutable)
     frame, variants, counts = build_comparison(obs, forecasts, weights)
     if args.days > 0 and not frame.empty:
         frame = frame[frame["slot_start"] >= frame["slot_start"].max() - timedelta(days=args.days)]
@@ -265,6 +291,11 @@ def main(argv: list[str] | None = None) -> int:
         f"{frame['slot_start'].max():%Y-%m-%d} ({len(frame)} slots, timezone {tz})"
     )
     print("Row counts: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    print(
+        "NOTE: 'aurora' is the stored forecast, not always the pure model: it holds the "
+        "7-day slot mean\nfor periods without a usable load model, and the blended value "
+        "once the blend is enabled."
+    )
     print("\nUnits: kWh per 15-min slot. bias = forecast - actual (negative = under-forecast).")
     print(
         "under% = share of slots forecast below the recorded load. "
