@@ -270,6 +270,93 @@ class TestRescueSubtractsCyclic:
         assert record["cyclic_kwh"] == 0.0
 
 
+HEATER = {
+    "id": "kim_heater",
+    "enabled": True,
+    "mode": "window",
+    "switch_entity": "switch.kims_uttag",
+    "power_sensor": "sensor.kims_uttag_power",
+    "power_kw": 1.0,
+    "window_entities": ["calendar.kim"],
+}
+
+
+class TestWindowModeLoadIsMeteredLikeAnyCyclicLoad:
+    """A room heater (cyclic load, mode: window) has no daily kWh need. Its energy is
+    still metered from its plug, recorded under its id and taken out of base load."""
+
+    @pytest.mark.asyncio
+    async def test_energy_is_recorded_per_device_and_subtracted(self):
+        """The radiator's thermostat cycles it: 900 W for 10 of 15 minutes."""
+        config = _base_config(cyclic_loads=[HEATER])
+        record = await _run(
+            config,
+            pv_delta=1.25,
+            load_delta=3.0,
+            history={"sensor.kims_uttag_power": _states((0, 900), (10, 0))},
+        )
+        assert record["water_heater_energy"] == {"kim_heater": pytest.approx(0.15)}
+        assert record["cyclic_kwh"] == pytest.approx(0.15)
+        assert record["load_kwh"] == pytest.approx(2.85)
+        assert record["water_kwh"] == 0.0  # not hot water
+
+    @pytest.mark.asyncio
+    async def test_rescued_rows_subtract_it_too(self):
+        config = _base_config(cyclic_loads=[HEATER])
+        hist = {"sensor.kims_uttag_power": _states((0, 900), (10, 0))}
+        record = await _run(config, pv_delta=1.25, load_delta=0.0, history=hist)
+        assert "load_rescued" in _flags(record)
+        assert record["load_kwh"] + record["cyclic_kwh"] == pytest.approx(3.0, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_an_idle_radiator_records_a_measured_zero(self):
+        config = _base_config(cyclic_loads=[HEATER])
+        record = await _run(
+            config,
+            pv_delta=1.25,
+            load_delta=3.0,
+            history={"sensor.kims_uttag_power": _states((0, 0))},
+        )
+        assert record["water_heater_energy"] == {"kim_heater": 0.0}
+        assert record["cyclic_kwh"] == 0.0
+        assert record["load_kwh"] == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "history",
+        [
+            {},  # HA has no history for the plug at all
+            {"sensor.kims_uttag_power": _states((0, "unavailable"))},
+            {"sensor.kims_uttag_power": _states((0, "unknown"), (7, "unavailable"))},
+        ],
+    )
+    async def test_an_unavailable_plug_creates_no_phantom_energy(self, history):
+        """No numeric sample in the slot: nothing is recorded for the heater and
+        nothing leaves base load — and, unlike a tank, there is no nameplate or
+        snapshot fallback that could invent a draw (a live 1 kW snapshot is on offer
+        here and must be ignored)."""
+        config = _base_config(cyclic_loads=[HEATER])
+        record = await _run(
+            config,
+            pv_delta=1.25,
+            load_delta=3.0,
+            history=history,
+            snapshots={"sensor.kims_uttag_power": 1.0},
+        )
+        assert record["water_heater_energy"] is None
+        assert record["cyclic_kwh"] == 0.0
+        assert record["load_kwh"] == pytest.approx(3.0)
+
+    def test_a_plug_that_drops_out_mid_slot_carries_its_last_reading_to_the_slot_end(self):
+        """The one place an unavailable sensor still books energy, on purpose: the
+        last numeric value stands in until the slot ends (at most 15 min). The next
+        slot has no numeric sample at all and records nothing (test above)."""
+        states = _states((0, 900), (5, "unavailable"))
+        assert integrate_power_history_kwh(states, START, END) == pytest.approx(0.225)
+        nxt = _states((0, "unavailable"))
+        assert integrate_power_history_kwh(nxt, START, END) is None
+
+
 SPA = {"id": "spa", "enabled": True, "sensor": "sensor.spa_power"}
 
 

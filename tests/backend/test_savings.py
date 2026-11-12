@@ -365,6 +365,18 @@ def test_cyclic_load_ids_from_config():
     assert cyclic_load_ids({}) == set()
 
 
+def test_window_mode_load_is_a_cyclic_load_for_the_add_back():
+    """A room heater (mode: window, no daily kWh need) is recorded and subtracted
+    like a pump, so its energy must be added back to the whole-house load too."""
+    cfg = {"cyclic_loads": [{"id": "kim_heater", "mode": "window", "power_kw": 1.0}]}
+    assert cyclic_load_ids(cfg) == {"kim_heater"}
+    rows = [_legacy("2026-11-13T15:00:00+01:00")]
+    devices = [{"slot_start": "2026-11-13T15:00:00+01:00", "device_id": "kim_heater", "kwh": 0.15}]
+    attach_cyclic_kwh(rows, devices, cyclic_load_ids(cfg))
+    assert rows[0]["cyclic_kwh"] == pytest.approx(0.15)
+    assert house_kwh(rows[0]) == pytest.approx(0.65)
+
+
 def _legacy(slot: str, flags: str | None = None, cyclic=None) -> dict:
     return {"slot_start": slot, "load_kwh": 0.5, "quality_flags": flags, "cyclic_kwh": cyclic}
 

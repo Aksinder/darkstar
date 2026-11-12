@@ -274,3 +274,12 @@ async def test_repair_applies_heater_idle_cutoff_and_cyclic(monkeypatch):
     # load = (4.0 + 0.8 - 0.4) / 4 per slot; the 0.04 kW spa standby stays in it.
     assert (written["load_kwh"] - 1.1).abs().max() < 1e-6
     assert (written["water_kwh"]).abs().max() < 1e-9
+
+    # A room heater (cyclic load, mode: window, no daily need) leaves base load the
+    # same way: 0.2 kW mean over the hour on top of the pump.
+    cfg["cyclic_loads"].append(
+        {"id": "kim_heater", "mode": "window", "power_sensor": "sensor.pool_power"}
+    )
+    await repair_observations(cfg, start, end, dry_run=False)
+    assert (engine.store.written["load_kwh"] - 1.0).abs().max() < 1e-6
+    assert (engine.store.written["cyclic_kwh"] - 0.2).abs().max() < 1e-6
