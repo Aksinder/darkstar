@@ -1,3 +1,7 @@
+## dev-20261112.2231 — 2026-11-12 22:33
+
+- fix(heaters): a price-driven off is never held; heat first; slot price
+
 ## dev-20261112.1915 — 2026-11-12 19:17
 
 - fix(planner): bound the dump count, stricter dump retention, no symlinks in the dump API
