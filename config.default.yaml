@@ -1129,6 +1129,9 @@ kepler:
   #   time_limit_s: 240
   #   gap_rel: 0.01
   #   highs_options: {}
+  #   dump_all_instances: 0     # keep the newest N SUCCESSFUL solve instances as
+  #                             # data/solver_dumps/kepler_ok_*.json (failures are always
+  #                             # dumped as kepler_fail_*). Fetch: GET /api/debug/solver_dumps
 
   # Battery-only FALLBACK planner (planner/plan_guard.py). When Kepler fails
   # (SOLVER_TIMEOUT incl. the comfort-floor tripwire reject, infeasible, undefined) or

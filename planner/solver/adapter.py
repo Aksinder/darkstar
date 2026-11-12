@@ -1056,6 +1056,16 @@ def parse_pv_charge_efficiency(raw: Any) -> float | None:
     return value
 
 
+def _non_negative_int(raw: Any) -> int:
+    """Count-style config value -> int >= 0; unset, bool or garbage means 0 (off)."""
+    if raw is None or isinstance(raw, bool):
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def config_to_kepler_config(
     planner_config: dict[str, Any],
     overrides: dict[str, Any] | None = None,
@@ -1253,6 +1263,9 @@ def config_to_kepler_config(
         ),
         solver_highs_options=(
             (planner_config.get("kepler", {}).get("solver") or {}).get("highs_options") or None
+        ),
+        solver_dump_all_instances=_non_negative_int(
+            (planner_config.get("kepler", {}).get("solver") or {}).get("dump_all_instances")
         ),
         export_threshold_sek_per_kwh=get_val("export_threshold_sek_per_kwh", 0.0),
         # Per-device water heater inputs

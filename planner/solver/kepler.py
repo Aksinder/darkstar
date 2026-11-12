@@ -9,6 +9,7 @@ import logging
 import os
 from collections import defaultdict
 from datetime import timedelta  # Rev WH2
+from pathlib import Path
 from typing import Any
 
 import pulp  # type: ignore[import,no-redef]
@@ -185,8 +186,19 @@ def _phase_fraction_items(
     return [str(k).strip().upper() for k in fractions], vals
 
 
+def solver_dump_dir() -> Path:
+    """Directory holding solver instance dumps (failed solves and opt-in OK ones)."""
+    # Env-overridable so the test suite (whose solver tests intentionally fail
+    # solves) never writes into — or evicts real incident dumps from — the
+    # production data/ directory. tests/planner/conftest.py points this at tmp.
+    return Path(os.environ.get("DARKSTAR_SOLVER_DUMP_DIR", "data/solver_dumps"))
+
+
 # Keep only this many failed-solve dumps; each is a few hundred KB.
 _SOLVER_DUMP_KEEP = 5
+# Filename prefixes: failed solves, and successful ones (kepler.solver.dump_all_instances).
+_DUMP_PREFIX_FAIL = "kepler_fail"
+_DUMP_PREFIX_OK = "kepler_ok"
 
 
 def _dump_failed_solve_instance(
@@ -200,6 +212,8 @@ def _dump_failed_solve_instance(
     solve_duration_s: float,
     chain_duration_s: float,
     extra: dict[str, Any] | None = None,
+    prefix: str = _DUMP_PREFIX_FAIL,
+    keep: int = _SOLVER_DUMP_KEEP,
 ) -> str | None:
     """Persist the exact solver input + outcome of a FAILED solve for offline replay.
 
@@ -209,19 +223,19 @@ def _dump_failed_solve_instance(
     offline distinguishes a no-incumbent timeout from a comfort-violating incumbent
     and validates any solver-tuning fix against the REAL instance. Best-effort —
     a dump failure must never mask the PlannerError being raised.
+
+    kepler.solver.dump_all_instances reuses it for SUCCESSFUL solves (prefix
+    kepler_ok, its own retention) so real instances can be collected for A/B
+    replays; the two prefixes never evict each other.
     """
     try:
         import dataclasses
         import json
         import time as _time
-        from pathlib import Path
 
-        # Env-overridable so the test suite (whose solver tests intentionally fail
-        # solves) never writes into — or evicts real incident dumps from — the
-        # production data/ directory. tests/planner/conftest.py points this at tmp.
-        dump_dir = Path(os.environ.get("DARKSTAR_SOLVER_DUMP_DIR", "data/solver_dumps"))
+        dump_dir = solver_dump_dir()
         dump_dir.mkdir(parents=True, exist_ok=True)
-        path = dump_dir / f"kepler_fail_{_time.strftime('%Y%m%dT%H%M%S')}.json"
+        path = dump_dir / f"{prefix}_{_time.strftime('%Y%m%dT%H%M%S')}.json"
         payload: dict[str, Any] = {
             "reason": reason,
             "status": status,
@@ -235,13 +249,16 @@ def _dump_failed_solve_instance(
             "input": dataclasses.asdict(input_data),
         }
         path.write_text(json.dumps(payload, default=str))
-        # Retention: newest _SOLVER_DUMP_KEEP only (name-sorted == time-sorted).
-        for old in sorted(dump_dir.glob("kepler_fail_*.json"))[:-_SOLVER_DUMP_KEEP]:
+        # Retention: newest `keep` only (name-sorted == time-sorted).
+        for old in sorted(dump_dir.glob(f"{prefix}_*.json"))[: -max(1, keep)]:
             old.unlink(missing_ok=True)
-        logger.warning("Failed solve instance persisted to %s for offline replay", path)
+        if prefix == _DUMP_PREFIX_FAIL:
+            logger.warning("Failed solve instance persisted to %s for offline replay", path)
+        else:
+            logger.info("Solve instance persisted to %s for offline replay", path)
         return str(path)
     except Exception as exc:
-        logger.warning("Could not persist failed solve instance: %s", exc)
+        logger.warning("Could not persist solve instance: %s", exc)
         return None
 
 
@@ -1979,8 +1996,15 @@ class KeplerSolver:
             )
 
         if not is_optimal:
-            prob.writeLP("kepler_debug.lp")  # type: ignore[reportUnknownMemberType]
-            print(f"Solver failed: {status}. LP written to kepler_debug.lp")
+            # Next to the dump directory (data/ in production), never the working
+            # directory (the repo root in tests and dev runs).
+            _debug_lp: Path = solver_dump_dir().parent / "kepler_debug.lp"
+            try:
+                _debug_lp.parent.mkdir(parents=True, exist_ok=True)
+                prob.writeLP(str(_debug_lp))  # type: ignore[reportUnknownMemberType]
+                logger.warning("Solver failed: %s. LP written to %s", str(status), _debug_lp)  # type: ignore[reportUnknownArgumentType]
+            except OSError as exc:
+                logger.warning("Solver failed: %s. Could not write debug LP: %s", str(status), exc)  # type: ignore[reportUnknownArgumentType]
 
             # Persist the exact failing instance BEFORE it is discarded with the
             # error, so it can be replayed offline (see _dump_failed_solve_instance).
@@ -2174,6 +2198,28 @@ class KeplerSolver:
                 objective_cost = float(_obj_val) if _obj_val is not None else None
             except (TypeError, ValueError):
                 objective_cost = None
+
+        # Opt-in instance collection (kepler.solver.dump_all_instances): keep the
+        # newest N SUCCESSFUL instances too, so formulation/solver changes can be
+        # A/B replayed on real data (failure dumps alone are the pathological tail).
+        if is_optimal and config.solver_dump_all_instances > 0:
+            _dump_failed_solve_instance(
+                input_data,
+                config,
+                reason="ok",
+                status=str(status),  # type: ignore[reportUnknownArgumentType]
+                sol_status=_sol_status,
+                used_solver=used_solver,
+                solve_duration_s=solve_duration,
+                chain_duration_s=total_duration,
+                extra={
+                    "var_count": var_count,
+                    "const_count": const_count,
+                    "objective_cost_sek": objective_cost,
+                },
+                prefix=_DUMP_PREFIX_OK,
+                keep=config.solver_dump_all_instances,
+            )
 
         return KeplerResult(
             slots=result_slots,

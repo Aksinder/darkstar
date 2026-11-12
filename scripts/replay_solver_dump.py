@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay a solver-failure dump from data/solver_dumps/ locally.
+"""Replay a solver dump from data/solver_dumps/ locally.
 
 The dump writer (planner/solver/kepler.py::_dump_failed_solve_instance) was built
 for exactly this — "persisted for offline replay" — but no reader existed until
@@ -13,6 +13,10 @@ Usage:
         [--solver highs|cbc|glpk] [--time-limit N] [--gap G] [--threads N]
         [--highs-opt key=val ...] [--mutate NAME[:ARG] ...]
         [--sweep] [--repeat K] [--seed N] [--json]
+
+Dumps: kepler_fail_*.json (every failed solve) and kepler_ok_*.json (successful
+solves, collected when kepler.solver.dump_all_instances > 0). Pull them off the
+box with GET /api/debug/solver_dumps and /api/debug/solver_dumps/<name>.
 
 Mutations: no_hourly_blocks | no_anchor | no_spacing | no_absorb_cap
            | truncate:H (drop slots beyond H hours)
@@ -314,6 +318,7 @@ def run_replay(path: Path, args: argparse.Namespace, label: str = "") -> dict[st
     dump = json.loads(path.read_text())
     ki = rehydrate_input(dump["input"])
     cfg = rehydrate_config(dump["config"])
+    cfg.solver_dump_all_instances = 0  # a replay is not a new instance to collect
     for m in args.mutate or []:
         name, _, marg = m.partition(":")
         ki, cfg = MUTATIONS[name](ki, cfg, marg or None)
@@ -328,8 +333,9 @@ def run_replay(path: Path, args: argparse.Namespace, label: str = "") -> dict[st
     }
     tmp = tempfile.mkdtemp(prefix="replay_")
     old_cwd = Path.cwd()
-    os.environ["DARKSTAR_SOLVER_DUMP_DIR"] = tmp  # never evict real incident dumps
-    os.chdir(tmp)  # kepler_debug.lp lands here, not in the repo
+    # Never evict real incident dumps; kepler_debug.lp lands next to this dir (in tmp).
+    os.environ["DARKSTAR_SOLVER_DUMP_DIR"] = str(Path(tmp) / "solver_dumps")
+    os.chdir(tmp)
     t0 = time.monotonic()
     try:
         with _solver_overrides(args):

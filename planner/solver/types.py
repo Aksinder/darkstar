@@ -422,6 +422,10 @@ class KeplerConfig:
     solver_time_limit_s: float = 0.0
     solver_gap_rel: float = 0.0
     solver_highs_options: dict[str, float | int | bool | str] | None = None
+    # kepler.solver.dump_all_instances: keep the newest N SUCCESSFUL solve instances
+    # in data/solver_dumps/ (kepler_ok_*.json, same format as the failure dumps) for
+    # offline A/B replay. 0 = off.
+    solver_dump_all_instances: int = 0
 
     def __post_init__(self):
         """Validate configuration after initialization."""
