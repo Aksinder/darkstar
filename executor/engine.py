@@ -1702,7 +1702,7 @@ class ExecutorEngine:
                 else:
                     battery_cfg = self._full_config.get("battery", {})
                     min_soc = float(battery_cfg.get("min_soc_percent", 10.0))
-                    boost_soc_target = max(round(state.current_soc_percent), int(min_soc))
+                    boost_soc_target = max(round(state.current_soc_percent), round(min_soc))
                 override = OverrideResult(
                     override_needed=True,
                     override_type=OverrideType.FORCE_HEAT,

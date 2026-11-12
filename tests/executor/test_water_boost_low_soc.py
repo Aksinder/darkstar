@@ -24,9 +24,9 @@ from tests.executor.test_control_pause import (  # noqa: F401  (fixtures)
 )
 
 
-def _engine_at_soc(temp_schedule, temp_db, soc: float):  # noqa: F811
+def _engine_at_soc(temp_schedule, temp_db, soc: float, min_soc: float = 12):  # noqa: F811
     engine = _build_engine(temp_schedule, temp_db, paused_on=set())
-    engine._full_config = {**engine._full_config, "battery": {"min_soc_percent": 12}}
+    engine._full_config = {**engine._full_config, "battery": {"min_soc_percent": min_soc}}
     engine.dispatcher._send_notification = AsyncMock()
     engine.dispatcher.notify_override = AsyncMock()
 
@@ -106,3 +106,13 @@ class TestWaterBoostNotCancelledBySoc:
         assert engine._water_boost_until is not None
         assert result["override"]["type"] == "force_heat"
         assert seen["decision"].soc_target == 12  # max(round(7.4), min_soc 12)
+
+    async def test_fractional_min_soc_is_rounded_not_truncated(self, temp_schedule, temp_db):  # noqa: F811
+        engine = _engine_at_soc(temp_schedule, temp_db, 7.4, min_soc=12.6)
+        engine._water_boost_until = datetime.now(TZ) + timedelta(minutes=30)
+        Path(temp_schedule).write_text(
+            json.dumps({"schedule": [], "meta": {}}), encoding="utf-8"
+        )
+        with _capture_decision() as seen:
+            await engine.run_once()
+        assert seen["decision"].soc_target == 13
