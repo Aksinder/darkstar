@@ -26,6 +26,41 @@ BASELINE_VERSION = "baseline_7_day_avg"
 MIN_SLOT_MEAN_OBSERVATIONS = 3
 
 
+LOAD_BLEND_WEIGHT_KEY = "load_blend_slot_mean_weight"
+
+
+def load_blend_weight_issue(raw: Any) -> str | None:
+    """Why ``raw`` is not a usable forecasting.load_blend_slot_mean_weight (None = fine)."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return "must be a number between 0 and 1, not true/false"
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return f"must be a number between 0 and 1, got {raw!r}"
+    if value != value or not 0.0 <= value <= 1.0:
+        return f"must be between 0 and 1 (0.6 = 60 % slot mean), got {raw!r}"
+    return None
+
+
+def resolve_load_blend_weight(config: dict[str, Any]) -> float:
+    """forecasting.load_blend_slot_mean_weight as a weight in [0, 1].
+
+    Share of the 7-day per-slot mean in the stored load forecast; the model gets the
+    rest. Unset/0 = off (pure model, the behaviour without this option). An invalid
+    or out-of-range value is NOT clamped — it is reported and treated as 0, because a
+    typo such as 40 must not silently turn the forecast into a pure trailing mean.
+    """
+    forecasting_cfg: dict[str, Any] = config.get("forecasting", {}) or {}
+    raw: Any = forecasting_cfg.get(LOAD_BLEND_WEIGHT_KEY)
+    issue = load_blend_weight_issue(raw)
+    if issue is not None:
+        logger.warning("Ignoring forecasting.%s: %s; blend disabled", LOAD_BLEND_WEIGHT_KEY, issue)
+        return 0.0
+    return float(raw) if raw is not None else 0.0
+
+
 def _time_of_day_key(iso_ts: str) -> str | None:
     try:
         dt = datetime.fromisoformat(iso_ts)

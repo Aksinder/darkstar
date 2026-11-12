@@ -32,7 +32,8 @@ _forecast_lock: threading.Lock = threading.Lock()
 _load_forecast_status: str = "ok"  # "ok", "degraded"
 _load_forecast_reason: str = ""  # "ml", "baseline", "demo", ""
 # Which source the STORED load forecast came from (set by ml/forward.py):
-# "model", "slot_mean_7d", "slot_mean_7d+ha_profile", "ha_profile", or "" (unknown).
+# "model", "model+slot_mean_7d" (opt-in blend), "slot_mean_7d",
+# "slot_mean_7d+ha_profile", "ha_profile", or "" (unknown).
 # "ha_profile" means 0.0 was stored and the planner substitutes the HA profile, or
 # the flat demo profile when that fetch fails too (reason "demo").
 _load_forecast_tier: str = ""

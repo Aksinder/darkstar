@@ -401,6 +401,47 @@ async def generate_forward_slots(
             set_load_forecast_tier("model")
             logger.info("Load forecast source: model")
 
+            # Opt-in blend toward the 7-day per-slot mean of recorded base load
+            # (forecasting.load_blend_slot_mean_weight, default 0 = this block is
+            # skipped and the model output is stored untouched). p10/p90 move by the
+            # same amount as p50, so the band keeps its width. A time-of-day without
+            # enough recorded data keeps the pure model value.
+            from backend.learning.baseline import (
+                get_load_slot_means_7d,
+                resolve_load_blend_weight,
+                time_of_day_key,
+            )
+
+            blend_weight = resolve_load_blend_weight(engine.config)
+            if blend_weight > 0.0 and "load_p50" in predictions and "load_p50" in models:
+                try:
+                    blend_means = await get_load_slot_means_7d(engine.store, slot_start)
+                except Exception as exc:
+                    logger.warning("7-day load slot means unavailable: %s", exc)
+                    blend_means = {}
+                slot_mean = pd.Series(
+                    [blend_means.get(time_of_day_key(ts)) for ts in df["slot_start"]],
+                    index=df.index,
+                    dtype="float64",
+                )
+                delta = (blend_weight * (slot_mean - predictions["load_p50"])).fillna(0.0)
+                for q in quantiles:
+                    if f"load_{q}" in models:
+                        predictions[f"load_{q}"] = (predictions[f"load_{q}"] + delta).clip(
+                            lower=0.01, upper=16.0
+                        )
+                blended = int(slot_mean.notna().sum())
+                set_load_forecast_tier("model+slot_mean_7d" if blended else "model")
+                logger.info(
+                    "Load forecast blend: %.0f%% 7-day slot mean / %.0f%% model on %d/%d slots "
+                    "(mean shift %+.3f kWh/slot)",
+                    blend_weight * 100,
+                    (1 - blend_weight) * 100,
+                    blended,
+                    len(df),
+                    float(delta.mean()),
+                )
+
     if not load_model_ok:
         # Fallback tiers, in order:
         #   1. the learning DB's 7-day per-slot mean of recorded base load (same
