@@ -47,6 +47,15 @@ CLAMP_WARN_INTERVAL_S = 3600.0
 # Cap on the HA error body kept in an HACallError (HA answers a refused service
 # call with a short JSON message; a proxy error page can be long).
 HA_ERROR_BODY_MAX_CHARS = 300
+# ...and on how long reading it may take. The body is a courtesy; a peer that sends
+# the status line and then stalls must not hold the write for its whole timeout.
+HA_ERROR_BODY_TIMEOUT_S = 1.0
+# A clamp is LOUD (one error notification per episode) when it is on the max side,
+# or moves the value by more than this fraction of the entity's range. Raising a 0
+# to a 10 W minimum is the quiet case the clamp exists for; writing 5000 where the
+# configuration asked for 9500 is a misconfiguration somebody has to hear about —
+# before the clamp it was an HTTP 400 and a "failed 3 ticks in a row" notice.
+CLAMP_MATERIAL_FRACTION = 0.01
 
 
 def _finite_float(raw: Any) -> float | None:
@@ -557,8 +566,13 @@ class HAClient:
                     status = getattr(response, "status", None)
                     if isinstance(status, int) and status >= 400:
                         with contextlib.suppress(Exception):
-                            text = await response.text()
+                            text = await asyncio.wait_for(
+                                response.text(), timeout=HA_ERROR_BODY_TIMEOUT_S
+                            )
                             if isinstance(text, str) and text.strip():
+                                # A proxy or debug page can echo the request headers.
+                                if self.token:
+                                    text = text.replace(self.token, "[redacted]")
                                 error_body[:] = [text.strip()[:HA_ERROR_BODY_MAX_CHARS]]
                     response.raise_for_status()
             finally:
@@ -777,6 +791,9 @@ class ActionDispatcher:
         self._water_commit_until: dict[str, float] = {}
         # Entity-range clamp warnings, rate limited per entity (monotonic seconds).
         self._clamp_log_at: dict[str, float] = {}
+        # Entities whose current run of out-of-range requests was already reported
+        # (loud clamps only); cleared by the first request that needs no loud clamp.
+        self._clamp_notified: set[str] = set()
 
     def water_claims_supply(self, entity_id: str | None) -> bool:
         """Has this heater been TOLD to draw, whatever it happens to be drawing now?
@@ -897,7 +914,9 @@ class ActionDispatcher:
             return getattr(decision, field_name)
         return value
 
-    def _clamp_to_entity(self, entity_id: str, value: Any) -> Any:
+    async def _clamp_to_entity(
+        self, entity_id: str, value: Any, *, track_episode: bool = True
+    ) -> Any:
         """Clamp a number write to the entity's min/max, if we know them.
 
         The attributes come from the state read every write path makes right before
@@ -906,6 +925,12 @@ class ActionDispatcher:
         use the result for the skip check, the write AND the read-back, so an
         entity limit shows up neither as a failed/unverified write nor as a rewrite
         every tick.
+
+        A min-side nudge is quiet (rate-limited log). A max-side clamp, or one that
+        moves the value materially, also sends ONE error notification per episode:
+        the write still succeeds, but the device is not doing what was configured.
+        ``track_episode`` False (the second, defensive clamp inside _write_entity,
+        which sees the already clamped value) leaves the episode state alone.
         """
         getter = getattr(self.ha, "cached_attributes", None)
         if not callable(getter):
@@ -919,7 +944,17 @@ class ActionDispatcher:
             return value
         clamped = _clamp_to_entity_range(value, attributes)
         if clamped is value:
+            if track_episode:
+                self._clamp_notified.discard(entity_id)
             return value
+        low = _finite_float(attributes.get("min"))
+        high = _finite_float(attributes.get("max"))
+        requested = cast("float", _finite_float(value))
+        span = high - low if low is not None and high is not None else None
+        loud = (high is not None and requested > high) or (
+            span is not None
+            and abs(float(clamped) - requested) > CLAMP_MATERIAL_FRACTION * span
+        )
         now = time.monotonic()
         last = self._clamp_log_at.get(entity_id)
         if last is None or now - last >= CLAMP_WARN_INTERVAL_S:
@@ -935,6 +970,21 @@ class ActionDispatcher:
             attributes.get("min"),
             attributes.get("max"),
         )
+        if not loud:
+            if track_episode:
+                self._clamp_notified.discard(entity_id)
+        elif entity_id not in self._clamp_notified:
+            self._clamp_notified.add(entity_id)
+            msg = (
+                f"{entity_id}: requested {value} is outside the entity's range "
+                f"(min {attributes.get('min')}, max {attributes.get('max')}) — wrote "
+                f"{clamped} instead. Check the configured limit against the entity."
+            )
+            logger.warning(msg)
+            try:
+                await self.notify_error(msg)
+            except Exception as e:
+                logger.warning("Clamp notification failed: %s", e)
         return clamped
 
     async def _write_entity(
@@ -960,7 +1010,7 @@ class ActionDispatcher:
         """
         try:
             if domain in NUMBER_DOMAINS:
-                value = self._clamp_to_entity(entity_id, value)
+                value = await self._clamp_to_entity(entity_id, value, track_episode=False)
                 return await self.ha.set_number(entity_id, float(value))
             elif domain == "select":
                 return await self.ha.set_select_option(entity_id, str(value))
@@ -1194,7 +1244,7 @@ class ActionDispatcher:
         # Clamp before the skip check so an entity already at its limit is not
         # rewritten every tick (attributes come from the read just above).
         if entity_def.domain in NUMBER_DOMAINS:
-            resolved_value = self._clamp_to_entity(entity_id, resolved_value)
+            resolved_value = await self._clamp_to_entity(entity_id, resolved_value)
 
         if self._values_match(previous_value, resolved_value):
             return ActionResult(
@@ -1665,10 +1715,14 @@ class ActionDispatcher:
         except (ValueError, TypeError):
             current_val = None
 
-        # Number helper: keep the target inside the helper's own min/max.
-        target = self._clamp_to_entity(entity, target)
+        # Number helper: keep the target inside the helper's own min/max. Whether
+        # this is a heat or an off command is decided by what was ASKED for.
+        requested_target = target
+        target = await self._clamp_to_entity(entity, target)
 
-        if current_val == target:
+        # _values_match as well: a fractional helper bound (max 62.5) never equals
+        # the truncated int, which would rewrite the same value every tick.
+        if current_val == target or self._values_match(current, target):
             return ActionResult(
                 action_type="water_temp",
                 success=True,
@@ -1719,7 +1773,7 @@ class ActionDispatcher:
         duration = int((time.time() - start) * 1000)
 
         # Determine if this is start or stop
-        is_heating = target > self.config.water_heater.temp_off
+        is_heating = requested_target > self.config.water_heater.temp_off
         action = "start" if is_heating else "stop"
         if success:
             await self._maybe_notify(f"water_heat_{action}", f"Water heater target: {target}°C")
@@ -1818,7 +1872,7 @@ class ActionDispatcher:
         current = await self.ha.get_state_value(entity)
 
         if domain in NUMBER_DOMAINS:
-            value = write_value = self._clamp_to_entity(entity, value)
+            value = write_value = await self._clamp_to_entity(entity, value)
 
         if self._values_match(current, value):
             return ActionResult(
@@ -2134,7 +2188,7 @@ class ActionDispatcher:
         except (ValueError, TypeError):
             current_val = None
 
-        watts = self._clamp_to_entity(entity, watts)
+        watts = await self._clamp_to_entity(entity, watts)
 
         if current_val is not None:
             change = abs(watts - current_val)
