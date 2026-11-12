@@ -33,6 +33,7 @@ import pytz
 
 # import yaml
 # Import existing HA config loader
+from backend.core.load_windows import MODE_WINDOW
 from backend.core.secrets import load_home_assistant_config
 from backend.loads.service import LoadDisaggregator
 
@@ -71,6 +72,13 @@ from .water_hold import (
     price_percentile,
     should_boost_on_surplus,
     should_hold_off_write,
+)
+from .window_load import (
+    STATE_FUSE_SHED,
+    STATE_OVERRIDE_OFF,
+    STATE_OVERRIDE_ON,
+    STATE_PAUSED,
+    WindowLoadRuntime,
 )
 from .write_verify import VerifySignal, VerifyState, note_attempt
 
@@ -4103,6 +4111,12 @@ class ExecutorEngine:
                 if not load.enabled:
                     self._cyclic_extra_ts.pop(load.id, None)
                     continue
+                # A room heater (mode: window) is gated LIVE, not from the plan slot.
+                if load.mode == MODE_WINDOW:
+                    await self._actuate_window_load(
+                        load, slot, water_ctx, pause_cache, action_results
+                    )
+                    continue
                 # Rent-out hands-off: never command a paused device on OR off.
                 if await self._device_control_paused(
                     load.control_pause_entities, f"cyclic:{load.id}", load.id, pause_cache
@@ -4211,6 +4225,136 @@ class ExecutorEngine:
                         f"Cyclic load {load.id} actuation",
                     )
                 )
+
+    def _window_runtime(self) -> WindowLoadRuntime:
+        # Lazy, like the failure counters: unit tests build bare engines.
+        runtime: WindowLoadRuntime | None = self.__dict__.get("_window_loads")
+        if runtime is None:
+            runtime = WindowLoadRuntime()
+            self.__dict__["_window_loads"] = runtime
+        return runtime
+
+    async def _actuate_window_load(
+        self,
+        load: Any,
+        slot: Any,
+        water_ctx: dict[str, Any] | None,
+        pause_cache: dict[str, bool],
+        action_results: list[Any],
+    ) -> None:
+        """Drive one ``mode: window`` cyclic load (a room heater on a plug).
+
+        Same precedence as every other load — control pause, fuse shed, the human's
+        override — and only then the automatic decision, which here is a LIVE window
+        gate plus an optional room thermostat (executor/window_load.py) instead of
+        the plan slot: the plan may be a kept-previous one, or older than the last
+        calendar edit. The plan slot is only the fallback for a gate that has been
+        unreadable for a long time. Runs inside the caller's per-load isolation.
+        """
+        runtime = self._window_runtime()
+        now = time.time()
+        tz_name = self.config.timezone
+        shadow = bool(self.config.shadow_mode)
+
+        async def _status(
+            state: str, reason: str, *, room: float | None = None, target: float | None = None
+        ) -> None:
+            await runtime.publish(
+                self.ha_client, load, state, reason, now, tz_name,
+                shadow=shadow, room_temp=room, target_temp=target,
+            )
+
+        async def _write(want_on: bool, *, gate_driven: bool) -> None:
+            result = await self.dispatcher.set_cyclic_load(
+                load.switch_entity, want_on, name=load.name
+            )
+            action_results.append(result)
+            runtime.note_write(load.id, want_on, result, now, gate_driven=gate_driven)
+            await self._note_window_write_verified(load, want_on, result)
+
+        # Hands-off: never command a paused device on OR off.
+        if await self._device_control_paused(
+            load.control_pause_entities, f"cyclic:{load.id}", load.id, pause_cache
+        ):
+            runtime.forget(load.id)
+            await _status(STATE_PAUSED, "control pause — leaving the plug alone")
+            return
+
+        # Fuse relief outranks the window and the human alike.
+        if load.fuse_shed and water_ctx is not None:
+            shed, why = should_shed_for_fuse(
+                phase_currents_a=water_ctx["phase_currents"],
+                budget_a=water_ctx["fuse_budget_a"],
+                heater_phases=load.phase_map,
+                grid_w=water_ctx["grid_w"] or 0.0,
+            )
+            if shed:
+                logger.warning("Cyclic FUSE SHED %s: %s — forcing off", load.id, why)
+                await _write(False, gate_driven=False)
+                await _status(STATE_FUSE_SHED, why)
+                return
+
+        ovr = await self._heater_override(load)
+        if ovr != "auto":
+            if self._override_state.get(load.id) != ovr:
+                self._override_state[load.id] = ovr
+                logger.info("Cyclic override %s: %s", load.id, ovr)
+            await _write(ovr == "force_on", gate_driven=False)
+            await _status(
+                STATE_OVERRIDE_ON if ovr == "force_on" else STATE_OVERRIDE_OFF,
+                f"{load.override_entity} is {ovr}",
+            )
+            return
+        self._override_state.pop(load.id, None)
+
+        decision = await runtime.decide(
+            self.ha_client, load, slot.water_heater_plans or {}, now, tz_name
+        )
+        prev_state = self.__dict__.setdefault("_window_state_logged", {})
+        if prev_state.get(load.id) != decision.state:
+            prev_state[load.id] = decision.state
+            logger.info("Window load %s: %s (%s)", load.id, decision.state, decision.reason)
+        if decision.want_on is not None:
+            await _write(decision.want_on, gate_driven=True)
+        await _status(
+            decision.state, decision.reason,
+            room=decision.room_temp, target=decision.target_temp,
+        )
+
+    async def _note_window_write_verified(
+        self, load: Any, want_on: bool, result: Any
+    ) -> None:
+        """Escalate a plug that keeps ignoring us (same ladder as the tanks).
+
+        A service call that FAILS is already loud (failed ActionResult ->
+        recent_errors, ws broadcast, _track_command_failures). What that path cannot
+        see is the call that succeeds while the plug never changes — a plug that
+        dropped off the network — so the read-back is counted here: three ticks in
+        a row without the switch reading what we asked for notifies once, and once
+        more when it follows again.
+        """
+        if not result.success:
+            return
+        ok = True if result.skipped else result.verification_success is True
+        key = f"cyclic:{load.id}"
+        new, signal = note_attempt(self._verify_state.get(key, VerifyState()), ok=ok)
+        self._verify_state[key] = new
+        wanted = "on" if want_on else "off"
+        if signal is VerifySignal.ALERT:
+            logger.error(
+                "Window load %s: %s still reads %r after %d commands to turn %s",
+                load.id, load.switch_entity, result.verified_value, new.streak, wanted,
+            )
+            await self.dispatcher.notify_unverified(
+                load.name or load.id,
+                f"{load.switch_entity} läser {result.verified_value!r} efter "
+                f"{new.streak} kommandon ({wanted}).",
+            )
+        elif signal is VerifySignal.RECOVERED:
+            logger.info("Window load %s: the plug follows commands again", load.id)
+            await self.dispatcher.notify_unverified(
+                load.name or load.id, "uttaget följer kommandon igen.", recovered=True
+            )
 
     async def _release_load_balancer(self) -> list[str]:
         """Write back every cap/shed the balancer still holds, then forget them."""

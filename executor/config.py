@@ -13,6 +13,8 @@ from typing import Any, cast
 
 from ruamel.yaml import YAML
 
+from backend.core.load_windows import MODE_INVALID, MODE_WINDOW, load_mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -456,13 +458,16 @@ class WaterHeaterDeviceConfig:
 
 @dataclass
 class CyclicLoadConfig:
-    """A recurring on/off load: pool pump, filter, circulation.
+    """A recurring on/off load on a switch: pool pump, filter, circulation — or, in
+    ``mode: window``, a room heater.
 
-    Same planning problem as a water heater — a daily energy need, splittable across
-    slots, with spacing and gap constraints — so it rides the SAME solver primitive
-    (see cyclic_loads_as_heater_specs in the planner adapter). What differs is only
-    the actuation: a switch, not a temperature. Keeping the config surface honest
-    matters, though: a pool pump should not have to be spelled as a water heater.
+    The default mode is a daily energy need with a maximum gap between runs, planned
+    greedily against the price curve OUTSIDE the MILP (planner/cyclic_preschedule.py)
+    and handed to the solver as fixed load; the executor switches the load from the
+    plan's per-slot value. ``mode: window`` has no daily need: the load is ON while
+    one of its window entities (typically a calendar) is on, and the executor decides
+    that from a LIVE read every tick (executor/window_load.py) — the plan only books
+    the consumption.
     """
 
     id: str
@@ -489,6 +494,27 @@ class CyclicLoadConfig:
     presence_max_price_percentile: float | None = None
     price_window_hours: float = 24.0
     max_extra_hours_per_day: float | None = None
+    # "daily" (above) or "window": ON while any of window_entities is on, OFF
+    # otherwise. The daily need, the gap rule and the opportunistic gates do not
+    # apply in window mode.
+    mode: str = "daily"
+    # calendar.* (on = an event is active), or input_boolean / schedule /
+    # binary_sensor / switch (on = warm). ANY of them on opens the window.
+    window_entities: list[str] = field(default_factory=lambda: [])
+    # Calendars only: count just the events whose summary contains this text
+    # (case-insensitive), so one shared calendar can gate several rooms.
+    window_event_match: str | None = None
+    # Switch on this long before a calendar event starts.
+    preheat_minutes: float = 0.0
+    # Optional room thermostat on top of the window. Off unless temp_sensor is set,
+    # and it stands down to plain window on/off whenever the reading is missing or
+    # older than temp_max_age_minutes.
+    temp_sensor: str | None = None
+    target_temp_c: float | None = None
+    hysteresis_c: float = 0.5
+    temp_max_age_minutes: float = 30.0
+    # Outside a window keep the room at least this warm. Unset = off outside.
+    setback_temp_c: float | None = None
     enabled: bool = True
 
 
@@ -1555,6 +1581,19 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 "cyclic_load %r skipped: needs both id and switch_entity", cl_id or raw_cl
             )
             continue
+        cl_mode = load_mode(raw_cl)
+        cl_windows = _str_list(raw_cl.get("window_entities"))
+        if cl_mode == MODE_INVALID or (cl_mode == MODE_WINDOW and not cl_windows):
+            # Skipped, not defaulted: read as a daily need of 0 kWh a mistyped
+            # "window" would be planned as an explicit OFF in every slot.
+            logger.warning(
+                "cyclic_load %r skipped: %s",
+                cl_id,
+                f"unknown mode {raw_cl.get('mode')!r}"
+                if cl_mode == MODE_INVALID
+                else "mode: window needs window_entities",
+            )
+            continue
         cyclic_loads.append(
             CyclicLoadConfig(
                 id=cl_id,
@@ -1587,6 +1626,24 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 max_extra_hours_per_day=_float_or_none(
                     raw_cl.get("max_extra_hours_per_day")
                 ),
+                mode=cl_mode,
+                window_entities=cl_windows,
+                window_event_match=_str_or_none(raw_cl.get("window_event_match")),
+                preheat_minutes=max(0.0, _float_or_none(raw_cl.get("preheat_minutes")) or 0.0),
+                temp_sensor=_str_or_none(raw_cl.get("temp_sensor")),
+                target_temp_c=_float_or_none(raw_cl.get("target_temp_c")),
+                hysteresis_c=abs(
+                    cl_hyst
+                    if (cl_hyst := _float_or_none(raw_cl.get("hysteresis_c"))) is not None
+                    else CyclicLoadConfig.hysteresis_c
+                ),
+                temp_max_age_minutes=(
+                    cl_age
+                    if (cl_age := _float_or_none(raw_cl.get("temp_max_age_minutes")))
+                    is not None
+                    else CyclicLoadConfig.temp_max_age_minutes
+                ),
+                setback_temp_c=_float_or_none(raw_cl.get("setback_temp_c")),
                 enabled=bool(raw_cl.get("enabled", True)),
             )
         )
