@@ -332,3 +332,18 @@ def test_failed_solve_writes_debug_lp_next_to_the_dumps_not_the_cwd(tmp_path, mo
         KeplerSolver().solve(KeplerInput(slots=_slots(), initial_soc_kwh=9.1), cfg)
     assert (tmp_path / "data" / "kepler_debug.lp").exists()
     assert not list(cwd.iterdir())
+
+
+def test_retention_ignores_stray_files_and_count_setting_is_bounded(tmp_path, monkeypatch):
+    """Review follow-ups: a stray kepler_ok_*.json must not evict a real dump, and a
+    garbage dump count (inf) must not raise out of the adapter."""
+    from planner.solver import kepler as kepler_mod
+    from planner.solver.adapter import _COUNT_SETTING_MAX, _non_negative_int
+
+    assert _non_negative_int(float("inf")) == 0
+    assert _non_negative_int("1e999") == 0
+    assert _non_negative_int(10**9) == _COUNT_SETTING_MAX
+    assert _non_negative_int(20) == 20
+
+    assert kepler_mod._DUMP_STAMP_RE.fullmatch("kepler_ok_20261112T201500")
+    assert not kepler_mod._DUMP_STAMP_RE.fullmatch("kepler_ok_notes")

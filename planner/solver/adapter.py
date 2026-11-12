@@ -1056,13 +1056,17 @@ def parse_pv_charge_efficiency(raw: Any) -> float | None:
     return value
 
 
+_COUNT_SETTING_MAX = 500
+
+
 def _non_negative_int(raw: Any) -> int:
     """Count-style config value -> int >= 0; unset, bool or garbage means 0 (off)."""
     if raw is None or isinstance(raw, bool):
         return 0
     try:
-        return max(0, int(float(raw)))
-    except (TypeError, ValueError):
+        # OverflowError: int(float("inf")). Capped so a typo cannot fill the data volume.
+        return min(_COUNT_SETTING_MAX, max(0, int(float(raw))))
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 

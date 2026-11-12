@@ -7,6 +7,7 @@ Migrated from backend/kepler/solver.py during Rev K13 modularization.
 
 import logging
 import os
+import re
 from collections import defaultdict
 from datetime import timedelta  # Rev WH2
 from pathlib import Path
@@ -285,6 +286,7 @@ _SOLVER_DUMP_KEEP = 5
 # Filename prefixes: failed solves, and successful ones (kepler.solver.dump_all_instances).
 _DUMP_PREFIX_FAIL = "kepler_fail"
 _DUMP_PREFIX_OK = "kepler_ok"
+_DUMP_STAMP_RE = re.compile(r"kepler_(?:fail|ok)_\d{8}T\d{6}")
 
 
 def _dump_failed_solve_instance(
@@ -336,7 +338,12 @@ def _dump_failed_solve_instance(
         }
         path.write_text(json.dumps(payload, default=str))
         # Retention: newest `keep` only (name-sorted == time-sorted).
-        for old in sorted(dump_dir.glob(f"{prefix}_*.json"))[: -max(1, keep)]:
+        # Only names this writer produces: a stray "<prefix>_notes.json" would sort last,
+        # count as the newest and push a real dump out.
+        stamped = [
+            p for p in dump_dir.glob(f"{prefix}_*.json") if _DUMP_STAMP_RE.fullmatch(p.stem)
+        ]
+        for old in sorted(stamped)[: -max(1, keep)]:
             old.unlink(missing_ok=True)
         if prefix == _DUMP_PREFIX_FAIL:
             logger.warning("Failed solve instance persisted to %s for offline replay", path)

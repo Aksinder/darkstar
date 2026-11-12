@@ -90,9 +90,14 @@ async def list_solver_dumps() -> dict[str, Any]:
     dumps: list[dict[str, Any]] = []
     if dump_dir.is_dir():
         for path in dump_dir.iterdir():
-            if not _SOLVER_DUMP_NAME.fullmatch(path.name) or not path.is_file():
+            if not _SOLVER_DUMP_NAME.fullmatch(path.name) or path.is_symlink():
                 continue
-            stat = path.stat()
+            try:
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+            except OSError:  # removed by retention between listing and stat
+                continue
             dumps.append(
                 {
                     "name": path.name,
@@ -116,7 +121,8 @@ async def get_solver_dump(name: str) -> FileResponse:
     if not _SOLVER_DUMP_NAME.fullmatch(name):
         raise HTTPException(404, "No such solver dump")
     path = solver_dump_dir() / name
-    if not path.is_file():
+    # A symlink with a valid dump name must not serve a file outside the directory.
+    if path.is_symlink() or not path.is_file():
         raise HTTPException(404, "No such solver dump")
     return FileResponse(path, media_type="application/json", filename=name)
 
