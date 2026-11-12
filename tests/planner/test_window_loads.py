@@ -435,6 +435,30 @@ class TestInitialState:
         assert planned == []  # a paused heater's calendar is not even read
 
     @pytest.mark.asyncio
+    async def test_a_single_pause_entity_written_as_a_string(self, tmp_path):
+        """`control_pause_entities: input_boolean.x` (no list). Iterated as it
+        stands that is one HA read per CHARACTER and a pause that is never seen."""
+        read: list[str] = []
+        kim = {**KIM, "control_pause_entities": PAUSE}
+
+        async def entity_state(entity_id):
+            read.append(entity_id)
+            if entity_id == "sensor.batt_soc":
+                return {"state": "75.0"}
+            return {"state": "on"} if entity_id == PAUSE else None
+
+        from backend.core import ha_client as hac
+
+        with (
+            patch.object(hac, "get_ha_entity_state", side_effect=entity_state),
+            patch("backend.core.secrets.load_home_assistant_config", return_value={}),
+        ):
+            res = await hac.get_initial_state(_initial_state_config(tmp_path, [kim]))
+        (state,) = res["cyclic_load_states"]
+        assert state["control_paused"] is True and state["control_paused_via"] == PAUSE
+        assert all(len(e) > 1 for e in read)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("state", ["off", "unavailable", "unknown", None, RuntimeError("x")])
     async def test_a_read_error_is_not_a_pause(self, tmp_path, state):
         kim = {**KIM, "control_pause_entities": [PAUSE]}
@@ -678,7 +702,7 @@ class TestPriceRulesInThePlan:
             read.append(entity_id)
             if entity_id == "sensor.batt_soc":
                 return {"state": "75.0"}
-            if entity_id == "sensor.darkstar_alex_heater_state":
+            if entity_id == "sensor.darkstar_alex_heater_heating_state":
                 return {"state": "early_start", "attributes": attrs}
             return None
 
@@ -694,4 +718,4 @@ class TestPriceRulesInThePlan:
         states = {s["id"]: s for s in res["cyclic_load_states"]}
         assert states["alex_heater"]["price_rule_state"] == attrs
         assert "price_rule_state" not in states["kim_heater"]
-        assert "sensor.darkstar_kim_heater_state" not in read
+        assert "sensor.darkstar_kim_heater_heating_state" not in read

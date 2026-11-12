@@ -699,8 +699,12 @@ async def _control_paused_via(entities: Any) -> str | None:
     fail-safe direction: an unreadable helper is NOT a pause, or one HA hiccup would
     silently drop a device out of the plan.
     """
+    # A single entity may be written as a bare string in YAML; iterating that would
+    # ask HA for each CHARACTER and never see the pause.
+    if isinstance(entities, str):
+        entities = [entities]
     for ent_any in cast("list[Any]", entities or []):
-        ent = str(ent_any or "")
+        ent = str(ent_any or "").strip()
         if not ent:
             continue
         try:
