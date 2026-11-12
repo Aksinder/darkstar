@@ -6,7 +6,7 @@ which would charge it twice on fees entered "as billed").
 """
 
 import calendar
-from datetime import date, timedelta
+from datetime import date
 from typing import Any, cast
 
 
@@ -35,13 +35,20 @@ def fixed_fees_for_range(start_date: date, end_date: date, config: dict[str, Any
     if end_date < start_date or (monthly == 0.0 and yearly == 0.0):
         return 0.0
 
+    # Closed form per calendar month (not per day): the range comes from an API query
+    # string, so the work must not scale with an arbitrarily long custom range.
     total = 0.0
-    day = start_date
-    while day <= end_date:
-        days_in_month = calendar.monthrange(day.year, day.month)[1]
-        days_in_year = 366 if calendar.isleap(day.year) else 365
-        total += monthly / days_in_month + yearly / days_in_year
-        day += timedelta(days=1)
+    year, month = start_date.year, start_date.month
+    while (year, month) <= (end_date.year, end_date.month):
+        days_in_month = calendar.monthrange(year, month)[1]
+        days_in_year = 366 if calendar.isleap(year) else 365
+        first = start_date.day if (year, month) == (start_date.year, start_date.month) else 1
+        last = (
+            end_date.day if (year, month) == (end_date.year, end_date.month) else days_in_month
+        )
+        overlap_days = last - first + 1
+        total += overlap_days * (monthly / days_in_month + yearly / days_in_year)
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     if bool(pricing_cfg.get("fees_include_vat", False)):
         return total
     return total * (1 + _non_negative(pricing_cfg.get("vat_percent", 25.0)) / 100.0)
