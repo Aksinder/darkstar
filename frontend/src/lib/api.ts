@@ -89,6 +89,7 @@ export type ConfigResponse = {
         vat_percent?: number
         grid_transfer_fee_sek?: number
         energy_tax_sek?: number
+        supplier_markup_sek_kwh?: number
     }
     input_sensors?: {
         vacation_mode?: string
@@ -376,6 +377,8 @@ export type EnergyRangeResponse = {
     grid_charge_cost_sek: number
     self_consumption_savings_sek: number
     net_cost_sek: number
+    fixed_fees_sek?: number
+    net_cost_incl_fixed_fees_sek?: number
     slot_count: number
     error?: string
 }

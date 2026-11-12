@@ -914,6 +914,18 @@ pricing:
                                        #   the spot only and the fees are added as-is, so you can point
                                        #   grid_transfer_fee_entity / energy_tax_entity straight at those
                                        #   helpers WITHOUT VAT being charged on them twice.
+  supplier_markup_sek_kwh: 0.0         # Elhandlarens påslag per kWh on IMPORT (0.0 = none, the
+                                       # historical behaviour). Enter it in the SAME VAT basis as the
+                                       # two fees above, i.e. as fees_include_vat says:
+                                       #   fees_include_vat: false -> EXCL. VAT (VAT is added: 0.02 costs 0.025)
+                                       #   fees_include_vat: true  -> INCL. VAT (added as-is: enter 0.025
+                                       #     for a markup quoted as 2 öre excl. VAT)
+                                       # Negative = a per-kWh discount. Never affects the export price
+                                       # (see export_premium_sek_kwh below for that side).
+  # --- Fixed fees (cost REPORTING only: /api/energy/range fixed_fees_sek; never the planner) ---
+  # Same VAT basis as fees_include_vat (false = excl. VAT, VAT added; true = incl. VAT, as billed).
+  subscription_fee_sek_per_month: 0.0  # Grid operator's fixed monthly fee (abonnemang)
+  supplier_fee_sek_per_year: 0.0       # Electricity supplier's fixed yearly fee (årsavgift)
   # --- Time-of-use grid transfer fee (optional; default OFF = flat fee above, unchanged) ---
   # When enabled, the transfer fee is chosen PER SLOT from the windows below, matched on the
   # slot start in LOCAL wall time (timezone above; DST-safe). First matching window wins;

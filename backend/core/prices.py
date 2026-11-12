@@ -60,6 +60,29 @@ _OVERRIDE_LAST_GOOD_MAX_AGE = timedelta(hours=24)
 _override_stale_logged: set[str] = set()
 
 
+def _nordpool_cache_key(pricing_config: dict[str, Any]) -> str:
+    """Cache key of the price series: EVERY input of the import/export formula.
+
+    Embedding them means a contract/tariff/sensor change invalidates the stale series
+    instead of serving prices computed under the old settings until the TTL expires.
+    ``vat_percent``, ``fees_include_vat`` and ``supplier_markup_sek_kwh`` used to be
+    missing, so changing any of those kept serving the old import prices.
+    """
+    _pc = pricing_config
+    return "nordpool_data:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}".format(
+        _pc.get("export_includes_spot", True),
+        _pc.get("export_premium_sek_kwh", 0.0),
+        _pc.get("export_grid_benefit_sek_kwh", 0.0),
+        _pc.get("export_fee_sek_kwh", 0.0),
+        _pc.get("grid_transfer_fee_sek", 0.2456),
+        _pc.get("energy_tax_sek", 0.439),
+        grid_tariff.cache_token(_pc),
+        _pc.get("vat_percent", 25.0),
+        bool(_pc.get("fees_include_vat", False)),
+        float(_pc.get("supplier_markup_sek_kwh", 0.0) or 0.0),
+    )
+
+
 async def get_nordpool_data(
     config_path: str = "config.yaml",
     *,
@@ -78,18 +101,7 @@ async def get_nordpool_data(
         config["pricing"] = {**config.get("pricing", {}), **pricing_overrides}
 
     # --- Smart Cache Check ---
-    # The cache key embeds the export components so a contract/sensor change invalidates any
-    # stale price series instead of serving export prices computed under the old contract.
-    _pc: dict[str, Any] = config.get("pricing", {}) or {}
-    cache_key = "nordpool_data:{}:{}:{}:{}:{}:{}:{}".format(
-        _pc.get("export_includes_spot", True),
-        _pc.get("export_premium_sek_kwh", 0.0),
-        _pc.get("export_grid_benefit_sek_kwh", 0.0),
-        _pc.get("export_fee_sek_kwh", 0.0),
-        _pc.get("grid_transfer_fee_sek", 0.2456),
-        _pc.get("energy_tax_sek", 0.439),
-        grid_tariff.cache_token(_pc),
-    )
+    cache_key = _nordpool_cache_key(config.get("pricing", {}) or {})
     cached = cache_sync.get(cache_key)
 
     local_tz = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
@@ -424,11 +436,16 @@ def calculate_import_export_prices(
     ``pricing`` keys via :func:`resolve_export_price_components` so a contract change just
     means updating a sensor/helper — no code change.
 
-    Import price is ``(spot + grid_transfer_fee + energy_tax) * (1 + VAT)``. When
-    ``fees_include_vat`` is true the fees are treated as already VAT-inclusive, so VAT is
-    applied to the spot only and the fees are added as-is — letting you point
+    Import price is ``(spot + grid_transfer_fee + energy_tax + supplier_markup) * (1 + VAT)``.
+    When ``fees_include_vat`` is true the fees are treated as already VAT-inclusive, so VAT
+    is applied to the spot only and the fees are added as-is — letting you point
     ``grid_transfer_fee_entity`` / ``energy_tax_entity`` straight at your "as billed" öre
     helpers (nätavgift / energiskatt) without the VAT being applied a second time.
+
+    ``supplier_markup_sek_kwh`` (elhandlarens påslag on IMPORT, default 0.0) is one more
+    per-kWh fee and follows the SAME VAT basis as the other two: VAT-exclusive when
+    ``fees_include_vat`` is false, VAT-inclusive when it is true. It never touches the
+    export price (that side has its own ``export_premium_sek_kwh``).
 
     Args:
         spot_price_mwh: Spot price in SEK/MWh
@@ -447,6 +464,7 @@ def calculate_import_export_prices(
         config.get("timezone", "Europe/Stockholm"),
     )
     energy_tax_sek = pricing_config.get("energy_tax_sek", 0.439)
+    supplier_markup_sek = float(pricing_config.get("supplier_markup_sek_kwh", 0.0) or 0.0)
 
     spot_price_sek_kwh = spot_price_mwh / 1000.0
 
@@ -475,6 +493,12 @@ def calculate_import_export_prices(
         import_price_sek_kwh = (
             spot_price_sek_kwh + grid_transfer_fee_sek + energy_tax_sek
         ) * vat_multiplier
+    # Supplier markup: same VAT basis as the fees. Added as a separate term, and only when
+    # set, so a config without it yields the bit-identical float it always did.
+    if supplier_markup_sek:
+        import_price_sek_kwh += (
+            supplier_markup_sek if fees_include_vat else supplier_markup_sek * vat_multiplier
+        )
 
     return import_price_sek_kwh, export_price_sek_kwh
 
