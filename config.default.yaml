@@ -236,7 +236,8 @@ water_heating:
 #     # tomorrow's prices are not published yet). "Cheap" must also be below the
 #     # window's median and a "peak" above it, so a flat price day has neither.
 #     # An unknown price never starts early and never switches off: inside a
-#     # window the heater just stays on. Nothing is persisted: after a restart the
+#     # window the heater just stays on. After a restart the rule state is picked
+#     # up from the status sensor if that is under 20 min old; otherwise the
 #     # heater must run peak_off_min_on_minutes before a peak-off, and a plug that
 #     # is on inside the early-start span is taken to be latched.
 #     #
@@ -252,8 +253,12 @@ water_heating:
 #     # Peak off: while the price is at or above this percentile the heater is OFF,
 #     # also inside a window and during early start / preheat. Time is the only
 #     # protection against a cold room without a temperature sensor, so one
-#     # off-stretch lasts at most peak_off_max_minutes and the heater must then run
-#     # peak_off_min_on_minutes before the next one. With the thermostat active
+#     # off-stretch lasts at most peak_off_max_minutes and the heater must run
+#     # peak_off_min_on_minutes before ANY peak-off, the first included: a window
+#     # that opens at a peak heats first. peak_off_min_on_minutes is at least 30
+#     # and peak_off_max_minutes at most 240 (clamped with a warning; 0 = rule
+#     # off). An unreadable calendar or pause helper ends a running peak-off: a
+#     # price-driven off is never held longer than the maximum. With the thermostat active
 #     # there is no peak-off while the room is below
 #     # target_temp_c - hysteresis_c - peak_off_temp_margin_c.
 #     peak_off_price_percentile: 85    # unset = off (default)

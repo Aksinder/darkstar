@@ -17,8 +17,9 @@ I/O, no clock — and carries its little memory in a RuleState the caller keeps.
 * Peak off. While the price is at or above the ``peak_off_price_percentile`` the
   heater is off, also inside a window. Both room temperature sensors are dead, so
   TIME is the protection against a cold bedroom: one off-stretch lasts at most
-  ``peak_off_max_minutes``, and the heater must then have been on for
-  ``peak_off_min_on_minutes`` before the next one may begin. With a working
+  ``peak_off_max_minutes``, and the heater must have been on for
+  ``peak_off_min_on_minutes`` before one may begin — the first one included, so a
+  window that opens at a peak heats first. With a working
   thermostat the caller additionally passes ``keep_warm`` when the room is well
   below target, which forbids (and ends) a peak-off.
 
@@ -32,6 +33,7 @@ Thresholds are percentiles of a rolling price window (executor/water_hold.py
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -40,6 +42,15 @@ from .water_hold import price_percentile
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+logger = logging.getLogger(__name__)
+
+# Bounds on the peak-off timers, enforced when the config is read. Time is the only
+# thing between a peak-off and a cold bedroom, so it is not left to a typo:
+# peak_off_min_on_minutes 0 would allow off 99.5 % of a dear day.
+PEAK_OFF_MIN_ON_FLOOR_MIN = 30.0
+PEAK_OFF_MAX_CEILING_MIN = 240.0
+_clamp_warned: set[tuple[str, str, float]] = set()
 
 PHASE_IDLE = "idle"  # nothing asks for heat
 PHASE_WINDOW = "window"  # in a window (or preheat), heating allowed
@@ -75,6 +86,23 @@ class PriceRules:
         """Parse one ``cyclic_loads[]`` entry — the ONLY parser, so the planner (raw
         config) and the executor (CyclicLoadConfig) cannot read the keys differently."""
         peak = raw.get("peak_off_price_percentile")
+        load_id = str(raw.get("id", "?"))
+
+        def _clamped(key: str, value: float, low: float, high: float) -> float:
+            bounded = min(high, max(low, value))
+            if bounded != value and (load_id, key, value) not in _clamp_warned:
+                # Once per value: this parser runs on every plan and config reload.
+                _clamp_warned.add((load_id, key, value))
+                logger.warning(
+                    "Window load %s: %s %.0f is outside %.0f..%.0f — using %.0f",
+                    load_id, key, value, low, high, bounded,
+                )
+            return bounded
+
+        max_off = max(
+            0.0, _number(raw.get("peak_off_max_minutes"), cls.peak_off_max_minutes)
+        )
+        min_on = _number(raw.get("peak_off_min_on_minutes"), cls.peak_off_min_on_minutes)
         return cls(
             early_start_hours=max(0.0, _number(raw.get("early_start_hours"), 0.0)),
             early_start_price_percentile=_number(
@@ -83,11 +111,14 @@ class PriceRules:
             peak_off_price_percentile=(
                 None if peak is None or peak == "" else _number(peak, 100.0)
             ),
-            peak_off_max_minutes=max(
-                0.0, _number(raw.get("peak_off_max_minutes"), cls.peak_off_max_minutes)
+            # 0 (or less) keeps meaning "no peak-off"; anything else is capped.
+            peak_off_max_minutes=(
+                _clamped("peak_off_max_minutes", max_off, 0.0, PEAK_OFF_MAX_CEILING_MIN)
+                if max_off > 0
+                else 0.0
             ),
-            peak_off_min_on_minutes=max(
-                0.0, _number(raw.get("peak_off_min_on_minutes"), cls.peak_off_min_on_minutes)
+            peak_off_min_on_minutes=_clamped(
+                "peak_off_min_on_minutes", min_on, PEAK_OFF_MIN_ON_FLOOR_MIN, float("inf")
             ),
             peak_off_temp_margin_c=max(
                 0.0, _number(raw.get("peak_off_temp_margin_c"), cls.peak_off_temp_margin_c)
@@ -261,9 +292,12 @@ def step(
 
     heat_since = state.heat_since
     if at_peak:
-        # A heat period that BEGINS at a peak may wait it out; one already running
-        # must first have been on for the minimum time.
-        on_long_enough = heat_since is None or now - heat_since >= timedelta(
+        # No peak-off until the heater has actually been on for the minimum time in
+        # THIS heat period. A window (or early start) that begins at a peak heats
+        # first: heat_since is None then, which is "not on long enough" — it used to
+        # count as long enough, and a child came home to a room that stayed cold
+        # for up to three hours.
+        on_long_enough = heat_since is not None and now - heat_since >= timedelta(
             minutes=rules.peak_off_min_on_minutes
         )
         if on_long_enough and rules.peak_off_max_minutes > 0:
@@ -278,6 +312,13 @@ def step(
         RuleState(early_latched=latched, heat_since=heat_since or now),
         Verdict(True, base_phase, base_reason),
     )
+
+
+def end_peak_off(state: RuleState, now: datetime) -> RuleState:
+    """``state`` with a running peak-off ended now (the min-on clock restarts)."""
+    if state.peak_off_since is None:
+        return state
+    return RuleState(early_latched=state.early_latched, heat_since=now)
 
 
 def rolling_price_window(

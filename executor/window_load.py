@@ -44,6 +44,8 @@ from .window_price import (
     PHASE_EARLY,
     PHASE_PEAK_OFF,
     RuleState,
+    end_peak_off,
+    rule_state_from_attributes,
     step,
     thresholds,
 )
@@ -66,6 +68,9 @@ MIN_DWELL_S = 300.0
 # restart forgets states that were only ever POSTed).
 PUBLISH_REFRESH_S = 600.0
 EVENT_LOOKAHEAD = timedelta(days=15)
+# Our own status sensor is trusted as a record of the price-rule state after a
+# restart only while it is this fresh (it is re-published every PUBLISH_REFRESH_S).
+RULE_STATE_RESTORE_MAX_AGE_S = 2 * PUBLISH_REFRESH_S
 
 STATE_PAUSED = "paused"
 STATE_OFF = "off"
@@ -101,6 +106,9 @@ class Gate:
     window_start: datetime | None = None
     window_end: datetime | None = None
     detail: str = ""
+    # False when a calendar's event list could not be read: window_start then says
+    # nothing about the future ("no known window" is not "no window").
+    schedule_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -177,8 +185,9 @@ class WindowLoadRuntime:
         self._last_want: dict[str, bool] = {}
         self._last_switch_ts: dict[str, float] = {}
         self._last_gate: dict[str, Gate] = {}
-        # Price rules: the early-start latch and the peak-off clocks, per load. In
-        # memory only — see _seed_rule_state for what a fresh process does instead.
+        # Price rules: the early-start latch and the peak-off clocks, per load.
+        # Restored after a restart from our own status sensor while that is fresh
+        # (restore_rule_state), otherwise started safe (_seed_rule_state).
         self._rule_state: dict[str, RuleState] = {}
         # load id -> was the window open at the last reading (to confirm a close).
         self._raw_in_window: dict[str, bool] = {}
@@ -189,6 +198,14 @@ class WindowLoadRuntime:
         # load id -> when its pause helper first could not be read (this episode).
         self._pause_unknown_since: dict[str, float] = {}
         self._pause_unknown_logged: set[str] = set()
+        # One-time notices for a human, picked up by the engine (pop_notice).
+        self._notices: dict[str, tuple[str, str]] = {}
+        # The last gate that COULD be determined, and when the plug would next have
+        # come on by the last readable event list (keeps an early-start latch alive
+        # through an unreadable list).
+        self._last_known_gate: dict[str, Gate] = {}
+        self._last_next_on: dict[str, datetime] = {}
+        self._restore_tried: set[str] = set()
         self._price_memo: dict[str, tuple[tuple[int, float], float, list[float]]] = {}
         self._published: dict[str, tuple[float, str, dict[str, Any]]] = {}
 
@@ -227,10 +244,12 @@ class WindowLoadRuntime:
         match = load.window_event_match
         readings: list[Gate] = []
         unknown: list[str] = []
+        schedule_known = True
         for entity in load.window_entities:
             listed: list[Window] | None = None
             if is_calendar(entity):
                 listed = await self._event_windows(entity, match, now_ts, now, tz)
+                schedule_known = schedule_known and listed is not None
             if is_calendar(entity) and match:
                 if listed is None:
                     unknown.append(f"{entity} event list unreadable")
@@ -257,9 +276,10 @@ class WindowLoadRuntime:
                 False,
                 min(starts) if starts else None,
                 max(ends) if len(ends) == len(active) else None,
+                schedule_known=schedule_known,
             )
         if unknown:
-            return Gate(None, detail="; ".join(unknown))
+            return Gate(None, detail="; ".join(unknown), schedule_known=schedule_known)
         coming = [g for g in readings if g.window_start is not None]
         nxt = min(coming, key=lambda g: g.window_start or now) if coming else None
         return Gate(
@@ -267,6 +287,7 @@ class WindowLoadRuntime:
             any(g.preheat for g in readings),
             nxt.window_start if nxt else None,
             nxt.window_end if nxt else None,
+            schedule_known=schedule_known,
         )
 
     async def _read_temp(
@@ -316,14 +337,12 @@ class WindowLoadRuntime:
             raw = await ha.get_state_value(entity)
             value = str(raw).strip().lower() if raw is not None else ""
             if value == "on":
-                self._pause_unknown_since.pop(load.id, None)
-                self._pause_unknown_logged.discard(load.id)
+                self._pause_readable_again(load)
                 return PAUSE_PAUSED, entity
             if value in _UNREADABLE:
                 unreadable.append(entity)
         if not unreadable:
-            self._pause_unknown_since.pop(load.id, None)
-            self._pause_unknown_logged.discard(load.id)
+            self._pause_readable_again(load)
             return PAUSE_CLEAR, ""
         since = self._pause_unknown_since.setdefault(load.id, now_ts)
         detail = f"pause helper {', '.join(unreadable)} unreadable"
@@ -340,7 +359,72 @@ class WindowLoadRuntime:
                 "Window load %s: %s for over %.0f min — treating it as NOT paused",
                 load.id, detail, GATE_HOLD_S / 60.0,
             )
+            self._notices[load.id] = (
+                "alert",
+                f"{load.name or load.id}: {detail} i över {GATE_HOLD_S / 60.0:.0f} min — "
+                "elementet räknas som INTE pausat och styrs igen.",
+            )
         return PAUSE_CLEAR, ""
+
+    def _pause_readable_again(self, load: Any) -> None:
+        self._pause_unknown_since.pop(load.id, None)
+        if load.id in self._pause_unknown_logged:
+            self._pause_unknown_logged.discard(load.id)
+            self._notices[load.id] = (
+                "recovered",
+                f"{load.name or load.id}: paushjälparen går att läsa igen.",
+            )
+
+    async def restore_rule_state(self, ha: Any, load: Any, now_ts: float) -> None:
+        """Once per process and load: pick the price-rule state up from our own
+        status sensor, if that was published within RULE_STATE_RESTORE_MAX_AGE_S.
+
+        Without this a restart during a peak-off leaves a plug that is off with
+        nobody remembering why — and if the gate or the pause helper happens to be
+        unreadable just then, the "hold as it is" branches would keep it off. With
+        it, the peak-off continues on its REAL clock (and can be ended by a hold).
+        An older or missing sensor is not trusted: _seed_rule_state then starts
+        from the safe reading of the plug instead.
+        """
+        if load.id in self._restore_tried or not load.price_rules.enabled:
+            return
+        self._restore_tried.add(load.id)
+        if load.id in self._rule_state:
+            return
+        try:
+            status = await ha.get_state(status_entity_id(load.id))
+        except Exception:
+            return
+        if not isinstance(status, Mapping):
+            return
+        stamp = reading_timestamp(status)
+        if stamp is None or not 0 <= now_ts - stamp.timestamp() <= RULE_STATE_RESTORE_MAX_AGE_S:
+            return
+        attrs = status.get("attributes")
+        restored = rule_state_from_attributes(attrs if isinstance(attrs, Mapping) else None)
+        if restored is not None and restored != RuleState():
+            self._rule_state[load.id] = restored
+            logger.info("Window load %s: price-rule state restored: %s", load.id, restored)
+
+    def pop_notice(self, load_id: str) -> tuple[str, str] | None:
+        """A pending one-time notice for a human ("alert" | "recovered", text)."""
+        return self._notices.pop(load_id, None)
+
+    def end_peak_off_for_hold(self, load_id: str, now_ts: float) -> bool:
+        """True when the load is in a price peak-off that must be ended (plug ON)
+        before a "leave the plug as it is" branch takes over.
+
+        THE INVARIANT of the price rule: a plug is never off on account of the price
+        for longer than peak_off_max_minutes (plus one dwell). Every hold — unknown
+        gate, unreadable pause helper, a pause switched on — stops running the
+        rule's clock, so a plug that is off for the price when the hold begins would
+        stay off for as long as the hold lasts. It is switched on first.
+        """
+        state = self._rule_state.get(load_id)
+        if state is None or state.peak_off_since is None:
+            return False
+        self._rule_state[load_id] = end_peak_off(state, datetime.fromtimestamp(now_ts, UTC))
+        return True
 
     async def decide(
         self,
@@ -360,8 +444,21 @@ class WindowLoadRuntime:
         gate = await self.read_gate(ha, load, now_ts, tz_name)
         self._last_gate[load.id] = gate
 
+        rules = load.price_rules
         if gate.active is None:
             since = self._unknown_since.setdefault(load.id, now_ts)
+            if self.end_peak_off_for_hold(load.id, now_ts):
+                # Off for the price when the gate went dark: on first, then hold.
+                logger.warning(
+                    "Window load %s: gate cannot be determined (%s) during a price "
+                    "peak-off — switching ON before holding",
+                    load.id, gate.detail,
+                )
+                return Decision(
+                    True,
+                    STATE_GATE_UNKNOWN,
+                    f"{gate.detail} — price peak-off ended, then holding the relay",
+                )
             if now_ts - since < GATE_HOLD_S:
                 if since == now_ts:
                     logger.warning(
@@ -406,9 +503,26 @@ class WindowLoadRuntime:
                     "plan slot (%s) until it can be read again",
                     load.id, GATE_HOLD_S / 60.0, "on" if want else "off",
                 )
-            want, reason = self._dwell(
-                load.id, want, f"{gate.detail} — following the plan slot", now_ts
-            )
+            reason = f"{gate.detail} — following the plan slot"
+            if rules.peak_enabled and self._believed_heating(load.id, now_ts):
+                # The plan's 0 may be a peak-off the PLANNER simulated, and every
+                # replan can start a new one: the executor's clocks do not run while
+                # the gate is dark. So while the last readable gate says the heater
+                # belongs on, a plan "off" is treated as what it is most likely to
+                # be — a price peak — and bounded by the same max-off / min-on
+                # clocks as a live one.
+                now = datetime.fromtimestamp(now_ts, UTC)
+                state = self._rule_state[load.id]
+                state, verdict = step(
+                    rules, state, now=now, in_window=True, next_on=None,
+                    price=1.0 if not want else 0.0,
+                    early_threshold=None, peak_threshold=1.0,
+                )
+                self._rule_state[load.id] = state
+                if verdict.heat and not want:
+                    reason += "; plan says off, but the peak-off time bound keeps it on"
+                want = verdict.heat
+            want, reason = self._dwell(load.id, want, reason, now_ts)
             return Decision(want, STATE_ON if want else STATE_OFF, reason, notice=notice)
 
         notice = None
@@ -425,6 +539,7 @@ class WindowLoadRuntime:
         # switched off: a calendar coming back from "unavailable" can read "off"
         # for one tick, and that tick would cost five minutes of heat (the dwell).
         # Opening is immediate, and a fresh process has nothing to confirm.
+        self._last_known_gate[load.id] = gate
         raw_in_window = bool(gate.active or gate.preheat)
         closing = not raw_in_window and self._raw_in_window.get(load.id) is True
         self._raw_in_window[load.id] = raw_in_window
@@ -448,7 +563,6 @@ class WindowLoadRuntime:
             return temp_memo[0]
 
         # Price rules: cheap early start before the window, off at price peaks.
-        rules = load.price_rules
         heat = in_window
         phase: str | None = None
         early_thr: float | None = None
@@ -460,6 +574,18 @@ class WindowLoadRuntime:
                 if not in_window and gate.window_start is not None
                 else None
             )
+            if next_on is not None:
+                self._last_next_on[load.id] = next_on
+            elif not in_window and not gate.schedule_known:
+                # The event list is unreadable, so "no next window" is not known —
+                # only not readable. A latch must not be dropped over that: keep
+                # the start time it was held for, until that time passes or a
+                # fresh list says the window moved or vanished.
+                remembered = self._last_next_on.get(load.id)
+                if remembered is not None and remembered > now:
+                    next_on = remembered
+            else:
+                self._last_next_on.pop(load.id, None)
             state = self._rule_state.get(load.id)
             if state is None:
                 state = await self._seed_rule_state(ha, load, now, in_window, next_on)
@@ -575,9 +701,9 @@ class WindowLoadRuntime:
     async def _seed_rule_state(
         self, ha: Any, load: Any, now: datetime, in_window: bool, next_on: datetime | None
     ) -> RuleState:
-        """The price-rule state of a load we have no memory of (fresh process, or
-        control just handed back after a pause). Nothing is persisted; instead the
-        start is made SAFE:
+        """The price-rule state of a load we have no memory of: control just handed
+        back after a pause, or a fresh process whose status sensor was too old (or
+        absent) to restore from (restore_rule_state). The start is made SAFE:
 
         * the min-on clock starts now, so no peak-off can begin until the heater has
           been on for the full peak_off_min_on_minutes — a restart can never grant a
@@ -607,11 +733,12 @@ class WindowLoadRuntime:
         read_window: Callable[[float], Awaitable[list[float]]],
     ) -> tuple[float | None, list[float]]:
         """(current import price, rolling price window) for a load's price rules,
-        from the executor's own price source. Kept per load for the clock hour — the
-        source only moves hourly — but an UNKNOWN price is never kept: it is asked
-        for again on the next tick. Any failure reads as unknown."""
+        from the executor's own price source. Kept per load for the 15-minute slot —
+        the feed's own resolution; an hour's memo acted on a price up to 59 minutes
+        old — but an UNKNOWN price is never kept: it is asked for again on the next
+        tick. Any failure reads as unknown."""
         hours = float(load.price_rules.price_window_hours)
-        key = (int(now_ts // 3600), hours)
+        key = (int(now_ts // 900), hours)
         memo = self._price_memo.get(load.id)
         if memo is not None and memo[0] == key:
             return memo[1], memo[2]
@@ -625,6 +752,25 @@ class WindowLoadRuntime:
             return None, []
         self._price_memo[load.id] = (key, price, window)
         return price, window
+
+    def _believed_heating(self, load_id: str, now_ts: float) -> bool:
+        """By what was last known, does this heater belong on now? The rule state
+        says whether a heat period was running (it is reset whenever nothing asks
+        for heat, and survives a restart through the status sensor); the last
+        readable gate says when that window was due to end, if it knew."""
+        state = self._rule_state.get(load_id)
+        if state is None or not (
+            state.early_latched
+            or state.heat_since is not None
+            or state.peak_off_since is not None
+        ):
+            return False
+        last = self._last_known_gate.get(load_id)
+        return (
+            last is None
+            or last.window_end is None
+            or now_ts < last.window_end.timestamp()
+        )
 
     def _dwell(self, load_id: str, want: bool, reason: str, now_ts: float) -> tuple[bool, str]:
         """Hold the previous command while the relay switched under MIN_DWELL_S ago."""
@@ -654,6 +800,8 @@ class WindowLoadRuntime:
         self._last_gate.pop(load_id, None)
         self._rule_state.pop(load_id, None)
         self._raw_in_window.pop(load_id, None)
+        self._last_known_gate.pop(load_id, None)
+        self._last_next_on.pop(load_id, None)
         self._thermo_last.pop(load_id, None)
         self._thermo_stale_since.pop(load_id, None)
 
@@ -690,7 +838,8 @@ class WindowLoadRuntime:
         early_threshold: float | None = None,
         peak_threshold: float | None = None,
     ) -> None:
-        """Publish ``sensor.darkstar_<id>_state`` — on change, or to keep it alive."""
+        """Publish ``sensor.darkstar_<id>_heating_state`` — on change, or to keep it
+        alive."""
         if ha is None:
             return
         gate = self._last_gate.get(load.id)

@@ -74,6 +74,7 @@ from .water_hold import (
     should_hold_off_write,
 )
 from .window_load import (
+    PAUSE_CLEAR,
     PAUSE_HOLD,
     PAUSE_PAUSED,
     STATE_FUSE_SHED,
@@ -3591,6 +3592,13 @@ class ExecutorEngine:
 
         Memoized per hour: this runs on every tick for every idle-hold heater, and
         the price series it reads only changes hourly.
+
+        NOTE: on a 15-minute feed this is NOT the current slot's price. The match
+        below is ``st <= now < st + 1h`` and takes the first hit, so it returns the
+        slot that began 45-60 min ago, and the per-hour memo then holds that value
+        for up to another hour (45-105 min old in all). Existing callers were tuned
+        against this behaviour and it is left alone; anything that needs the price
+        of the slot containing ``now`` should use _slot_import_price().
         """
         try:
             import pytz
@@ -3618,6 +3626,19 @@ class ExecutorEngine:
                     return price
         except Exception as e:
             logger.debug("Idle-hold: import price unavailable: %s", e)
+        return None
+
+    async def _slot_import_price(self) -> float | None:
+        """Import price of the feed slot that contains NOW (15 min or an hour,
+        whatever the feed delivers), or None when unknown.
+
+        Same series as _current_import_price, without its lag; memoised per
+        15-minute slot through _forward_import_prices.
+        """
+        now_ts = datetime.now(pytz.timezone(self.config.timezone)).timestamp()
+        for start_ts, end_ts, price in await self._forward_import_prices():
+            if start_ts <= now_ts < end_ts:
+                return price
         return None
 
     async def _forward_import_prices(self) -> tuple[tuple[float, float, float], ...]:
@@ -4274,7 +4295,19 @@ class ExecutorEngine:
 
         # Hands-off: never command a paused device on OR off. Unlike the other
         # loads, an UNREADABLE pause helper holds too (see pause_state).
+        await runtime.restore_rule_state(self.ha_client, load, now)
         paused, pause_why = await runtime.pause_state(self.ha_client, load, now)
+        await self._send_window_notice(runtime.pop_notice(load.id))
+        if paused != PAUSE_CLEAR and runtime.end_peak_off_for_hold(load.id, now):
+            # The one write a pause (or an unreadable pause helper) still gets: the
+            # plug is off because WE switched it off for a price peak, and from here
+            # on nobody runs that rule's clock. Hand it over ON, then hands off.
+            logger.warning(
+                "Window load %s: %s during a price peak-off — switching ON before "
+                "leaving the plug alone",
+                load.id, "paused" if paused == PAUSE_PAUSED else pause_why,
+            )
+            await _write(True, gate_driven=False)
         if paused == PAUSE_PAUSED:
             # The shared helper only for its once-per-episode log line; the answer
             # is already known, so it reads nothing.
@@ -4322,7 +4355,7 @@ class ExecutorEngine:
         price_window: list[float] = []
         if load.price_rules.enabled:
             price, price_window = await runtime.price_inputs(
-                load, now, self._current_import_price, self._price_window
+                load, now, self._slot_import_price, self._price_window
             )
         decision = await runtime.decide(
             self.ha_client, load, slot.water_heater_plans or {}, now, tz_name,
@@ -4332,16 +4365,7 @@ class ExecutorEngine:
         if prev_state.get(load.id) != decision.state:
             prev_state[load.id] = decision.state
             logger.info("Window load %s: %s (%s)", load.id, decision.state, decision.reason)
-        if decision.notice is not None and self.config.notifications.on_error:
-            kind, text = decision.notice
-            await self.dispatcher._send_notification(  # type: ignore[protected-access]
-                text,
-                title=(
-                    "⚠️ Darkstar: element utan kalender"
-                    if kind == "alert"
-                    else "Darkstar: element styrs av kalendern igen"
-                ),
-            )
+        await self._send_window_notice(decision.notice)
         if decision.want_on is not None:
             await _write(decision.want_on, gate_driven=True)
         await _status(
@@ -4349,6 +4373,21 @@ class ExecutorEngine:
             room_temp=decision.room_temp, target_temp=decision.target_temp,
             price_now=decision.price_now, early_threshold=decision.early_threshold,
             peak_threshold=decision.peak_threshold,
+        )
+
+    async def _send_window_notice(self, notice: tuple[str, str] | None) -> None:
+        """One-time notice about a window-mode load (unknown gate, unreadable pause
+        helper, and their recovery). Gated on notifications.on_error."""
+        if notice is None or not self.config.notifications.on_error:
+            return
+        kind, text = notice
+        await self.dispatcher._send_notification(  # type: ignore[protected-access]
+            text,
+            title=(
+                "⚠️ Darkstar: element behöver tillsyn"
+                if kind == "alert"
+                else "Darkstar: element styrs normalt igen"
+            ),
         )
 
     async def _note_window_write_verified(

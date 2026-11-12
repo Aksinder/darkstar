@@ -657,6 +657,22 @@ class TestPriceRulesInThePlan:
         )
         assert min(long_ago) == 0  # its 180 min are up
 
+    @pytest.mark.parametrize(
+        "state",
+        [
+            None,
+            {},
+            {"early_start_latched": False, "peak_off_since": None, "heat_since": None},
+        ],
+    )
+    def test_a_paused_or_absent_rule_state_is_not_a_peak_off_in_progress(self, state):
+        """While paused the status sensor publishes an EMPTY rule state. Planning at
+        a peak inside the window must not book a wait-out-the-peak zero at slot 0:
+        the heater heats first, for the min-on time."""
+        slots = _two_day_slots()[_slot_at(1, 17):]  # Friday 17:00, evening peak
+        plan, _ = self._plan({"peak_off_price_percentile": 85}, slots=slots, state=state)
+        assert _ranges(plan)[0] == (0, 2 * 4)
+
     def test_without_published_state_a_heater_in_a_window_is_taken_to_be_on(self):
         """No status sensor (first plan, executor down): book load at a peak rather
         than assume an off-stretch nobody commanded."""

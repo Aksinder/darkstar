@@ -83,6 +83,44 @@ class TestConfig:
         assert rules.early_start_hours == 0.0 and rules.early_start_price_percentile == 30.0
         assert rules.peak_off_price_percentile is None
         assert rules.peak_off_max_minutes == 0.0 and rules.price_window_hours == 24.0
+        assert rules.peak_off_min_on_minutes == 120.0
+
+    def test_the_peak_off_timers_are_bounded_at_parse_time(self, caplog):
+        """min-on 0 allowed off 99.5 % of a dear day; max 600 a ten-hour stretch."""
+        with caplog.at_level("WARNING"):
+            for _ in range(3):  # parsed on every plan: warned once per value
+                rules = PriceRules.from_mapping({
+                    "id": "kim", "peak_off_price_percentile": 85,
+                    "peak_off_min_on_minutes": 0, "peak_off_max_minutes": 600,
+                })
+        assert (rules.peak_off_min_on_minutes, rules.peak_off_max_minutes) == (30.0, 240.0)
+        assert sum("peak_off_min_on_minutes" in r.message for r in caplog.records) == 1
+        assert sum("peak_off_max_minutes" in r.message for r in caplog.records) == 1
+        inside = PriceRules.from_mapping({"peak_off_min_on_minutes": 30,
+                                          "peak_off_max_minutes": 240})
+        assert (inside.peak_off_min_on_minutes, inside.peak_off_max_minutes) == (30.0, 240.0)
+
+    @pytest.mark.parametrize("value", [0, -5])
+    def test_max_minutes_zero_or_less_still_disables_the_rule(self, value):
+        rules = PriceRules.from_mapping({"peak_off_price_percentile": 85,
+                                         "peak_off_max_minutes": value})
+        assert rules.peak_off_max_minutes == 0.0
+        out, _ = _run(rules, [(0, 1.0), (5, 9.0), (9, 9.0)])
+        assert out == [ON, ON, ON]
+
+    def test_at_the_bounds_a_permanent_peak_is_off_at_most_8_9ths(self):
+        """Worst legal config (240 off / 30 on), price at a peak all day."""
+        rules = PriceRules.from_mapping({"peak_off_price_percentile": 85,
+                                         "peak_off_min_on_minutes": 1,
+                                         "peak_off_max_minutes": 9999})
+        state, off, longest, run = RuleState(), 0, 0, 0
+        for minute in range(24 * 60):
+            state, v = _step(rules, state, minute / 60, price=9.0, in_window=True,
+                             next_on=None)
+            run = 0 if v.heat else run + 1
+            off += not v.heat
+            longest = max(longest, run)
+        assert longest == 240 and off / (24 * 60) < 0.9
 
     def test_a_zero_percentile_is_a_setting_not_unset(self):
         assert PriceRules.from_mapping({"peak_off_price_percentile": 0}).peak_enabled
@@ -201,9 +239,17 @@ class TestPeakOff:
         out, _ = _run(PEAK_ONLY, [(0, 1.0), (0.5, 9.0), (1.99, 9.0), (2, 9.0)])
         assert out == [ON, ON, ON, OFF]
 
-    def test_a_window_that_begins_at_a_peak_waits_it_out(self):
-        out, _ = _run(PEAK_ONLY, [(0, 9.0), (2.9, 9.0), (3, 9.0)])
-        assert out == [OFF, OFF, ON]
+    def test_a_window_that_opens_at_a_peak_heats_first(self):
+        """It used to wait the peak out: up to three hours before the first heat in
+        a room somebody has just come home to."""
+        out, _ = _run(PEAK_ONLY, [(0, 9.0), (1.99, 9.0), (2, 9.0), (4.99, 9.0), (5, 9.0)])
+        assert out == [ON, ON, OFF, OFF, ON]
+
+    def test_an_early_start_that_latches_at_a_peak_heats_first_too(self):
+        state, v = step(OWNER, RuleState(), now=_h(11), in_window=False,
+                        next_on=WINDOW_START, price=0.5, early_threshold=0.8,
+                        peak_threshold=0.4)
+        assert (v.heat, v.phase) == (True, PHASE_EARLY) and state.heat_since == _h(11)
 
     def test_an_unknown_price_never_switches_off_and_ends_a_running_peak_off(self):
         out, _ = _run(PEAK_ONLY, [(0, 1.0), (3, None), (4, 9.0), (5, None), (6, 9.0)])
@@ -218,7 +264,8 @@ class TestPeakOff:
         state, v = _step(PEAK_ONLY, RuleState(), 0, price=9.0, in_window=True,
                          next_on=None, keep_warm=True)
         assert v.heat and state.peak_off_since is None
-        state, v = _step(PEAK_ONLY, RuleState(), 0, price=9.0, in_window=True, next_on=None)
+        on_for_hours = RuleState(heat_since=_h(-3))
+        state, v = _step(PEAK_ONLY, on_for_hours, 0, price=9.0, in_window=True, next_on=None)
         assert not v.heat
         state, v = _step(PEAK_ONLY, state, 1, price=9.0, in_window=True, next_on=None,
                          keep_warm=True)
@@ -278,7 +325,8 @@ class TestDst:
         began = tz.localize(datetime(2026, 10, 25, 1, 30), is_dst=True)
         kw = {"in_window": True, "next_on": None, "price": 9.0, "early_threshold": None,
                   "peak_threshold": PEAK_THR}
-        state, v = step(PEAK_ONLY, RuleState(), now=began, **kw)
+        on_for_hours = RuleState(heat_since=began - timedelta(hours=3))
+        state, v = step(PEAK_ONLY, on_for_hours, now=began, **kw)
         assert v.phase == PHASE_PEAK_OFF
         second_230 = tz.localize(datetime(2026, 10, 25, 2, 30), is_dst=False)
         state, v = step(PEAK_ONLY, state, now=second_230, **kw)

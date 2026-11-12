@@ -57,6 +57,7 @@ class FakeHA:
         self.reads: list[str] = []
         self.plug_obeys = True
         self.service_error: Exception | None = None
+        self.now = T0
 
     async def get_state_value(self, entity_id: str):
         self.reads.append(entity_id)
@@ -81,6 +82,12 @@ class FakeHA:
 
     async def set_state(self, entity_id: str, state: str, attributes=None):
         self.published.append((entity_id, state, dict(attributes or {})))
+        # Like HA: a published sensor can be read back, with its timestamp.
+        self.states[entity_id] = state
+        self.attrs[entity_id] = {
+            "attributes": dict(attributes or {}),
+            "last_updated": datetime.fromtimestamp(self.now, UTC).isoformat(),
+        }
         return True
 
     @property
@@ -136,7 +143,7 @@ class Rig:
         # The executor's price source: None = unknown price.
         self.price: float | None = None
         self.price_window: list[float] = list(PRICE_WINDOW)
-        self.engine._current_import_price = AsyncMock(  # type: ignore[method-assign]
+        self.engine._slot_import_price = AsyncMock(  # type: ignore[method-assign]
             side_effect=lambda: self.price
         )
         self.engine._price_window = AsyncMock(  # type: ignore[method-assign]
@@ -152,6 +159,7 @@ class Rig:
                    ctx: dict[str, Any] | None = None) -> list[Any]:
         """One executor pass over the cyclic loads at T0 + ``minutes``."""
         self.now = T0 + minutes * MIN
+        self.ha.now = self.now
         results: list[Any] = []
         slot = SimpleNamespace(water_heater_plans=plan if plan is not None else {})
         with patch("executor.engine.time.time", return_value=self.now), patch(
@@ -1006,7 +1014,7 @@ class TestPriceRulesLive:
         rig.set_price(99.0)
         await rig.tick(0)
         assert rig.plug == "on" and rig.ha.status[0] == "on"
-        rig.engine._current_import_price.assert_not_awaited()
+        rig.engine._slot_import_price.assert_not_awaited()
         rig.engine._price_window.assert_not_awaited()
         attrs = rig.ha.status[1]
         assert attrs["price_now"] is None and attrs["peak_off_threshold"] is None
@@ -1073,7 +1081,7 @@ class TestPriceRulesLive:
             assert rig.plug == "on" and rig.ha.status[0] == "on"
         assert rig.ha.status[1]["price_now"] is None
         # The price source failing outright is the same thing.
-        rig.engine._current_import_price.side_effect = RuntimeError("nordpool down")
+        rig.engine._slot_import_price.side_effect = RuntimeError("nordpool down")
         await rig.tick(460)
         assert rig.plug == "on"
 
@@ -1119,15 +1127,18 @@ class TestPriceRulesLive:
                                               "turn_on"]
 
     @pytest.mark.asyncio
-    async def test_a_window_that_opens_at_a_peak_waits_it_out(self, tmp_path):
+    async def test_a_window_that_opens_at_a_peak_heats_first(self, tmp_path):
+        """First heat at window start, not up to 180 min later."""
         rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "off"})
         rig.set_price(2.2)
         await rig.tick(0)
         rig.ha.states[CAL] = "on"
         await rig.tick(10)
-        assert rig.plug == "off" and rig.ha.status[0] == "peak_off" and rig.writes == []
-        await rig.tick(190)
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+        await rig.tick(129)
         assert rig.plug == "on"
+        await rig.tick(130)  # on for the minimum time: now the peak may switch it off
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
 
     @pytest.mark.asyncio
     async def test_a_peak_interrupts_an_early_start_and_the_latch_survives(self, tmp_path):
@@ -1168,22 +1179,26 @@ class TestPriceRulesLive:
         rig.ha.states.update({OVERRIDE: "auto", PAUSE: "on"})
         await rig.tick(1)
         assert rig.ha.status[0] == "paused" and len(rig.writes) == 1
-        rig.engine._current_import_price.assert_not_awaited()
+        rig.engine._slot_import_price.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_price_is_read_once_per_hour_not_once_per_tick(self, tmp_path):
+    async def test_the_price_is_read_once_per_15_min_slot_not_once_per_tick(self, tmp_path):
         rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on"})
-        rig.set_price(1.0)
-        for minute in range(0, 60, 5):
+        rig.price = 1.0
+        for minute in range(15):
             await rig.tick(minute)
-        assert rig.engine._current_import_price.await_count == 1
-        await rig.tick(60)
-        assert rig.engine._current_import_price.await_count == 2
+        assert rig.engine._slot_import_price.await_count == 1
+        rig.price = 2.2  # the next slot's price is seen in its first minute
+        await rig.tick(15)
+        assert rig.engine._slot_import_price.await_count == 2
+        assert rig.ha.status[1]["price_now"] == 2.2
+        await rig.tick(120)
         # ...but an unknown price is asked for again every tick.
+        before = rig.engine._slot_import_price.await_count
         rig.set_price(None)
-        for minute in (120, 121, 122):
+        for minute in (121, 122, 123):
             await rig.tick(minute)
-        assert rig.engine._current_import_price.await_count == 5
+        assert rig.engine._slot_import_price.await_count == before + 3
 
 
 class TestPriceRulesRestart:
@@ -1260,46 +1275,449 @@ class TestPeakOffThermostatGuard:
     """With a working thermostat there is no peak-off while the room is below
     target - hysteresis - margin (20 - 0.5 - 1.0 = 18.5)."""
 
-    async def _window_opening_at_a_peak(self, tmp_path, temp: str) -> Rig:
-        rig = Rig(tmp_path, _ruled(**PEAK, **THERMO), {CAL: "off"})
-        rig.set_price(2.2)
+    async def _peak_after_two_hours_on(self, tmp_path, temp: str) -> Rig:
+        rig = Rig(tmp_path, _ruled(**PEAK, **THERMO), {CAL: "on"})
+        rig.set_price(1.0)
+        _temp(rig, "19.0")
         await rig.tick(0)
-        rig.ha.states[CAL] = "on"
-        _temp(rig, temp, minutes=10)
-        await rig.tick(10)
+        assert rig.plug == "on"
+        rig.set_price(2.2)
+        _temp(rig, temp, minutes=120)
+        await rig.tick(120)
         return rig
 
     @pytest.mark.asyncio
     async def test_a_cold_room_is_heated_through_the_peak(self, tmp_path):
-        rig = await self._window_opening_at_a_peak(tmp_path, "18.4")
+        rig = await self._peak_after_two_hours_on(tmp_path, "18.4")
         assert rig.plug == "on" and rig.ha.status[0] == "on"
 
     @pytest.mark.asyncio
     async def test_a_room_above_the_margin_may_wait_out_the_peak(self, tmp_path):
-        rig = await self._window_opening_at_a_peak(tmp_path, "18.5")
+        rig = await self._peak_after_two_hours_on(tmp_path, "18.5")
         assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
-        _temp(rig, "18.4", minutes=40)  # cools below the margin: the peak-off ends
-        await rig.tick(40)
+        _temp(rig, "18.4", minutes=150)  # cools below the margin: the peak-off ends
+        await rig.tick(150)
         assert rig.plug == "on" and "too cold" in rig.ha.status[1]["reason"]
 
     @pytest.mark.asyncio
     async def test_a_dead_sensor_leaves_only_the_time_bounds(self, tmp_path):
-        rig = await self._window_opening_at_a_peak(tmp_path, "unknown")
+        rig = await self._peak_after_two_hours_on(tmp_path, "unknown")
         assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
-        await rig.tick(190)
+        await rig.tick(300)
         assert rig.plug == "on"
 
     @pytest.mark.asyncio
     async def test_the_setback_still_protects_the_room_during_a_peak_off(self, tmp_path):
         rig = Rig(tmp_path, _ruled(**PEAK, temp_sensor=TEMP, setback_temp_c=15.0),
-                  {CAL: "off"})
-        rig.set_price(2.2)
+                  {CAL: "on"})
+        rig.set_price(1.0)
         _temp(rig, "16.0")
         await rig.tick(0)
-        rig.ha.states[CAL] = "on"
-        _temp(rig, "14.0", minutes=10)
-        await rig.tick(10)
+        rig.set_price(2.2)
+        _temp(rig, "16.0", minutes=120)
+        await rig.tick(120)
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
+        _temp(rig, "14.0", minutes=130)
+        await rig.tick(130)
         assert rig.plug == "on" and rig.ha.status[0] == "setback"
+
+
+async def _into_a_peak_off(tmp_path, load=None, **states) -> Rig:
+    """In a window, on for two hours, then a price peak: the plug is OFF for the
+    price from minute 120 (max 180 min, i.e. until minute 300)."""
+    rig = Rig(tmp_path, load or _ruled(**PEAK), {CAL: "on", **states},
+              events=[(_at(-60), _at(48 * HOURS))])
+    rig.set_price(1.0)
+    await rig.tick(0)
+    rig.set_price(2.2)
+    await rig.tick(120)
+    assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
+    return rig
+
+
+def _longest_off(rig: Rig, ticks) -> int:
+    """Longest run of minutes the plug was off, sampled after each tick."""
+    return max((len(run) for run in "".join(ticks).split("1")), default=0)
+
+
+class TestPriceOffIsNeverHeld:
+    """THE invariant of the price rule: a plug is off on account of the price for at
+    most peak_off_max_minutes plus one dwell — whatever happens to the gate, the
+    pause helper or the calendar's event list meanwhile. Every "leave the plug as
+    it is" branch stops the rule's clock, so each must end a peak-off first."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("plan", [{}, {"kim_heater": 0.0}, {"kim_heater": 0.5}])
+    async def test_a_gate_that_goes_dark_during_a_peak_off_switches_on(self, tmp_path, plan):
+        """Reproduced by review: calendar unavailable 20 min into a peak-off kept
+        the plug off for the whole outage (381 min)."""
+        rig = await _into_a_peak_off(tmp_path)
+        await rig.tick(139, plan=plan)
+        rig.ha.states[CAL] = "unavailable"
+        await rig.tick(140, plan=plan)
+        assert rig.plug == "on" and rig.ha.status[0] == "gate_unknown"
+        assert "peak-off ended" in rig.ha.status[1]["reason"]
+        await rig.tick(141, plan=plan)
+        await rig.tick(169, plan=plan)
+        assert rig.plug == "on"  # ...and then it holds
+
+    @pytest.mark.asyncio
+    async def test_a_match_gate_whose_event_list_expires_during_a_peak_off(self, tmp_path):
+        rig = await _into_a_peak_off(tmp_path, _ruled(window_event_match="kim", **PEAK))
+        rig.events = RuntimeError("calendar integration down")
+        for minute in range(121, 160):
+            await rig.tick(minute)
+        assert rig.plug == "on" and rig.ha.status[0] == "gate_unknown"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_pause_helper_during_a_peak_off_switches_on(self, tmp_path):
+        """Reproduced by review: helper unreadable from minute 170 of a peak-off
+        stretched it to 201 min. The hold must not hold a price-driven OFF."""
+        rig = await _into_a_peak_off(tmp_path)
+        rig.ha.states[PAUSE] = "unavailable"
+        await rig.tick(125)
+        assert rig.plug == "on" and rig.ha.status[0] == "pause_unknown"
+        writes = len(rig.writes)
+        for minute in (126, 140, 154):
+            await rig.tick(minute)
+        assert len(rig.writes) == writes  # one write, then hands off
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_pause_helper_otherwise_still_writes_nothing(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on", PLUG: "off", PAUSE: "on"})
+        await rig.tick(0)
+        rig.ha.states[PAUSE] = "unavailable"
+        await rig.tick(1)
+        assert rig.writes == []
+
+    @pytest.mark.asyncio
+    async def test_pausing_during_a_peak_off_hands_the_plug_over_on(self, tmp_path):
+        """Paused, nobody runs the peak-off clock any more. The plug is off because
+        WE switched it off, so it is switched on once and then left alone."""
+        rig = await _into_a_peak_off(tmp_path)
+        rig.ha.states[PAUSE] = "on"
+        await rig.tick(125)
+        assert rig.plug == "on" and rig.ha.status[0] == "paused"
+        writes = len(rig.writes)
+        rig.ha.states[PLUG] = "off"  # the human's own choice now
+        for minute in (126, 200, 400):
+            await rig.tick(minute)
+        assert len(rig.writes) == writes and rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_the_plan_cannot_hold_it_off_past_the_bound_either(self, tmp_path):
+        """Gate dark for hours, the planner keeps booking a peak-off (slot value 0)
+        on every replan. While the last readable gate says "in a window", a plan
+        off is bounded by the same max-off / min-on clocks."""
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on"},
+                  events=[(_at(-60), _at(48 * HOURS))])
+        rig.set_price(1.0)
+        await rig.tick(0)
+        rig.ha.states[CAL] = "unavailable"
+        trace = []
+        for minute in range(1, 16 * 60):
+            await rig.tick(minute, plan={"kim_heater": 0.0})
+            trace.append("1" if rig.plug == "on" else "0")
+        # 30 min hold (on), then: on until 120 min on, off 180, on 120, off 180...
+        assert _longest_off(rig, trace) <= 180 + 5
+        assert trace.count("0") / len(trace) <= 0.62
+        assert "0" in trace  # the plan IS followed, within the bound
+
+    @pytest.mark.asyncio
+    async def test_the_plan_is_followed_freely_once_the_last_known_window_ended(
+        self, tmp_path
+    ):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on"}, events=[(_at(-60), _at(90))])
+        rig.set_price(1.0)
+        await rig.tick(0)
+        rig.ha.states[CAL] = "unavailable"
+        for minute in range(1, 12 * 60, 7):
+            await rig.tick(minute, plan={"kim_heater": 0.0})
+        assert rig.plug == "off"  # off since the fallback, and never forced on
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("seed", [20261113, 1, 2, 3, 4, 5])
+    async def test_no_combination_of_outages_stretches_a_price_off(self, tmp_path, seed):
+        """Four days of a price that is ALWAYS at a peak (the worst case for the rule),
+        with the calendar, the pause helper and the event list dropping out at
+        awkward moments, restarts included. Longest off: max + one dwell."""
+        import random
+
+        rnd = random.Random(seed)
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on"},
+                  events=[(_at(-60), _at(400 * HOURS))])
+        rig.price_window = [1.0] * 20 + [2.2] * 4
+        rig.set_price(2.2)
+        trace = []
+        cal_out = pause_out = list_out = 0
+        for minute in range(4 * 24 * 60):
+            if cal_out == 0 and rnd.random() < 0.004:
+                cal_out = rnd.choice([1, 3, 25, 45, 200, 400])
+            if pause_out == 0 and rnd.random() < 0.004:
+                pause_out = rnd.choice([1, 10, 29, 31, 90])
+            if list_out == 0 and rnd.random() < 0.002:
+                list_out = rnd.choice([10, 45, 300])
+            if rnd.random() < 0.002:  # add-on restart
+                rig.engine.__dict__["_window_loads"] = wl.WindowLoadRuntime(
+                    fetch=rig.engine.__dict__["_window_loads"]._fetch
+                )
+            rig.ha.states[CAL] = "unavailable" if cal_out else "on"
+            rig.ha.states[PAUSE] = "unavailable" if pause_out else "off"
+            saved = rig.events
+            if list_out:
+                rig.events = RuntimeError("list down")
+            await rig.tick(minute, plan={"kim_heater": 0.0} if minute % 2 else {})
+            rig.events = saved
+            cal_out, pause_out, list_out = (max(0, x - 1) for x in (cal_out, pause_out, list_out))
+            trace.append("1" if rig.plug == "on" else "0")
+        assert _longest_off(rig, trace) <= 180 + 5
+        assert "0" * 170 in "".join(trace)  # and the rule really was at work
+
+
+class TestRuleStateAcrossARestart:
+    """The executor's own status sensor carries the rule state. A fresh process picks
+    it up while it is at most 20 min old, so a peak-off keeps its REAL clock; an
+    older or missing sensor is not trusted and the safe start applies instead."""
+
+    def _restart(self, rig: Rig) -> None:
+        rig.engine.__dict__["_window_loads"] = wl.WindowLoadRuntime(
+            fetch=rig.engine.__dict__["_window_loads"]._fetch
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_peak_off_continues_on_its_real_clock(self, tmp_path):
+        rig = await _into_a_peak_off(tmp_path)  # off since minute 120
+        await rig.tick(200)
+        self._restart(rig)
+        await rig.tick(201)
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
+        assert rig.ha.status[1]["peak_off_since"] == "2026-11-13T15:00+01:00"
+        await rig.tick(299)
+        assert rig.plug == "off"
+        await rig.tick(300)  # 180 min after it really began — not after the restart
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_a_restart_into_a_dark_gate_during_a_peak_off_switches_on(self, tmp_path):
+        """The hole a fresh process used to have: plug off, nobody remembers why,
+        gate unreadable -> "hold as it is" for the whole outage."""
+        rig = await _into_a_peak_off(tmp_path)
+        await rig.tick(130)
+        self._restart(rig)
+        rig.ha.states[CAL] = "unavailable"
+        await rig.tick(131, plan={"kim_heater": 0.0})
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_a_restart_into_an_unreadable_pause_helper_during_a_peak_off(self, tmp_path):
+        rig = await _into_a_peak_off(tmp_path)
+        await rig.tick(130)
+        self._restart(rig)
+        rig.ha.states[PAUSE] = "unavailable"
+        await rig.tick(131)
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_a_stale_status_sensor_is_not_trusted(self, tmp_path):
+        """Add-on down for an hour mid peak-off: the record is too old. Safe start:
+        on at once, and the full min-on time before the next peak-off."""
+        rig = await _into_a_peak_off(tmp_path)
+        self._restart(rig)
+        await rig.tick(180)  # 60 min after the last publish
+        assert rig.plug == "on"
+        await rig.tick(299)
+        assert rig.plug == "on"
+        await rig.tick(300)
+        assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_the_min_on_clock_survives_a_restart_too(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on"})
+        rig.set_price(1.0)
+        await rig.tick(0)
+        await rig.tick(100)
+        self._restart(rig)
+        rig.set_price(2.2)
+        await rig.tick(105)
+        assert rig.plug == "on"  # on for 105 min only
+        await rig.tick(120)
+        assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_a_load_without_rules_reads_nothing_back(self, tmp_path):
+        rig = Rig(tmp_path, _load(), {CAL: "on"})
+        await rig.tick(0)
+        self._restart(rig)
+        rig.ha.reads.clear()
+        await rig.tick(1)
+        assert STATUS not in rig.ha.reads
+
+
+class TestPauseHelperNotice:
+    @pytest.mark.asyncio
+    async def test_a_helper_unreadable_for_30_min_is_told_to_a_human_once(self, tmp_path):
+        """From here the heater is controlled again although it may be meant to be
+        paused — not something to leave in a log line."""
+        rig = Rig(tmp_path, _load(), {PAUSE: "unavailable", CAL: "on"})
+        notify = AsyncMock()
+        rig.engine.dispatcher._send_notification = notify  # type: ignore[method-assign]
+        for minute in (0, 15, 29):
+            await rig.tick(minute)
+        notify.assert_not_awaited()
+        for minute in (30, 31, 200):
+            await rig.tick(minute)
+        assert notify.await_count == 1
+        text = notify.await_args.args[0]
+        assert "Kims element" in text and PAUSE in text and "INTE pausat" in text
+        rig.ha.states[PAUSE] = "off"
+        await rig.tick(201)
+        await rig.tick(202)
+        assert notify.await_count == 2 and "igen" in notify.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_a_short_blip_notifies_nobody(self, tmp_path):
+        rig = Rig(tmp_path, _load(), {PAUSE: "unavailable", CAL: "on"})
+        notify = AsyncMock()
+        rig.engine.dispatcher._send_notification = notify  # type: ignore[method-assign]
+        await rig.tick(0)
+        rig.ha.states[PAUSE] = "on"
+        await rig.tick(5)
+        notify.assert_not_awaited()
+
+
+class TestEarlyLatchSurvivesAnUnreadableEventList:
+    """The latch needs the window's start time, which comes from the event list.
+    A list that cannot be refreshed (and has aged out) is not "no window"."""
+
+    async def _latched(self, tmp_path) -> Rig:
+        rig = Rig(tmp_path, _ruled(**EARLY), {},
+                  events=[(_at(10 * HOURS), _at(99 * HOURS))])
+        rig.set_price(0.4)
+        await rig.tick(0)
+        assert rig.ha.status[0] == "early_start"
+        rig.set_price(2.0)  # dear from here on: only the latch keeps it on
+        return rig
+
+    @pytest.mark.asyncio
+    async def test_the_latch_is_kept_while_the_list_is_unreadable(self, tmp_path):
+        rig = await self._latched(tmp_path)
+        rig.events = RuntimeError("calendar list down")
+        for minute in range(1, 4 * 60, 3):  # well past the 30 min the list is trusted
+            await rig.tick(minute)
+            assert rig.plug == "on", minute
+        assert rig.ha.status[0] == "early_start" and len(rig.writes) == 1
+
+    @pytest.mark.asyncio
+    async def test_it_hands_over_to_the_window_when_the_calendar_turns_on(self, tmp_path):
+        rig = await self._latched(tmp_path)
+        rig.events = RuntimeError("calendar list down")
+        await rig.tick(9 * HOURS)
+        rig.ha.states[CAL] = "on"
+        await rig.tick(10 * HOURS)
+        assert rig.plug == "on" and rig.ha.status[0] == "on" and len(rig.writes) == 1
+
+    @pytest.mark.asyncio
+    async def test_it_ends_when_the_remembered_start_passes_without_a_window(self, tmp_path):
+        rig = await self._latched(tmp_path)
+        rig.events = RuntimeError("calendar list down")
+        await rig.tick(9 * HOURS)
+        await rig.tick(10 * HOURS + 1)  # start time gone, calendar still off
+        await rig.tick(10 * HOURS + 2)
+        assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("moved", [[], [(_at(40 * HOURS), _at(99 * HOURS))]])
+    async def test_a_fresh_list_that_says_moved_or_gone_still_drops_it(self, tmp_path, moved):
+        rig = await self._latched(tmp_path)
+        rig.events = moved
+        await rig.tick(6)  # the next list refresh
+        await rig.tick(7)
+        assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_list_does_not_create_a_latch(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**EARLY), {}, events=RuntimeError("down"))
+        rig.set_price(0.2)
+        await rig.tick(0)
+        assert rig.plug == "off"
+
+
+class TestSlotPrice:
+    """F2: the rules must see the price of the 15-minute slot that contains NOW.
+    The shared _current_import_price returns the slot that began up to an hour ago
+    and holds it for the clock hour (45-105 min old on a 15-minute feed)."""
+
+    def _feed(self):
+        import pytz
+
+        tz = pytz.timezone("Europe/Stockholm")
+        day = tz.localize(datetime(2026, 11, 13, 0, 0))
+        return tz, [
+            {
+                "start_time": day + timedelta(minutes=15 * q),
+                "end_time": day + timedelta(minutes=15 * (q + 1)),
+                "import_price_sek_kwh": 1.0 + q / 100.0,  # 07:00 -> 1.28
+            }
+            for q in range(96)
+        ]
+
+    async def _at(self, engine, tz, feed, hour, minute):
+        import executor.engine as engine_module
+
+        moment = tz.localize(datetime(2026, 11, 13, hour, minute, 20))
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return moment.astimezone(tz) if tz else moment
+
+        async def nordpool(_path, **_kw):
+            return feed
+
+        with patch.object(engine_module, "datetime", Clock), patch(
+            "backend.core.prices.get_nordpool_data", nordpool
+        ):
+            return await engine._slot_import_price(), await engine._current_import_price()
+
+    @pytest.mark.asyncio
+    async def test_the_rule_sees_the_0700_slot_at_0705(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {})
+        engine = rig.engine
+        del engine._slot_import_price  # the real one
+        tz, feed = self._feed()
+        slot, hourly = await self._at(engine, tz, feed, 6, 50)
+        assert slot == pytest.approx(1.27)  # the 06:45 slot
+        assert hourly == pytest.approx(1.24)  # the shared helper: the 06:00 slot
+        slot, hourly = await self._at(engine, tz, feed, 7, 5)
+        assert slot == pytest.approx(1.28)  # the 07:00 slot, five minutes in
+        slot, _ = await self._at(engine, tz, feed, 7, 14)
+        assert slot == pytest.approx(1.28)
+        slot, _ = await self._at(engine, tz, feed, 7, 15)
+        assert slot == pytest.approx(1.29)  # memoised per slot, not per hour
+        slot, hourly = await self._at(engine, tz, feed, 7, 59)
+        assert slot == pytest.approx(1.31)
+        assert hourly == pytest.approx(1.25)  # ...where the shared helper still is
+
+    @pytest.mark.asyncio
+    async def test_an_hourly_feed_and_a_missing_slot(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {})
+        engine = rig.engine
+        del engine._slot_import_price
+        tz, feed = self._feed()
+        hourly_feed = [
+            {**p, "end_time": p["start_time"] + timedelta(hours=1)} for p in feed[::4]
+        ]
+        slot, _ = await self._at(engine, tz, hourly_feed, 7, 40)
+        assert slot == pytest.approx(1.28)
+        engine._forward_price_cache = None
+        slot, _ = await self._at(engine, tz, [], 8, 40)
+        assert slot is None  # unknown, never a stale neighbour
+
+    @pytest.mark.asyncio
+    async def test_the_engine_hands_the_slot_price_to_the_rules(self, tmp_path):
+        rig = await _into_a_peak_off(tmp_path)
+        rig.engine._slot_import_price.assert_awaited()
+        assert rig.ha.status[1]["price_now"] == 2.2
 
 
 class TestGateFromWindows:
