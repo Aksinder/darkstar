@@ -19,6 +19,7 @@ solves, collected when kepler.solver.dump_all_instances > 0). Pull them off the
 box with GET /api/debug/solver_dumps and /api/debug/solver_dumps/<name>.
 
 Mutations: no_hourly_blocks | no_anchor | no_spacing | no_absorb_cap
+           | flow_water (water_heating.flow_formulation on; flow_water:off forces it off)
            | truncate:H (drop slots beyond H hours)
            | retail:H  (coarsen the tail beyond H hours to whole clock hours)
 
@@ -142,6 +143,12 @@ def _mut_no_hourly_blocks(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
     return ki, cfg
 
 
+def _mut_flow_water(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
+    """A/B the arc-flow water formulation (water_heating.flow_formulation)."""
+    cfg.water_flow_formulation = (arg or "on").lower() not in ("off", "0", "false")
+    return ki, cfg
+
+
 def _mut_no_anchor(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
     for h in cfg.water_heaters:
         h.anchor_on_slots = None
@@ -228,6 +235,7 @@ def _mut_retail(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
 
 MUTATIONS = {
     "no_hourly_blocks": _mut_no_hourly_blocks,
+    "flow_water": _mut_flow_water,
     "no_anchor": _mut_no_anchor,
     "no_spacing": _mut_no_spacing,
     "no_absorb_cap": _mut_no_absorb_cap,
