@@ -34,26 +34,41 @@ if TYPE_CHECKING:
 # into "load", and it cannot be cross-checked (the balance tripwire abstains on it).
 DERIVED_LOAD_FLAG_KEYS: tuple[str, ...] = ("load_rescued", "repaired")
 
+# Value shapes written by the recorder (a flag is a key, present only when it fired):
+#   pv_unmeasured      "snapshot" | "counter"
+#   water_unmeasured   {heater_id_or_sensor: "unavailable" | "snapshot"}
+#   ev_unmeasured      {charger_id_or_sensor: "unavailable" | "snapshot"}
+#   base_load_clamped  true — only when the stored load_kwh IS the clamped 0.0 (a
+#                      balance-rescued row carries load_rescued and a real value)
+#   load_spike_zeroed  sorted LIST of the zeroed columns, e.g. ["load_kwh", "pv_kwh"];
+#                      fires for ANY zeroed energy column, so it is matched per column.
+SPIKE_ZEROED_FLAG = "load_spike_zeroed"
+
 # PV target (pv_kwh, trained as pv_kwh - physics): the value is a single power
 # snapshot x 15 min or a counter that may omit the AC-coupled array — not weather.
+# Plus load_spike_zeroed naming pv_kwh: the stored 0.0 would train residual = -physics.
 PV_BAD_FLAGS: tuple[str, ...] = ("pv_unmeasured",)
+PV_SPIKE_ZEROED = "load_spike_zeroed[pv_kwh]"
 
 # Load target (load_kwh = BASE load = total - EV - water - cyclic):
-#   water_unmeasured / ev_unmeasured  the subtracted term is a snapshot guess (or 0),
-#                                     so the base load is off by the unmeasured part.
+#   water_unmeasured / ev_unmeasured  the subtracted term is a snapshot guess (or 0,
+#                                     leaving the device inside base load), so the
+#                                     base load is off by the unmeasured part.
 #   base_load_clamped                 managed loads exceeded the total; base load was
-#                                     clamped to 0 (or a floor) — an artefact.
-#   load_spike_zeroed                 validation replaced an implausible load by 0.
+#                                     clamped to 0 — an artefact.
+#   load_spike_zeroed                 only when the list names load_kwh: validation
+#                                     replaced an implausible load by 0.
 LOAD_BAD_FLAGS: tuple[str, ...] = (
     "water_unmeasured",
     "ev_unmeasured",
     "base_load_clamped",
-    "load_spike_zeroed",
+    SPIKE_ZEROED_FLAG,
 )
 
-# Name of the one cross-channel rule: a balance-derived load computed FROM an
-# unmeasured PV value (load = pv + import - ...) inherits the PV error.
+# Cross-channel rules for a balance-DERIVED load (load = pv + import - export + ...):
+# it inherits the error of an unmeasured PV value, and of any zeroed energy column.
 DERIVED_FROM_UNMEASURED_PV = "pv_unmeasured+derived_load"
+DERIVED_FROM_ZEROED_COLUMN = "load_spike_zeroed+derived_load"
 
 # Starvation guard: cleaning is abandoned for a target (unfiltered rows are used,
 # with a warning) when it would remove more than this share of the rows ...
@@ -62,41 +77,67 @@ MAX_DROP_FRACTION: float = 0.5
 # enough (min_rows is passed by the caller, normally TrainingConfig.min_samples).
 
 
-def flag_keys(raw: Any) -> set[str]:
-    """Return the set of flag tokens present in one quality_flags value.
+def parse_flags(raw: Any) -> dict[str, Any] | None:
+    """Parse one quality_flags value into {token: value}.
 
-    Accepts the recorder's JSON object (``{"pv_unmeasured": "snapshot"}``), a JSON
-    list of tokens, or an already parsed dict/list. A key whose value is ``false`` or
-    ``null`` counts as absent. NULL/NaN/empty -> no flags. A truncated or malformed
-    JSON string is matched on the quoted token as a plain substring (see ``has_flag``).
+    Accepts the recorder's JSON object, a JSON list of tokens (each -> True), or an
+    already parsed dict/list. NULL/NaN/empty/other types -> {} (no flags). Returns
+    None for a string that is not valid JSON (see ``has_flag`` for how that matches).
     """
     if raw is None or (isinstance(raw, float) and np.isnan(raw)):
-        return set()
+        return {}
     flags: Any = raw
     if isinstance(raw, str):
         if not raw.strip():
-            return set()
+            return {}
         try:
             flags = json.loads(raw)
         except ValueError:
-            return set()
+            return None
     if isinstance(flags, dict):
-        return {str(k) for k, v in flags.items() if v is not None and v is not False}
+        return {str(k): v for k, v in flags.items()}
     if isinstance(flags, list):
-        return {str(item) for item in flags if isinstance(item, str)}
-    return set()
+        return {str(item): True for item in flags if isinstance(item, str)}
+    return {}
+
+
+def _fired(value: Any) -> bool:
+    """A key whose value is false/null counts as absent; any other value fired."""
+    return value is not None and value is not False
 
 
 def has_flag(raw: Any, tokens: tuple[str, ...]) -> bool:
-    """True if any of ``tokens`` is present in one quality_flags value."""
-    if isinstance(raw, str):
-        try:
-            json.loads(raw)
-        except ValueError:
-            # Malformed/truncated JSON: fall back to a quoted-substring match.
-            return any(f'"{token}"' in raw for token in tokens)
-    keys = flag_keys(raw)
-    return any(token in keys for token in tokens)
+    """True if any of ``tokens`` is present (and not false/null) in a flags value.
+
+    A truncated or otherwise malformed JSON string is matched on the quoted token as
+    a plain substring.
+    """
+    flags = parse_flags(raw)
+    if flags is None:
+        return any(f'"{token}"' in str(raw) for token in tokens)
+    return any(_fired(flags.get(token)) for token in tokens)
+
+
+def spike_zeroed_column(raw: Any, column: str) -> bool:
+    """True if load_spike_zeroed says ``column`` was zeroed by validation.
+
+    The flag value is a list of column names. A bare string is read as one column.
+    Any other fired value (e.g. a legacy ``true``) names no column, so it is taken to
+    mean what the flag's name says: load_kwh only. Malformed JSON: both the quoted
+    flag and the quoted column must occur in the string.
+    """
+    flags = parse_flags(raw)
+    if flags is None:
+        text = str(raw)
+        return f'"{SPIKE_ZEROED_FLAG}"' in text and f'"{column}"' in text
+    value = flags.get(SPIKE_ZEROED_FLAG)
+    if not _fired(value):
+        return False
+    if isinstance(value, list | tuple | set):
+        return column in value
+    if isinstance(value, str):
+        return value == column
+    return column == "load_kwh"
 
 
 def flag_mask(df: pd.DataFrame, tokens: tuple[str, ...]) -> pd.Series:
@@ -107,6 +148,13 @@ def flag_mask(df: pd.DataFrame, tokens: tuple[str, ...]) -> pd.Series:
     if "quality_flags" not in df.columns:
         return pd.Series(False, index=df.index)
     return df["quality_flags"].map(lambda raw: has_flag(raw, tokens)).astype(bool)
+
+
+def spike_zeroed_mask(df: pd.DataFrame, column: str) -> pd.Series:
+    """Boolean mask of rows whose load_spike_zeroed list names ``column``."""
+    if "quality_flags" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["quality_flags"].map(lambda raw: spike_zeroed_column(raw, column)).astype(bool)
 
 
 @dataclass
@@ -136,12 +184,17 @@ class CleaningReport:
 
 def _rule_masks(df: pd.DataFrame, target: str) -> dict[str, pd.Series]:
     if target == "pv":
-        return {token: flag_mask(df, (token,)) for token in PV_BAD_FLAGS}
+        masks = {token: flag_mask(df, (token,)) for token in PV_BAD_FLAGS}
+        masks[PV_SPIKE_ZEROED] = spike_zeroed_mask(df, "pv_kwh")
+        return masks
     if target == "load":
-        masks = {token: flag_mask(df, (token,)) for token in LOAD_BAD_FLAGS}
-        masks[DERIVED_FROM_UNMEASURED_PV] = flag_mask(df, PV_BAD_FLAGS) & flag_mask(
-            df, DERIVED_LOAD_FLAG_KEYS
-        )
+        masks = {
+            token: flag_mask(df, (token,)) for token in LOAD_BAD_FLAGS if token != SPIKE_ZEROED_FLAG
+        }
+        masks[SPIKE_ZEROED_FLAG] = spike_zeroed_mask(df, "load_kwh")
+        derived = flag_mask(df, DERIVED_LOAD_FLAG_KEYS)
+        masks[DERIVED_FROM_UNMEASURED_PV] = derived & flag_mask(df, PV_BAD_FLAGS)
+        masks[DERIVED_FROM_ZEROED_COLUMN] = derived & flag_mask(df, (SPIKE_ZEROED_FLAG,))
         return masks
     raise ValueError(f"Unknown cleaning target: {target!r} (expected 'pv' or 'load')")
 

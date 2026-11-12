@@ -22,11 +22,14 @@ import ml.train as train_mod
 from backend.learning import LearningEngine
 from ml.cleaning import (
     DERIVED_FROM_UNMEASURED_PV,
+    DERIVED_FROM_ZEROED_COLUMN,
     LOAD_BAD_FLAGS,
     PV_BAD_FLAGS,
+    PV_SPIKE_ZEROED,
     bad_row_mask,
     clean_training_rows,
     has_flag,
+    spike_zeroed_column,
 )
 
 TZ = pytz.timezone("Europe/Stockholm")
@@ -78,7 +81,33 @@ def test_has_flag_parses_recorder_formats(raw, expected):
     assert has_flag(raw, ("pv_unmeasured",)) is expected
 
 
-def test_pv_rule_drops_only_pv_unmeasured():
+@pytest.mark.parametrize(
+    ("raw", "column", "expected"),
+    [
+        (json.dumps({"load_spike_zeroed": ["import_kwh", "load_kwh", "pv_kwh"]}), "load_kwh", True),
+        (json.dumps({"load_spike_zeroed": ["import_kwh", "load_kwh", "pv_kwh"]}), "pv_kwh", True),
+        (json.dumps({"load_spike_zeroed": ["import_kwh"]}), "load_kwh", False),
+        (json.dumps({"load_spike_zeroed": ["import_kwh"]}), "pv_kwh", False),
+        (json.dumps({"load_spike_zeroed": ["pv_kwh"]}), "load_kwh", False),
+        (json.dumps({"load_spike_zeroed": []}), "load_kwh", False),
+        ({"load_spike_zeroed": ["load_kwh"]}, "load_kwh", True),  # already parsed
+        (json.dumps({"load_spike_zeroed": "pv_kwh"}), "pv_kwh", True),  # bare string
+        (json.dumps({"load_spike_zeroed": True}), "load_kwh", True),  # no list: name says load
+        (json.dumps({"load_spike_zeroed": True}), "pv_kwh", False),
+        (json.dumps({"load_spike_zeroed": False}), "load_kwh", False),
+        ('{"load_spike_zeroed": ["load_kwh", "pv_', "load_kwh", True),  # truncated JSON
+        ('{"load_spike_zeroed": ["load_kwh", "pv_', "pv_kwh", False),
+        (json.dumps({"soc_stale": True}), "load_kwh", False),
+        (None, "load_kwh", False),
+        ("not json", "load_kwh", False),
+        (17, "load_kwh", False),
+    ],
+)
+def test_spike_zeroed_is_matched_per_column(raw, column, expected):
+    assert spike_zeroed_column(raw, column) is expected
+
+
+def test_pv_rule_drops_pv_unmeasured_and_zeroed_pv_only():
     df = _frame(
         [
             None,
@@ -86,12 +115,15 @@ def test_pv_rule_drops_only_pv_unmeasured():
             json.dumps({"water_unmeasured": {"main": "snapshot"}}),
             json.dumps({"load_rescued": "energy_balance"}),
             "{}",
+            json.dumps({"load_spike_zeroed": ["import_kwh", "pv_kwh"]}),
+            json.dumps({"load_spike_zeroed": ["load_kwh"]}),  # PV untouched -> kept
+            json.dumps({"ev_unmeasured": {"easee": "unavailable"}}),
         ]
         * 4
     )
     out, report = clean_training_rows(df, "pv", log=_silent)
-    assert len(out) == 16
-    assert report.dropped_by_rule == {"pv_unmeasured": 4}
+    assert len(out) == 24
+    assert report.dropped_by_rule == {"pv_unmeasured": 4, PV_SPIKE_ZEROED: 4}
     assert not report.starved
     assert not bad_row_mask(out, "pv").any()
 
@@ -100,9 +132,13 @@ def test_load_rules_drop_each_contract_flag_and_keep_plain_pv_unmeasured():
     flags = [
         None,
         json.dumps({"water_unmeasured": {"main": "unavailable"}}),
-        json.dumps({"ev_unmeasured": True}),
+        json.dumps({"ev_unmeasured": {"easee": "snapshot"}}),
         json.dumps({"base_load_clamped": True}),
-        json.dumps({"load_spike_zeroed": True}),
+        json.dumps({"load_spike_zeroed": ["load_kwh", "pv_kwh"]}),
+        # another column was zeroed, the METERED load is fine -> kept
+        json.dumps({"load_spike_zeroed": ["export_kwh"]}),
+        # ... but a balance-derived load was computed from the zeroed column -> dropped
+        json.dumps({"load_spike_zeroed": ["import_kwh"], "load_rescued": "energy_balance"}),
         # PV fallback with a METERED load: load target unaffected -> kept
         json.dumps({"pv_unmeasured": "snapshot"}),
         # ... but a balance-derived load was computed from that PV -> dropped
@@ -118,9 +154,10 @@ def test_load_rules_drop_each_contract_flag_and_keep_plain_pv_unmeasured():
         "base_load_clamped": 3,
         "load_spike_zeroed": 3,
         DERIVED_FROM_UNMEASURED_PV: 3,
+        DERIVED_FROM_ZEROED_COLUMN: 3,
     }
-    assert len(out) == 30 - 15
-    assert report.rows_dropped == 15
+    assert len(out) == 36 - 18
+    assert report.rows_dropped == 18
 
 
 def test_absent_flags_are_an_exact_noop():
