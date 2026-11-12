@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -37,6 +37,14 @@ from backend.core.load_windows import (
     fetch_calendar_windows,
     is_calendar,
     on_off_state,
+)
+
+from .window_price import (
+    PHASE_EARLY,
+    PHASE_PEAK_OFF,
+    RuleState,
+    step,
+    thresholds,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +76,8 @@ STATE_OVERRIDE_ON = "override_on"
 STATE_OVERRIDE_OFF = "override_off"
 STATE_FUSE_SHED = "fuse_shed"
 STATE_GATE_UNKNOWN = "gate_unknown"
+STATE_EARLY_START = "early_start"
+STATE_PEAK_OFF = "peak_off"
 
 
 @dataclass(frozen=True)
@@ -91,6 +101,10 @@ class Decision:
     reason: str
     room_temp: float | None = None
     target_temp: float | None = None
+    # Price rules (None when the rule is off or the price is unknown).
+    price_now: float | None = None
+    early_threshold: float | None = None
+    peak_threshold: float | None = None
 
 
 def gate_from_windows(windows: list[Window], now: datetime, preheat_minutes: float) -> Gate:
@@ -146,6 +160,10 @@ class WindowLoadRuntime:
         self._last_want: dict[str, bool] = {}
         self._last_switch_ts: dict[str, float] = {}
         self._last_gate: dict[str, Gate] = {}
+        # Price rules: the early-start latch and the peak-off clocks, per load. In
+        # memory only — see _seed_rule_state for what a fresh process does instead.
+        self._rule_state: dict[str, RuleState] = {}
+        self._price_memo: dict[str, tuple[tuple[int, float], float, list[float]]] = {}
         self._published: dict[str, tuple[float, str, dict[str, Any]]] = {}
 
     async def _event_windows(
@@ -250,8 +268,14 @@ class WindowLoadRuntime:
         plans: Mapping[str, float],
         now_ts: float,
         tz_name: str,
+        *,
+        price: float | None = None,
+        price_window: Sequence[float] = (),
     ) -> Decision:
-        """What the gate and the optional thermostat want from the relay now."""
+        """What the gate, the price rules and the optional thermostat want from the
+        relay now. ``price`` / ``price_window`` are only read when the load has a
+        price rule; an unknown price (None) switches the rules off, never the heater.
+        """
         gate = await self.read_gate(ha, load, now_ts, tz_name)
         self._last_gate[load.id] = gate
 
@@ -298,7 +322,6 @@ class WindowLoadRuntime:
         self._fallback_logged.discard(load.id)
 
         in_window = bool(gate.active or gate.preheat)
-        want = in_window
         if gate.active:
             reason = "window active"
         elif gate.preheat:
@@ -306,12 +329,69 @@ class WindowLoadRuntime:
         else:
             reason = "no window active"
 
-        # Optional thermostat: the comfort target inside a window, the setback
-        # (if any) outside. Without a fresh reading the window alone decides.
-        target = load.target_temp_c if in_window else load.setback_temp_c
+        # The room temperature is read at most once, and only when something below
+        # needs it.
+        temp_memo: list[float | None] = []
+
+        async def room_temp() -> float | None:
+            if not temp_memo:
+                temp_memo.append(await self._fresh_temp(ha, load, now_ts))
+            return temp_memo[0]
+
+        # Price rules: cheap early start before the window, off at price peaks.
+        rules = load.price_rules
+        heat = in_window
+        phase: str | None = None
+        early_thr: float | None = None
+        peak_thr: float | None = None
+        if rules.enabled:
+            now = datetime.fromtimestamp(now_ts, UTC)
+            next_on = (
+                gate.window_start - timedelta(minutes=load.preheat_minutes)
+                if not in_window and gate.window_start is not None
+                else None
+            )
+            state = self._rule_state.get(load.id)
+            if state is None:
+                state = await self._seed_rule_state(ha, load, now, in_window, next_on)
+            early_thr, peak_thr = thresholds(rules, price_window)
+            keep_warm = False
+            if (
+                rules.peak_enabled
+                and load.temp_sensor
+                and load.target_temp_c is not None
+                and (in_window or state.early_latched)
+            ):
+                room = await room_temp()
+                keep_warm = room is not None and room < (
+                    load.target_temp_c - load.hysteresis_c - rules.peak_off_temp_margin_c
+                )
+            state, verdict = step(
+                rules,
+                state,
+                now=now,
+                in_window=in_window,
+                next_on=next_on,
+                price=price,
+                early_threshold=early_thr,
+                peak_threshold=peak_thr,
+                keep_warm=keep_warm,
+            )
+            self._rule_state[load.id] = state
+            heat = verdict.heat
+            phase = verdict.phase
+            if phase in (PHASE_EARLY, PHASE_PEAK_OFF):
+                reason = verdict.reason
+            elif in_window:
+                reason += verdict.reason.removeprefix("window active")
+        want = heat
+
+        # Optional thermostat: the comfort target while heat is wanted, the setback
+        # (if any) otherwise. Without a fresh reading the window alone decides.
+        target = load.target_temp_c if heat else load.setback_temp_c
         temp: float | None = None
         if load.temp_sensor and target is not None:
-            temp = await self._fresh_temp(ha, load, now_ts)
+            temp = await room_temp()
             if temp is None:
                 reason += "; room temperature missing or stale — window only"
                 target = None
@@ -323,7 +403,7 @@ class WindowLoadRuntime:
                 want = thermostat_wants_heat(temp, target, load.hysteresis_c, heating)
                 reason = (
                     f"{reason}; room {temp:.1f} C, "
-                    f"{'target' if in_window else 'setback'} {target:.1f} C"
+                    f"{'target' if heat else 'setback'} {target:.1f} C"
                 )
         else:
             target = None
@@ -331,15 +411,85 @@ class WindowLoadRuntime:
 
         want, reason = self._dwell(load.id, want, reason, now_ts)
         if want:
-            if gate.active:
-                state = STATE_ON
+            if phase == PHASE_PEAK_OFF:
+                # Only the setback floor (or the dwell) keeps it on through a peak.
+                state_label = STATE_SETBACK if thermostat_on else STATE_ON
+            elif gate.active:
+                state_label = STATE_ON
             elif gate.preheat:
-                state = STATE_PREHEAT
+                state_label = STATE_PREHEAT
+            elif phase == PHASE_EARLY:
+                state_label = STATE_EARLY_START
             else:
-                state = STATE_SETBACK if thermostat_on else STATE_ON
+                state_label = STATE_SETBACK if thermostat_on else STATE_ON
+        elif phase == PHASE_PEAK_OFF:
+            state_label = STATE_PEAK_OFF
         else:
-            state = STATE_TEMP_HOLD if in_window else STATE_OFF
-        return Decision(want, state, reason, temp, target)
+            state_label = STATE_TEMP_HOLD if heat else STATE_OFF
+        return Decision(
+            want,
+            state_label,
+            reason,
+            temp,
+            target,
+            price if rules.enabled else None,
+            early_thr,
+            peak_thr,
+        )
+
+    async def _seed_rule_state(
+        self, ha: Any, load: Any, now: datetime, in_window: bool, next_on: datetime | None
+    ) -> RuleState:
+        """The price-rule state of a load we have no memory of (fresh process, or
+        control just handed back after a pause). Nothing is persisted; instead the
+        start is made SAFE:
+
+        * the min-on clock starts now, so no peak-off can begin until the heater has
+          been on for the full peak_off_min_on_minutes — a restart can never grant a
+          fresh off-stretch right after one ended (a restart IN a peak-off ends it);
+        * a plug that is ON inside the early-start span is taken to be latched, so a
+          restart does not switch off a heater that started on last night's cheap
+          price just because the price has risen since.
+        """
+        rules = load.price_rules
+        latched = False
+        if (
+            rules.early_enabled
+            and not in_window
+            and next_on is not None
+            and next_on - timedelta(hours=rules.early_start_hours) <= now < next_on
+        ):
+            latched = on_off_state(await ha.get_state_value(load.switch_entity)) is True
+        return RuleState(
+            early_latched=latched, heat_since=now if (in_window or latched) else None
+        )
+
+    async def price_inputs(
+        self,
+        load: Any,
+        now_ts: float,
+        read_price: Callable[[], Awaitable[float | None]],
+        read_window: Callable[[float], Awaitable[list[float]]],
+    ) -> tuple[float | None, list[float]]:
+        """(current import price, rolling price window) for a load's price rules,
+        from the executor's own price source. Kept per load for the clock hour — the
+        source only moves hourly — but an UNKNOWN price is never kept: it is asked
+        for again on the next tick. Any failure reads as unknown."""
+        hours = float(load.price_rules.price_window_hours)
+        key = (int(now_ts // 3600), hours)
+        memo = self._price_memo.get(load.id)
+        if memo is not None and memo[0] == key:
+            return memo[1], memo[2]
+        try:
+            price = await read_price()
+            window = list(await read_window(hours)) if price is not None else []
+        except Exception as exc:
+            logger.debug("Window load %s: price read failed: %s", load.id, exc)
+            return None, []
+        if price is None or not window:
+            return None, []
+        self._price_memo[load.id] = (key, price, window)
+        return price, window
 
     def _dwell(self, load_id: str, want: bool, reason: str, now_ts: float) -> tuple[bool, str]:
         """Hold the previous command while the relay switched under MIN_DWELL_S ago."""
@@ -367,6 +517,7 @@ class WindowLoadRuntime:
         self._unknown_since.pop(load_id, None)
         self._fallback_logged.discard(load_id)
         self._last_gate.pop(load_id, None)
+        self._rule_state.pop(load_id, None)
 
     def note_write(
         self, load_id: str, want_on: bool, result: Any, now_ts: float, *, gate_driven: bool
@@ -392,6 +543,9 @@ class WindowLoadRuntime:
         shadow: bool,
         room_temp: float | None = None,
         target_temp: float | None = None,
+        price_now: float | None = None,
+        early_threshold: float | None = None,
+        peak_threshold: float | None = None,
     ) -> None:
         """Publish ``sensor.darkstar_<id>_state`` — on change, or to keep it alive."""
         if ha is None:
@@ -402,6 +556,10 @@ class WindowLoadRuntime:
         def _iso(moment: datetime | None) -> str | None:
             return moment.astimezone(tz).isoformat(timespec="minutes") if moment else None
 
+        def _round(value: float | None) -> float | None:
+            return round(value, 4) if value is not None else None
+
+        rule = self._rule_state.get(load.id, RuleState())
         attrs: dict[str, Any] = {
             "friendly_name": f"{load.name or load.id} status",
             "icon": "mdi:radiator",
@@ -413,6 +571,15 @@ class WindowLoadRuntime:
             "target_temp": target_temp,
             "reason": reason,
             "shadow_mode": shadow,
+            # Price rules: null when the rule is off (or the price unknown).
+            "price_now": _round(price_now),
+            "early_start_threshold": _round(early_threshold),
+            "peak_off_threshold": _round(peak_threshold),
+            # The rules' memory, so the planner can start its forward simulation
+            # from where the plug really is.
+            "early_start_latched": rule.early_latched,
+            "peak_off_since": _iso(rule.peak_off_since),
+            "heat_since": _iso(rule.heat_since),
         }
         prev = self._published.get(load.id)
         if (

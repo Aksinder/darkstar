@@ -4256,12 +4256,9 @@ class ExecutorEngine:
         tz_name = self.config.timezone
         shadow = bool(self.config.shadow_mode)
 
-        async def _status(
-            state: str, reason: str, *, room: float | None = None, target: float | None = None
-        ) -> None:
+        async def _status(state: str, reason: str, **shown: float | None) -> None:
             await runtime.publish(
-                self.ha_client, load, state, reason, now, tz_name,
-                shadow=shadow, room_temp=room, target_temp=target,
+                self.ha_client, load, state, reason, now, tz_name, shadow=shadow, **shown
             )
 
         async def _write(want_on: bool, *, gate_driven: bool) -> None:
@@ -4307,8 +4304,17 @@ class ExecutorEngine:
             return
         self._override_state.pop(load.id, None)
 
+        # Price rules (cheap early start, peak off) read the executor's own price
+        # source; an unknown price disables the rules for the tick, not the heater.
+        price: float | None = None
+        price_window: list[float] = []
+        if load.price_rules.enabled:
+            price, price_window = await runtime.price_inputs(
+                load, now, self._current_import_price, self._price_window
+            )
         decision = await runtime.decide(
-            self.ha_client, load, slot.water_heater_plans or {}, now, tz_name
+            self.ha_client, load, slot.water_heater_plans or {}, now, tz_name,
+            price=price, price_window=price_window,
         )
         prev_state = self.__dict__.setdefault("_window_state_logged", {})
         if prev_state.get(load.id) != decision.state:
@@ -4318,7 +4324,9 @@ class ExecutorEngine:
             await _write(decision.want_on, gate_driven=True)
         await _status(
             decision.state, decision.reason,
-            room=decision.room_temp, target=decision.target_temp,
+            room_temp=decision.room_temp, target_temp=decision.target_temp,
+            price_now=decision.price_now, early_threshold=decision.early_threshold,
+            peak_threshold=decision.peak_threshold,
         )
 
     async def _note_window_write_verified(

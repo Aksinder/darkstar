@@ -225,6 +225,38 @@ water_heating:
 #     temp_max_age_minutes: 30     # an older reading counts as missing
 #     setback_temp_c:              # outside a window keep at least this warm
 #                                  # (unset = off outside the window)
+#     # Price rules, both off unless set. Decided live by the executor from the
+#     # current import price and simulated by the planner on the forecast prices.
+#     # Thresholds are percentiles of the rolling price window (price_window_hours,
+#     # default 24: the hours ahead, filled up with today's passed hours while
+#     # tomorrow's prices are not published yet). "Cheap" must also be below the
+#     # window's median and a "peak" above it, so a flat price day has neither.
+#     # An unknown price never starts early and never switches off: inside a
+#     # window the heater just stays on. Nothing is persisted: after a restart the
+#     # heater must run peak_off_min_on_minutes before a peak-off, and a plug that
+#     # is on inside the early-start span is taken to be latched.
+#     #
+#     # Cheap early start: from early_start_hours before the plug would otherwise
+#     # come on (window start minus preheat_minutes) it starts as soon as the price
+#     # is at or below the percentile, and then STAYS on until the window begins —
+#     # it does not switch off again when the price rises (only peak-off does).
+#     # NOTE: this costs extra energy — the room is heated for longer — and only
+#     # pays when the early hours are clearly cheaper than the window's first
+#     # hours. Calendar gates only: other entities have no known start time.
+#     early_start_hours: 14        # 0 = off (default)
+#     early_start_price_percentile: 30
+#     # Peak off: while the price is at or above this percentile the heater is OFF,
+#     # also inside a window and during early start / preheat. Time is the only
+#     # protection against a cold room without a temperature sensor, so one
+#     # off-stretch lasts at most peak_off_max_minutes and the heater must then run
+#     # peak_off_min_on_minutes before the next one. With the thermostat active
+#     # there is no peak-off while the room is below
+#     # target_temp_c - hysteresis_c - peak_off_temp_margin_c.
+#     peak_off_price_percentile: 85    # unset = off (default)
+#     peak_off_max_minutes: 180
+#     peak_off_min_on_minutes: 120
+#     peak_off_temp_margin_c: 1.0
+#     price_window_hours: 24
 
 # Real-time per-phase load balancing (main-fuse protection)
 # Ported from upstream (decision core + thermal fuse model). OBSERVE-ONLY by

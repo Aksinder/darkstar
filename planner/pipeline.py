@@ -870,11 +870,12 @@ class PlannerPipeline:
             load_mode,
             windows_from_iso,
         )
+        from executor.window_price import PriceRules, rule_state_from_attributes
         from planner.cyclic_preschedule import (
             CyclicSpec,
             PriceSlot,
             preschedule_cyclic_loads,
-            window_slot_kw,
+            window_plan_with_price_rules,
         )
 
         by_id: dict[str, dict[str, Any]] = {
@@ -923,8 +924,16 @@ class PlannerPipeline:
                         load_id,
                     )
                     continue
-                window_plan[load_id] = window_slot_kw(
-                    [(s.start_time, s.end_time) for s in slots], windows, kw
+                # Cheap early start / peak off (off unless configured): the same
+                # decision function the executor runs live, walked over the horizon
+                # on the forecast prices. Without a rule this is window_slot_kw.
+                window_plan[load_id] = window_plan_with_price_rules(
+                    [(s.start_time, s.end_time) for s in slots],
+                    [float(s.import_price_sek_kwh) for s in slots],
+                    windows,
+                    kw,
+                    PriceRules.from_mapping(c),
+                    rule_state_from_attributes(st.get("price_rule_state")),
                 )
                 continue
             if mode != MODE_DAILY:

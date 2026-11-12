@@ -1130,6 +1130,18 @@ async def get_initial_state(
                 logger.warning("window load %s: window read failed (%s)", cid, exc)
                 found_w = None
             entry_c["windows"] = None if found_w is None else windows_to_iso(found_w)
+            # Price rules (cheap early start, peak off): where the executor's latch
+            # and peak-off clocks stand now, from its status sensor, so the
+            # planner's forward simulation starts from the plug's real state.
+            from executor.window_load import status_entity_id
+            from executor.window_price import PriceRules
+
+            if PriceRules.from_mapping(cyclic).enabled:
+                try:
+                    status = await get_ha_entity_state(status_entity_id(cid))
+                except Exception:
+                    status = None
+                entry_c["price_rule_state"] = (status or {}).get("attributes") or None
             cyclic_load_states.append(entry_c)
             continue
         try:

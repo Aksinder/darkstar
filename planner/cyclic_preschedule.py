@@ -22,6 +22,10 @@ gates (surplus_run / presence) cover the surplus case live, which is the honest
 signal anyway; the rest is rounding error at these powers.
 
 Pure: no I/O, no config access — takes prices and returns slot indices.
+
+``mode: window`` loads (room heaters) are not scheduled at all — they are on while a
+window is active — and are only BOOKED here: window_slot_kw, and
+window_plan_with_price_rules when the load has a price rule.
 """
 
 from __future__ import annotations
@@ -30,6 +34,10 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from executor.window_price import PriceRules, RuleState
 
 
 @dataclass(frozen=True)
@@ -199,4 +207,70 @@ def window_slot_kw(
                 covered += overlap
         if covered > 0:
             out[i] = power_kw * min(1.0, covered / length)
+    return out
+
+
+def window_plan_with_price_rules(
+    slot_bounds: list[tuple[datetime, datetime]],
+    prices: list[float],
+    windows: list[tuple[datetime, datetime]],
+    power_kw: float,
+    rules: PriceRules,
+    state: RuleState | None = None,
+) -> dict[int, float]:
+    """:func:`window_slot_kw` with the load's price rules applied (cheap early start,
+    peak off — executor/window_price.py): ``{slot_index: kw}``.
+
+    The executor decides these rules live, from the current price. So that the solver
+    sees the load it will really get, the SAME decision function is walked forward
+    over the horizon here with the forecast price of each slot, carrying the
+    early-start latch and the peak-off max/min-on clocks from slot to slot:
+
+    * a slot the heater is latched on early in is booked at ``power_kw`` although no
+      window covers it;
+    * a slot it is peak-off in is booked 0 (absent from the result) although a window
+      covers it.
+
+    ``windows`` already start ``preheat_minutes`` early, so "when the plug would next
+    come on" is simply the next window start. ``state`` is where the plug stands now
+    (from the executor's status sensor); without it, a heater inside a window at slot
+    0 is taken to have just come on, which books load rather than a peak-off.
+    """
+    # Imported here, like the adapter's executor.config import: the executor package
+    # pulls in the whole engine, and this module is otherwise dependency-free.
+    from executor.window_price import PHASE_EARLY, RuleState, simulate
+
+    cover = window_slot_kw(slot_bounds, windows, 1.0)
+    if power_kw <= 0 or not slot_bounds:
+        return {}
+    if not rules.enabled:
+        return {i: power_kw * share for i, share in cover.items()}
+
+    reference = slot_bounds[0][0]
+    win_starts = sorted(
+        w for w in (_as_naive_like(start, reference) for start, _ in windows) if w is not None
+    )
+    starts = [s for s, _ in slot_bounds]
+    in_window = [i in cover for i in range(len(starts))]
+    next_on = [next((w for w in win_starts if w > s), None) for s in starts]
+    if state is None:
+        state = RuleState(heat_since=starts[0] if in_window[0] else None)
+    else:
+        state = RuleState(
+            early_latched=state.early_latched,
+            peak_off_since=_as_naive_like(state.peak_off_since, reference),
+            heat_since=_as_naive_like(state.heat_since, reference),
+        )
+    verdicts = simulate(
+        rules, state, starts=starts, prices=prices, in_window=in_window, next_on=next_on
+    )
+    out: dict[int, float] = {}
+    latched_before = False
+    for i, verdict in enumerate(verdicts):
+        if verdict.heat:
+            # A window that begins mid-slot covers only part of it — unless the
+            # heater was already on, latched, when the slot began.
+            whole = verdict.phase == PHASE_EARLY or latched_before
+            out[i] = power_kw * (1.0 if whole else cover.get(i, 1.0))
+        latched_before = verdict.phase == PHASE_EARLY and verdict.heat
     return out

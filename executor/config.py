@@ -15,6 +15,8 @@ from ruamel.yaml import YAML
 
 from backend.core.load_windows import MODE_INVALID, MODE_WINDOW, load_mode
 
+from .window_price import PriceRules
+
 logger = logging.getLogger(__name__)
 
 
@@ -515,6 +517,9 @@ class CyclicLoadConfig:
     temp_max_age_minutes: float = 30.0
     # Outside a window keep the room at least this warm. Unset = off outside.
     setback_temp_c: float | None = None
+    # Window mode only: cheap early start and peak off (executor/window_price.py).
+    # Everything off unless early_start_hours / peak_off_price_percentile is set.
+    price_rules: PriceRules = field(default_factory=PriceRules)
     enabled: bool = True
 
 
@@ -1644,6 +1649,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                     else CyclicLoadConfig.temp_max_age_minutes
                 ),
                 setback_temp_c=_float_or_none(raw_cl.get("setback_temp_c")),
+                price_rules=PriceRules.from_mapping(raw_cl),
                 enabled=bool(raw_cl.get("enabled", True)),
             )
         )

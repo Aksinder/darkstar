@@ -37,6 +37,10 @@ MIN = 60.0
 T0 = datetime(2026, 11, 13, 12, 0, tzinfo=UTC).timestamp()
 
 
+# 30th percentile 0.8, median 1.2, 85th percentile 1.9.
+PRICE_WINDOW = (0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2)
+
+
 def _at(minutes: float) -> datetime:
     return datetime.fromtimestamp(T0 + minutes * MIN, UTC)
 
@@ -129,6 +133,20 @@ class Rig:
             return self.events
 
         self.engine.__dict__["_window_loads"] = wl.WindowLoadRuntime(fetch=fetch)
+        # The executor's price source: None = unknown price.
+        self.price: float | None = None
+        self.price_window: list[float] = list(PRICE_WINDOW)
+        self.engine._current_import_price = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda: self.price
+        )
+        self.engine._price_window = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda hours: list(self.price_window)
+        )
+
+    def set_price(self, price: float | None) -> None:
+        """A new hour's price (the runtime keeps a known price for the clock hour)."""
+        self.price = price
+        self.engine.__dict__["_window_loads"]._price_memo.clear()
 
     async def tick(self, minutes: float = 0.0, *, plan: dict[str, float] | None = None,
                    ctx: dict[str, Any] | None = None) -> list[Any]:
@@ -702,10 +720,336 @@ class TestStatusSensor:
             "target_temp": None,
             "reason": "no window active",
             "shadow_mode": False,
+            "price_now": None,
+            "early_start_threshold": None,
+            "peak_off_threshold": None,
+            "early_start_latched": False,
+            "peak_off_since": None,
+            "heat_since": None,
         }
 
     def test_ids_are_slugged(self):
         assert wl.status_entity_id("Kim's heater") == "sensor.darkstar_kim_s_heater_state"
+
+
+EARLY = {"early_start_hours": 14}
+PEAK = {"peak_off_price_percentile": 85}
+OWNER = {**EARLY, **PEAK}
+HOURS = 60.0
+
+
+def _ruled(**keys: Any) -> CyclicLoadConfig:
+    from executor.window_price import PriceRules
+
+    rule_keys = {k: keys.pop(k) for k in list(keys) if k in PriceRules.__dataclass_fields__}
+    return _load(price_rules=PriceRules.from_mapping(rule_keys), **keys)
+
+
+class TestPriceRulesLive:
+    """Cheap early start and peak off, live. The decision itself is pinned down in
+    test_window_price.py; here: the wiring to the executor's price source, the
+    latch and clocks across ticks, the dwell, restarts, and the status sensor."""
+
+    @pytest.mark.asyncio
+    async def test_a_load_without_the_keys_never_asks_for_a_price(self, tmp_path):
+        rig = Rig(tmp_path, _load(), {CAL: "on"}, events=[(_at(-60), _at(600))])
+        rig.set_price(99.0)
+        await rig.tick(0)
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+        rig.engine._current_import_price.assert_not_awaited()
+        rig.engine._price_window.assert_not_awaited()
+        attrs = rig.ha.status[1]
+        assert attrs["price_now"] is None and attrs["peak_off_threshold"] is None
+
+    @pytest.mark.asyncio
+    async def test_early_start_latches_on_a_cheap_price_and_stays_on(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**EARLY), {}, events=[(_at(10 * HOURS), _at(99 * HOURS))])
+        rig.set_price(1.0)  # above the 30th percentile (0.8)
+        await rig.tick(0)
+        assert rig.plug == "off" and rig.ha.status[0] == "off"
+        rig.set_price(0.8)
+        await rig.tick(60)
+        state, attrs = rig.ha.status
+        assert rig.plug == "on" and state == "early_start"
+        assert (attrs["price_now"], attrs["early_start_threshold"]) == (0.8, 0.8)
+        assert attrs["peak_off_threshold"] is None  # that rule is off
+        assert attrs["early_start_latched"] is True and attrs["window_active"] is False
+        rig.set_price(2.2)  # dear again: latched, stays on
+        await rig.tick(120)
+        assert rig.plug == "on" and rig.ha.status[0] == "early_start"
+        rig.ha.states[CAL] = "on"  # the window begins: no gap, no extra write
+        await rig.tick(600)
+        assert rig.ha.status[0] == "on" and len(rig.writes) == 1
+
+    @pytest.mark.asyncio
+    async def test_early_start_only_inside_its_span(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**EARLY), {}, events=[(_at(20 * HOURS), _at(99 * HOURS))])
+        rig.set_price(0.2)
+        await rig.tick(0)  # 20 h before
+        assert rig.plug == "off"
+        await rig.tick(6 * HOURS)  # 14 h before
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_the_span_counts_from_when_preheat_would_switch_on(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(early_start_hours=2, preheat_minutes=60), {},
+                  events=[(_at(4 * HOURS), _at(99 * HOURS))])
+        rig.set_price(0.2)
+        await rig.tick(59)  # 3 h 01 before the window: preheat at -1 h, span from -3 h
+        assert rig.plug == "off"
+        await rig.tick(60)
+        assert rig.plug == "on" and rig.ha.status[0] == "early_start"
+        rig.set_price(2.2)
+        await rig.tick(3 * HOURS)  # preheat takes over, still on
+        assert rig.plug == "on" and rig.ha.status[0] == "preheat"
+
+    @pytest.mark.asyncio
+    async def test_a_non_calendar_gate_has_no_early_start(self, tmp_path):
+        gate = "input_boolean.kim_here"
+        rig = Rig(tmp_path, _ruled(window_entities=[gate], **EARLY), {gate: "off"})
+        rig.set_price(0.2)
+        await rig.tick(0)
+        assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_price_never_starts_early_and_never_switches_off(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**OWNER), {}, events=[(_at(HOURS), _at(99 * HOURS))])
+        rig.set_price(None)
+        await rig.tick(0)
+        assert rig.plug == "off"
+        rig.ha.states[CAL] = "on"
+        for minute in (60, 200, 400):
+            await rig.tick(minute)
+            assert rig.plug == "on" and rig.ha.status[0] == "on"
+        assert rig.ha.status[1]["price_now"] is None
+        # The price source failing outright is the same thing.
+        rig.engine._current_import_price.side_effect = RuntimeError("nordpool down")
+        await rig.tick(460)
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_a_price_window_without_prices_disables_the_rules(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "off"})
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        rig.price_window = []
+        rig.set_price(99.0)
+        await rig.tick(10)
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_peak_off_inside_a_window_with_its_time_bounds(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "off"})
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        rig.set_price(1.0)
+        await rig.tick(10)
+        assert rig.plug == "on"
+        rig.set_price(1.9)  # the 85th percentile
+        await rig.tick(100)  # on for 90 min: not yet
+        assert rig.plug == "on" and "on for less than 120 min" in rig.ha.status[1]["reason"]
+        await rig.tick(130)  # 120 min on
+        state, attrs = rig.ha.status
+        assert rig.plug == "off" and state == "peak_off"
+        assert (attrs["price_now"], attrs["peak_off_threshold"]) == (1.9, 1.9)
+        assert attrs["peak_off_since"] == "2026-11-13T15:10+01:00"
+        assert attrs["window_active"] is True
+        await rig.tick(309)  # 179 min off
+        assert rig.plug == "off"
+        await rig.tick(310)  # 180 min: must run again, although still dear
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+        await rig.tick(429)
+        assert rig.plug == "on"
+        await rig.tick(430)  # 120 min on: the next stretch may begin
+        assert rig.plug == "off"
+        rig.set_price(1.0)
+        await rig.tick(440)
+        assert rig.plug == "on"
+        assert [c[1] for c in rig.writes] == ["turn_on", "turn_off", "turn_on", "turn_off",
+                                              "turn_on"]
+
+    @pytest.mark.asyncio
+    async def test_a_window_that_opens_at_a_peak_waits_it_out(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "off"})
+        rig.set_price(2.2)
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        await rig.tick(10)
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off" and rig.writes == []
+        await rig.tick(190)
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_a_peak_interrupts_an_early_start_and_the_latch_survives(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**OWNER), {}, events=[(_at(12 * HOURS), _at(99 * HOURS))])
+        rig.set_price(0.4)
+        await rig.tick(0)
+        assert rig.ha.status[0] == "early_start"
+        rig.set_price(2.0)
+        await rig.tick(120)
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
+        assert rig.ha.status[1]["early_start_latched"] is True
+        rig.set_price(1.4)  # no longer a peak, not cheap either: latched, back on
+        await rig.tick(180)
+        assert rig.plug == "on" and rig.ha.status[0] == "early_start"
+
+    @pytest.mark.asyncio
+    async def test_the_dwell_applies_to_price_driven_switches(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "off"})
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        rig.set_price(1.0)
+        await rig.tick(10)
+        rig.set_price(2.2)
+        await rig.tick(130)
+        assert rig.plug == "off"
+        rig.set_price(1.0)  # the peak is over a minute later
+        await rig.tick(131)
+        assert rig.plug == "off" and "switched under 5 min ago" in rig.ha.status[1]["reason"]
+        await rig.tick(135)
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_fuse_shed_pause_and_override_still_outrank_the_price_rules(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**OWNER), {OVERRIDE: "force_on", CAL: "on"})
+        rig.set_price(2.2)
+        await rig.tick(0)
+        assert rig.plug == "on" and rig.ha.status[0] == "override_on"
+        rig.ha.states.update({OVERRIDE: "auto", PAUSE: "on"})
+        await rig.tick(1)
+        assert rig.ha.status[0] == "paused" and len(rig.writes) == 1
+        rig.engine._current_import_price.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_price_is_read_once_per_hour_not_once_per_tick(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on"})
+        rig.set_price(1.0)
+        for minute in range(0, 60, 5):
+            await rig.tick(minute)
+        assert rig.engine._current_import_price.await_count == 1
+        await rig.tick(60)
+        assert rig.engine._current_import_price.await_count == 2
+        # ...but an unknown price is asked for again every tick.
+        rig.set_price(None)
+        for minute in (120, 121, 122):
+            await rig.tick(minute)
+        assert rig.engine._current_import_price.await_count == 5
+
+
+class TestPriceRulesRestart:
+    """Nothing is persisted. A fresh process (and a load just un-paused) instead
+    starts from a SAFE reading of the plug: the min-on clock starts now, and a plug
+    that is on inside the early-start span is taken to be latched."""
+
+    @pytest.mark.asyncio
+    async def test_no_fresh_off_stretch_right_after_a_restart(self, tmp_path):
+        """In a window, at a peak, plug on (it may have just come back from a
+        peak-off): it must run the full min-on time first."""
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on", PLUG: "on"})
+        rig.set_price(2.2)
+        for minute in (0, 60, 119):
+            await rig.tick(minute)
+        assert rig.writes == []
+        await rig.tick(120)
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
+
+    @pytest.mark.asyncio
+    async def test_a_restart_during_a_peak_off_ends_it(self, tmp_path):
+        """The off-clock is gone, so the stretch cannot be bounded any more: on."""
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "on", PLUG: "off"})
+        rig.set_price(2.2)
+        await rig.tick(0)
+        assert rig.plug == "on"
+        await rig.tick(60)
+        assert rig.plug == "on" and len(rig.writes) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_restart_keeps_an_early_start_that_is_running(self, tmp_path):
+        """Started on last night's cheap price; restarted at noon when it is dear.
+        Switching it off now would throw the stored heat away."""
+        rig = Rig(tmp_path, _ruled(**EARLY), {PLUG: "on"},
+                  events=[(_at(3 * HOURS), _at(99 * HOURS))])
+        rig.set_price(2.0)
+        for minute in (0, 1, 30):
+            await rig.tick(minute)
+        assert rig.writes == [] and rig.plug == "on"
+        assert rig.ha.status[0] == "early_start"
+
+    @pytest.mark.asyncio
+    async def test_a_restart_does_not_invent_an_early_start(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**EARLY), {PLUG: "off"},
+                  events=[(_at(3 * HOURS), _at(99 * HOURS))])
+        rig.set_price(2.0)
+        await rig.tick(0)
+        assert rig.writes == [] and rig.ha.status[0] == "off"
+
+    @pytest.mark.asyncio
+    async def test_a_plug_left_on_outside_the_span_is_not_a_latch(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**EARLY), {PLUG: "on"},
+                  events=[(_at(20 * HOURS), _at(99 * HOURS))])
+        rig.set_price(2.0)
+        await rig.tick(0)
+        assert rig.plug == "off"
+
+    @pytest.mark.asyncio
+    async def test_un_pausing_starts_like_a_fresh_process(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK), {CAL: "off"})
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        rig.set_price(1.0)
+        await rig.tick(10)
+        rig.ha.states[PAUSE] = "on"
+        await rig.tick(200)
+        rig.ha.states[PAUSE] = "off"
+        rig.set_price(2.2)
+        await rig.tick(201)  # on for 190 min by the old clock — which is forgotten
+        assert rig.plug == "on"
+
+
+class TestPeakOffThermostatGuard:
+    """With a working thermostat there is no peak-off while the room is below
+    target - hysteresis - margin (20 - 0.5 - 1.0 = 18.5)."""
+
+    async def _window_opening_at_a_peak(self, tmp_path, temp: str) -> Rig:
+        rig = Rig(tmp_path, _ruled(**PEAK, **THERMO), {CAL: "off"})
+        rig.set_price(2.2)
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        _temp(rig, temp, minutes=10)
+        await rig.tick(10)
+        return rig
+
+    @pytest.mark.asyncio
+    async def test_a_cold_room_is_heated_through_the_peak(self, tmp_path):
+        rig = await self._window_opening_at_a_peak(tmp_path, "18.4")
+        assert rig.plug == "on" and rig.ha.status[0] == "on"
+
+    @pytest.mark.asyncio
+    async def test_a_room_above_the_margin_may_wait_out_the_peak(self, tmp_path):
+        rig = await self._window_opening_at_a_peak(tmp_path, "18.5")
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
+        _temp(rig, "18.4", minutes=40)  # cools below the margin: the peak-off ends
+        await rig.tick(40)
+        assert rig.plug == "on" and "too cold" in rig.ha.status[1]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_a_dead_sensor_leaves_only_the_time_bounds(self, tmp_path):
+        rig = await self._window_opening_at_a_peak(tmp_path, "unknown")
+        assert rig.plug == "off" and rig.ha.status[0] == "peak_off"
+        await rig.tick(190)
+        assert rig.plug == "on"
+
+    @pytest.mark.asyncio
+    async def test_the_setback_still_protects_the_room_during_a_peak_off(self, tmp_path):
+        rig = Rig(tmp_path, _ruled(**PEAK, temp_sensor=TEMP, setback_temp_c=15.0),
+                  {CAL: "off"})
+        rig.set_price(2.2)
+        _temp(rig, "16.0")
+        await rig.tick(0)
+        rig.ha.states[CAL] = "on"
+        _temp(rig, "14.0", minutes=10)
+        await rig.tick(10)
+        assert rig.plug == "on" and rig.ha.status[0] == "setback"
 
 
 class TestGateFromWindows:
@@ -767,6 +1111,24 @@ class TestConfig:
         assert (load.temp_sensor, load.target_temp_c, load.setback_temp_c) == (TEMP, 20.0, 15.0)
         assert (load.hysteresis_c, load.temp_max_age_minutes) == (0.3, 20.0)
         assert load.control_pause_entities == [PAUSE] and load.fuse_shed is True
+
+    def test_price_rule_keys(self, tmp_path):
+        from executor.window_price import PriceRules
+
+        base = {"id": "h", "mode": "window", "switch_entity": PLUG, "window_entities": [CAL]}
+        plain, ruled = self._load(tmp_path, [
+            base,
+            {**base, "id": "r", "early_start_hours": 14, "early_start_price_percentile": 30,
+             "peak_off_price_percentile": 85, "peak_off_max_minutes": 180,
+             "peak_off_min_on_minutes": 120, "price_window_hours": 48},
+        ])
+        assert plain.price_rules == PriceRules() and not plain.price_rules.enabled
+        assert ruled.price_rules == PriceRules(
+            early_start_hours=14.0, early_start_price_percentile=30.0,
+            peak_off_price_percentile=85.0, peak_off_max_minutes=180.0,
+            peak_off_min_on_minutes=120.0, peak_off_temp_margin_c=1.0,
+            price_window_hours=48.0,
+        )
 
     def test_an_existing_pump_config_is_a_daily_load(self, tmp_path):
         (load,) = self._load(tmp_path, [{
