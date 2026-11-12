@@ -1689,43 +1689,30 @@ class ExecutorEngine:
                     actions=actions,
                 )
             elif water_boost:
-                # Water Boost Logic with battery protection (Issue 2 fix)
+                # A manual water boost is never cancelled or refused based on SoC:
+                # the FORCE_HEAT override runs in idle (no battery discharge), so
+                # the boost heats from PV or grid and a low-battery guard protected
+                # nothing - it only switched the boost off.
                 from .override import OverrideResult, OverrideType
 
-                battery_cfg = self._full_config.get("battery", {})
-                min_soc = float(battery_cfg.get("min_soc_percent", 10.0))
-                min_boost_soc = min_soc + 10.0  # 10% buffer above min_soc
-
-                if state.current_soc_percent < min_boost_soc:
-                    # Battery too low - disable boost to protect battery
-                    logger.warning(
-                        "Water boost cancelled: SoC %.1f%% < required %.1f%%",
-                        state.current_soc_percent,
-                        min_boost_soc,
-                    )
-                    # Clear the boost
-                    with self._lock:
-                        self._water_boost_until = None
-                    # Send notification
-                    if self.dispatcher:
-                        await self.dispatcher._send_notification(  # type: ignore[protected-access]
-                            f"Water boost cancelled - battery too low ({state.current_soc_percent:.0f}% < {min_boost_soc:.0f}%)",
-                            title="Darkstar Water Boost",
-                        )
-                    override = OverrideResult(override_needed=False)
+                # Same idle floor hold slots write (the plan's soc_target); without
+                # a plan slot, hold the current charge (never below min_soc).
+                if slot is not None:
+                    boost_soc_target = slot.soc_target
                 else:
-                    # Battery healthy - allow boost with SoC protection
-                    protected_soc = max(int(state.current_soc_percent - 10), int(min_boost_soc))
-                    override = OverrideResult(
-                        override_needed=True,
-                        override_type=OverrideType.FORCE_HEAT,
-                        priority=8.0,
-                        reason=f"Water Boost active until {water_boost['expires_at']}",
-                        actions={
-                            "soc_target": protected_soc,  # Protect from excessive drain
-                            "water_temp": self.config.water_heater.temp_boost,
-                        },
-                    )
+                    battery_cfg = self._full_config.get("battery", {})
+                    min_soc = float(battery_cfg.get("min_soc_percent", 10.0))
+                    boost_soc_target = max(round(state.current_soc_percent), int(min_soc))
+                override = OverrideResult(
+                    override_needed=True,
+                    override_type=OverrideType.FORCE_HEAT,
+                    priority=8.0,
+                    reason=f"Water Boost active until {water_boost['expires_at']}",
+                    actions={
+                        "soc_target": boost_soc_target,
+                        "water_temp": self.config.water_heater.temp_boost,
+                    },
+                )
             else:
                 # Normal override evaluation
                 # Read override thresholds from config (with sensible defaults)
