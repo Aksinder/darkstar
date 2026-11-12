@@ -891,6 +891,22 @@ def _validate_config_for_save(
                 }
             )
 
+    # Load forecast blend weight: a share, not a percentage.
+    from backend.learning.baseline import LOAD_BLEND_WEIGHT_KEY, load_blend_weight_issue
+
+    forecasting_cfg = config.get("forecasting", {})
+    if isinstance(forecasting_cfg, dict):
+        blend_issue = load_blend_weight_issue(forecasting_cfg.get(LOAD_BLEND_WEIGHT_KEY))
+        if blend_issue is not None:
+            issues.append(
+                {
+                    "severity": "error",
+                    "message": f"forecasting.{LOAD_BLEND_WEIGHT_KEY} {blend_issue}",
+                    "guidance": "Use 0 to disable the blend, or a share such as 0.6 "
+                    "(60 % 7-day slot mean, 40 % model).",
+                }
+            )
+
     return issues
 
 

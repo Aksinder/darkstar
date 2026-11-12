@@ -1003,7 +1003,24 @@ forecasting:
                                        # than a dirty PV retrain) — check the training history if
                                        # models stop refreshing. (3) Training weather comes from the
                                        # Open-Meteo forecast API (max 92 past days), so PV training
-                                       # is effectively a 92-day sliding window regardless of floor.
+                                       # is effectively a 92-day sliding window regardless of floor
+                                       # (unless pv_training_weather_source is historical_forecast).
+  pv_training_weather_source: "forecast_past_days"
+                                       # Where PV residual TRAINING takes its weather history from
+                                       # (inference always uses the forecast endpoint):
+                                       #   forecast_past_days  (default) the forecast endpoint's
+                                       #     hindcast — max 92 days back, oldest weeks may be empty.
+                                       #   historical_forecast Open-Meteo's historical-forecast
+                                       #     archive — explicit date range, no 92-day cliff, gaps
+                                       #     of a missing hour or more are left empty (never
+                                       #     interpolated across).
+                                       # The archive has been measured to give 8-18 % HIGHER
+                                       # radiation than the hindcast, which shifts the physics
+                                       # baseline the residual is learned against. Compare first:
+                                       #   python scripts/compare_pv_training_sources.py --db <learning db>
+                                       # Takes effect at the next retrain; until then the forecast
+                                       # log warns that model and config disagree. Load models are
+                                       # not affected. Unknown value = forecast_past_days.
   pv_confidence_percent: 83.0          # PV forecast scaling (100 = trust forecast fully)
   pv_p10_weight: 0.0                   # 0 = legacy scalar haircut above. >0 (e.g. 0.3-0.5):
                                        # blend each slot toward Aurora's own pessimistic p10
@@ -1037,6 +1054,19 @@ forecasting:
     max_soc_percent: 98.0              # slots with battery ≥ this may be PV-throttled: ignored
                                        # (slots with a negative OR unknown export price are
                                        # ignored too: export curtailment may have clamped PV)
+  load_blend_slot_mean_weight: 0.0     # 0 = off (stored load forecast = pure model output).
+                                       # >0 (0..1): blend the model with the mean RECORDED base
+                                       # load of the same quarter-hour over the last 7 days:
+                                       #   forecast = (1-w) * model + w * slot mean
+                                       # (upstream Darkstar hard-codes w = 0.6). p10/p90 shift with
+                                       # p50. Removes a level bias of the model, at the price of a
+                                       # slower reaction to weather changes (heat pumps, AC sink).
+                                       # It STACKS with load_safety_margin_percent below: if that
+                                       # floor is already compensating a low model, enabling the
+                                       # blend without lowering the floor over-reserves. Pick both
+                                       # together from real data:
+                                       #   python scripts/compare_load_forecasts.py --db <learning db>
+                                       # Values outside 0..1 are rejected (treated as 0).
   load_safety_margin_percent: 117.0    # HARD FLOOR on the S-Index load margin: the planner never
                                        # plans for less load than this % of the forecast, regardless
                                        # of s_index.risk_appetite (which tunes conservatism ABOVE it).

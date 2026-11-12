@@ -7,9 +7,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ import yaml
 
 from backend.core.open_meteo_retry import is_transient_http_error, retry_sync
 from utils.time_utils import dst_safe_localize
+
+logger = logging.getLogger("darkstar.ml.weather")
 
 
 def _calculate_solar_position(
@@ -506,6 +509,193 @@ def get_weather_series(
     _weather_cache[cache_key] = (time.time(), df.copy())
 
     return df
+
+
+# --- PV training weather source -------------------------------------------------
+# forecasting.pv_training_weather_source selects where PV residual TRAINING takes its
+# weather history from. Inference always uses the forecast endpoint (get_weather_series).
+#   forecast_past_days   the forecast endpoint's hindcast (past_days, max 92 days, the
+#                        oldest weeks can come back null). Default = behaviour so far.
+#   historical_forecast  Open-Meteo's historical-forecast archive: explicit date range,
+#                        no 92-day cliff. NOT the same data: it has been measured to
+#                        differ from the hindcast by 8-18 % in radiation, which shifts
+#                        the physics baseline the residual is learned against.
+PV_WEATHER_SOURCE_FORECAST = "forecast_past_days"
+PV_WEATHER_SOURCE_HISTORICAL = "historical_forecast"
+PV_WEATHER_SOURCES: tuple[str, ...] = (PV_WEATHER_SOURCE_FORECAST, PV_WEATHER_SOURCE_HISTORICAL)
+
+_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+_HISTORICAL_HOURLY: dict[str, str] = {
+    "temperature_2m": "temp_c",
+    "cloud_cover": "cloud_cover_pct",
+    "shortwave_radiation": "shortwave_radiation_w_m2",
+    "direct_normal_irradiance": "dni_w_m2",
+    "diffuse_radiation": "dhi_w_m2",
+}
+# Hourly -> 15 min leaves 3 empty slots between two consecutive hourly samples. Only
+# such runs are interpolated; a longer run means at least one hourly value is missing
+# (null in the payload, or an outage) and stays NaN so the rows are dropped from PV
+# training instead of being trained against invented weather.
+MAX_INTERPOLATION_GAP_SLOTS = 3
+
+
+def resolve_pv_training_weather_source(config: dict[str, Any] | None) -> str:
+    """Return the configured PV training weather source (see PV_WEATHER_SOURCES).
+
+    Unset/empty -> the default. An unknown value logs a warning and also falls back
+    to the default, i.e. to the behaviour the installation had before the key existed.
+    """
+    forecasting_cfg: dict[str, Any] = (config or {}).get("forecasting", {}) or {}
+    raw: Any = forecasting_cfg.get("pv_training_weather_source")
+    if raw is None or str(raw).strip() == "":
+        return PV_WEATHER_SOURCE_FORECAST
+    value = str(raw).strip().lower()
+    if value not in PV_WEATHER_SOURCES:
+        logger.warning(
+            "Unknown forecasting.pv_training_weather_source %r (expected one of %s); using %s",
+            raw,
+            ", ".join(PV_WEATHER_SOURCES),
+            PV_WEATHER_SOURCE_FORECAST,
+        )
+        return PV_WEATHER_SOURCE_FORECAST
+    return value
+
+
+def interpolate_capped(
+    df: pd.DataFrame, max_gap_slots: int = MAX_INTERPOLATION_GAP_SLOTS
+) -> pd.DataFrame:
+    """Resample to 15 min and linearly interpolate only short interior gaps.
+
+    A run of more than ``max_gap_slots`` consecutive missing 15-min values is left
+    entirely NaN (pandas' own ``limit`` would fill the first slots of a long gap).
+    Leading and trailing gaps are never filled.
+    """
+    if df.empty or len(df) < 2:
+        return df
+    grid = df.resample("15min").asfreq()
+    out = grid.interpolate(method="linear", limit_area="inside")
+    for col in grid.columns:
+        missing = grid[col].isna()
+        run_id = (~missing).cumsum()
+        run_len = missing.groupby(run_id).transform("sum")
+        out.loc[missing & (run_len > max_gap_slots), col] = float("nan")
+    return out
+
+
+def get_historical_weather_series(
+    start_time: datetime,
+    end_time: datetime,
+    config: dict[str, Any] | None = None,
+    *,
+    config_path: str = "config.yaml",
+) -> pd.DataFrame:
+    """Fetch weather HISTORY from Open-Meteo's historical-forecast archive.
+
+    For PV training only (forecasting.pv_training_weather_source: historical_forecast).
+    Same columns and 15-min local-time index as get_weather_series, including the
+    DNI/DHI physics inputs, but with an explicit date range instead of past_days and
+    with capped interpolation (see MAX_INTERPOLATION_GAP_SLOTS).
+
+    Coordinates come from system.location; without them nothing is fetched. Best
+    effort: returns an empty DataFrame on any failure, and the caller must then NOT
+    substitute the other source.
+    """
+    cfg: dict[str, Any] = config or _load_config(config_path)
+    system_cfg: dict[str, Any] = cfg.get("system", {}) or {}
+    loc_cfg: dict[str, Any] = system_cfg.get("location", {}) or {}
+    try:
+        latitude = float(loc_cfg["latitude"])
+        longitude = float(loc_cfg["longitude"])
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Historical weather: system.location latitude/longitude not configured")
+        return pd.DataFrame(dtype="float64")
+
+    timezone_name: str = cfg.get("timezone", "Europe/Stockholm")
+    tz = pytz.timezone(timezone_name)
+    start_local = start_time.astimezone(tz)
+    end_local = end_time.astimezone(tz)
+    if end_local <= start_local:
+        return pd.DataFrame(dtype="float64")
+
+    # Requested in UTC (no DST localisation needed). One day of padding on each side
+    # so the edge slots have a neighbour to interpolate against; the archive does not
+    # serve dates after today.
+    today_utc = datetime.now(pytz.UTC).date()
+    start_date_obj = start_time.astimezone(pytz.UTC).date() - timedelta(days=1)
+    end_date_obj = min(end_time.astimezone(pytz.UTC).date() + timedelta(days=1), today_utc)
+    if end_date_obj < start_date_obj:
+        return pd.DataFrame(dtype="float64")
+
+    cache_key = f"hist_{latitude:.2f}_{longitude:.2f}_{start_date_obj}_{end_date_obj}"
+    if cache_key in _weather_cache:
+        cached_ts, cached_df = _weather_cache[cache_key]
+        if time.time() - cached_ts < _CACHE_TTL_SECONDS:
+            return cached_df[
+                (cached_df.index >= start_local) & (cached_df.index < end_local)
+            ].copy()
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": ",".join(_HISTORICAL_HOURLY),
+        "start_date": start_date_obj.isoformat(),
+        "end_date": end_date_obj.isoformat(),
+        "timezone": "UTC",
+    }
+
+    try:
+
+        def _fetch() -> requests.Response:
+            response = requests.get(_HISTORICAL_FORECAST_URL, params=params, timeout=30)
+            response.raise_for_status()
+            return response
+
+        response = retry_sync(
+            _fetch, label="historical weather", is_transient=is_transient_http_error
+        )
+        payload: dict[str, Any] = response.json()  # type: ignore[assignment]
+    except Exception as exc:
+        logger.warning(
+            "Historical weather fetch failed (%s .. %s): %s", start_date_obj, end_date_obj, exc
+        )
+        return pd.DataFrame(dtype="float64")
+
+    hourly: dict[str, Any] = payload.get("hourly") or {}
+    times: list[Any] = hourly.get("time") or []
+    if not times:
+        return pd.DataFrame(dtype="float64")
+
+    data: dict[str, list[Any]] = {}
+    for param, column in _HISTORICAL_HOURLY.items():
+        values: list[Any] = hourly.get(param) or []
+        if values and len(values) == len(times):
+            data[column] = values
+    if not data:
+        return pd.DataFrame(dtype="float64")
+
+    dt_index = pd.to_datetime(times, utc=True)
+    df = pd.DataFrame(data, index=dt_index).astype("float64")
+    if df.index.duplicated().any():
+        df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+
+    df = interpolate_capped(df)
+    df.index = df.index.tz_convert(tz)
+
+    radiation = df.get("shortwave_radiation_w_m2")
+    if radiation is not None:
+        window = radiation[(df.index >= start_local) & (df.index < end_local)]
+        n_missing = int(window.isna().sum())
+        if n_missing:
+            logger.warning(
+                "Historical weather: %d of %d slots have no radiation after capped "
+                "interpolation (left empty, not filled)",
+                n_missing,
+                len(window),
+            )
+
+    _weather_cache[cache_key] = (time.time(), df.copy())
+    return df[(df.index >= start_local) & (df.index < end_local)]
 
 
 async def async_get_weather_series(

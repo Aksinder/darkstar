@@ -13,11 +13,20 @@ from typing import Any
 import lightgbm as lgb
 import pandas as pd
 
-from backend.health import clear_load_forecast_status, set_load_forecast_status
+from backend.health import (
+    clear_load_forecast_status,
+    set_load_forecast_status,
+    set_load_forecast_tier,
+)
 from backend.learning import LearningEngine, get_learning_engine
 from ml.context_features import get_alarm_armed_series, get_vacation_mode_series
 from ml.train import _build_time_features  # type: ignore[reportPrivateUsage]
-from ml.weather import async_get_weather_series, calculate_physics_pv
+from ml.weather import (
+    PV_WEATHER_SOURCE_FORECAST,
+    async_get_weather_series,
+    calculate_physics_pv,
+    resolve_pv_training_weather_source,
+)
 from utils.time_utils import dst_safe_date_range
 
 
@@ -159,6 +168,57 @@ def _load_models(models_dir: str = "data/ml/models") -> dict[str, lgb.Booster]:
         logger.info(f"✅ Loaded {len(models)} ML models from {models_dir}")
 
     return models
+
+
+def pv_model_weather_source(models_dir: str = "data/ml/models") -> str | None:
+    """Weather source the stored PV residual model was trained on.
+
+    Read from the model's .features.json sidecar (written by ml/train.py). A model
+    without the entry predates the option and was trained on the forecast endpoint's
+    hindcast. Returns None when there is no PV model sidecar at all.
+    """
+    import json
+    from pathlib import Path as _Path
+
+    for name in ("pv_model_p50", "pv_model"):
+        sidecar = _Path(models_dir) / f"{name}.features.json"
+        if not sidecar.exists():
+            continue
+        try:
+            stored = json.loads(sidecar.read_text())
+        except Exception:
+            continue
+        if not isinstance(stored, dict):
+            continue
+        return str(stored.get("weather_source") or PV_WEATHER_SOURCE_FORECAST)
+    return None
+
+
+def warn_on_pv_weather_source_mismatch(
+    config: dict[str, Any], models_dir: str = "data/ml/models"
+) -> bool:
+    """Warn when the PV model's training weather source differs from the config.
+
+    The two sources differ by 8-18 % in radiation, so a model trained on one is not
+    interchangeable with a model trained on the other; after changing
+    forecasting.pv_training_weather_source the old model stays live until the next
+    retrain. Returns True when a mismatch was reported.
+    """
+    trained = pv_model_weather_source(models_dir)
+    if trained is None:
+        return False
+    configured = resolve_pv_training_weather_source(config)
+    if trained == configured:
+        return False
+    logger.warning(
+        "⚠️ PV residual model was trained on weather source '%s' but "
+        "forecasting.pv_training_weather_source is '%s'. The model stays in use; "
+        "retrain to switch source, or set the config back to '%s'.",
+        trained,
+        configured,
+        trained,
+    )
+    return True
 
 
 async def generate_forward_slots(
@@ -314,23 +374,107 @@ async def generate_forward_slots(
         has_pv_models = False
         pv_forced_physics_only = True
 
+    if has_pv_models:
+        warn_on_pv_weather_source_mismatch(engine.config)
+
     # --- LOAD INFERENCE (or fallback) ---
+    load_model_ok = has_load_models
     if has_load_models:
-        for q in quantiles:
-            model_key = f"load_{q}"
-            if model_key in models:
-                raw_pred: Any = models[model_key].predict(X)  # type: ignore[reportUnknownMemberType]
-                # Apply guardrails (same for all bands)
-                # Floor at 0.01, Ceiling at 16kW
-                cleaned = [max(0.01, min(float(x), 16.0)) for x in raw_pred]
-                predictions[model_key] = pd.Series(cleaned, index=df.index)
-        # REV F65 Phase 5b: Clear degraded status when ML models working
-        clear_load_forecast_status()
-    else:
-        # Fallback: Write 0.0 to DB so inputs.py applies HA 7-day profile fallback
-        # Only use 0.5 flat as last resort when even HA fetch fails
+        try:
+            model_preds: dict[str, pd.Series] = {}
+            for q in quantiles:
+                model_key = f"load_{q}"
+                if model_key in models:
+                    raw_pred: Any = models[model_key].predict(X)  # type: ignore[reportUnknownMemberType]
+                    # Apply guardrails (same for all bands)
+                    # Floor at 0.01, Ceiling at 16kW
+                    cleaned = [max(0.01, min(float(x), 16.0)) for x in raw_pred]
+                    model_preds[model_key] = pd.Series(cleaned, index=df.index)
+        except Exception as exc:
+            # A model that loads but cannot predict is as absent as a missing one.
+            logger.error("❌ Load model inference failed (%s); using the fallback tiers", exc)
+            load_model_ok = False
+        else:
+            predictions.update(model_preds)
+            # REV F65 Phase 5b: Clear degraded status when ML models working
+            clear_load_forecast_status()
+            set_load_forecast_tier("model")
+            logger.info("Load forecast source: model")
+
+            # Opt-in blend toward the 7-day per-slot mean of recorded base load
+            # (forecasting.load_blend_slot_mean_weight, default 0 = this block is
+            # skipped and the model output is stored untouched). p10/p90 move by the
+            # same amount as p50, so the band keeps its width. A time-of-day without
+            # enough recorded data keeps the pure model value.
+            from backend.learning.baseline import (
+                get_load_slot_means_7d,
+                resolve_load_blend_weight,
+                time_of_day_key,
+            )
+
+            blend_weight = resolve_load_blend_weight(engine.config)
+            if blend_weight > 0.0 and "load_p50" in predictions and "load_p50" in models:
+                try:
+                    blend_means = await get_load_slot_means_7d(engine.store, slot_start)
+                except Exception as exc:
+                    logger.warning("7-day load slot means unavailable: %s", exc)
+                    blend_means = {}
+                slot_mean = pd.Series(
+                    [blend_means.get(time_of_day_key(ts)) for ts in df["slot_start"]],
+                    index=df.index,
+                    dtype="float64",
+                )
+                delta = (blend_weight * (slot_mean - predictions["load_p50"])).fillna(0.0)
+                for q in quantiles:
+                    if f"load_{q}" in models:
+                        predictions[f"load_{q}"] = (predictions[f"load_{q}"] + delta).clip(
+                            lower=0.01, upper=16.0
+                        )
+                blended = int(slot_mean.notna().sum())
+                set_load_forecast_tier("model+slot_mean_7d" if blended else "model")
+                logger.info(
+                    "Load forecast blend: %.0f%% 7-day slot mean / %.0f%% model on %d/%d slots "
+                    "(mean shift %+.3f kWh/slot)",
+                    blend_weight * 100,
+                    (1 - blend_weight) * 100,
+                    blended,
+                    len(df),
+                    float(delta.mean()),
+                )
+
+    if not load_model_ok:
+        # Fallback tiers, in order:
+        #   1. the learning DB's 7-day per-slot mean of recorded base load (same
+        #      quantity as the model's target; needs no HA call),
+        #   2. 0.0 for a time-of-day without enough recorded data — the planner
+        #      (backend/core/forecasts.py) then substitutes the HA 7-day profile,
+        #   3. and the flat 0.5 kWh demo profile only when that HA fetch fails too.
+        from backend.learning.baseline import get_load_slot_means_7d, time_of_day_key
+
+        try:
+            slot_means = await get_load_slot_means_7d(engine.store, slot_start)
+        except Exception as exc:  # no store at all: same as "no recorded data"
+            logger.warning("7-day load slot means unavailable: %s", exc)
+            slot_means = {}
+        fallback_load = pd.Series(
+            [float(slot_means.get(time_of_day_key(ts), 0.0)) for ts in df["slot_start"]],
+            index=df.index,
+        )
+        covered = int((fallback_load > 0.0).sum())
+        if covered == len(df):
+            load_tier = "slot_mean_7d"
+        elif covered > 0:
+            load_tier = "slot_mean_7d+ha_profile"
+        else:
+            load_tier = "ha_profile"
+        set_load_forecast_tier(load_tier)
         logger.warning(
-            "⚠️ Load models not available, using 0.0 (inputs.py will apply HA profile fallback)"
+            "⚠️ Load models not available. Load forecast source: %s (%d/%d slots from the "
+            "7-day per-slot mean; the rest stored as 0.0 so the planner applies the HA "
+            "profile, or the demo profile if HA has no history)",
+            load_tier,
+            covered,
+            len(df),
         )
 
         # REV F65 Phase 5e: Distinguish new setup vs ML failure
@@ -342,14 +486,13 @@ async def generate_forward_slots(
             # Level 1+ but no ML models - warning, should have models
             set_load_forecast_status("degraded", "no_ml")
 
-        baseline_load = 0.0  # Let inputs.py apply HA profile fallback
         for q in quantiles:
             if q == "p10":
-                predictions[f"load_{q}"] = pd.Series(baseline_load * 0.7, index=df.index)
+                predictions[f"load_{q}"] = fallback_load * 0.7
             elif q == "p50":
-                predictions[f"load_{q}"] = pd.Series(baseline_load, index=df.index)
+                predictions[f"load_{q}"] = fallback_load
             else:  # p90
-                predictions[f"load_{q}"] = pd.Series(baseline_load * 1.3, index=df.index)
+                predictions[f"load_{q}"] = fallback_load * 1.3
 
     # --- PV INFERENCE (Hybrid: Physics + ML Residual) ---
     # Setup Astro Clamping
@@ -489,7 +632,7 @@ async def generate_forward_slots(
             predictions[f"ml_residual_{q}"] = pd.Series(0.0, index=df.index)
 
     # Repair applies only when all 3 quantile models were predicted (not default-zero placeholders)
-    _load_all_q = all(f"load_{q}" in models for q in quantiles)
+    _load_all_q = load_model_ok and all(f"load_{q}" in models for q in quantiles)
     # has_pv_models may have been forced False by the physics-only gate above, in which
     # case the physics-only bands (already monotonic) are used rather than model output.
     _pv_all_q = has_pv_models and all(f"pv_{q}" in models for q in quantiles)

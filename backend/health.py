@@ -31,6 +31,12 @@ _forecast_lock: threading.Lock = threading.Lock()
 # REV F65 Phase 5b: Load forecast status tracking
 _load_forecast_status: str = "ok"  # "ok", "degraded"
 _load_forecast_reason: str = ""  # "ml", "baseline", "demo", ""
+# Which source the STORED load forecast came from (set by ml/forward.py):
+# "model", "model+slot_mean_7d" (opt-in blend), "slot_mean_7d",
+# "slot_mean_7d+ha_profile", "ha_profile", or "" (unknown).
+# "ha_profile" means 0.0 was stored and the planner substitutes the HA profile, or
+# the flat demo profile when that fetch fails too (reason "demo").
+_load_forecast_tier: str = ""
 _load_forecast_lock: threading.Lock = threading.Lock()
 
 
@@ -102,12 +108,20 @@ def set_load_forecast_status(status: str, reason: str = "") -> None:
         logger.warning(f"⚠️ Load forecast degraded: {reason}")
 
 
+def set_load_forecast_tier(tier: str) -> None:
+    """Record which source the stored load forecast came from (see _load_forecast_tier)."""
+    global _load_forecast_tier
+    with _load_forecast_lock:
+        _load_forecast_tier = tier
+
+
 def get_load_forecast_status() -> dict[str, Any]:
     """Get current load forecast health status."""
     with _load_forecast_lock:
         return {
             "status": _load_forecast_status,
             "reason": _load_forecast_reason,
+            "tier": _load_forecast_tier,
         }
 
 
@@ -1131,12 +1145,26 @@ class HealthChecker:
                         guidance=(
                             "Historical data exists but ML models are not trained. "
                             "Run the ML training pipeline to enable accurate load predictions. "
-                            "Current forecast uses HA historical profile."
+                            + _LOAD_TIER_GUIDANCE.get(
+                                str(load_info.get("tier", "")),
+                                "Current forecast uses HA historical profile.",
+                            )
                         ),
                     )
                 )
 
         return issues
+
+
+# What the stored load forecast is made of while no model is usable (by tier).
+_LOAD_TIER_GUIDANCE: dict[str, str] = {
+    "slot_mean_7d": "Current forecast uses the 7-day per-slot mean of recorded load.",
+    "slot_mean_7d+ha_profile": (
+        "Current forecast uses the 7-day per-slot mean of recorded load, and the "
+        "HA historical profile for times of day without enough recorded data."
+    ),
+    "ha_profile": "Current forecast uses HA historical profile.",
+}
 
 
 async def get_health_status(config_path: str = "config.yaml") -> HealthStatus:

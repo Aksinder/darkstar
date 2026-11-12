@@ -66,6 +66,9 @@ class ForecastHealth(BaseModel):
     pv_status: str  # ok, degraded, error
     load_status: str  # ok, degraded
     load_reason: str  # ml, baseline, demo, no_ml, ""
+    # Source of the stored load forecast: model, model+slot_mean_7d, slot_mean_7d,
+    # slot_mean_7d+ha_profile, ha_profile, "" (unknown / not generated yet)
+    load_tier: str = ""
 
 
 class SystemMetrics(BaseModel):

@@ -308,6 +308,7 @@ async def get_system_health() -> SystemHealthResponse:
         pv_status=pv_info.get("status", "ok"),
         load_status=load_info.get("status", "ok"),
         load_reason=load_info.get("reason", ""),
+        load_tier=load_info.get("tier", ""),
     )
 
     return SystemHealthResponse(
