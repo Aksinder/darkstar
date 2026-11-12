@@ -186,6 +186,92 @@ def _phase_fraction_items(
     return [str(k).strip().upper() for k in fractions], vals
 
 
+def add_water_flow(
+    prob: Any,
+    name: str,
+    unit_heat: list[Any],
+    spacing_units: list[int],
+    window_ages: list[list[int]],
+    block_penalty: float,
+) -> tuple[list[Any], Any]:
+    """Arc-flow form of one heater's start / spacing / block-overshoot rules.
+
+    (water_heating.flow_formulation; the idea is upstream eafd3c81, rebuilt on the
+    fork's own decision grid.) One unit of flow walks through the water decision
+    units — hour groups with hourly_blocks, slots otherwise — over the states
+
+      N      never heated since plan start
+      F(k)   off for k units since the last heat, saturating at the longest lookback
+      O(l)   on, l units into the block, saturating at the longest block window
+
+    ``unit_heat[u]`` is the water_heat binary deciding unit u; it is tied to the
+    flow into the on-states, so once water_heat is integral the flow is a single
+    path and every arc is 0/1 without being declared integer.
+
+    ``spacing_units[u]``: a block may start in unit u only from N or from
+    F(k >= spacing_units[u]) — the hard spacing rule, with the caller's wall-clock
+    lookback counted in units (0 = no spacing).
+
+    ``window_ages[u]``: one entry per block-cap window ENDING in unit u, holding the
+    block age (in units, at u) from which that window lies entirely inside the
+    block. Entering unit u at age l costs block_penalty per entry <= l — exactly
+    the old one-overshoot-per-fully-ON-window, mixed grid included.
+
+    Returns (per-unit start expression, total overshoot cost expression). The LP
+    relaxation is far tighter than start binaries + big-M spacing + window rows:
+    it cannot run a heater at a fraction in every slot to dodge start and
+    overshoot costs.
+    """
+    lp_sum: Any = pulp.lpSum  # type: ignore[reportUnknownMemberType]
+    n_units = len(unit_heat)
+    k_max = max(1, max(spacing_units, default=0))
+    a_max = max(1, max((a for ages in window_ages for a in ages), default=1))
+    starts: list[Any] = []
+    cost_terms: list[Any] = []
+    # Arcs INTO each state of a layer; states are ("N", 0), ("F", k), ("O", l).
+    prev_in: dict[tuple[str, int], list[Any]] = {}
+    for u in range(n_units):
+        cur_in: dict[tuple[str, int], list[Any]] = {}
+
+        def arc(src: str, dst: tuple[str, int], u: int = u, into: Any = cur_in) -> Any:
+            var: Any = pulp.LpVariable(  # type: ignore[reportUnknownMemberType]
+                f"wflow_{name}_{u}_{src}_{dst[0]}{dst[1]}", lowBound=0.0, upBound=1.0
+            )
+            into.setdefault(dst, []).append(var)
+            return var  # type: ignore[reportUnknownVariableType]
+
+        start_arcs: list[Any] = []
+        if u == 0:
+            # A heat in unit 0 counts as a start, as water_start[0] == water_heat[0] did.
+            start_arcs.append(arc("S", ("O", 1)))
+            prob += arc("S", ("N", 0)) + start_arcs[0] == 1  # type: ignore[operator]
+        for (kind, n), inflow in prev_in.items():
+            out: list[Any]
+            if kind == "N":
+                start_arcs.append(arc("N0", ("O", 1)))
+                out = [arc("N0", ("N", 0)), start_arcs[-1]]
+            elif kind == "F":
+                out = [arc(f"F{n}", ("F", min(n + 1, k_max)))]
+                if n >= spacing_units[u]:
+                    start_arcs.append(arc(f"F{n}", ("O", 1)))
+                    out.append(start_arcs[-1])
+            else:
+                out = [arc(f"O{n}", ("O", min(n + 1, a_max))), arc(f"O{n}", ("F", 1))]
+            prob += lp_sum(inflow) == lp_sum(out)  # type: ignore[operator]  # conservation
+        on_arcs: list[Any] = []
+        for (kind, n), inflow in cur_in.items():
+            if kind != "O":
+                continue
+            on_arcs.extend(inflow)
+            over: int = sum(1 for a in window_ages[u] if a <= n)
+            if over:
+                cost_terms.append((block_penalty * over) * lp_sum(inflow))
+        prob += unit_heat[u] == lp_sum(on_arcs)  # type: ignore[operator]
+        starts.append(lp_sum(start_arcs))
+        prev_in = cur_in
+    return starts, lp_sum(cost_terms)  # type: ignore[reportUnknownVariableType]
+
+
 def solver_dump_dir() -> Path:
     """Directory holding solver instance dumps (failed solves and opt-in OK ones)."""
     # Env-overridable so the test suite (whose solver tests intentionally fail
@@ -361,7 +447,9 @@ class KeplerSolver:
                 needs_start = (
                     heater.min_spacing_hours > 0 or config.water_block_start_penalty_sek > 0
                 )
-                if needs_start:
+                # Flow formulation: starts are arc flows (built with the water
+                # constraints below), not binaries.
+                if needs_start and not config.water_flow_formulation:
                     water_start[d] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
                         f"water_start_{safe_d}", range(T), cat="Binary"
                     )
@@ -507,7 +595,8 @@ class KeplerSolver:
         # Discomfort variable removed.
         # Per-device "Block Overshoot" variables (soft penalty for massive blocks)
         block_overshoot: dict[str, dict[int, Any]] = {}
-        if water_enabled:
+        # (Flow formulation prices overshoot on its on-state arcs instead.)
+        if water_enabled and not config.water_flow_formulation:
             for heater in water_heaters:
                 d = heater.id
                 safe_d = d.replace("-", "_").replace(".", "_")
@@ -1326,6 +1415,24 @@ class KeplerSolver:
             # Nominal slot length: a short in-progress slot 0 is not a grid quantum.
             h_unit: float = min(full_slot_hours) if full_slot_hours else 0.25
 
+            # Flow formulation (water_heating.flow_formulation): one layer per water
+            # DECISION unit — the hour group when hourly_blocks ties the slots of a
+            # wall-clock hour together, the slot otherwise (coarse-tail slots are
+            # hourly already). unit_of[t] = index of the unit holding slot t.
+            unit_first: list[int] = []
+            unit_of: list[int] = []
+            if config.water_flow_formulation:
+                for t in range(T):
+                    same_hour: bool = (
+                        config.water_hourly_blocks
+                        and t > 0
+                        and slots[t].start_time.replace(minute=0, second=0, microsecond=0)
+                        == slots[t - 1].start_time.replace(minute=0, second=0, microsecond=0)
+                    )
+                    if not same_hour:
+                        unit_first.append(t)
+                    unit_of.append(len(unit_first) - 1)
+
             # Soft-cap overage price: just above the boost reward so reward-farming
             # beyond the cap nets negative per kWh, yet orders of magnitude below the
             # reliability floor (15-1000 SEK/kWh) and the WTP credits — comfort and
@@ -1466,6 +1573,9 @@ class KeplerSolver:
                 # budget. On a uniform grid this reduces exactly to the old
                 # "max_block_slots+1 window <= max_block_slots" form, including
                 # the floor-quantization of non-divisible max_block_hours.
+                # Flow formulation: per unit, the block age from which each window
+                # ending there is entirely ON (see add_water_flow).
+                window_ages: list[list[int]] = [[] for _ in unit_first]
                 if config.water_block_penalty_sek > 0:
                     eff_block_h: float = max(config.max_block_hours, h_unit)
                     e: int = 0
@@ -1487,6 +1597,9 @@ class KeplerSolver:
                         # heating into pricier hours and re-create the block walk.
                         # Uniform grids: byte-identical to the pre-2026-08-26
                         # max_block_slots formulation.
+                        if config.water_flow_formulation:
+                            window_ages[unit_of[e]].append(unit_of[e] - unit_of[t] + 1)
+                            continue
                         prob += (  # type: ignore[operator]
                             pulp.lpSum(water_heat[d][j] for j in range(t, e + 1))
                             <= (e - t) + block_overshoot[d][t]
@@ -1499,20 +1612,56 @@ class KeplerSolver:
                 # production config) this is byte-equivalent to the old
                 # slot-counted window; on the coarse tail the old count of 10
                 # slots spanned 10 HOURS instead of the intended 4.
-                if heater.min_spacing_hours > 0 and d in water_start:
+                spacing_units: list[int] = [0] * len(unit_first)
+                if heater.min_spacing_hours > 0 and (
+                    d in water_start or config.water_flow_formulation
+                ):
                     lookbacks: list[list[int]] = []
                     lo: int = 0
                     for t in range(T):
                         while lo < t and H[t] - H[lo + 1] >= heater.min_spacing_hours:
                             lo += 1
                         lookbacks.append(list(range(lo, t)))
+                    if config.water_flow_formulation:
+                        # The same lookback, counted in units: a block starting in
+                        # unit u needs every unit the lookback of its first slot
+                        # touches to be OFF.
+                        spacing_units = [
+                            unit_of[t] - unit_of[lookbacks[t][0]] if lookbacks[t] else 0
+                            for t in unit_first
+                        ]
                     M: int = max(1, max((len(j) for j in lookbacks), default=1))
                     for t in range(1, T):
+                        if config.water_flow_formulation:
+                            break  # spacing is the F(k) start gate in the flow below
                         prob += (  # type: ignore[operator]
                             pulp.lpSum(water_heat[d][j] for j in lookbacks[t])
                             + water_start[d][t] * M  # type: ignore[operator]
                             <= M
                         )
+
+                # Flow formulation: starts, spacing and overshoot for this heater in
+                # one graph. water_start becomes the start-arc inflow (an expression
+                # on the unit's first slot, 0 elsewhere) so the per-heater start
+                # penalty waiver in the objective applies unchanged.
+                if config.water_flow_formulation and (
+                    heater.min_spacing_hours > 0
+                    or config.water_block_start_penalty_sek > 0
+                    or config.water_block_penalty_sek > 0
+                ):
+                    flow_starts, flow_overshoot_cost = add_water_flow(
+                        prob,
+                        d.replace("-", "_").replace(".", "_"),
+                        [water_heat[d][t] for t in unit_first],
+                        spacing_units,
+                        window_ages,
+                        config.water_block_penalty_sek,
+                    )
+                    total_cost.append(flow_overshoot_cost)
+                    if heater.min_spacing_hours > 0 or config.water_block_start_penalty_sek > 0:
+                        water_start[d] = dict.fromkeys(range(T), 0)
+                        for u, t in enumerate(unit_first):
+                            water_start[d][t] = flow_starts[u]
 
             # Build #16: price-gated previous-plan anchor (the plan-stability root fix).
             # For each heater carrying an anchor (its previous-plan ON slots, already

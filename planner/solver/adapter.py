@@ -1297,6 +1297,8 @@ def config_to_kepler_config(
         ),
         defer_up_to_hours=float(wh_cfg.get("defer_up_to_hours", 0.0)),
         water_hourly_blocks=bool(wh_cfg.get("hourly_blocks", True)),
+        # Opt-in arc-flow water formulation (kepler.add_water_flow). Default off.
+        water_flow_formulation=bool(wh_cfg.get("flow_formulation", False)),
         # Build #16 plan-stability anchor bonus (öre-scale). Default 0.05 SEK/slot:
         # over a typical 3-6 slot block that is ~0.6-1.2 SEK total. It must EXCEED the
         # solver's within-gap slack (gapRel 0.01 x a tens-of-SEK objective ~= 0.2-0.5 SEK,
