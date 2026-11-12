@@ -1056,6 +1056,16 @@ def parse_pv_charge_efficiency(raw: Any) -> float | None:
     return value
 
 
+def _non_negative_int(raw: Any) -> int:
+    """Count-style config value -> int >= 0; unset, bool or garbage means 0 (off)."""
+    if raw is None or isinstance(raw, bool):
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def config_to_kepler_config(
     planner_config: dict[str, Any],
     overrides: dict[str, Any] | None = None,
@@ -1254,6 +1264,9 @@ def config_to_kepler_config(
         solver_highs_options=(
             (planner_config.get("kepler", {}).get("solver") or {}).get("highs_options") or None
         ),
+        solver_dump_all_instances=_non_negative_int(
+            (planner_config.get("kepler", {}).get("solver") or {}).get("dump_all_instances")
+        ),
         export_threshold_sek_per_kwh=get_val("export_threshold_sek_per_kwh", 0.0),
         # Per-device water heater inputs
         water_heaters=water_inputs,
@@ -1284,6 +1297,8 @@ def config_to_kepler_config(
         ),
         defer_up_to_hours=float(wh_cfg.get("defer_up_to_hours", 0.0)),
         water_hourly_blocks=bool(wh_cfg.get("hourly_blocks", True)),
+        # Opt-in arc-flow water formulation (kepler.add_water_flow). Default off.
+        water_flow_formulation=bool(wh_cfg.get("flow_formulation", False)),
         # Build #16 plan-stability anchor bonus (öre-scale). Default 0.05 SEK/slot:
         # over a typical 3-6 slot block that is ~0.6-1.2 SEK total. It must EXCEED the
         # solver's within-gap slack (gapRel 0.01 x a tens-of-SEK objective ~= 0.2-0.5 SEK,

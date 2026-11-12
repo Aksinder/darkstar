@@ -307,6 +307,13 @@ class KeplerConfig:
     # objective cost on the live model. Off by default so unit tests keep exact
     # sub-hour semantics; the production adapter turns it on.
     water_hourly_blocks: bool = False
+    # Arc-flow formulation of the per-heater start / spacing / block-overshoot rules
+    # (water_heating.flow_formulation; see kepler.add_water_flow). Same cost for
+    # every water pattern as the default rows, with a far tighter LP relaxation:
+    # water_start and block_overshoot become flows on a small state graph built on
+    # the water decision grid (hour groups with water_hourly_blocks). Off = the
+    # model is exactly the pre-flag one.
+    water_flow_formulation: bool = False
 
     # Rev E4: Export Toggle
     enable_export: bool = True  # If False, enforce 0 export
@@ -422,6 +429,10 @@ class KeplerConfig:
     solver_time_limit_s: float = 0.0
     solver_gap_rel: float = 0.0
     solver_highs_options: dict[str, float | int | bool | str] | None = None
+    # kepler.solver.dump_all_instances: keep the newest N SUCCESSFUL solve instances
+    # in data/solver_dumps/ (kepler_ok_*.json, same format as the failure dumps) for
+    # offline A/B replay. 0 = off.
+    solver_dump_all_instances: int = 0
 
     def __post_init__(self):
         """Validate configuration after initialization."""
