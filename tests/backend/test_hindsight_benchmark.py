@@ -11,6 +11,7 @@ import pytest
 import pytz
 
 from backend.hindsight_benchmark import (
+    BENCHMARK_VERSION,
     benchmark_day,
     rows_by_local_day,
     state_key,
@@ -166,6 +167,84 @@ def test_load_rescued_is_clean_but_grid_unmeasured_counts():
     assert rec["status"] == "excluded" and rec["reason"] == "not_clean_recording"
 
 
+def test_clamped_base_load_and_zeroed_spike_count_as_unverified():
+    few = {i: {"base_load_clamped": True} for i in range(3)}
+    rec = benchmark_day(DAY, _by_day(_day_rows(DAY, flags=few)), _config(), TZ, NOW)
+    assert rec["status"] == "scored" and rec["warnings"] == ["unverified_slots"]
+    assert rec["unverified_slots"] == 3
+    assert rec["unverified_by_flag"] == {"base_load_clamped": 3}
+
+    many = {i: {"load_spike_zeroed": ["load_kwh"]} for i in range(10)}
+    rec = benchmark_day(DAY, _by_day(_day_rows(DAY, flags=many)), _config(), TZ, NOW)
+    assert rec["status"] == "excluded" and rec["reason"] == "not_clean_recording"
+    assert rec["unverified_slots"] == 10
+    assert rec["unverified_by_flag"] == {"load_spike_zeroed": 10}
+
+
+def test_unmeasured_devices_degrade_but_never_exclude():
+    """ev_unmeasured is treated like water_unmeasured / pv_unmeasured: the device's
+    energy is still inside whole-house demand, so the day scores exactly as a clean
+    one — but the record says how many slots were affected."""
+    flags: dict[int, dict[str, Any]] = {}
+    for i in range(40):
+        flags[i] = {"ev_unmeasured": {"easee": "unavailable"}}
+    for i in range(30, 50):
+        flags.setdefault(i, {})["water_unmeasured"] = {"spa": "snapshot"}
+    flags[60] = {"pv_unmeasured": "counter"}
+    rec = benchmark_day(DAY, _by_day(_day_rows(DAY, flags=flags)), _config(), TZ, NOW)
+    clean = benchmark_day(DAY, _by_day(_day_rows(DAY)), _config(), TZ, NOW)
+    assert rec["status"] == "scored" and rec["warnings"] == []
+    assert rec["unverified_slots"] == 0 and rec["unverified_by_flag"] == {}
+    assert rec["degraded_by_flag"] == {
+        "ev_unmeasured": 40,
+        "water_unmeasured": 20,
+        "pv_unmeasured": 1,
+    }
+    assert clean["degraded_by_flag"] == {} and clean["unverified_by_flag"] == {}
+    for key in ("actual_cost_sek", "hindsight_cost_sek", "grid_only_cost_sek"):
+        assert rec[key] == clean[key], key
+
+
+def test_reason_codes_count_every_cause_of_a_slot():
+    """One slot with two flags counts under both codes but is one unverified slot;
+    a missing energy value and unreadable flags have their own codes."""
+    rows = _day_rows(
+        DAY,
+        flags={
+            0: {"grid_unmeasured": True, "soc_stale": True, "ev_unmeasured": {"e": "snapshot"}},
+            1: {"balance_residual_kwh": -2.5},
+        },
+    )
+    rows[2]["load_kwh"] = None
+    rows[3]["quality_flags"] = "{not json"
+    rec = benchmark_day(DAY, _by_day(rows), _config(), TZ, NOW)
+    assert rec["status"] == "scored" and rec["unverified_slots"] == 4
+    assert rec["unverified_by_flag"] == {
+        "grid_unmeasured": 1,
+        "soc_stale": 1,
+        "balance_residual_kwh": 1,
+        "non_finite_energy": 1,
+        "unparseable": 1,
+    }
+    assert rec["degraded_by_flag"] == {"ev_unmeasured": 1}
+
+
+def test_completeness_fields_say_what_is_missing():
+    rec = benchmark_day(DAY, _by_day(_day_rows(DAY, drop=40)), _config(), TZ, NOW)
+    assert rec["reason"] == "incomplete_day"
+    assert (rec["expected_slots"], rec["recorded_slots"]) == (96, 95)
+
+    rows = _day_rows(DAY)
+    for r in rows[:7]:
+        r["import_price_sek_kwh"] = None
+    rec = benchmark_day(DAY, _by_day(rows), _config(), TZ, NOW)
+    assert rec["reason"] == "missing_prices" and rec["unpriced_slots"] == 7
+
+    rec = benchmark_day(DAY, _by_day(_day_rows(DAY)), _config(), TZ, NOW)
+    assert rec["status"] == "scored"
+    assert (rec["expected_slots"], rec["recorded_slots"], rec["unpriced_slots"]) == (96, 96, 0)
+
+
 def test_incomplete_and_unfinished_days_are_excluded():
     rec = benchmark_day(DAY, _by_day(_day_rows(DAY, drop=40)), _config(), TZ, NOW)
     assert rec["reason"] == "incomplete_day"
@@ -200,6 +279,27 @@ def test_summarize_totals():
     assert s["days_scored"] == 1 and s["days_total"] == 2
     assert s["by_reason"] == {"incomplete_day": 1}
     assert s["missed_sek"] == pytest.approx(a["missed_sek"], abs=1e-3)
+
+
+def test_summarize_reason_codes_by_flag():
+    """Per-flag slot totals over all days; excluded_by_flag only for the days a flag
+    cost. A record stored before v3 (no counts) is tolerated."""
+    warned = benchmark_day(
+        DAY,
+        _by_day(_day_rows(DAY, flags={0: {"soc_stale": True}, 1: {"ev_unmeasured": {"e": "x"}}})),
+        _config(),
+        TZ,
+        NOW,
+    )
+    many = {i: {"base_load_clamped": True} for i in range(10)}
+    many[0]["soc_stale"] = True
+    excluded = benchmark_day(DAY, _by_day(_day_rows(DAY, flags=many)), _config(), TZ, NOW)
+    legacy = {"status": "excluded", "reason": "not_clean_recording", "warnings": []}
+    s = summarize([warned, excluded, legacy])
+    assert s["by_reason"] == {"not_clean_recording": 2}
+    assert s["unverified_by_flag"] == {"soc_stale": 2, "base_load_clamped": 10}
+    assert s["excluded_by_flag"] == {"soc_stale": 1, "base_load_clamped": 10}
+    assert s["degraded_by_flag"] == {"ev_unmeasured": 1}
 
 
 # ---------------------------------------------------------------- service
@@ -321,3 +421,53 @@ def test_service_disabled_does_nothing():
     svc = BenchmarkService(config_loader=lambda: cfg, now=lambda: NOW.astimezone(UTC))
     store = _FakeStore([])
     assert asyncio.run(svc.run_once(store)) == []  # type: ignore[arg-type]
+
+
+def test_version_3_rescores_days_stored_by_an_older_version():
+    """Stored v2 results (no reason codes, old unverified set) are pending again; a
+    v3 result is left alone."""
+    assert BENCHMARK_VERSION == 3
+    rows = []
+    for k in range(4, 0, -1):
+        rows += _day_rows(date(2026, 10, 22) - timedelta(days=k))
+    store = _FakeStore(rows)
+    old_day, current_day = date(2026, 10, 19), date(2026, 10, 20)
+    store.state[state_key(old_day)] = json.dumps(
+        {"version": 2, "date": old_day.isoformat(), "status": "scored", "warnings": []}
+    )
+    marker = {"version": 3, "date": current_day.isoformat(), "status": "scored", "kept": True}
+    store.state[state_key(current_day)] = json.dumps(marker)
+    svc = BenchmarkService(
+        config_loader=_service_config, now=lambda: NOW.astimezone(UTC), planner_busy=lambda: False
+    )
+    done = asyncio.run(svc.run_once(store))  # type: ignore[arg-type]
+    assert done == [old_day, date(2026, 10, 21)]
+    rescored = json.loads(store.state[state_key(old_day)])
+    assert rescored["version"] == 3 and rescored["status"] == "scored"
+    assert rescored["unverified_by_flag"] == {} and rescored["expected_slots"] == 96
+    assert json.loads(store.state[state_key(current_day)]) == marker
+
+
+def test_api_payload_carries_the_reason_codes(monkeypatch: pytest.MonkeyPatch):
+    """GET /api/energy/battery-benchmark: the new fields ride along in days[] and
+    totals; every pre-existing key is still there."""
+    from backend.api.routers import energy
+
+    many = {i: {"load_spike_zeroed": ["pv_kwh"]} for i in range(6)}
+    many[7] = {"ev_unmeasured": {"easee": "snapshot"}}
+    rec = benchmark_day(DAY, _by_day(_day_rows(DAY, flags=many)), _config(), TZ, NOW)
+    store = _FakeStore([])
+    store.state[state_key(DAY)] = json.dumps(rec)
+    monkeypatch.setattr(energy, "load_yaml", lambda _path: {"timezone": "Europe/Stockholm"})
+    payload = asyncio.run(
+        energy.get_battery_benchmark(start_date=DAY, end_date=DAY, store=store)  # type: ignore[arg-type]
+    )
+    (day,) = payload["days"]
+    assert day["reason"] == "not_clean_recording" and day["unverified_slots"] == 6
+    assert day["unverified_by_flag"] == {"load_spike_zeroed": 6}
+    assert day["degraded_by_flag"] == {"ev_unmeasured": 1}
+    totals = payload["totals"]
+    assert totals["by_reason"] == {"not_clean_recording": 1}
+    assert totals["excluded_by_flag"] == {"load_spike_zeroed": 6}
+    assert totals["unverified_by_flag"] == {"load_spike_zeroed": 6}
+    assert totals["degraded_by_flag"] == {"ev_unmeasured": 1}

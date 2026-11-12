@@ -15,8 +15,12 @@ and 67bd4717 (grid-only baseline), adapted to this fork's data model:
   equals the measured battery flow by construction.
 * Slot provenance uses this fork's quality_flags: ``load_rescued`` is normal and
   accepted; ``grid_unmeasured``, ``soc_stale``, ``load_read_invalid``,
-  ``balance_residual_kwh`` and ``multi_slot_delta`` count as UNVERIFIED (a few are
-  tolerated with a warning, more exclude the day).
+  ``balance_residual_kwh``, ``multi_slot_delta``, ``base_load_clamped`` and
+  ``load_spike_zeroed`` count as UNVERIFIED (a few are tolerated with a warning, more
+  exclude the day). The device-level ``water_unmeasured`` / ``pv_unmeasured`` /
+  ``ev_unmeasured`` are DEGRADED only: the device's energy stays in ``load_kwh``, so
+  whole-house demand is intact and the slot is still scored. Every record carries the
+  per-flag slot counts of both groups, so an excluded or degraded day says why.
 * ``soc_start_percent`` is never populated in this DB; the day's start stock comes
   from the previous slot's ``soc_end_percent``, or — when that is missing — is
   back-derived from the first slot of the day that has one.
@@ -52,7 +56,10 @@ if TYPE_CHECKING:
 
 # 2: demand adds cyclic_kwh back (pool pump/filter were missing from v1 demand, which
 # understated grid-only and hindsight costs). The bump rescores the stored window.
-BENCHMARK_VERSION = 2
+# 3: base_load_clamped and load_spike_zeroed slots count as unverified (demand above
+# the metered total / an energy column zeroed as a spike), and records carry per-flag
+# reason counts (unverified_by_flag, degraded_by_flag, slot/price completeness).
+BENCHMARK_VERSION = 3
 STATE_PREFIX = "hindsight_benchmark:"
 SLOT_MINUTES = 15
 MAX_UNVERIFIED_SLOTS = 4
@@ -66,7 +73,12 @@ UNVERIFIED_FLAGS = (
     "load_read_invalid",
     "balance_residual_kwh",
     "multi_slot_delta",
+    "base_load_clamped",
+    "load_spike_zeroed",
 )
+# Counted per day, never excluding: one device was not measured from power history,
+# but its energy is still inside the slot's whole-house demand (see module docstring).
+DEGRADED_FLAGS = ("water_unmeasured", "pv_unmeasured", "ev_unmeasured")
 
 
 def state_key(day: date) -> str:
@@ -89,9 +101,20 @@ def _flags(row: Mapping[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def slot_unverified(row: Mapping[str, Any]) -> bool:
+def unverified_codes(row: Mapping[str, Any]) -> list[str]:
+    """Why one slot is unverified: its UNVERIFIED_FLAGS, plus ``unparseable`` (flags
+    not JSON) and ``non_finite_energy`` (an energy column missing or not finite)."""
     flags = _flags(row)
-    return bool(flags.get("unparseable")) or any(flags.get(k) for k in UNVERIFIED_FLAGS)
+    codes = ["unparseable"] if flags.get("unparseable") else []
+    codes += [k for k in UNVERIFIED_FLAGS if flags.get(k)]
+    if not all(_finite(row, k) for k in ENERGY_FIELDS):
+        codes.append("non_finite_energy")
+    return codes
+
+
+def degraded_codes(row: Mapping[str, Any]) -> list[str]:
+    flags = _flags(row)
+    return [k for k in DEGRADED_FLAGS if flags.get(k)]
 
 
 def demand_kwh(row: Mapping[str, Any]) -> float:
@@ -157,6 +180,13 @@ def base_record(day: date, config: KeplerConfig) -> dict[str, Any]:
         "wear_cost_sek_per_kwh": config.wear_cost_sek_per_kwh,
         "day_slots": 0,
         "unverified_slots": 0,
+        # Reason codes (v3): slots per flag. A slot with two flags counts under both,
+        # so the values can sum to more than unverified_slots.
+        "unverified_by_flag": {},
+        "degraded_by_flag": {},
+        "expected_slots": None,
+        "recorded_slots": None,
+        "unpriced_slots": None,
         "start_soc_kwh": None,
         "stored_change_kwh": None,
         "metered_cost_sek": None,
@@ -176,14 +206,22 @@ def base_record(day: date, config: KeplerConfig) -> dict[str, Any]:
 
 def _check_day(
     day: date, rows: list[dict[str, Any]], tz: Any, now: datetime
-) -> tuple[str | None, int]:
-    """First failing data reason (or None) and the unverified-slot count."""
+) -> tuple[str | None, dict[str, Any]]:
+    """First failing data reason (or None) and the record fields that explain it."""
     start, end = local_day_bounds(day, tz)
-    if end > now:
-        return "not_finished", 0
     expected = int((end - start).total_seconds() // (SLOT_MINUTES * 60))
+    detail: dict[str, Any] = {
+        "unverified_slots": 0,
+        "unverified_by_flag": {},
+        "degraded_by_flag": {},
+        "expected_slots": expected,
+        "recorded_slots": len(rows),
+        "unpriced_slots": None,
+    }
+    if end > now:
+        return "not_finished", detail
     if len(rows) != expected:
-        return "incomplete_day", 0
+        return "incomplete_day", detail
     times = [
         (datetime.fromisoformat(r["slot_start"]), datetime.fromisoformat(r["slot_end"]))
         for r in rows
@@ -193,15 +231,22 @@ def _check_day(
         or times[-1][1] != end
         or any(times[i - 1][1] != times[i][0] for i in range(1, len(times)))
     ):
-        return "incomplete_day", 0
-    unverified = sum(
-        slot_unverified(r) or not all(_finite(r, k) for k in ENERGY_FIELDS) for r in rows
-    )
+        return "incomplete_day", detail
+    unverified = 0
+    for r in rows:
+        codes = unverified_codes(r)
+        unverified += bool(codes)
+        for code in codes:
+            detail["unverified_by_flag"][code] = detail["unverified_by_flag"].get(code, 0) + 1
+        for code in degraded_codes(r):
+            detail["degraded_by_flag"][code] = detail["degraded_by_flag"].get(code, 0) + 1
+    detail["unverified_slots"] = unverified
+    detail["unpriced_slots"] = sum(not all(_finite(r, k) for k in PRICE_FIELDS) for r in rows)
     if unverified > MAX_UNVERIFIED_SLOTS:
-        return "not_clean_recording", unverified
-    if not all(_finite(r, k) for r in rows for k in PRICE_FIELDS):
-        return "missing_prices", unverified
-    return None, unverified
+        return "not_clean_recording", detail
+    if detail["unpriced_slots"]:
+        return "missing_prices", detail
+    return None, detail
 
 
 def _filled(row: dict[str, Any]) -> dict[str, Any]:
@@ -255,7 +300,8 @@ def benchmark_day(
     config = replace(config, pv_charge_efficiency=None)
     record = base_record(day, config)
     raw_rows = rows_by_day.get(day, [])
-    reason, record["unverified_slots"] = _check_day(day, raw_rows, tz, now)
+    reason, detail = _check_day(day, raw_rows, tz, now)
+    record.update(detail)
     if reason is not None:
         record["reason"] = reason
         return record
@@ -358,14 +404,29 @@ def benchmark_day(
 
 
 def summarize(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Totals over scored days plus counts by status, reason and warning."""
+    """Totals over scored days plus counts by status, reason and warning.
+
+    ``unverified_by_flag`` / ``degraded_by_flag`` sum the per-day slot counts over all
+    days; ``excluded_by_flag`` over the days excluded as ``not_clean_recording`` only,
+    i.e. which flags cost whole days. Records stored before v3 lack the counts.
+    """
     scored = [r for r in records if r.get("status") == "scored"]
     value_actual = sum(r["value_actual_sek"] for r in scored)
     value_hindsight = sum(r["value_hindsight_sek"] for r in scored)
     by_status: dict[str, int] = {}
     by_reason: dict[str, int] = {}
     by_warning: dict[str, int] = {}
+    unverified_by_flag: dict[str, int] = {}
+    degraded_by_flag: dict[str, int] = {}
+    excluded_by_flag: dict[str, int] = {}
     for r in records:
+        targets = [(unverified_by_flag, r.get("unverified_by_flag"))]
+        targets.append((degraded_by_flag, r.get("degraded_by_flag")))
+        if r.get("reason") == "not_clean_recording":
+            targets.append((excluded_by_flag, r.get("unverified_by_flag")))
+        for total, counts in targets:
+            for flag, n in (counts or {}).items():
+                total[flag] = total.get(flag, 0) + int(n)
         by_status[r["status"]] = by_status.get(r["status"], 0) + 1
         if r.get("reason"):
             by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
@@ -388,4 +449,7 @@ def summarize(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "by_status": by_status,
         "by_reason": by_reason,
         "by_warning": by_warning,
+        "unverified_by_flag": unverified_by_flag,
+        "degraded_by_flag": degraded_by_flag,
+        "excluded_by_flag": excluded_by_flag,
     }

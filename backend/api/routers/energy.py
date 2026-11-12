@@ -295,7 +295,11 @@ BENCHMARK_MAX_DAYS = 366
     summary="Get Battery Hindsight Benchmark",
     description=(
         "Stored nightly battery hindsight results (actual vs battery-only optimum vs "
-        "grid-only) for inclusive local dates, plus totals. Never triggers a solve."
+        "grid-only) for inclusive local dates, plus totals. Never triggers a solve. "
+        "Each day says why it was excluded or degraded: unverified_by_flag and "
+        "degraded_by_flag (slots per recorder quality flag), expected_slots, "
+        "recorded_slots, unpriced_slots; totals add the same per-flag sums plus "
+        "excluded_by_flag (days stored before benchmark v3 lack them)."
     ),
 )
 async def get_battery_benchmark(
