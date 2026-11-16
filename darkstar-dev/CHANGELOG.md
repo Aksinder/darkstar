@@ -1,3 +1,7 @@
+## dev-20261116.1806 — 2026-11-16 18:08
+
+- fix(ev): don't send turn_off to an already-off switch on the first tick after restart
+
 ## dev-20261116.1543 — 2026-11-16 15:45
 
 - Merge branch 'perf/spa-bathing-solver' into feat/spa-bathing
