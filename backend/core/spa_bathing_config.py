@@ -40,6 +40,25 @@ COOLING_K_MIN = 0.005
 COOLING_K_MAX = 0.08
 AMBIENT_MIN_C = -40.0
 AMBIENT_MAX_C = 45.0
+# The LayZSpa bridge maps a helper value at or below 30 C to ``fan_only`` (no heat).
+# The executor writes whole degrees (``round``), so the eco-floor write must round to
+# at least 31 C or the "heat" it asks for is silently a fan.
+BRIDGE_FAN_ONLY_C = 30.0
+FLOOR_WRITE_MIN_C = 31.0
+
+
+def floor_write_minimum_c(eco_floor_c: float) -> float:
+    """The lowest valid ``floor_write_temp_c``: above the bridge's fan_only threshold
+    (as a rounded whole degree) and at least ``eco_floor_c + 1`` (the latch release)."""
+    return max(FLOOR_WRITE_MIN_C, float(math.ceil(eco_floor_c + 1.0)))
+
+
+def floor_write_is_valid(floor_write_c: float, eco_floor_c: float) -> bool:
+    return (
+        math.isfinite(floor_write_c)
+        and round(floor_write_c) > BRIDGE_FAN_ONLY_C
+        and floor_write_c >= eco_floor_c + 1.0
+    )
 
 
 @dataclass(frozen=True)
@@ -209,6 +228,19 @@ def parse_bathing_config(raw: Mapping[str, Any] | None) -> BathingConfig | None:
         )
         ambient_default = d.ambient_default_c
 
+    floor_write = _as_float(r.get("floor_write_temp_c"), d.floor_write_temp_c, "floor_write_temp_c")
+    if not floor_write_is_valid(floor_write, eco_floor):
+        fixed = floor_write_minimum_c(eco_floor)
+        logger.warning(
+            "spa bathing: floor_write_temp_c=%s must round above the bridge's %s C "
+            "fan_only threshold and be >= eco_floor_c + 1 (%s), using %s",
+            floor_write,
+            BRIDGE_FAN_ONLY_C,
+            eco_floor + 1.0,
+            fixed,
+        )
+        floor_write = fixed
+
     def nn(key: str, default: float) -> float:
         return _non_negative(_as_float(r.get(key), default, key), default, key)
 
@@ -233,9 +265,7 @@ def parse_bathing_config(raw: Mapping[str, Any] | None) -> BathingConfig | None:
             "overshoot_penalty_sek_per_c", d.overshoot_penalty_sek_per_c
         ),
         catch_up_margin_c=nn("catch_up_margin_c", d.catch_up_margin_c),
-        floor_write_temp_c=_as_float(
-            r.get("floor_write_temp_c"), d.floor_write_temp_c, "floor_write_temp_c"
-        ),
+        floor_write_temp_c=floor_write,
         learn=learn,
     )
 
@@ -245,12 +275,16 @@ def bathing_config_problem(cfg: BathingConfig) -> str | None:
 
     Clamping already fixed every numeric value; what is left are the inputs that have
     no safe default: without a calendar there are no windows, and without a
-    temperature sensor there is no state to start the model from.
+    temperature sensor there is no state to start the model from. A hand-built
+    ``BathingConfig`` (not from the parser) can also carry an eco-floor write the
+    bridge would read as ``fan_only``.
     """
     if not cfg.window_entities:
         return "no_window_entities"
     if not cfg.temp_sensor:
         return "no_temp_sensor"
+    if not floor_write_is_valid(cfg.floor_write_temp_c, cfg.eco_floor_c):
+        return "invalid_floor_write_temp"
     return None
 
 

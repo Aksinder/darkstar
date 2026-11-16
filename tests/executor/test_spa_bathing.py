@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import tempfile
 from collections import defaultdict
 from dataclasses import replace
@@ -30,6 +31,7 @@ from executor.config import (
     ControllerConfig,
     ExecutorConfig,
     InverterConfig,
+    LoadGroupConfig,
     NotificationConfig,
     WaterHeaterDeviceConfig,
     WaterHeaterGlobalConfig,
@@ -155,14 +157,69 @@ class TestCatchUp:
         )
         assert d.action == "none"
 
-    def test_unreachable_target_heats_now(self):
-        # Asymptote amb + P/(kC) below ready: never reachable -> heat now.
-        cfg = replace(CFG, cooling_k_per_h=0.08, heat_capacity_kwh_per_c=0.9)
-        start = NOW + timedelta(days=2)
+    # Winter, inflatable spa: amb -10, k 0.05 -> asymptote -10 + 1.8/(0.9*0.05) = 30 C,
+    # below ready 38: never reachable. From 29 C, getting within the 0.5 C margin of
+    # the asymptote (29.5) takes ln(2)/0.05 = 13.86 h.
+    UNREACH_CFG = replace(CFG, cooling_k_per_h=0.05)
+    UNREACH_LEAD_H = math.log(2.0) / 0.05
+
+    def test_unreachable_target_heats_within_bounded_lead(self):
+        start = NOW + timedelta(hours=self.UNREACH_LEAD_H - 0.1)
         d, _ = _decide(
-            cfg=cfg, windows=[(start, start + timedelta(hours=1))], power_kw=0.3, ambient_c=-20.0
+            cfg=self.UNREACH_CFG,
+            windows=[(start, start + timedelta(hours=2))],
+            measured_temp_c=29.0,
+            ambient_c=-10.0,
         )
-        assert d.rule == RULE_CATCH_UP and d.action == "heat"
+        assert d.rule == RULE_CATCH_UP and d.action == "heat" and d.temp_c == 38
+        assert "ej nåbar" in d.reason
+
+    @pytest.mark.parametrize("hours_ahead", [UNREACH_LEAD_H + 0.1, 24.0 * 10])
+    def test_unreachable_target_does_not_fire_days_ahead(self, hours_ahead):
+        """Regression: an unreachable target used to count as 'behind' at ANY lead,
+        so the spa heated at any price for the whole 15-day lookahead."""
+        start = NOW + timedelta(hours=hours_ahead)
+        d, _ = _decide(
+            cfg=self.UNREACH_CFG,
+            windows=[(start, start + timedelta(hours=2))],
+            measured_temp_c=29.0,
+            ambient_c=-10.0,
+        )
+        assert d.action == "none"
+
+    def test_unreachable_at_k_clamp_and_default_ambient_waits(self):
+        # k 0.08 (the clamp max) at the 10 C default -> asymptote 35 < 38. From 34 C
+        # the lead is ln(2)/0.08 = 8.7 h: six days ahead must not fire.
+        cfg = replace(CFG, cooling_k_per_h=0.08)
+        start = NOW + timedelta(days=6)
+        d, _ = _decide(
+            cfg=cfg,
+            windows=[(start, start + timedelta(hours=2))],
+            measured_temp_c=34.0,
+            ambient_c=None,
+        )
+        assert d.action == "none"
+        soon = NOW + timedelta(hours=8)
+        d, _ = _decide(
+            cfg=cfg,
+            windows=[(soon, soon + timedelta(hours=2))],
+            measured_temp_c=34.0,
+            ambient_c=None,
+        )
+        assert d.rule == RULE_CATCH_UP
+
+    def test_unreachable_lead_is_capped_at_24h(self):
+        # Zero margin: "within 0 C of the asymptote" is never reached -> the 24 h cap.
+        cfg = replace(self.UNREACH_CFG, catch_up_margin_c=0.0)
+        for hours, want in ((23.9, RULE_CATCH_UP), (24.1, RULE_NONE)):
+            start = NOW + timedelta(hours=hours)
+            d, _ = _decide(
+                cfg=cfg,
+                windows=[(start, start + timedelta(hours=2))],
+                measured_temp_c=29.0,
+                ambient_c=-10.0,
+            )
+            assert d.rule == want, hours
 
     def test_already_at_ready_does_not_fire(self):
         start = NOW + timedelta(minutes=5)
@@ -206,6 +263,21 @@ class TestEcoFloor:
     def test_plan_heat_leaves_latch_but_no_write(self):
         d, latched = _decide(measured_temp_c=26.0, planned_temp=38)
         assert d.action == "none" and latched is True
+
+    def test_latch_releases_when_eco_floor_sits_above_write_value(self):
+        """Regression: eco_floor 30.5 needs 31.5 to unlatch, but the write is 31 and
+        the spa thermostat holds there -> the latch (and the heat) stuck forever."""
+        cfg = replace(CFG, eco_floor_c=30.5)
+        d, latched = _decide(cfg=cfg, measured_temp_c=29.0)
+        assert latched and d.rule == RULE_ECO_FLOOR and d.temp_c == 31
+        d, latched = _decide(cfg=cfg, measured_temp_c=31.0, floor_latched=True)
+        assert d.action == "none" and latched is False
+
+    def test_latch_release_follows_device_cap(self):
+        # A device capped below the floor write: release at the capped value - 0.5.
+        cfg = replace(CFG, eco_floor_c=30.0, floor_write_temp_c=32.0)
+        d, latched = _decide(cfg=cfg, measured_temp_c=30.5, floor_latched=True, device_max_temp=31)
+        assert d.action == "none" and latched is False
 
     def test_floor_works_without_windows(self):
         d, _ = _decide(measured_temp_c=26.0, windows=None)
@@ -473,7 +545,12 @@ class Rig:
     def set_bathing(self, cfg: BathingConfig | None) -> None:
         self.set_spa(bathing=cfg)
 
-    def write_slot(self, spa_kw: float = 0.0, bathing_mode: str | None = None) -> None:
+    def write_slot(
+        self,
+        spa_kw: float = 0.0,
+        bathing_mode: str | None = None,
+        meta_extra: dict[str, Any] | None = None,
+    ) -> None:
         now = datetime.now(TZ)
         start = now - timedelta(minutes=5)
         end = start + timedelta(minutes=15)
@@ -492,7 +569,8 @@ class Rig:
         if bathing_mode is not None:
             slot["water_heater_bathing"] = {"spa": bathing_mode}
         with Path(self.schedule).open("w", encoding="utf-8") as f:
-            json.dump({"schedule": [slot], "meta": {"generated_at": now.isoformat()}}, f)
+            meta: dict[str, Any] = {"generated_at": now.isoformat(), **(meta_extra or {})}
+            json.dump({"schedule": [slot], "meta": meta}, f)
 
     def spa_writes(self) -> list[float]:
         return [
@@ -746,3 +824,222 @@ class TestEngine:
         reference = await rig.tick()
         assert with_block == reference
         assert TEMP_SENSOR not in reads_with_block
+
+
+def _add_villavagn_group(rig: Rig) -> None:
+    """The reference site: spa + villavagn tank in one 2.3 kW group on the 10 A sub-fuse, with
+    the tank told to draw (as the dispatcher records a planned block)."""
+    cfg = rig.eng.config
+    cfg.water_heater_devices.append(
+        WaterHeaterDeviceConfig(
+            id="villavagn", name="VV", target_entity="switch.villavagn_vvb", power_kw=1.6
+        )
+    )
+    cfg.load_groups = [
+        LoadGroupConfig(id="villavagn", max_power_kw=2.3, members=["spa", "villavagn"])
+    ]
+    rig.eng.dispatcher._last_water_cmd["switch.villavagn_vvb"] = "on"
+
+
+class TestLoadGroupCap:
+    """Fuse/group safety beats comfort: no bathing heat-write while a sibling claims
+    the group's supply (1.8 + 1.6 kW > 2.3 kW)."""
+
+    @pytest.mark.asyncio
+    async def test_catch_up_waits_for_group(self, rig, caplog):
+        _add_villavagn_group(rig)
+        start = datetime.now(TZ) + timedelta(minutes=30)
+        rig.windows = [(start, start + timedelta(hours=2))]
+        rig.states[TEMP_SENSOR] = "30.0"
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        with caplog.at_level(logging.INFO, logger="executor.spa_bathing"):
+            first = await rig.tick()
+            rig.states[SPA_HELPER] = "25"
+            # The tank is still told to draw (its plan block continues).
+            rig.eng.dispatcher._last_water_cmd["switch.villavagn_vvb"] = "on"
+            second = await rig.tick()
+        assert 38.0 not in first and 38.0 not in second
+        assert first == [20.0]  # the planned off stands (solver plan, outside window)
+        waits = [r for r in caplog.records if "badregel" in r.getMessage()]
+        assert len(waits) == 1  # once per episode, not per tick
+        assert "väntar" in waits[0].getMessage()
+        # The waiting rule does not claim to be heating.
+        assert not any("efter schemat" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_in_window_waits_for_group(self, rig):
+        _add_villavagn_group(rig)
+        rig.windows = [_live_window()]
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert 38.0 not in await rig.tick()
+
+    @pytest.mark.asyncio
+    async def test_eco_floor_waits_for_group(self, rig):
+        _add_villavagn_group(rig)
+        rig.states[TEMP_SENSOR] = "26.5"
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert 31.0 not in await rig.tick()
+
+    @pytest.mark.asyncio
+    async def test_rule_resumes_when_group_frees(self, rig, caplog):
+        _add_villavagn_group(rig)
+        rig.states[TEMP_SENSOR] = "26.5"
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert 31.0 not in await rig.tick()
+        rig.eng.dispatcher._last_water_cmd["switch.villavagn_vvb"] = "off"
+        rig.states[SPA_HELPER] = "25"
+        with caplog.at_level(logging.INFO, logger="executor.spa_bathing"):
+            assert await rig.tick() == [31.0]
+        assert any("fri igen" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_group_with_room_does_not_block(self, rig):
+        _add_villavagn_group(rig)
+        rig.eng.config.load_groups = [
+            LoadGroupConfig(id="villavagn", max_power_kw=3.5, members=["spa", "villavagn"])
+        ]
+        rig.states[TEMP_SENSOR] = "26.5"
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert await rig.tick() == [31.0]
+
+
+class TestNoEnergyCtx:
+    """The in-window no-off rule must survive a failed energy-ctx read."""
+
+    @staticmethod
+    def _break_ctx(rig: Rig) -> None:
+        async def boom(*_a: Any, **_k: Any) -> dict[str, Any]:
+            raise RuntimeError("ctx down")
+
+        rig.eng._water_energy_ctx = boom  # type: ignore[method-assign]
+
+    @pytest.mark.asyncio
+    async def test_in_window_off_write_skipped_without_ctx(self, rig, caplog):
+        self._break_ctx(rig)
+        rig.windows = [_live_window()]
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        with caplog.at_level(logging.WARNING, logger="executor.spa_bathing"):
+            assert await rig.tick() == []  # neither off nor heat: left as it is
+        assert any("energikontexten saknas" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_never_heats_without_ctx(self, rig):
+        # Catch-up / eco floor need the ctx path; without it they never write heat.
+        self._break_ctx(rig)
+        start = datetime.now(TZ) + timedelta(minutes=30)
+        rig.windows = [(start, start + timedelta(hours=2))]
+        rig.states[TEMP_SENSOR] = "26.0"
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert await rig.tick() == [20.0]  # legacy: the plan's off lands
+
+    @pytest.mark.asyncio
+    async def test_group_claim_lets_off_land_without_ctx(self, rig):
+        self._break_ctx(rig)
+        _add_villavagn_group(rig)
+        rig.windows = [_live_window()]
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert await rig.tick() == [20.0]
+
+    @pytest.mark.asyncio
+    async def test_force_off_lets_off_land_without_ctx(self, rig):
+        self._break_ctx(rig)
+        rig.override = "force_off"
+        rig.windows = [_live_window()]
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert await rig.tick() == [20.0]
+
+    @pytest.mark.asyncio
+    async def test_unknown_windows_keep_legacy_without_ctx(self, rig):
+        self._break_ctx(rig)
+        rig.windows = None
+        rig.write_slot(spa_kw=0.0, bathing_mode="solver")
+        assert await rig.tick() == [20.0]
+
+    @pytest.mark.asyncio
+    async def test_shadow_keeps_legacy_without_ctx(self, rig):
+        self._break_ctx(rig)
+        rig.set_bathing(replace(CFG, shadow=True))
+        rig.windows = [_live_window()]
+        rig.write_slot(spa_kw=0.0, bathing_mode="shadow")
+        assert await rig.tick() == [20.0]
+
+
+class TestPlanAmbient:
+    """Catch-up judges reachability with the planner's ambient (meta.spa_bathing)."""
+
+    @staticmethod
+    def _need_h(amb: float) -> float:
+        reach = hours_to_reach_c(30.0, 38.0, amb, 1.8, 0.9, 0.021)
+        assert reach is not None
+        return reach + 0.5 / heat_rate_c_per_h(1.8, 0.9)
+
+    def _setup(self, rig: Rig, *, planned_at: datetime, heater_id: str = "spa") -> None:
+        # Between the 10 C (default/sensor) need and the -30 C (plan) need: only the
+        # plan's colder ambient makes the spa "behind".
+        mid = (self._need_h(10.0) + self._need_h(-30.0)) / 2.0
+        start = datetime.now(TZ) + timedelta(hours=mid)
+        rig.windows = [(start, start + timedelta(hours=2))]
+        rig.states[TEMP_SENSOR] = "30.0"
+        rig.states["sensor.outdoor"] = "10.0"
+        rig.set_bathing(replace(CFG, ambient_sensor="sensor.outdoor"))
+        rig.write_slot(
+            spa_kw=0.0,
+            bathing_mode="solver",
+            meta_extra={
+                "spa_bathing": {
+                    "heater_id": heater_id,
+                    "planned_at": planned_at.isoformat(),
+                    "ambient_c": -30.0,
+                }
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_plan_ambient_beats_sensor(self, rig):
+        self._setup(rig, planned_at=datetime.now(TZ) - timedelta(minutes=10))
+        assert await rig.tick() == [38.0]
+
+    @pytest.mark.asyncio
+    async def test_stale_plan_ambient_falls_back_to_sensor(self, rig):
+        self._setup(rig, planned_at=datetime.now(TZ) - timedelta(hours=7))
+        assert await rig.tick() == [20.0]
+
+    @pytest.mark.asyncio
+    async def test_other_heaters_plan_ambient_ignored(self, rig):
+        self._setup(rig, planned_at=datetime.now(TZ) - timedelta(minutes=10), heater_id="main_tank")
+        assert await rig.tick() == [20.0]
+
+    def test_naive_planned_at_ignored(self, tmp_path):
+        p = tmp_path / "schedule.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "meta": {
+                        "spa_bathing": {
+                            "heater_id": "spa",
+                            "planned_at": "2026-11-16T13:50:00",
+                            "ambient_c": -5.0,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        rt = SpaBathingRuntime(fetch=AsyncMock(), learned=lambda: None)
+        assert rt.plan_ambient_c(str(p), "spa", NOW) is None
+        p.write_text(
+            json.dumps(
+                {
+                    "meta": {
+                        "spa_bathing": {
+                            "heater_id": "spa",
+                            "planned_at": (NOW - timedelta(minutes=10)).isoformat(),
+                            "ambient_c": -5.0,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert rt.plan_ambient_c(str(p), "spa", NOW) == -5.0
+        assert rt.plan_ambient_c(str(tmp_path / "missing.json"), "spa", NOW) is None

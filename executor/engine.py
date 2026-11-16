@@ -68,6 +68,7 @@ from .override import (
 from .spa_bathing import (
     RULE_CATCH_UP,
     RULE_ECO_FLOOR,
+    RULE_IN_WINDOW,
     BathingStep,
     SpaBathingRuntime,
     decide_bathing_rules,
@@ -2191,6 +2192,17 @@ class ExecutorEngine:
                                         if device.temp_off is not None
                                         else self.config.water_heater.temp_off
                                     )
+                                    # Spa bathing, energy ctx missing: the in-window
+                                    # no-off rule still holds (only that rule — it
+                                    # never writes heat, it skips the off-write).
+                                    if (
+                                        water_ctx is None
+                                        and _bathing_enabled(device)
+                                        and await self._spa_bathing_hold_without_ctx(
+                                            device, temp, off_temp, now
+                                        )
+                                    ):
+                                        continue
                                     if water_ctx is not None:
                                         heater_w = await self._heater_power_w(device)
                                         # Update the load-group saturation view while
@@ -4926,7 +4938,12 @@ class ExecutorEngine:
                 cfg, now.timestamp(), self.config.timezone, ha
             )
             measured = await runtime.read_temp_c(ha, cfg.temp_sensor)
-            ambient = await runtime.read_ambient_c(ha, cfg)
+            # The planner's ambient first (same plan => same reachability verdict),
+            # then the sensor, then the configured default.
+            ambient = runtime.plan_ambient_c(self.config.schedule_path, device.id, now)
+            if ambient is None:
+                ambient = await runtime.read_ambient_c(ha, cfg)
+            runtime.log_no_ctx_hold(device.id, False)
             eff = runtime.effective_config(cfg)
             idle_w = float(getattr(device, "idle_power_w", 100.0) or 0.0)
             normal = (
@@ -4949,10 +4966,27 @@ class ExecutorEngine:
                 heating_now=None if heater_w is None else heater_w > idle_w,
             )
             runtime.floor_latched[device.id] = latched
-            runtime.log_transition(device.id, decision, shadow=cfg.shadow)
             if cfg.shadow:
+                runtime.log_transition(device.id, decision, shadow=True)
                 return None
             acting = decision.action != "none"
+            # Load-group cap beats comfort (owner decision): a sibling that claims the
+            # group's supply (the villavagn tank on the shared 10 A sub-fuse) keeps
+            # every bathing heat-write away, exactly like the surplus boost. The
+            # planned command stands; the rule waits for the group.
+            blocked_by = (
+                self._group_sibling_claiming_supply(device)
+                if acting
+                and decision.temp_c is not None
+                and int(decision.temp_c) > int(off_temp)
+                else None
+            )
+            runtime.log_group_wait(device.id, blocked_by, decision.rule)
+            if blocked_by is not None:
+                acting = False
+                runtime.forget_logged(device.id)  # re-log the rule once the group frees
+            else:
+                runtime.log_transition(device.id, decision, shadow=False)
             plan_mode = getattr(slot, "water_heater_bathing", {}).get(device.id)
             # An idle-held spa at its setpoint thermostat-reheats at every 1 C drop,
             # which is exactly the cooling a bathing plan counts on — so outside a
@@ -4977,6 +5011,56 @@ class ExecutorEngine:
                 exc_info=True,
             )
             return None
+
+    async def _spa_bathing_hold_without_ctx(
+        self, device: Any, planned_temp: Any, off_temp: Any, now: datetime
+    ) -> bool:
+        """True = skip this tick's write: a bath is on, the plan says off, and the
+        energy ctx read failed (so the normal bathing step never ran).
+
+        Only the in-window no-off rule, and it can only ever HOLD (no write at all) —
+        never heat. Still below what can be judged without the ctx: a load-group
+        sibling claiming the supply, or a manual override, lets the planned command
+        through. The fuse shed needs the ctx's phase currents; it cannot be judged, so
+        the device is left as it is rather than heated. False = the legacy path.
+        """
+        cfg = getattr(device, "bathing", None)
+        if cfg is None or not cfg.enabled or cfg.shadow:
+            return False
+        try:
+            if now.tzinfo is None:
+                return False
+            runtime = self._spa_bathing_runtime()
+            if int(planned_temp) > int(off_temp):
+                runtime.log_no_ctx_hold(device.id, False)
+                return False
+            windows = await runtime.windows(
+                cfg, now.timestamp(), self.config.timezone, self.ha_client
+            )
+            if window_active(windows, now) is not True:
+                runtime.log_no_ctx_hold(device.id, False)
+                return False
+            blocked_by = self._group_sibling_claiming_supply(device)
+            runtime.log_group_wait(device.id, blocked_by, RULE_IN_WINDOW)
+            if blocked_by is not None:
+                runtime.log_no_ctx_hold(device.id, False)
+                return False
+            try:
+                ovr = await self._heater_override(device)
+            except Exception:
+                ovr = None  # unknown: hold rather than write either way
+            if ovr not in (None, "auto"):
+                runtime.log_no_ctx_hold(device.id, False)
+                return False
+            runtime.log_no_ctx_hold(device.id, True, "ingen ctx")
+            return True
+        except Exception as exc:
+            logger.warning(
+                "spa-bathing %s: no-ctx hold failed (%s) — legacy control this tick",
+                getattr(device, "id", "?"),
+                exc,
+            )
+            return False
 
     def _water_surplus_boost(
         self,

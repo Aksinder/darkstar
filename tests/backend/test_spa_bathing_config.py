@@ -113,6 +113,39 @@ class TestParse:
             is None
         )
 
+    @pytest.mark.parametrize(
+        ("raw", "eco_floor", "want"),
+        [
+            (29, None, 31.0),  # below the bridge's 30 C fan_only threshold
+            (30, None, 31.0),  # AT the threshold is fan_only too
+            (30.4, None, 31.0),  # rounds to 30 when written
+            (31, 30.5, 32.0),  # below eco_floor + 1 (31.5): the latch could never release
+            (31, None, 31.0),  # valid: kept
+            (33.5, 30.5, 33.5),  # valid: kept
+        ],
+    )
+    def test_floor_write_temp_is_validated(self, raw, eco_floor, want):
+        """Regression: floor_write_temp_c 29 was accepted and mapped to fan_only — the
+        eco floor's "heat" never heated."""
+        block: dict[str, object] = {"enabled": True, "floor_write_temp_c": raw}
+        if eco_floor is not None:
+            block["eco_floor_c"] = eco_floor
+        cfg = parse_bathing_config(block)
+        assert cfg is not None and cfg.floor_write_temp_c == want
+        assert round(cfg.floor_write_temp_c) > 30
+        assert cfg.floor_write_temp_c >= cfg.eco_floor_c + 1.0
+
+    def test_problem_reports_invalid_floor_write(self):
+        base = BathingConfig(window_entities=("calendar.spa",), temp_sensor="sensor.t")
+        assert (
+            bathing_config_problem(BathingConfig(**{**base.__dict__, "floor_write_temp_c": 29.0}))
+            == "invalid_floor_write_temp"
+        )
+        assert (
+            bathing_config_problem(BathingConfig(**{**base.__dict__, "eco_floor_c": 30.5}))
+            == "invalid_floor_write_temp"
+        )
+
     def test_any_bathing_enabled(self):
         assert any_bathing_enabled({}) is False
         assert any_bathing_enabled({"water_heaters": [{"id": "spa"}]}) is False
