@@ -356,7 +356,11 @@ def build_spa_bathing_sensors(meta: Mapping[str, Any] | None) -> list[PublishedS
             state=on_track_state,
             icon="mdi:hot-tub",
             friendly_name="Spa i fas inför bad",
-            attributes=common,
+            attributes={
+                **common,
+                # A time-boxed plan whose bath shortfall is not proven forced.
+                "unproven_shortfall_c": num(m.get("unproven_shortfall_c")),
+            },
             domain="binary_sensor",
         ),
     ]

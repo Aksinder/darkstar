@@ -27,6 +27,10 @@ Mutations: no_hourly_blocks | no_anchor | no_spacing | no_absorb_cap
              k 0.021, ready 38, floor 28, max 40, windows 19:00-21:00 on the next 3
              evenings after slot 0, ready_by = start - 30 min)
            | no_bathing (drop every heater's BathingSpec: the legacy baseline)
+           | bath_set:FIELD=V[,FIELD=V]  (override BathingSpec fields after
+             synth_bathing; windows=N keeps the first N windows)
+           | heater_floor:ID=KWH (set a heater's daily floor, heated_today 0:
+             the energy-matched legacy baseline for a bathing comparison)
 
 Dumps written with a BathingSpec carry it as a nested dict (datetimes as str);
 rehydrate_config rebuilds BathingSpec/BathWindow from it. Windows are
@@ -154,9 +158,7 @@ def rehydrate_config(cfg: dict[str, Any]) -> KeplerConfig:
         )
         for e in cfg.get("ev_chargers") or []
     ]
-    cfg["excess_pv_sinks"] = [
-        _build(ExcessPVSinkSpec, s) for s in cfg.get("excess_pv_sinks") or []
-    ]
+    cfg["excess_pv_sinks"] = [_build(ExcessPVSinkSpec, s) for s in cfg.get("excess_pv_sinks") or []]
     cfg["deferrable_loads"] = [
         _build(DeferrableLoadInput, d) for d in cfg.get("deferrable_loads") or []
     ]
@@ -226,8 +228,9 @@ def _mut_synth_bathing(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
     for day in range(3):
         start = first + timedelta(days=day)
         windows.append(
-            BathWindow(start=start, end=start + timedelta(hours=2),
-                       ready_by=start - timedelta(minutes=30))
+            BathWindow(
+                start=start, end=start + timedelta(hours=2), ready_by=start - timedelta(minutes=30)
+            )
         )
     heater.bathing = BathingSpec(
         initial_temp_c=30.0,
@@ -239,6 +242,35 @@ def _mut_synth_bathing(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
         temp_max_c=40.0,
         windows=windows,
     )
+    return ki, cfg
+
+
+def _mut_bath_set(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
+    """Override BathingSpec fields on every bathing heater (apply after
+    synth_bathing): bath_set:initial_temp_c=37,cooling_k_per_h=0.005. The pseudo
+    field windows=N keeps only the first N windows (fair-comparison runs)."""
+    for kv in (arg or "").split(","):
+        if not kv:
+            continue
+        key, _, val = kv.partition("=")
+        for h in cfg.water_heaters:
+            if h.bathing is None:
+                continue
+            if key == "windows":
+                h.bathing.windows = h.bathing.windows[: int(val)]
+            else:
+                setattr(h.bathing, key, float(val))
+    return ki, cfg
+
+
+def _mut_heater_floor(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
+    """Legacy fair-comparison: heater_floor:ID=KWH sets that heater's daily floor
+    (and zeroes heated_today_kwh so the first bucket carries the full floor)."""
+    hid, _, val = (arg or "").partition("=")
+    for h in cfg.water_heaters:
+        if h.id == hid:
+            h.min_kwh_per_day = float(val)
+            h.heated_today_kwh = 0.0
     return ki, cfg
 
 
@@ -324,6 +356,8 @@ MUTATIONS = {
     "retail": _mut_retail,
     "synth_bathing": _mut_synth_bathing,
     "no_bathing": _mut_no_bathing,
+    "bath_set": _mut_bath_set,
+    "heater_floor": _mut_heater_floor,
 }
 
 # ------------------------------------------------------------------- solving
@@ -392,14 +426,15 @@ def _floor_report(ki: KeplerInput, cfg: KeplerConfig, result: Any) -> list[str]:
     avg_h = sum(hours) / len(hours)
     for h in cfg.water_heaters:
         on = [
-            t
-            for t, rs in enumerate(result.slots)
-            if rs.water_heater_results.get(h.id, 0.0) > 0.0
+            t for t, rs in enumerate(result.slots) if rs.water_heater_results.get(h.id, 0.0) > 0.0
         ]
         credited = len(on) * h.power_kw * avg_h
         physical = sum(h.power_kw * hours[t] for t in on)
+        # A heater kepler planned in bathing mode has no daily-kWh floor row.
+        bathing = h.id in (getattr(result, "bathing_reports", None) or {})
+        floor = "bathing" if bathing else f"floor {h.min_kwh_per_day:.2f}"
         lines.append(
-            f"    {h.id}: floor {h.min_kwh_per_day:.2f} | credited {credited:.2f}"
+            f"    {h.id}: {floor} | credited {credited:.2f}"
             f" | physical {physical:.2f} kWh ({len(on)} ON-slots)"
         )
     return lines
@@ -509,19 +544,34 @@ SWEEP = [
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("dumps", nargs="+", type=Path)
     ap.add_argument("--solver", choices=["highs", "cbc", "glpk"], default="highs")
-    ap.add_argument("--time-limit", type=float, default=None,
-                    help="seconds (default: the dump's own time_limit_s). "
-                    "This machine is ~15x faster than the box: 16 =~ prod 240")
+    ap.add_argument(
+        "--time-limit",
+        type=float,
+        default=None,
+        help="seconds (default: the dump's own time_limit_s). "
+        "This machine is ~15x faster than the box: 16 =~ prod 240",
+    )
     ap.add_argument("--gap", type=float, default=0.01)
-    ap.add_argument("--threads", type=int, default=None,
-                    help="HiGHS threads (kepler deliberately omits this in prod)")
-    ap.add_argument("--highs-opt", action="append", metavar="KEY=VAL",
-                    help="raw HiGHS option, typed coercion (repeatable)")
-    ap.add_argument("--mutate", action="append", metavar="NAME[:ARG]",
-                    help=f"one of: {', '.join(MUTATIONS)}")
+    ap.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="HiGHS threads (kepler deliberately omits this in prod)",
+    )
+    ap.add_argument(
+        "--highs-opt",
+        action="append",
+        metavar="KEY=VAL",
+        help="raw HiGHS option, typed coercion (repeatable)",
+    )
+    ap.add_argument(
+        "--mutate", action="append", metavar="NAME[:ARG]", help=f"one of: {', '.join(MUTATIONS)}"
+    )
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--seed", type=int, default=None)
@@ -550,19 +600,27 @@ def main() -> None:
 def _print_row(r: dict[str, Any]) -> None:
     head = f"{r['dump']}  [{r['label']}]  T={r['slots']}"
     if r["status"] == "shipped":
-        print(f"{head}  SHIPPED in {r['seconds']}s  obj={r.get('objective')}  "
-              f"cost={r.get('total_cost')}  ({r.get('status_msg', '')[:60]})")
+        print(
+            f"{head}  SHIPPED in {r['seconds']}s  obj={r.get('objective')}  "
+            f"cost={r.get('total_cost')}  ({r.get('status_msg', '')[:60]})"
+        )
         for line in r.get("floor_lines", []):
             print(line)
         if "int_vars" in r:
-            print(f"    model: {r['vars']} vars ({r['int_vars']} integer), "
-                  f"{r['constraints']} constraints")
+            print(
+                f"    model: {r['vars']} vars ({r['int_vars']} integer), "
+                f"{r['constraints']} constraints"
+            )
         for hid, b in (r.get("bathing") or {}).items():
-            print(f"    bathing {hid}: ready T {b['ready_temp_c']} short {b['shortfall_c']} "
-                  f"unavoidable {b['unavoidable_c']} planned {b['planned_kwh']} kWh")
+            print(
+                f"    bathing {hid}: ready T {b['ready_temp_c']} short {b['shortfall_c']} "
+                f"unavoidable {b['unavoidable_c']} planned {b['planned_kwh']} kWh"
+            )
     else:
-        print(f"{head}  REJECTED in {r['seconds']}s  {r.get('error_code')}  "
-              f"reason={r.get('reason', '')[:50]}  violation={r.get('violation')}")
+        print(
+            f"{head}  REJECTED in {r['seconds']}s  {r.get('error_code')}  "
+            f"reason={r.get('reason', '')[:50]}  violation={r.get('violation')}"
+        )
     orig = f"    prod: {r['orig_solver']} {r['orig_seconds']}s violation={r['orig_violation']}"
     print(orig)
 

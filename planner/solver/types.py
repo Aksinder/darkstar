@@ -588,6 +588,11 @@ class BathingReport:
     overshoot_c: float = 0.0
     # max(0, ready - max_reachable_temp_c(...)) from now to ready_by (pure Python).
     unavoidable_shortfall_c: list[float | None] = field(default_factory=lambda: [])
+    # Set (degC) when the plan is a time-boxed incumbent whose worst ready shortfall
+    # exceeds the element-alone unavoidable part by more than BATHING_TRIPWIRE_C:
+    # it ships (comfort is soft), but nobody proved the shortfall is forced. None
+    # when proven optimal or within tolerance.
+    incumbent_unproven_shortfall_c: float | None = None
 
 
 @dataclass

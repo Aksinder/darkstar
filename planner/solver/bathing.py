@@ -7,12 +7,20 @@ an exact Newtonian recursion (backend/core/spa_thermal.py), and every comfort ru
 is a soft, slack-priced row. No integer variables are added, and no row can make
 the model infeasible:
 
-    Tt[0]   == T0
-    Tt[t+1] == a_t*Tt[t] + (1-a_t)*ambient + g_t*on[t]      a_t = exp(-k*h_t)
+    Tt[0]   =  T0
+    Tt[t+1] =  a_t*Tt[t] + (1-a_t)*ambient + g_t*on[t]       a_t = exp(-k*h_t)
     over[t] >= Tt[t+1] - temp_max                            (soft cap)
     Tt[k_j] + sr_j >= ready_temp                             (ready by, per window)
     Tt[t+1] + sh_t >= ready_temp - hold_tolerance            (hold, in-window slots)
     Tt[s]   + sf_s >= eco_floor                              (s >= 1)
+
+Tt is not an LP variable: unrolling the (linear) recursion makes every state an
+affine expression of the binaries, substituted into the rows. Measured
+2026-11-16 on the five hard 2026-08-26 dumps: with Tt as variables chained by
+one equality per slot the MIP bound stalled (1 rejected, 2 time-boxed of 5);
+unrolled, each row is the knapsack over the binaries it constrains, visible to
+HiGHS's cuts, and all five prove optimal. Rows that cannot bind are omitted
+(see build_bathing_model).
 
 Window -> index mapping (t_now = the planning start, i.e. slot 0's end minus its
 planned hours, so a partial slot 0 is respected):
@@ -43,12 +51,11 @@ from .types import BathingReport, BathingSpec, KeplerInputSlot, WaterHeaterInput
 
 logger = logging.getLogger("darkstar.kepler")
 
-# Margin (degC) on the state variable bounds. The bounds only help numerics; they
-# are chosen wide enough to never bind on any heating pattern (see build).
-_BOUND_MARGIN_C = 15.0
-
-# Tripwire: a time-boxed incumbent whose AVOIDABLE ready shortfall (planned
-# shortfall minus the physically unavoidable part) exceeds this is rejected.
+# A time-boxed incumbent whose AVOIDABLE ready shortfall (planned shortfall minus
+# the element-alone unavoidable part) exceeds this is flagged on its BathingReport
+# (incumbent_unproven_shortfall_c). It is NOT rejected: the element-alone bound
+# ignores load-group caps and co-member force_on/floors, so a forced shortfall
+# can read as avoidable.
 BATHING_TRIPWIRE_C = 1.0
 
 
@@ -182,11 +189,11 @@ class BathingModel:
     heater_id: str
     spec: BathingSpec
     wmap: BathingWindowMap
-    temp: dict[int, Any]  # Tt[s], s = 0..T
-    over: dict[int, Any]  # over[t], t = 0..T-1
+    temp: dict[int, Any]  # Tt[s], s = 0..T (affine expressions of the binaries)
+    over: dict[int, Any]  # over[t], only where all-on can exceed temp_max
     ready_short: dict[int, Any]  # window j -> sr_j
-    hold_short: dict[int, Any]  # slot t -> sh_t
-    floor_short: dict[int, Any]  # state s -> sf_s
+    hold_short: dict[int, Any]  # state s = t + 1 -> sh_t (only where it can bind)
+    floor_short: dict[int, Any]  # state s -> sf_s (only where it can bind)
     unavoidable_c: list[float | None]
 
 
@@ -228,10 +235,23 @@ def build_bathing_model(
     wmap: BathingWindowMap,
     total_cost: list[Any],
 ) -> BathingModel:
-    """Add the temperature recursion and its soft rows for one heater.
+    """Add the temperature model and its soft rows for one heater.
 
     ``on_terms[t]`` is the heater's element-on expression in slot t (heat plus
-    boost, the same expression that prices its energy in the balance).
+    boost, the same expression that prices its energy in the balance), in [0, 1]
+    (heat + boost <= 1 is a kepler row).
+
+    Formulation (2026-11-16 performance pass, see the module docstring): the
+    temperature is NOT a variable. The recursion is linear, so every state is an
+    affine expression of the binaries,
+        Tt[s] = c_s + sum_{t<s} g_t * prod_{u=t+1}^{s-1} a_u * on[t],
+    and each soft row is written directly on it. A row then IS the knapsack over
+    the binaries it constrains, which HiGHS's cut separator can see; behind a
+    chain of T equalities (one per slot) it could not, and the bound stalled.
+    Rows that can never bind are not emitted (overshoot where even all-on stays
+    at or below temp_max, floor/hold where even all-off stays at or above the
+    target), and every slack is bounded by its all-off/all-on trajectory. Both
+    are exact: the feasible set and the objective are those of the recursion.
     """
     T = len(on_terms)
     d = heater.id
@@ -242,69 +262,84 @@ def build_bathing_model(
     amb = spec.ambient_c
     T0 = spec.initial_temp_c
 
-    total_h = sum(slot_hours)
-    lo: float = min(T0, amb) - 1.0
-    # All-off decays monotonically toward ambient, so lo never binds. All-on is the
-    # pointwise-highest trajectory; keeping hi above it means even a long force_on
-    # run cannot turn the (deliberately soft) cap into an infeasible bound.
-    hi: float = max(
-        max(T0, spec.temp_max_c) + _BOUND_MARGIN_C,
-        max_reachable_temp_c(T0, amb, P, C, k, total_h) + 1.0,
-    )
-    temp: dict[int, Any] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
-        f"bath_temp_{safe_d}", range(T + 1), lowBound=lo, upBound=hi
-    )
-    over: dict[int, Any] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
-        f"bath_over_{safe_d}", range(T), lowBound=0.0
-    )
-    prob += temp[0] == T0  # type: ignore[operator]
+    # Affine state expressions plus the pointwise all-off (lowest) and all-on
+    # (highest) trajectories: on[t] in [0, 1] and every gain is positive.
+    temp: dict[int, Any] = {0: pulp.LpAffineExpression(constant=T0)}
+    low: list[float] = [T0]
+    high: list[float] = [T0]
     for t in range(T):
         h = slot_hours[t]
         a = decay_factor(k, h)
         g = heat_gain_c(P, C, k, h)
-        prob += (  # type: ignore[operator]
-            temp[t + 1] == a * temp[t] + (1.0 - a) * amb + g * on_terms[t]
+        temp[t + 1] = a * temp[t] + (1.0 - a) * amb + g * on_terms[t]
+        low.append(a * low[t] + (1.0 - a) * amb)
+        high.append(a * high[t] + (1.0 - a) * amb + g)
+    eps = 1e-6
+
+    # A zero-priced slack makes its row vacuous: emit neither.
+    over: dict[int, Any] = {}
+    for t in range(T if spec.overshoot_penalty_sek_per_c > 0 else 0):
+        if high[t + 1] <= spec.temp_max_c + eps:
+            continue  # unreachable even with the element on throughout
+        over[t] = pulp.LpVariable(
+            f"bath_over_{safe_d}_{t}", lowBound=0.0, upBound=high[t + 1] - spec.temp_max_c
         )
         prob += over[t] >= temp[t + 1] - spec.temp_max_c  # type: ignore[operator]
 
     ready_short: dict[int, Any] = {}
     for j, k_j in enumerate(wmap.ready_state):
-        if k_j is None:
+        if k_j is None or spec.ready_shortfall_sek_per_c <= 0:
             continue
         sr = pulp.LpVariable(
             f"bath_ready_short_{safe_d}_{j}",
             lowBound=0.0,
-            upBound=max(0.0, spec.ready_temp_c - lo),
+            upBound=max(0.0, spec.ready_temp_c - low[k_j]),
         )
         prob += temp[k_j] + sr >= spec.ready_temp_c  # type: ignore[operator]
         ready_short[j] = sr
 
-    hold_target = spec.ready_temp_c - spec.hold_tolerance_c
-    hold_short: dict[int, Any] = {}
-    for t in wmap.hold_slots:
-        sh = pulp.LpVariable(f"bath_hold_short_{safe_d}_{t}", lowBound=0.0)
-        prob += temp[t + 1] + sh >= hold_target  # type: ignore[operator]
-        hold_short[t] = sh
+    def _soft_rows(
+        name: str, states: list[int], target: float, tag: int, price: float
+    ) -> dict[int, Any]:
+        """state s -> shortfall slack of ``Tt[s] >= target`` (soft); the slack is
+        named by s + tag (hold: its slot t = s - 1, floor: its state s)."""
+        short: dict[int, Any] = {}
+        for s in states if price > 0 else []:
+            if low[s] >= target - eps:
+                continue  # met even with the element off throughout
+            v = pulp.LpVariable(
+                f"bath_{name}_short_{safe_d}_{s + tag}",
+                lowBound=0.0,
+                upBound=target - low[s],
+            )
+            prob.addConstraint(temp[s] + v >= target)  # type: ignore[operator]
+            short[s] = v
+        return short
 
-    floor_short: dict[int, Any] = {}
-    for s in range(1, T + 1):
-        sf = pulp.LpVariable(f"bath_floor_short_{safe_d}_{s}", lowBound=0.0)
-        prob += temp[s] + sf >= spec.eco_floor_c  # type: ignore[operator]
-        floor_short[s] = sf
+    hold_short = _soft_rows(
+        "hold",
+        [t + 1 for t in wmap.hold_slots],
+        spec.ready_temp_c - spec.hold_tolerance_c,
+        -1,
+        spec.hold_shortfall_sek_per_c_h,
+    )
+    floor_short = _soft_rows(
+        "floor", list(range(1, T + 1)), spec.eco_floor_c, 0, spec.floor_shortfall_sek_per_c_h
+    )
 
-    if ready_short and spec.ready_shortfall_sek_per_c > 0:
+    if ready_short:
         total_cost.append(spec.ready_shortfall_sek_per_c * pulp.lpSum(ready_short.values()))
-    if hold_short and spec.hold_shortfall_sek_per_c_h > 0:
+    if hold_short:
         total_cost.append(
             spec.hold_shortfall_sek_per_c_h
-            * pulp.lpSum(slot_hours[t] * sh for t, sh in hold_short.items())
+            * pulp.lpSum(slot_hours[s - 1] * v for s, v in hold_short.items())
         )
-    if floor_short and spec.floor_shortfall_sek_per_c_h > 0:
+    if floor_short:
         total_cost.append(
             spec.floor_shortfall_sek_per_c_h
-            * pulp.lpSum(slot_hours[s - 1] * sf for s, sf in floor_short.items())
+            * pulp.lpSum(slot_hours[s - 1] * v for s, v in floor_short.items())
         )
-    if spec.overshoot_penalty_sek_per_c > 0:
+    if over:
         total_cost.append(spec.overshoot_penalty_sek_per_c * pulp.lpSum(over.values()))
 
     return BathingModel(
