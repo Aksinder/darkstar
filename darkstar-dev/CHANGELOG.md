@@ -1,3 +1,7 @@
+## dev-20261116.1543 — 2026-11-16 15:45
+
+- Merge branch 'perf/spa-bathing-solver' into feat/spa-bathing
+
 ## dev-20261112.2231 — 2026-11-12 22:33
 
 - fix(heaters): a price-driven off is never held; heat first; slot price
