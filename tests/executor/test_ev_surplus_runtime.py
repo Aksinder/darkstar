@@ -882,3 +882,59 @@ class TestOwnerMinimumLevelFloor:
         )
         assert not on, "config floor 40 is met at 41"
         assert ctrl._live_floor_soc["tesla"] == 40.0
+
+
+class TestFirstStopAfterRestart:
+    """A fresh process must not send turn_off to a switch that already reads off.
+
+    Live 2026-11-16 17:02: every add-on restart sent switch.turn_off to a sleeping
+    Tesla whose switch was already off; the call woke the car and timed out.
+    """
+
+    _NO_SURPLUS = {"sensor.pv": "0", "sensor.grid": "3000", "sensor.soc": "20"}
+
+    def _tesla_calls(self, ha):
+        return [c for c in ha.calls if c[2] == "switch.tesla"]
+
+    @pytest.mark.asyncio
+    async def test_already_off_is_adopted_without_a_call(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ctrl = EVSurplusController(cfg)
+        ha = FakeHA(_states(**self._NO_SURPLUS, **{"switch.tesla": "off"}))
+        await ctrl.run(ha, now_ts=1000.0)
+        assert ("switch", "turn_off", "switch.tesla", None) not in ha.calls, ha.calls
+        assert ctrl._last_switch.get("tesla") is False
+        await ctrl.run(ha, now_ts=1030.0)
+        assert ("switch", "turn_off", "switch.tesla", None) not in ha.calls, ha.calls
+
+    @pytest.mark.asyncio
+    async def test_switch_on_still_gets_turn_off(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ha = FakeHA(_states(**self._NO_SURPLUS, **{"switch.tesla": "on"}))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_off", "switch.tesla", None) in ha.calls, ha.calls
+
+    @pytest.mark.asyncio
+    async def test_unreadable_switch_still_gets_turn_off(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ha = FakeHA(_states(**self._NO_SURPLUS))  # switch.tesla absent -> None
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_off", "switch.tesla", None) in ha.calls, ha.calls
+
+    @pytest.mark.asyncio
+    async def test_force_off_writes_even_if_switch_reads_off(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        ha = FakeHA(_states(**{"input_select.tesla_mode": "force_off", "switch.tesla": "off"}))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_off", "switch.tesla", None) in ha.calls, ha.calls
+
+    @pytest.mark.asyncio
+    async def test_drawing_car_gets_turn_off_despite_stale_off_switch(self):
+        cfg = parse_ev_surplus_config(_cfg_dict())
+        # The car's own 11 kW is in the grid reading; 3 kW short on top of it.
+        ha = FakeHA(_states(**{
+            **self._NO_SURPLUS, "sensor.grid": "14000",
+            "switch.tesla": "off", "sensor.tesla_power": "11000",
+        }))
+        await EVSurplusController(cfg).run(ha, now_ts=1000.0)
+        assert ("switch", "turn_off", "switch.tesla", None) in ha.calls, ha.calls

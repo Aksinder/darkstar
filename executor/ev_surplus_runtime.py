@@ -2707,8 +2707,34 @@ class EVSurplusController:
         # Switch: only toggle on change. `sw` carries what actually went to the
         # device (None = no switch write happened this tick).
         sw: bool | None = None
+        # FIRST STOP AFTER A RESTART. _last_switch is empty in a fresh process, so
+        # an ordinary "stay off" decision reads as a change (None != False) and
+        # sends turn_off to a switch that is already off. For a Tesla that write
+        # wakes a sleeping car and outlasts the 5 s call timeout (live 2026-11-16
+        # 17:02, one HACallError per add-on restart). If the entity itself says
+        # "off" and nothing is drawing, adopt OFF without a call. Fuse-guard and
+        # force_off stops still write: those must not trust a possibly stale state.
+        skip_write = False
+        if (
+            not cmd.switch_on
+            and ccfg.switch_entity is not None
+            and ccfg.id not in self._last_switch
+            and drawing_w < 100.0
+            and not cmd.fuse_limited
+            and not str(cmd.reason).startswith("override: force_off")
+        ):
+            try:
+                st = await ha.get_state(ccfg.switch_entity)
+            except Exception:
+                st = None
+            if isinstance(st, dict) and str(st.get("state")).strip().lower() == "off":
+                skip_write = True
+                logger.info(
+                    "EV surplus: %s switch already off at startup — adopting OFF "
+                    "without a turn_off call", ccfg.id,
+                )
         if ccfg.switch_entity is not None and self._last_switch.get(ccfg.id) != cmd.switch_on:
-            if not shadow:
+            if not shadow and not skip_write:
                 svc = "turn_on" if cmd.switch_on else "turn_off"
                 # A car with a wake button answers HTTP 500 while asleep, and
                 # in-place retries never help it — the client's default 4-attempt
@@ -2742,10 +2768,11 @@ class EVSurplusController:
                 self._clamp_since.pop(ccfg.id, None)
                 self._clamp_notified.discard(ccfg.id)
             self._last_switch[ccfg.id] = cmd.switch_on
-            sw = cmd.switch_on if not shadow else None
+            sw = cmd.switch_on if not (shadow or skip_write) else None
             self._switch_disagree_since.pop(ccfg.id, None)
             # Any write invalidates a power reading older than it (trust_commanded_draw).
-            self._last_cmd_ts[ccfg.id] = now_ts
+            if not skip_write:
+                self._last_cmd_ts[ccfg.id] = now_ts
 
         # Pause a switchless Easee: with no on/off switch, dynamic limit 0 IS the stop. Without
         # this an "off" command (SoC cap / force_off) on a switchless Easee would leave it
