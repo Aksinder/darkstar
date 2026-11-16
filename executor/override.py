@@ -123,6 +123,9 @@ class SlotPlan:
     ev_charger_plans: dict[str, float] = field(default_factory=lambda: {})
     water_heater_plans: dict[str, float] = field(default_factory=lambda: {})
     water_heating_boost: dict[str, bool] = field(default_factory=lambda: {})
+    # Spa bathing plan mode per heater: "solver" | "shadow" | "fallback" (absent =
+    # no bathing plan). Read by the executor's bathing step (executor/spa_bathing.py).
+    water_heater_bathing: dict[str, str] = field(default_factory=lambda: {})
     custom_entity_active: bool = False
     # Excess-PV sink ladder: sink_id -> planned-active this slot. Old schedule
     # files without the key get {first_sink_id: custom_entity_active} synthesized

@@ -116,8 +116,33 @@ def coarsen_slots(
     return coarse, groups
 
 
+def _interp_temps(
+    end_temps: dict[str, float],
+    prev_temps: dict[str, float] | None,
+    n: int,
+    k: int,
+) -> dict[str, float]:
+    """Member ``n`` (1-based) of ``k``: END-of-quarter temperature per heater.
+
+    Like soc_kwh, ``water_heater_temp_c`` is an END-of-slot state, so it is
+    interpolated linearly from the previous coarse slot's end value to this one's.
+    No previous value (first slot, or the heater was absent there) or a single
+    member: the end value is copied.
+    """
+    out: dict[str, float] = {}
+    for hid, end in end_temps.items():
+        start = prev_temps.get(hid) if prev_temps is not None else None
+        if start is None or k <= 1:
+            out[hid] = end
+        else:
+            out[hid] = start + (end - start) * n / k
+    return out
+
+
 def _split_slot(
-    coarse: KeplerResultSlot, originals: list[KeplerInputSlot]
+    coarse: KeplerResultSlot,
+    originals: list[KeplerInputSlot],
+    prev_temps: dict[str, float] | None = None,
 ) -> list[KeplerResultSlot]:
     """One coarse result slot back into its original quarter-hours.
 
@@ -128,12 +153,14 @@ def _split_slot(
 
     ``soc_kwh`` is the END-of-slot state, so it is interpolated across the members
     rather than repeated: a repeated value would draw a flat line through an hour
-    the battery actually spent charging.
+    the battery actually spent charging. ``water_heater_temp_c`` (spa bathing) is
+    an end-of-slot state too and is interpolated from ``prev_temps`` the same way.
     """
     k = len(originals)
     if k <= 1:
         return [replace(coarse, start_time=originals[0].start_time,
-                        end_time=originals[0].end_time)]
+                        end_time=originals[0].end_time,
+                        water_heater_temp_c=dict(coarse.water_heater_temp_c))]
     share = 1.0 / k
     out: list[KeplerResultSlot] = []
     soc_start = coarse.soc_kwh - (coarse.charge_kwh - coarse.discharge_kwh)
@@ -152,6 +179,9 @@ def _split_slot(
                 duration_h=None,  # members are re-timed; kW from their own length
                 soc_kwh=soc_start
                 + (coarse.charge_kwh - coarse.discharge_kwh) * share * n,
+                water_heater_temp_c=_interp_temps(
+                    coarse.water_heater_temp_c, prev_temps, n, k
+                ),
             )
         )
     return out
@@ -173,6 +203,10 @@ def expand_result(
         # said rather than inventing an alignment. Loud upstream, not silent here.
         return result
     expanded: list[KeplerResultSlot] = []
+    prev_temps: dict[str, float] | None = None
     for coarse_slot, members in zip(result.slots, groups, strict=True):
-        expanded.extend(_split_slot(coarse_slot, [original_slots[m] for m in members]))
+        expanded.extend(
+            _split_slot(coarse_slot, [original_slots[m] for m in members], prev_temps)
+        )
+        prev_temps = coarse_slot.water_heater_temp_c
     return replace(result, slots=expanded)

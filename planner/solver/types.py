@@ -44,6 +44,47 @@ class LoadGroup:
 
 
 @dataclass
+class BathWindow:
+    """One bathing window for a spa heater (spa bathing times, WP1).
+
+    tz-aware in production (load_windows guarantees it); all-naive is accepted in
+    tests. Kepler drops the whole BathingSpec when the awareness differs from the
+    slots' (never a TypeError on comparison).
+    """
+
+    start: datetime  # window start
+    end: datetime
+    ready_by: datetime  # = start - ready_margin; the temperature target moment
+
+
+@dataclass
+class BathingSpec:
+    """Temperature-state model for a spa heater (replaces daily-kWh economics).
+
+    When set on a WaterHeaterInput (and valid), kepler adds a continuous Newtonian
+    temperature recursion driven by the heater's existing binaries:
+        T[t+1] = a*T[t] + (1-a)*ambient + (1-a)/(k*C)*P*on[t],   a = exp(-k*h_t)
+    with soft (slack-priced) ready, in-window hold, eco-floor and temp_max rows. No
+    new integer variables. The spa's daily kWh floor, absorb cap, WTP credit and
+    block-overshoot rows are skipped for that heater.
+    """
+
+    initial_temp_c: float  # measured NOW (state 0 of the recursion)
+    ambient_c: float  # scalar
+    heat_capacity_kwh_per_c: float  # C
+    cooling_k_per_h: float  # k
+    ready_temp_c: float
+    eco_floor_c: float
+    temp_max_c: float
+    windows: list[BathWindow] = field(default_factory=lambda: [])
+    ready_shortfall_sek_per_c: float = 5.0  # per degC at ready_by
+    hold_shortfall_sek_per_c_h: float = 5.0  # per degC-hour in window
+    floor_shortfall_sek_per_c_h: float = 2.0  # per degC-hour below eco floor
+    hold_tolerance_c: float = 1.0
+    overshoot_penalty_sek_per_c: float = 10.0  # soft cap above temp_max_c
+
+
+@dataclass
 class WaterHeaterInput:
     """Per-device water heater input for the Kepler MILP solver."""
 
@@ -96,6 +137,9 @@ class WaterHeaterInput:
     # water_heaters[].phase_map). Only read by the fuse-relief rows: planned energy is
     # split 1/len(phases) onto each listed phase. EMPTY = unknown => even split.
     phases: list[str] = field(default_factory=lambda: [])
+    # Spa bathing times: temperature-state model. None => legacy daily-kWh mode,
+    # byte-identical LP. Attached by the pipeline after config_to_kepler_config.
+    bathing: BathingSpec | None = None
 
 
 @dataclass
@@ -526,6 +570,24 @@ class KeplerResultSlot:
     # slot 0, else the slot length. kW = kWh / duration_h. None = slot length.
     duration_h: float | None = None
     is_optimal: bool = True
+    # Spa bathing: end-of-slot predicted temperature (degC) per bathing heater.
+    water_heater_temp_c: dict[str, float] = field(default_factory=lambda: {})
+
+
+@dataclass
+class BathingReport:
+    """Post-solve summary of a bathing heater's plan (one per active BathingSpec)."""
+
+    heater_id: str
+    # Predicted T at ready_by per BathingSpec.windows[i]; None = no target (dropped,
+    # in progress or beyond the horizon).
+    window_ready_temp_c: list[float | None]
+    window_shortfall_c: list[float | None]  # ready slack per window; None = no target
+    hold_shortfall_c_h: float = 0.0
+    floor_shortfall_c_h: float = 0.0
+    overshoot_c: float = 0.0
+    # max(0, ready - max_reachable_temp_c(...)) from now to ready_by (pure Python).
+    unavoidable_shortfall_c: list[float | None] = field(default_factory=lambda: [])
 
 
 @dataclass
@@ -544,6 +606,8 @@ class KeplerResult:
     # the plan. Surfacing both makes that wedge visible instead of certifying
     # "optimal" against an objective the user never sees.
     objective_cost_sek: float | None = None
+    # Spa bathing: heater_id -> report, only for heaters with an active BathingSpec.
+    bathing_reports: dict[str, BathingReport] = field(default_factory=lambda: {})
 
 
 def planned_slot_hours(

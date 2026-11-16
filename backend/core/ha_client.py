@@ -958,6 +958,87 @@ async def get_water_absorption_stats(config: dict[str, Any]) -> dict[str, dict[s
         return {}
 
 
+async def _attach_bathing_inputs(
+    config: dict[str, Any],
+    heaters_cfg: list[Any],
+    water_heater_states: list[dict[str, Any]],
+) -> None:
+    """Fill ``water_heater_states[id]["bathing_inputs"]`` for bathing-enabled tanks.
+
+    ``{"windows": [[iso, iso], ...] | None, "temp_c": float | None,
+    "ambient_c": float | None, "read_at": aware iso}``. Windows come from the same
+    calendar reader as the room heaters (7-day lookahead, 6 h last-good), with no
+    preheat: the planner applies ``ready_margin_minutes`` itself.
+    """
+    from backend.core.spa_bathing_config import heater_bathing_config
+
+    for wh_any in heaters_cfg:
+        if not isinstance(wh_any, dict):
+            continue
+        wh_d = cast("dict[str, Any]", wh_any)
+        hid = str(wh_d.get("id", ""))
+        if not hid or not wh_d.get("enabled", True):
+            continue
+        try:
+            bcfg = heater_bathing_config(wh_d)
+        except Exception as exc:  # parse never raises, but never let it cost the state
+            logger.warning("spa bathing %s: config parse failed (%s)", hid, exc)
+            continue
+        if bcfg is None or not bcfg.enabled:
+            continue
+        try:
+            tz_b = pytz.timezone(config.get("timezone", "Europe/Stockholm"))
+        except Exception as exc:
+            logger.warning("spa bathing %s: bad timezone (%s), using Europe/Stockholm", hid, exc)
+            tz_b = pytz.timezone("Europe/Stockholm")
+        now_b = datetime.now(tz_b)
+        windows_iso: list[list[str]] | None = None
+        try:
+            found_b = await plan_windows_for_load(
+                {
+                    "id": hid,
+                    "window_entities": list(bcfg.window_entities),
+                    "window_event_match": bcfg.window_event_match,
+                    "preheat_minutes": 0,
+                },
+                now_b,
+                tz_b,
+                get_state=get_ha_entity_state,
+            )
+            windows_iso = None if found_b is None else windows_to_iso(found_b)
+        except Exception as exc:
+            logger.warning("spa bathing %s: window read failed (%s)", hid, exc)
+            windows_iso = None
+        temp_c: float | None = None
+        if bcfg.temp_sensor:
+            try:
+                temp_c = await get_ha_sensor_float(bcfg.temp_sensor)
+            except Exception as exc:
+                logger.warning("spa bathing %s: temperature read failed (%s)", hid, exc)
+                temp_c = None
+        ambient_c: float | None = None
+        if bcfg.ambient_sensor:
+            try:
+                ambient_c = await get_ha_sensor_float(bcfg.ambient_sensor)
+            except Exception as exc:
+                logger.warning("spa bathing %s: ambient read failed (%s)", hid, exc)
+                ambient_c = None
+        inputs: dict[str, Any] = {
+            "windows": windows_iso,
+            "temp_c": temp_c,
+            "ambient_c": ambient_c,
+            "read_at": now_b.isoformat(),
+        }
+        for st_e in water_heater_states:
+            if st_e.get("id") == hid:
+                st_e["bathing_inputs"] = inputs
+                break
+        else:
+            water_heater_states.append(
+                {"id": hid, "heated_today_kwh": 0.0, "bathing_inputs": inputs}
+            )
+
+
 async def get_initial_state(
     config_path: str = "config.yaml",
     ev_plugged_in_override: bool | None = None,
@@ -1095,6 +1176,11 @@ async def get_initial_state(
                     "control_paused_via": paused_via,
                 }
             )
+
+    # SPA BATHING TIMES: windows, measured water temperature and ambient for every
+    # tank with ``bathing.enabled``. Every read fails to None ("unknown"); the planner
+    # then falls back to the legacy daily-kWh plan. A window is never invented.
+    await _attach_bathing_inputs(config, _wh_cfg_list, water_heater_states)
 
     # Cyclic loads: when did each last run? The pre-scheduler's max-gap rule is
     # anchored here, so a filter that last ran at 16:11 is not left idle until

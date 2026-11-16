@@ -65,6 +65,14 @@ from .override import (
     SystemState,
     evaluate_overrides,
 )
+from .spa_bathing import (
+    RULE_CATCH_UP,
+    RULE_ECO_FLOOR,
+    BathingStep,
+    SpaBathingRuntime,
+    decide_bathing_rules,
+    window_active,
+)
 from .water_hold import (
     NO_SURPLUS_REASON,
     battery_charge_w,
@@ -128,6 +136,12 @@ def isolate_slot_for_ev(slot: SlotPlan) -> SlotPlan:
     stays for the execution record and the A-profile discharge paths.
     """
     return replace(slot, discharge_kw=0.0, ev_isolation=True)
+
+
+def _bathing_enabled(device: Any) -> bool:
+    """True when this heater carries an enabled spa ``bathing`` block."""
+    cfg = getattr(device, "bathing", None)
+    return bool(cfg is not None and getattr(cfg, "enabled", False))
 
 # The EV charge-failure notifier ignores zero-power ticks while the freshest EV power
 # report is older than this (see _ev_power_reading_stale). Matches the Tesla Fleet
@@ -2129,6 +2143,7 @@ class ExecutorEngine:
                             needs_ctx = any(
                                 getattr(d, "idle_hold", False)
                                 or getattr(d, "surplus_boost", False)
+                                or _bathing_enabled(d)
                                 for d in self.config.water_heater_devices
                             )
                             try:
@@ -2244,14 +2259,33 @@ class ExecutorEngine:
                                             continue
                                         self._override_state.pop(device.id, None)
 
+                                        # Spa bathing times: below the fuse shed and
+                                        # the human's override, above everything that
+                                        # reasons about price. None = not configured,
+                                        # shadow, or failed — the normal path below,
+                                        # unchanged (executor/spa_bathing.py).
+                                        bathing_step = await self._spa_bathing_step(
+                                            device, temp, off_temp, heater_w, slot, now
+                                        )
+                                        if (
+                                            bathing_step is not None
+                                            and bathing_step.temp_c is not None
+                                        ):
+                                            temp = bathing_step.temp_c
+
                                         # Free-and-cheap: push to the boost target.
                                         # This OVERRIDES the plan, which cannot see
                                         # real-time surplus (the planner's own boost
                                         # path needs excess_pv_sink, deliberately off
                                         # since the phantom-water incident).
-                                        boosted = self._water_surplus_boost(
-                                            device, heater_w, water_ctx,
-                                            heated_today_map.get(device.id),
+                                        boosted = (
+                                            None
+                                            if bathing_step is not None
+                                            and bathing_step.skip_surplus_boost
+                                            else self._water_surplus_boost(
+                                                device, heater_w, water_ctx,
+                                                heated_today_map.get(device.id),
+                                            )
                                         )
                                         if boosted is not None:
                                             temp = boosted
@@ -2259,7 +2293,10 @@ class ExecutorEngine:
                                         # idle or surplus-fed appliance alone instead
                                         # of throwing away its standing warmth with an
                                         # off-write.
-                                        elif self._water_idle_hold(
+                                        elif not (
+                                            bathing_step is not None
+                                            and bathing_step.skip_idle_hold
+                                        ) and self._water_idle_hold(
                                             device, temp, off_temp, heater_w, water_ctx
                                         ):
                                             continue
@@ -3528,6 +3565,14 @@ class ExecutorEngine:
             for k, v in raw_boost.items():  # type: ignore[union-attr]
                 water_heating_boost[str(k)] = bool(v)  # type: ignore[arg-type]
 
+        # Spa bathing plan mode per heater ("solver" | "shadow" | "fallback").
+        raw_bathing = slot_data.get("water_heater_bathing")
+        water_heater_bathing: dict[str, str] = {}
+        if isinstance(raw_bathing, dict):
+            for k, v in raw_bathing.items():  # type: ignore[union-attr]
+                if isinstance(v, str):
+                    water_heater_bathing[str(k)] = v  # type: ignore[arg-type]
+
         # Parse custom entity active flag
         custom_entity_active = bool(slot_data.get("custom_entity_active", False))
 
@@ -3579,6 +3624,7 @@ class ExecutorEngine:
             ev_charger_plans=ev_charger_plans,
             water_heater_plans=water_heater_plans,
             water_heating_boost=water_heating_boost,
+            water_heater_bathing=water_heater_bathing,
             custom_entity_active=custom_entity_active,
             sinks=sinks,
             # None (NOT 0.0) when the schedule lacks the field or the slot is stale:
@@ -4845,6 +4891,92 @@ class ExecutorEngine:
                         f"({sib_kw:.1f}+{my_kw:.1f} kW > {grp.max_power_kw:.1f} kW cap)"
                     )
         return None
+
+    def _spa_bathing_runtime(self) -> SpaBathingRuntime:
+        # Lazy, like the window-load runtime: unit tests build bare engines.
+        runtime: SpaBathingRuntime | None = self.__dict__.get("_spa_bathing")
+        if runtime is None:
+            runtime = SpaBathingRuntime()
+            self.__dict__["_spa_bathing"] = runtime
+        return runtime
+
+    async def _spa_bathing_step(
+        self,
+        device: Any,
+        planned_temp: Any,
+        off_temp: Any,
+        heater_w: float | None,
+        slot: Any,
+        now: datetime,
+    ) -> BathingStep | None:
+        """The bathing rules' say for this heater this tick (executor/spa_bathing.py).
+
+        None = no bathing block, ``enabled: false``, ``shadow: true`` (logged only) or
+        a failure: the caller then runs exactly the pre-bathing path. Never raises.
+        """
+        cfg = getattr(device, "bathing", None)
+        if cfg is None or not cfg.enabled:
+            return None
+        try:
+            if now.tzinfo is None:
+                return None
+            runtime = self._spa_bathing_runtime()
+            ha = self.ha_client
+            windows = await runtime.windows(
+                cfg, now.timestamp(), self.config.timezone, ha
+            )
+            measured = await runtime.read_temp_c(ha, cfg.temp_sensor)
+            ambient = await runtime.read_ambient_c(ha, cfg)
+            eff = runtime.effective_config(cfg)
+            idle_w = float(getattr(device, "idle_power_w", 100.0) or 0.0)
+            normal = (
+                device.temp_normal
+                if device.temp_normal is not None
+                else self.config.water_heater.temp_normal
+            )
+            decision, latched = decide_bathing_rules(
+                cfg=eff,
+                now=now,
+                windows=windows,
+                measured_temp_c=measured,
+                planned_temp=int(planned_temp),
+                off_temp=int(off_temp),
+                normal_temp=int(normal),
+                device_max_temp=getattr(device, "temp_max", None),
+                power_kw=float(getattr(device, "power_kw", 0.0) or 0.0),
+                ambient_c=ambient,
+                floor_latched=runtime.floor_latched.get(device.id, False),
+                heating_now=None if heater_w is None else heater_w > idle_w,
+            )
+            runtime.floor_latched[device.id] = latched
+            runtime.log_transition(device.id, decision, shadow=cfg.shadow)
+            if cfg.shadow:
+                return None
+            acting = decision.action != "none"
+            plan_mode = getattr(slot, "water_heater_bathing", {}).get(device.id)
+            # An idle-held spa at its setpoint thermostat-reheats at every 1 C drop,
+            # which is exactly the cooling a bathing plan counts on — so outside a
+            # window of a solver plan the off-write must land. Unknown windows keep
+            # the legacy hold (fail safe).
+            outside_window = window_active(windows, now) is False
+            skip_idle = acting or (plan_mode == "solver" and outside_window)
+            at_cap = measured is not None and measured >= eff.temp_max_c - 0.5
+            skip_boost = at_cap or (
+                acting and decision.rule in (RULE_CATCH_UP, RULE_ECO_FLOOR)
+            )
+            return BathingStep(
+                temp_c=decision.temp_c if acting else None,
+                skip_idle_hold=skip_idle,
+                skip_surplus_boost=skip_boost,
+            )
+        except Exception as exc:
+            logger.warning(
+                "spa-bathing %s: rules failed (%s) — legacy control this tick",
+                getattr(device, "id", "?"),
+                exc,
+                exc_info=True,
+            )
+            return None
 
     def _water_surplus_boost(
         self,

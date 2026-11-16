@@ -456,10 +456,12 @@ async def run_publisher_loop(
         get_ha_sensor_kw_normalized,
         make_ha_headers,
     )
+    from backend.core.spa_bathing_config import any_bathing_enabled
     from backend.learning.cycle_publisher import (
         build_loadshift_sensors,
         build_realism_sensors,
         build_savings_sensors,
+        build_spa_bathing_sensors,
         build_unknown_load_sensor,
         publish_sensors,
     )
@@ -468,7 +470,8 @@ async def run_publisher_loop(
     unknown_cfg: dict[str, Any] = config.get("unknown_load", {}) or {}
     publish_unknown = bool(unknown_cfg.get("enabled", False))
     load_power_entity = (config.get("input_sensors") or {}).get("load_power")
-    if not appliances and not tanks and not publish_unknown:
+    publish_spa = any_bathing_enabled(config)
+    if not appliances and not tanks and not publish_unknown and not publish_spa:
         logger.info("Cycle publisher: no tracked loads/tanks configured; not starting")
         return
 
@@ -560,6 +563,21 @@ async def run_publisher_loop(
         s_index: dict[str, Any] = meta.get("s_index") or {}
         realism: dict[str, Any] = s_index.get("realism") or {}
         sensors = build_realism_sensors(realism)
+        if sensors:
+            await publish(sensors)
+
+    async def publish_spa_bathing() -> None:
+        """Publish the spa bathing-times entities from schedule.json meta.spa_bathing."""
+        if not publish_spa:
+            return
+        sched = Path("data/schedule.json")
+        if not sched.exists():
+            return
+        with sched.open() as f:
+            payload: dict[str, Any] = json.load(f)
+        meta: dict[str, Any] = payload.get("meta") or {}
+        spa_meta: dict[str, Any] = meta.get("spa_bathing") or {}
+        sensors = build_spa_bathing_sensors(spa_meta)
         if sensors:
             await publish(sensors)
 
@@ -732,10 +750,12 @@ async def run_publisher_loop(
         )
 
     logger.info(
-        "Cycle publisher started: %d appliance(s), %d tank(s), unknown_load=%s, every %.0fs",
+        "Cycle publisher started: %d appliance(s), %d tank(s), unknown_load=%s, "
+        "spa_bathing=%s, every %.0fs",
         len(appliances),
         len(tanks),
         publish_unknown,
+        publish_spa,
         interval_s,
     )
     while True:
@@ -747,6 +767,10 @@ async def run_publisher_loop(
             await publish_realism()
         except Exception as exc:
             logger.debug("Realism sensor publish skipped: %s", exc)
+        try:
+            await publish_spa_bathing()
+        except Exception as exc:
+            logger.debug("Spa bathing publish skipped: %s", exc)
         try:
             await publish_unknown_load()
         except Exception as exc:

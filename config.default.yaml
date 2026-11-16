@@ -538,6 +538,48 @@ water_heaters:
   #   prior_draw_kw: 0.15            # avg draw seed (~3.6 kWh/day) until self-calibrated; lower for a small cabin tank
   #   sensor_prefix: "darkstar_"     # "" to own the bare canonical ids (no template conflict)
 
+  # Example: Spa bathing times — plan a spa (hot tub) on a temperature model against
+  # bathing windows from a calendar, instead of a daily kWh floor. Add the `bathing:`
+  # block to the spa's own water_heaters entry (not to main_tank).
+  #
+  # IMPORTANT — the add-on config save REPLACES lists, and the template merge is
+  # shallow: a `bathing:` block replaces any template block wholesale. Always send the
+  # WHOLE spa entry including the whole `bathing:` block. Omitted keys get the defaults
+  # shown below in code (backend/core/spa_bathing_config.py).
+  #
+  # Modes: no block or enabled: false = exactly today's plan. enabled + shadow: true
+  # (the default) = today's plan unchanged, but the predicted spa temperature is
+  # published (sensor.darkstar_spa_next_bath, sensor.darkstar_spa_ready_forecast_c,
+  # binary_sensor.darkstar_spa_on_track) to check the model against reality first.
+  # shadow: false = the solver plans the spa on the temperature model and the executor
+  # rules (no off-write inside a window, catch-up, eco floor) go live. An unreadable
+  # calendar or temperature always falls back to today's daily-kWh plan.
+  # - id: spa
+  #   ...                            # the existing spa keys stay as they are
+  #   bathing:
+  #     enabled: false
+  #     shadow: true                 # predict + publish only; flip to false after a shadow week
+  #     window_entities: []          # e.g. [calendar.spa]; every event (or matching one) is a bath
+  #     window_event_match: ""       # optional: only events whose title contains this text
+  #     ready_temp_c: 38.0           # water must be this warm at window start - ready_margin
+  #     eco_floor_c: 28.0            # never let it cool below this (clamped to >= 20)
+  #     temp_max_c: 40.0             # model ceiling (the spa's own max setpoint)
+  #     ready_margin_minutes: 30     # reach ready_temp_c this long before the bath starts
+  #     temp_sensor: ""              # measured water temperature, e.g. sensor.layzspa_temp_c
+  #     ambient_sensor: ""           # optional outdoor temperature at the spa
+  #     ambient_default_c: 10.0      # used when no ambient sensor/forecast is available
+  #     heat_capacity_kwh_per_c: 0.9 # C: kWh per degC of water (about 775 L)
+  #     cooling_k_per_h: 0.021       # k: Newtonian cooling constant (1/h), 0.005-0.08
+  #     ready_shortfall_sek_per_c: 5.0    # cost per degC short at ready-by (and per degC-h in a window)
+  #     floor_shortfall_sek_per_c: 2.0    # cost per degC-hour below the eco floor
+  #     hold_tolerance_c: 1.0        # in a window, keep within this of ready_temp_c
+  #     overshoot_penalty_sek_per_c: 10.0 # soft cap above temp_max_c
+  #     catch_up_margin_c: 0.5       # executor: heat early when this far behind schedule
+  #     floor_write_temp_c: 31.0     # executor eco-floor write. MUST stay above the spa
+  #                                  #   bridge's 30 C heat/fan_only threshold, or a floor
+  #                                  #   write will not heat. Change only with the bridge.
+  #     learn: true                  # use learned C/k from data/spa_thermal_params.json when fresh
+
 # Unknown-load observability (default OFF). Publishes the ALREADY-computed residual
 # (total load − metered controllable loads) as sensor.darkstar_unknown_load, with total /
 # metered / drift_rate attributes. This is NOT appliance disaggregation (infeasible on one

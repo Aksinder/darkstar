@@ -16,9 +16,11 @@ The state-building functions are pure (no I/O) and fully unit-testable; only
 from __future__ import annotations
 
 import logging
+import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from backend.learning.cycle_learning import CycleStats, DetectedCycle
@@ -38,6 +40,7 @@ __all__ = [
     "build_phase_sensors",
     "build_realism_sensors",
     "build_savings_sensors",
+    "build_spa_bathing_sensors",
     "publish_sensors",
 ]
 
@@ -57,10 +60,13 @@ class PublishedSensor:
     icon: str | None = None
     friendly_name: str | None = None
     attributes: dict[str, Any] = field(default_factory=lambda: {})
+    # HA entity domain. "sensor" for everything except e.g. the spa's on-track
+    # binary_sensor; the default keeps every existing entity id unchanged.
+    domain: str = "sensor"
 
     @property
     def entity_id(self) -> str:
-        return f"sensor.{self.object_id}"
+        return f"{self.domain}.{self.object_id}"
 
     def to_payload(self) -> dict[str, Any]:
         """REST body for /api/states (state + merged attributes)."""
@@ -273,6 +279,86 @@ def build_realism_sensors(realism: dict[str, Any] | None) -> list[PublishedSenso
                 "idle_exposed_slots": int(realism.get("idle_exposed_slots", 0) or 0),
             },
         )
+    ]
+
+
+def build_spa_bathing_sensors(meta: Mapping[str, Any] | None) -> list[PublishedSensor]:
+    """Spa bathing times (``schedule.json`` ``meta.spa_bathing``) as three entities.
+
+    * ``sensor.darkstar_spa_next_bath``: start of the next bath (timestamp);
+    * ``sensor.darkstar_spa_ready_forecast_c``: predicted water temperature at the
+      next bath's ready-by moment;
+    * ``binary_sensor.darkstar_spa_on_track``: every planned bath reaches its ready
+      temperature; ``unavailable`` while the planner is not in bathing mode
+      (disabled, or fallback to the legacy daily-kWh plan).
+
+    Missing data reads ``unknown``, never a guessed value.
+    """
+    m: Mapping[str, Any] = meta or {}
+    mode = str(m.get("mode") or "disabled")
+    raw_next: Any = m.get("next_bath")
+    nb: Mapping[str, Any] = (
+        cast("Mapping[str, Any]", raw_next) if isinstance(raw_next, Mapping) else {}
+    )
+
+    def num(raw: Any) -> float | None:
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    start = nb.get("start")
+    predicted = num(nb.get("predicted_temp_c"))
+    on_track_raw = m.get("on_track")
+    if mode in ("disabled", "fallback"):
+        on_track_state = "unavailable"
+    elif on_track_raw is True:
+        on_track_state = "on"
+    elif on_track_raw is False:
+        on_track_state = "off"
+    else:
+        on_track_state = "unknown"
+    common: dict[str, Any] = {"mode": mode, "reason": m.get("reason")}
+    return [
+        PublishedSensor(
+            object_id="darkstar_spa_next_bath",
+            state=str(start) if start else "unknown",
+            device_class="timestamp",
+            icon="mdi:hot-tub",
+            friendly_name="Spa nästa bad",
+            attributes={
+                **common,
+                "end": nb.get("end"),
+                "ready_by": nb.get("ready_by"),
+                "ready_temp_c": num(m.get("ready_temp_c")),
+            },
+        ),
+        PublishedSensor(
+            object_id="darkstar_spa_ready_forecast_c",
+            state=f"{round(predicted, 1)}" if predicted is not None else "unknown",
+            unit="°C",
+            device_class="temperature",
+            state_class="measurement",
+            icon="mdi:thermometer-water",
+            friendly_name="Spa prognos vid badstart",
+            attributes={
+                **common,
+                "shortfall_c": num(nb.get("shortfall_c")),
+                "measured_temp_c": num(m.get("measured_temp_c")),
+                "ready_temp_c": num(m.get("ready_temp_c")),
+            },
+        ),
+        PublishedSensor(
+            object_id="darkstar_spa_on_track",
+            state=on_track_state,
+            icon="mdi:hot-tub",
+            friendly_name="Spa i fas inför bad",
+            attributes=common,
+            domain="binary_sensor",
+        ),
     ]
 
 

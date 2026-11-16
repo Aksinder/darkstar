@@ -14,6 +14,7 @@ from typing import Any, cast
 from ruamel.yaml import YAML
 
 from backend.core.load_windows import MODE_INVALID, MODE_WINDOW, load_mode
+from backend.core.spa_bathing_config import BathingConfig, parse_bathing_config
 
 from .window_price import PriceRules
 
@@ -456,6 +457,9 @@ class WaterHeaterDeviceConfig:
     # conservative convention the EV phase_map uses.
     phase_map: tuple[str, ...] = ()
     absorb_cap_kwh_per_day: float | None = None
+    # Spa bathing times (executor/spa_bathing.py): in-window no-off, catch-up and
+    # eco-floor rules. None (block missing) => behaviour exactly as before.
+    bathing: BathingConfig | None = None
 
 
 @dataclass
@@ -1344,6 +1348,23 @@ def servo_current_charger_ids(data: dict[str, Any]) -> list[str]:
     return out
 
 
+def _bathing_or_none(heater_id: str, raw: Any) -> BathingConfig | None:
+    """The heater's ``bathing`` block, or None when missing or unparseable.
+
+    A broken bathing block must never take the whole executor config down with it:
+    it falls back to the legacy spa control, loudly.
+    """
+    if raw is None:
+        return None
+    try:
+        return parse_bathing_config(raw)
+    except Exception:
+        logger.exception(
+            "Water heater %s: invalid bathing block ignored (legacy spa control)", heater_id
+        )
+        return None
+
+
 def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
     """
     Load executor configuration from config.yaml.
@@ -1571,6 +1592,7 @@ def load_executor_config(config_path: str = "config.yaml") -> ExecutorConfig:
                 absorb_cap_kwh_per_day=_float_or_none(
                     heater.get("absorb_cap_kwh_per_day")
                 ),
+                bathing=_bathing_or_none(heater_id, heater.get("bathing")),
             )
         )
 

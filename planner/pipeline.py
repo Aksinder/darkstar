@@ -41,6 +41,7 @@ from planner.solver.adapter import (
     scale_first_slot_to_remaining,
 )
 from planner.solver.kepler import KeplerSolver
+from planner.spa_bathing import BathingDecision, decide_bathing, simulate_plan, summarize
 from planner.strategy.manual_plan import apply_manual_plan
 from planner.strategy.s_index import (
     calculate_dynamic_s_index,
@@ -773,6 +774,146 @@ def merge_cyclic_into_schedule(
             entry[load_id] = float(by_slot.get(pos, 0.0))
         merged.append(entry)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Spa bathing times (planner/spa_bathing.py). Exception-isolated: any failure in
+# here leaves the legacy plan intact (no spec, no columns, no meta).
+# ---------------------------------------------------------------------------
+
+
+def _decide_spa_bathing(
+    water_heaters_cfg: list[dict[str, Any]],
+    states_raw: list[dict[str, Any]],
+    heaters: list[Any],
+    kepler_input: Any,
+    now: datetime,
+    mean_outdoor_temp_c: Any,
+    vacation_included_ids: set[str] | None = None,
+) -> dict[str, BathingDecision]:
+    """One BathingDecision per planned heater with an enabled ``bathing`` block.
+
+    Mode ``solver`` attaches the spec to the heater in place. Disabled blocks are not
+    recorded at all, so a config without (or with a disabled) block is unchanged.
+    """
+    decisions: dict[str, BathingDecision] = {}
+    cfg_by_id: dict[str, dict[str, Any]] = {
+        str(wh.get("id", "")): wh
+        for wh in water_heaters_cfg
+        if isinstance(wh, dict) and wh.get("bathing") is not None  # pyright: ignore[reportUnnecessaryIsInstance]
+    }
+    if not cfg_by_id:
+        return decisions
+    inputs_by_id: dict[str, Any] = {
+        str(st.get("id", "")): st.get("bathing_inputs")
+        for st in states_raw or []
+        if isinstance(st, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
+    }
+    for heater in heaters:
+        heater_cfg = cfg_by_id.get(heater.id)
+        if heater_cfg is None:
+            continue
+        try:
+            decision = decide_bathing(
+                heater_cfg=heater_cfg,
+                inputs=inputs_by_id.get(heater.id),
+                heater=heater,
+                slots=kepler_input.slots,
+                first_slot_remaining_h=kepler_input.first_slot_remaining_h,
+                now=now,
+                mean_outdoor_temp_c=mean_outdoor_temp_c,
+            )
+            if decision.mode == "disabled":
+                continue
+            if vacation_included_ids and heater.id in vacation_included_ids:
+                # On vacation this tank is planned for anti-legionella only; its
+                # daily floor must stay, so the temperature model never replaces it.
+                decision = replace(decision, mode="fallback", reason="vacation", spec=None)
+            if decision.mode == "solver":
+                heater.bathing = decision.spec
+            decisions[heater.id] = decision
+        except Exception:
+            logger.exception("Spa bathing decision failed for %s; legacy plan", heater.id)
+            with contextlib.suppress(Exception):
+                heater.bathing = None
+    return decisions
+
+
+def _apply_spa_bathing_to_plan(
+    final_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    result: Any,
+    plan_meta: dict[str, Any] | None,
+    decisions: dict[str, BathingDecision],
+    first_slot_remaining_h: float | None,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Write ``water_heater_temp_c`` / ``water_heater_bathing`` into ``final_df`` and
+    return ``meta.spa_bathing`` (None when no heater is in bathing mode).
+
+    With no decisions the solver's (always present, empty) temperature column is
+    dropped, so a config without ``bathing`` produces the same schedule as before.
+    """
+    if not decisions:
+        final_df.drop(columns=["water_heater_temp_c"], errors="ignore", inplace=True)
+        return None
+
+    slots = list(result.slots)
+    n = len(slots)
+    if n != len(result_df):
+        raise ValueError(f"result has {n} slots but result_df has {len(result_df)} rows")
+    plan_fallback = str((plan_meta or {}).get("plan_source", "kepler")) != "kepler"
+    reports: dict[str, Any] = dict(getattr(result, "bathing_reports", {}) or {})
+
+    temp_rows: list[dict[str, float]] = []
+    if "water_heater_temp_c" in result_df.columns:
+        for raw in result_df["water_heater_temp_c"].tolist():
+            temp_rows.append(dict(raw) if isinstance(raw, dict) else {})  # pyright: ignore[reportUnknownArgumentType]
+    else:
+        temp_rows = [{} for _ in range(n)]
+    mode_rows: list[dict[str, str]] = [{} for _ in range(n)]
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for hid, decision in decisions.items():
+        d = decision
+        temps: list[float] | None = None
+        if d.mode in ("solver", "shadow") and plan_fallback:
+            d = replace(d, mode="fallback", reason="plan_guard_fallback", spec=None)
+        elif d.mode == "solver" and hid not in reports:
+            # Kepler dropped the spec (validation) and planned the heater legacy.
+            d = replace(d, mode="fallback", reason="solver_dropped_spec", spec=None)
+
+        if d.mode == "solver":
+            temps = [float(row.get(hid, float("nan"))) for row in temp_rows]
+        elif d.mode == "shadow":
+            kw = [float(s.water_heater_results.get(hid, 0.0) or 0.0) for s in slots]
+            temps = simulate_plan(d, slots, kw, first_slot_remaining_h)
+            for row, t in zip(temp_rows, temps, strict=True):
+                row[hid] = t
+        else:
+            for row in temp_rows:
+                row.pop(hid, None)
+
+        for row in mode_rows:
+            row[hid] = d.mode
+        summaries[hid] = summarize(
+            d, temps, reports.get(hid) if d.mode == "solver" else None, slots, now
+        )
+        logger.info(
+            "Spa bathing %s: published mode=%s%s",
+            hid,
+            d.mode,
+            f" ({d.reason})" if d.reason else "",
+        )
+
+    if any(temp_rows):
+        final_df["water_heater_temp_c"] = pd.Series(temp_rows, index=result_df.index, dtype=object)
+    else:
+        final_df.drop(columns=["water_heater_temp_c"], errors="ignore", inplace=True)
+    final_df["water_heater_bathing"] = pd.Series(mode_rows, index=result_df.index, dtype=object)
+
+    primary = "spa" if "spa" in summaries else next(iter(summaries))
+    return summaries[primary]
 
 
 class PlannerPipeline:
@@ -2046,6 +2187,30 @@ class PlannerPipeline:
                     _s0.start_time.isoformat(),
                 )
 
+        # Spa bathing times (planner/spa_bathing.py). Placed after every pre-solve
+        # consumer of min_kwh_per_day (excess-PV flags, shortfall gate), after the
+        # vacation rebuild (which re-creates heaters from config and would drop a
+        # spec) and after the partial-first-slot rewrite. Mode "solver" attaches a
+        # BathingSpec; "shadow"/"fallback" leave the heater exactly as planned today.
+        bathing_decisions: dict[str, Any] = {}
+        if mode == "full":
+            bathing_decisions = _decide_spa_bathing(
+                water_heaters_cfg,
+                ha_water_states_raw,
+                kepler_config.water_heaters,
+                kepler_input,
+                real_now.to_pydatetime(),
+                s_index_debug.get("mean_temperature_c"),
+                vacation_included_ids=(
+                    {
+                        str(wh.get("id", ""))
+                        for wh in partition_vacation_water_heaters(water_heaters_cfg)[1]
+                    }
+                    if vacation_enabled
+                    else None
+                ),
+            )
+
         # Preflight judges price horizon / SoC age against the run's own time
         # (upstream 846c8710): now_override during replay, wall clock live.
         # Naive now_override is UTC here too, same rule as now_slot above.
@@ -2129,6 +2294,29 @@ class PlannerPipeline:
             final_df["water_heaters"] = merge_cyclic_into_schedule(
                 list(final_df["water_heaters"]), cyclic_plan
             )
+
+        # Spa bathing: per-slot predicted temperature + mode columns, and the
+        # meta.spa_bathing summary. No bathing heater => the temperature column the
+        # solver result always carries is dropped, so the schedule is unchanged.
+        spa_bathing_meta: dict[str, Any] | None = None
+        try:
+            spa_bathing_meta = _apply_spa_bathing_to_plan(
+                final_df,
+                result_df,
+                result,
+                plan_meta,
+                bathing_decisions,
+                kepler_input.first_slot_remaining_h,
+                real_now.to_pydatetime(),
+            )
+        except Exception:
+            logger.exception("Spa bathing post-solve step failed; legacy plan kept")
+            final_df.drop(
+                columns=["water_heater_temp_c", "water_heater_bathing"],
+                errors="ignore",
+                inplace=True,
+            )
+            spa_bathing_meta = None
 
         # 6. Manual Plan
         final_df = apply_manual_plan(final_df, active_config)
@@ -2243,7 +2431,11 @@ class PlannerPipeline:
                 s_index_debug,
                 window_responsibilities,
                 planner_state_debug,
-                extra_meta={**(plan_meta or {}), "pv_correction": pv_correction.as_meta()},
+                extra_meta={
+                    **(plan_meta or {}),
+                    "pv_correction": pv_correction.as_meta(),
+                    **({"spa_bathing": spa_bathing_meta} if spa_bathing_meta else {}),
+                },
             )
 
             # Rev UI5: Always store plan to slot_plans for performance tracking

@@ -1485,6 +1485,8 @@ def kepler_result_to_dataframe(
                 "export_kwh": s.grid_export_kwh,
                 "water_heating_kw": s.water_heat_kw,  # Aggregate (backward compat)
                 "water_heaters": s.water_heater_results,  # Per-device: heater_id -> kW
+                # Spa bathing: heater_id -> end-of-slot predicted degC ({} without bathing)
+                "water_heater_temp_c": s.water_heater_temp_c,
                 "water_heating_boost": s.water_heating_boost,  # Per-device: heater_id -> bool
                 "custom_entity_active": s.custom_entity_active,  # First sink (backward compat)
                 "sinks": s.sink_states,  # Per-sink ladder: sink_id -> active

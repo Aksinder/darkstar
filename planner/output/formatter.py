@@ -7,6 +7,7 @@ Extracted from planner_legacy.py during Rev K13 modularization.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, cast
 
@@ -170,6 +171,36 @@ def dataframe_to_json_response(
                 for k, v in boost_val.items()  # type: ignore[union-attr]
                 if isinstance(v, bool | int | float)
             }
+
+        # Spa bathing: per-heater predicted end-of-slot temperature and planning mode.
+        # Normalised like the dicts above, but an EMPTY map is omitted rather than
+        # written as {}: a config without bathing must produce the same schedule.json
+        # as before (the executor reads an absent key as {}).
+        temp_val = record.get("water_heater_temp_c")
+        temp_map: dict[str, float] = {}
+        if isinstance(temp_val, dict):
+            for k, v in cast("dict[Any, Any]", temp_val).items():
+                if isinstance(v, bool) or not isinstance(v, int | float | np.integer | np.floating):
+                    continue
+                fv = float(cast("float", v))
+                if math.isfinite(fv):
+                    temp_map[str(k)] = round(fv, 1)
+        if temp_map:
+            record["water_heater_temp_c"] = temp_map
+        else:
+            record.pop("water_heater_temp_c", None)
+        bathing_val = record.get("water_heater_bathing")
+        bathing_map: dict[str, str] = {}
+        if isinstance(bathing_val, dict):
+            bathing_map = {
+                str(k): str(v)
+                for k, v in cast("dict[Any, Any]", bathing_val).items()
+                if isinstance(v, str) and v
+            }
+        if bathing_map:
+            record["water_heater_bathing"] = bathing_map
+        else:
+            record.pop("water_heater_bathing", None)
 
         # Normalize custom_entity_active: ensure it's always a bool
         custom_val = record.get("custom_entity_active")

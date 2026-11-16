@@ -17,7 +17,18 @@ import pulp  # type: ignore[import,no-redef]
 
 from planner.errors import PlannerError, PlannerErrorCode
 
+from .bathing import (
+    BATHING_TRIPWIRE_C,
+    BathingModel,
+    avoidable_shortfall_c,
+    build_bathing_model,
+    build_report,
+    map_windows,
+    validate_bathing_spec,
+)
 from .types import (
+    BathingReport,
+    BathingSpec,
     DeferrableLoadInput,
     EVChargerInput,
     ExcessPVSinkSpec,
@@ -434,6 +445,27 @@ class KeplerSolver:
         water_heaters: list[WaterHeaterInput] = config.water_heaters
         water_enabled: bool = len(water_heaters) > 0
 
+        # Spa bathing times: heaters whose BathingSpec is valid get a continuous
+        # temperature-state model (planner/solver/bathing.py) INSTEAD of the daily-kWh
+        # floor, absorb cap, WTP credit and block-overshoot rows. An invalid spec
+        # (non-finite numbers, bad ordering, naive/aware mismatch with the slots) is
+        # dropped loudly and the heater stays legacy. Empty => byte-identical LP.
+        bathing_active: dict[str, BathingSpec] = {}
+        for heater in water_heaters:
+            if heater.bathing is None:
+                continue
+            _bath_err = validate_bathing_spec(heater, slots)
+            if _bath_err is not None:
+                logger.error(
+                    "Spa bathing spec for %s dropped (%s) - planning it in legacy "
+                    "daily-kWh mode",
+                    heater.id,
+                    _bath_err,
+                )
+                continue
+            bathing_active[heater.id] = heater.bathing
+        bathing_models: dict[str, BathingModel] = {}
+
         # Per-device indexed variables: water_heat[device_id][t], water_start[device_id][t]
         water_heat: dict[str, dict[int, Any]] = {}
         water_start: dict[str, dict[int, Any]] = {}
@@ -606,6 +638,8 @@ class KeplerSolver:
         if water_enabled and not config.water_flow_formulation:
             for heater in water_heaters:
                 d = heater.id
+                if d in bathing_active:
+                    continue  # bathing: no block-overshoot rows (see Constraint 2)
                 safe_d = d.replace("-", "_").replace(".", "_")
                 block_overshoot[d] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
                     f"block_overshoot_{safe_d}", range(T), lowBound=0.0
@@ -685,7 +719,7 @@ class KeplerSolver:
                 water_min_kwh_violation[d] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
                     f"water_min_kwh_violation_{safe_d}", range(100), lowBound=0.0
                 )
-                if heater.absorb_cap_kwh_per_day is not None:
+                if heater.absorb_cap_kwh_per_day is not None and d not in bathing_active:
                     water_absorb_overage[d] = pulp.LpVariable.dicts(  # type: ignore[reportUnknownMemberType]
                         f"water_absorb_overage_{safe_d}", range(100), lowBound=0.0
                     )
@@ -1475,6 +1509,10 @@ class KeplerSolver:
                         day_min_kwh: float = max(0.0, bucket_floor - heater.heated_today_kwh)
                     else:
                         day_min_kwh = bucket_floor
+                    if d in bathing_active:
+                        # Bathing: the temperature model replaces the daily floor
+                        # (and with it the WTP credit, gated on day_min_kwh > 0).
+                        day_min_kwh = 0.0
 
                     if day_min_kwh > 0:
                         prob += (  # type: ignore[operator]
@@ -1511,7 +1549,11 @@ class KeplerSolver:
                     # above trailing) EXPANDS the cap and boost turns profitable again
                     # within it — the tank's own measured intake is the probe, and the
                     # thermostat terminates the feedback loop physically.
-                    if heater.absorb_cap_kwh_per_day is not None and d in water_absorb_overage:
+                    if (
+                        heater.absorb_cap_kwh_per_day is not None
+                        and d in water_absorb_overage
+                        and d not in bathing_active
+                    ):
                         # Subtract measured same-bucket absorption from bucket 0 ONLY
                         # when the stats were measured in THIS bucket: a solve that
                         # crosses the 10:00 boundary must not charge the new day with
@@ -1583,7 +1625,10 @@ class KeplerSolver:
                 # Flow formulation: per unit, the block age from which each window
                 # ending there is entirely ON (see add_water_flow).
                 window_ages: list[list[int]] = [[] for _ in unit_first]
-                if config.water_block_penalty_sek > 0:
+                # Bathing: no block-overshoot rows — a 5 h pre-bath heat is
+                # legitimate and temp_max is the physical cap. Spacing and the
+                # start penalty stay.
+                if config.water_block_penalty_sek > 0 and d not in bathing_active:
                     eff_block_h: float = max(config.max_block_hours, h_unit)
                     e: int = 0
                     for t in range(T):
@@ -1669,6 +1714,39 @@ class KeplerSolver:
                         water_start[d] = dict.fromkeys(range(T), 0)
                         for u, t in enumerate(unit_first):
                             water_start[d][t] = flow_starts[u]
+
+            # Spa bathing: temperature recursion driven by the heater's existing
+            # binaries (heat + boost, the same expression its energy is priced by in
+            # the balance). Continuous variables and soft rows only.
+            for heater in water_heaters:
+                d = heater.id
+                if d not in bathing_active:
+                    continue
+                _spec = bathing_active[d]
+                _on_terms: list[Any] = [
+                    water_heat[d][t] + (water_boost[d][t] if d in water_boost else 0)
+                    for t in range(T)
+                ]
+                _wmap = map_windows(_spec, slots, slot_hours)
+                bathing_models[d] = build_bathing_model(
+                    prob, heater, _spec, _on_terms, slot_hours, _wmap, total_cost
+                )
+                logger.info(
+                    "Spa bathing model active for %s: T0=%.1f amb=%.1f C=%.3f k=%.4f "
+                    "ready=%.1f floor=%.1f max=%.1f, %d window(s), ready states %s, "
+                    "%d hold slot(s)",
+                    d,
+                    _spec.initial_temp_c,
+                    _spec.ambient_c,
+                    _spec.heat_capacity_kwh_per_c,
+                    _spec.cooling_k_per_h,
+                    _spec.ready_temp_c,
+                    _spec.eco_floor_c,
+                    _spec.temp_max_c,
+                    len(_spec.windows),
+                    _wmap.ready_state,
+                    len(_wmap.hold_slots),
+                )
 
             # Build #16: price-gated previous-plan anchor (the plan-stability root fix).
             # For each heater carrying an anchor (its previous-plan ON slots, already
@@ -1895,7 +1973,8 @@ class KeplerSolver:
             # settle; already price-gated per heater above, so a genuine price change has
             # dropped it. Never touches the daily-minimum floor (reward-only).
             + (pulp.lpSum(anchor_reward_terms) if anchor_reward_terms else 0.0)
-            # Per-device reliability penalties (task 2.9)
+            # Per-device reliability penalties (task 2.9). A bathing heater needs no
+            # mirror edit here: it has no floor row, so its violation vars stay 0.
             + (
                 pulp.lpSum(
                     water_min_kwh_violation[d][i]
@@ -2109,6 +2188,8 @@ class KeplerSolver:
                     # buckets read as an 8 kWh comfort violation and five valid
                     # time-boxed plans were thrown away between 04:25 and 05:35.
                     continue
+                # A bathing heater needs no mirror edit: it has no floor row, so its
+                # violation vars are unconstrained and stay 0.
                 for i in range(len(sorted_days)):
                     _v: Any = pulp.value(water_min_kwh_violation[d][i])  # type: ignore[arg-type]
                     if _v is not None:
@@ -2142,6 +2223,43 @@ class KeplerSolver:
                         "dump_path": _dump_path,
                     },
                 )
+            # Spa bathing tripwire: an incumbent that misses a bath by more than the
+            # physics forces (avoidable shortfall > 1 degC) is garbage of the same
+            # kind as a floor violation. The unavoidable part (element on from now)
+            # is excluded, so a physically late schedule never rejects a plan.
+            for _bd, _bm in bathing_models.items():
+                _avoidable = avoidable_shortfall_c(build_report(_bm, slot_hours))
+                if _avoidable > BATHING_TRIPWIRE_C:
+                    logger.error(
+                        "Kepler returned a time-boxed incumbent that misses a %s bath "
+                        "by %.2f degC more than physics forces - rejecting the plan "
+                        "(executor keeps the previous one).",
+                        _bd,
+                        _avoidable,
+                    )
+                    _dump_path = _dump_failed_solve_instance(
+                        input_data,
+                        config,
+                        reason="tripwire_bathing_shortfall",
+                        status=str(status),  # type: ignore[reportUnknownArgumentType]
+                        sol_status=_sol_status,
+                        used_solver=used_solver,
+                        solve_duration_s=solve_duration,
+                        chain_duration_s=total_duration,
+                        extra={"heater_id": _bd, "avoidable_shortfall_c": round(_avoidable, 2)},
+                    )
+                    raise PlannerError(
+                        code=PlannerErrorCode.SOLVER_TIMEOUT,
+                        details={
+                            "solver_status": status,
+                            "solve_duration_s": round(solve_duration, 3),
+                            "chain_duration_s": round(total_duration, 3),
+                            "reason": "time-boxed incumbent misses a bathing window",
+                            "heater_id": _bd,
+                            "avoidable_shortfall_c": round(_avoidable, 2),
+                            "dump_path": _dump_path,
+                        },
+                    )
             status = f"{status} (time-boxed incumbent, gap unproven)"
             logger.warning(
                 "Kepler hit its %ds budget and returned an UNPROVEN incumbent "
@@ -2246,6 +2364,12 @@ class KeplerSolver:
                         water_heater_results[d_wh] = device_kw
                         total_water_kw += device_kw
                 w_kw: float = total_water_kw  # aggregate (backward compat)
+                # Spa bathing: end-of-slot predicted temperature per bathing heater.
+                water_heater_temp_c: dict[str, float] = {}
+                for _bd, _bm in bathing_models.items():
+                    _tv: float | None = pulp.value(_bm.temp[t + 1])  # type: ignore[assignment]
+                    if _tv is not None:
+                        water_heater_temp_c[_bd] = float(_tv)
 
                 # Per-device EV charging results
                 ev_charger_results: dict[str, float] = {}
@@ -2323,6 +2447,7 @@ class KeplerSolver:
                         # split, which re-times members) on start/end arithmetic.
                         duration_h=h if h != full_slot_hours[t] else None,
                         is_optimal=True,
+                        water_heater_temp_c=water_heater_temp_c,
                     )
                 )
 
@@ -2344,6 +2469,23 @@ class KeplerSolver:
                     logger.info(
                         "EV departure target short by %.2f grid kWh (%s)", _short_val, short.name
                     )
+
+        bathing_reports: dict[str, BathingReport] = {}
+        if is_optimal:
+            for _bd, _bm in bathing_models.items():
+                _rep = build_report(_bm, slot_hours)
+                bathing_reports[_bd] = _rep
+                logger.info(
+                    "Spa bathing %s: ready T %s, shortfall %s (unavoidable %s), "
+                    "hold %.2f degC-h, floor %.2f degC-h, overshoot %.2f degC",
+                    _bd,
+                    [None if v is None else round(v, 2) for v in _rep.window_ready_temp_c],
+                    [None if v is None else round(v, 2) for v in _rep.window_shortfall_c],
+                    [None if v is None else round(v, 2) for v in _rep.unavoidable_shortfall_c],
+                    _rep.hold_shortfall_c_h,
+                    _rep.floor_shortfall_c_h,
+                    _rep.overshoot_c,
+                )
 
         objective_cost: float | None = None
         if is_optimal:
@@ -2383,4 +2525,5 @@ class KeplerSolver:
             is_optimal=is_optimal,
             status_msg=status,
             objective_cost_sek=objective_cost,
+            bathing_reports=bathing_reports,
         )

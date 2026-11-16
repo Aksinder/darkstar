@@ -22,6 +22,15 @@ Mutations: no_hourly_blocks | no_anchor | no_spacing | no_absorb_cap
            | flow_water (water_heating.flow_formulation on; flow_water:off forces it off)
            | truncate:H (drop slots beyond H hours)
            | retail:H  (coarsen the tail beyond H hours to whole clock hours)
+           | synth_bathing[:HEATER_ID]  (attach a synthetic spa BathingSpec; default
+             heater "spa", appended at 1.8 kW when absent: T0 30, ambient 10, C 0.9,
+             k 0.021, ready 38, floor 28, max 40, windows 19:00-21:00 on the next 3
+             evenings after slot 0, ready_by = start - 30 min)
+           | no_bathing (drop every heater's BathingSpec: the legacy baseline)
+
+Dumps written with a BathingSpec carry it as a nested dict (datetimes as str);
+rehydrate_config rebuilds BathingSpec/BathWindow from it. Windows are
+time-based, so truncate/retail need no index fixing for them.
 
 Known limitation: dumps are captured AFTER coarse-tail coarsening
 (planner/pipeline.py replaces kepler_input.slots before solve), so the original
@@ -51,6 +60,8 @@ import planner.solver.kepler as kepler_mod
 from planner.errors import PlannerError
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
+    BathingSpec,
+    BathWindow,
     DeferrableLoadInput,
     EVChargerInput,
     EVDepartureTarget,
@@ -98,9 +109,34 @@ def rehydrate_input(inp: dict[str, Any]) -> KeplerInput:
     )
 
 
+def _rehydrate_bathing(b: Any) -> BathingSpec | None:
+    """Nested dump dict -> BathingSpec (windows as BathWindow, datetimes parsed)."""
+    if b is None or isinstance(b, BathingSpec):
+        return b
+    windows = [
+        _build(
+            BathWindow,
+            {
+                **w,
+                "start": _dt(w.get("start")),
+                "end": _dt(w.get("end")),
+                "ready_by": _dt(w.get("ready_by")),
+            },
+        )
+        for w in b.get("windows") or []
+    ]
+    return _build(BathingSpec, {**b, "windows": windows})
+
+
 def rehydrate_config(cfg: dict[str, Any]) -> KeplerConfig:
     cfg = dict(cfg)
-    cfg["water_heaters"] = [_build(WaterHeaterInput, w) for w in cfg.get("water_heaters") or []]
+    cfg["water_heaters"] = [
+        _build(
+            WaterHeaterInput,
+            {**w, "bathing": _rehydrate_bathing(w.get("bathing"))} if "bathing" in w else w,
+        )
+        for w in cfg.get("water_heaters") or []
+    ]
     cfg["ev_chargers"] = [
         _build(
             EVChargerInput,
@@ -164,6 +200,51 @@ def _mut_no_spacing(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
 def _mut_no_absorb_cap(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
     for h in cfg.water_heaters:
         h.absorb_cap_kwh_per_day = None
+    return ki, cfg
+
+
+def _mut_synth_bathing(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
+    """Attach a synthetic spa BathingSpec (replay check for spa bathing times)."""
+    from datetime import timedelta
+
+    hid = arg or "spa"
+    heater = next((h for h in cfg.water_heaters if h.id == hid), None)
+    if heater is None:
+        heater = WaterHeaterInput(
+            id=hid,
+            power_kw=1.8,
+            min_kwh_per_day=0.0,
+            max_hours_between_heating=24.0,
+            min_spacing_hours=0.0,
+        )
+        cfg.water_heaters.append(heater)
+    t0 = ki.slots[0].start_time
+    first = t0.replace(hour=19, minute=0, second=0, microsecond=0)
+    if first <= t0:
+        first = first + timedelta(days=1)
+    windows: list[BathWindow] = []
+    for day in range(3):
+        start = first + timedelta(days=day)
+        windows.append(
+            BathWindow(start=start, end=start + timedelta(hours=2),
+                       ready_by=start - timedelta(minutes=30))
+        )
+    heater.bathing = BathingSpec(
+        initial_temp_c=30.0,
+        ambient_c=10.0,
+        heat_capacity_kwh_per_c=0.9,
+        cooling_k_per_h=0.021,
+        ready_temp_c=38.0,
+        eco_floor_c=28.0,
+        temp_max_c=40.0,
+        windows=windows,
+    )
+    return ki, cfg
+
+
+def _mut_no_bathing(ki: KeplerInput, cfg: KeplerConfig, arg: str | None):
+    for h in cfg.water_heaters:
+        h.bathing = None
     return ki, cfg
 
 
@@ -241,6 +322,8 @@ MUTATIONS = {
     "no_absorb_cap": _mut_no_absorb_cap,
     "truncate": _mut_truncate,
     "retail": _mut_retail,
+    "synth_bathing": _mut_synth_bathing,
+    "no_bathing": _mut_no_bathing,
 }
 
 # ------------------------------------------------------------------- solving
@@ -322,6 +405,46 @@ def _floor_report(ki: KeplerInput, cfg: KeplerConfig, result: Any) -> list[str]:
     return lines
 
 
+@contextlib.contextmanager
+def _model_stats(stats: dict[str, int]):
+    """Record the LP's size (and its integer-variable count: spa bathing must add
+    none) at every prob.solve() kepler makes; the last attempt wins."""
+    real_solve = pulp.LpProblem.solve
+
+    def solve(self: Any, *a: Any, **kw: Any):
+        variables = self.variables()
+        stats["vars"] = len(variables)
+        stats["int_vars"] = sum(1 for v in variables if v.cat == pulp.LpInteger)
+        stats["constraints"] = len(self.constraints)
+        return real_solve(self, *a, **kw)
+
+    pulp.LpProblem.solve = solve  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        pulp.LpProblem.solve = real_solve  # type: ignore[method-assign]
+
+
+def _bathing_rows(result: Any) -> dict[str, Any]:
+    """Per bathing heater: ready T, shortfall and unavoidable part per window, and
+    the planned kWh (phantom-load check against temp_max)."""
+    out: dict[str, Any] = {}
+    for hid, rep in (getattr(result, "bathing_reports", None) or {}).items():
+        kwh = sum(
+            rs.water_heater_results.get(hid, 0.0)
+            * (rs.duration_h or (rs.end_time - rs.start_time).total_seconds() / 3600.0)
+            for rs in result.slots
+        )
+        out[hid] = {
+            "ready_temp_c": rep.window_ready_temp_c,
+            "shortfall_c": rep.window_shortfall_c,
+            "unavoidable_c": rep.unavoidable_shortfall_c,
+            "overshoot_c": rep.overshoot_c,
+            "planned_kwh": round(kwh, 2),
+        }
+    return out
+
+
 def run_replay(path: Path, args: argparse.Namespace, label: str = "") -> dict[str, Any]:
     dump = json.loads(path.read_text())
     ki = rehydrate_input(dump["input"])
@@ -345,9 +468,12 @@ def run_replay(path: Path, args: argparse.Namespace, label: str = "") -> dict[st
     os.environ["DARKSTAR_SOLVER_DUMP_DIR"] = str(Path(tmp) / "solver_dumps")
     os.chdir(tmp)
     t0 = time.monotonic()
+    stats: dict[str, int] = {}
     try:
-        with _solver_overrides(args):
+        with _solver_overrides(args), _model_stats(stats):
             result = KeplerSolver().solve(ki, cfg)
+        row.update(stats)
+        row["bathing"] = _bathing_rows(result)
         row.update(
             status="shipped",
             seconds=round(time.monotonic() - t0, 2),
@@ -357,6 +483,7 @@ def run_replay(path: Path, args: argparse.Namespace, label: str = "") -> dict[st
             floor_lines=_floor_report(ki, cfg, result),
         )
     except PlannerError as e:
+        row.update(stats)
         row.update(
             status="rejected",
             seconds=round(time.monotonic() - t0, 2),
@@ -427,6 +554,12 @@ def _print_row(r: dict[str, Any]) -> None:
               f"cost={r.get('total_cost')}  ({r.get('status_msg', '')[:60]})")
         for line in r.get("floor_lines", []):
             print(line)
+        if "int_vars" in r:
+            print(f"    model: {r['vars']} vars ({r['int_vars']} integer), "
+                  f"{r['constraints']} constraints")
+        for hid, b in (r.get("bathing") or {}).items():
+            print(f"    bathing {hid}: ready T {b['ready_temp_c']} short {b['shortfall_c']} "
+                  f"unavoidable {b['unavoidable_c']} planned {b['planned_kwh']} kWh")
     else:
         print(f"{head}  REJECTED in {r['seconds']}s  {r.get('error_code')}  "
               f"reason={r.get('reason', '')[:50]}  violation={r.get('violation')}")
