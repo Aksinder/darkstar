@@ -27,7 +27,6 @@ import pulp
 import pytest
 
 from backend.core.spa_thermal import simulate_temps_c
-from planner.errors import PlannerError, PlannerErrorCode
 from planner.solver.bathing import map_windows, validate_bathing_spec
 from planner.solver.kepler import KeplerSolver
 from planner.solver.types import (
@@ -408,7 +407,10 @@ def test_bathing_adds_no_integer_variables(flow: bool, monkeypatch: pytest.Monke
     result, bathing = _solve(monkeypatch, ki, bath_cfg)
     assert "spa" in result.bathing_reports
     assert _int_count(bathing) == _int_count(legacy)
-    assert len(bathing.variables()) > len(legacy.variables())  # continuous state added
+    # Only continuous slacks are added (the temperature itself is an affine
+    # expression of the existing binaries, not a variable).
+    assert any(v.name.startswith("bath_") for v in bathing.variables())
+    assert not any(v.name.startswith("bath_temp") for v in bathing.variables())
 
 
 def test_bathing_drops_the_spa_legacy_economics(monkeypatch: pytest.MonkeyPatch):
@@ -420,7 +422,7 @@ def test_bathing_drops_the_spa_legacy_economics(monkeypatch: pytest.MonkeyPatch)
     assert not any(n.startswith("block_overshoot_spa") for n in names)
     assert not any(n.startswith("wtp_served_spa") for n in names)
     assert any(n.startswith("block_overshoot_vvb") for n in names)  # the vvb keeps its rows
-    assert any(n.startswith("bath_temp_spa") for n in names)
+    assert any(n.startswith("bath_ready_short_spa") for n in names)
 
 
 # ------------------------------------- 10: other tank + load group unaffected
@@ -530,9 +532,10 @@ def test_window_mapping_rules():
 # ------------------------------------------------------------ 12: tripwire
 
 
-def test_tripwire_rejects_avoidable_shortfall(monkeypatch: pytest.MonkeyPatch):
+def test_tripwire_flags_avoidable_shortfall_without_rejecting(monkeypatch: pytest.MonkeyPatch):
     # A near-free ready penalty makes the "optimal" plan skip the bath entirely —
-    # exactly the garbage a time-boxed incumbent can ship.
+    # the shape a bad time-boxed incumbent can have. Comfort is soft, so it ships
+    # FLAGGED (incumbent_unproven_shortfall_c), never rejected.
     slots = _slots(8, 8)
     spec = _spec(
         [_window(BASE + timedelta(hours=8))],
@@ -540,12 +543,67 @@ def test_tripwire_rejects_avoidable_shortfall(monkeypatch: pytest.MonkeyPatch):
         hold_shortfall_sek_per_c_h=0.0,
     )
     cfg = _cfg([_spa(bathing=spec)])
+    proven = KeplerSolver().solve(KeplerInput(slots, 4.0), copy.deepcopy(cfg))
+    assert proven.bathing_reports["spa"].incumbent_unproven_shortfall_c is None
     monkeypatch.setattr("planner.solver.kepler.solve_is_time_boxed", lambda *a, **k: True)
-    with pytest.raises(PlannerError) as exc:
-        KeplerSolver().solve(KeplerInput(slots, 4.0), cfg)
-    assert exc.value.code == PlannerErrorCode.SOLVER_TIMEOUT
-    assert "bathing" in str(exc.value.details.get("reason", ""))
-    assert exc.value.details.get("avoidable_shortfall_c", 0) > 1.0
+    result = KeplerSolver().solve(KeplerInput(slots, 4.0), cfg)
+    assert "time-boxed incumbent" in result.status_msg
+    flag = result.bathing_reports["spa"].incumbent_unproven_shortfall_c
+    assert flag is not None and flag > 1.0
+
+
+def _tripwire_case(name: str) -> tuple[list[KeplerInputSlot], KeplerConfig]:
+    """2026-11-16 review repros: a shortfall FORCED by the model's own hard limits
+    (load-group cap, a co-member's force_on, its 1000 SEK/kWh floor) that the
+    element-alone "unavoidable" bound reads as avoidable."""
+    group = [LoadGroup(id="vv", max_power_kw=2.3, members=["spa", "villavagn_tank"])]
+    if name == "force_on_mid_block":  # e4: hourly blocks, co-member locked on 14-17
+        base = datetime(2026, 1, 15, 14, 0)
+        slots = _slots(48, 12, start=base, price=lambda i: 1.5)
+        vv = _spa(
+            id="villavagn_tank",
+            power_kw=1.5,
+            min_kwh_per_day=0.0,
+            absorb_cap_kwh_per_day=None,
+            force_on_slots=list(range(12)),
+        )
+        spa = _spa(bathing=_spec(initial_temp_c=34.0, windows=[_window(datetime(2026, 1, 15, 19))]))
+        return slots, _cfg([spa, vv], water_hourly_blocks=True, load_groups=group)
+    if name == "co_member_floor":  # e2 D: the co-member's floor outbids the bath
+        slots = _slots(8, 6, price=lambda i: 1.0)
+        vv = _spa(
+            id="villavagn_tank", power_kw=1.5, min_kwh_per_day=9.0, absorb_cap_kwh_per_day=None
+        )
+        spa = _spa(bathing=_spec(initial_temp_c=33.0, windows=[_window(BASE + timedelta(hours=8))]))
+        return slots, _cfg([spa, vv], water_reliability_penalty_sek=1000.0, load_groups=group)
+    # e1 B: the co-member is forced on through the heating run-up
+    slots = _slots(8, 20, price=lambda i: 1.0)
+    vv = _spa(
+        id="villavagn_tank",
+        power_kw=1.5,
+        min_kwh_per_day=0.0,
+        absorb_cap_kwh_per_day=None,
+        force_on_slots=list(range(18)),
+    )
+    spa = _spa(bathing=_spec(initial_temp_c=30.0, windows=[_window(BASE + timedelta(hours=14))]))
+    return slots, _cfg([spa, vv], load_groups=group)
+
+
+@pytest.mark.parametrize("case", ["force_on_mid_block", "co_member_floor", "co_member_force_on"])
+def test_forced_shortfall_never_rejects_a_time_boxed_plan(
+    case: str, monkeypatch: pytest.MonkeyPatch
+):
+    slots, cfg = _tripwire_case(case)
+    proven = KeplerSolver().solve(KeplerInput(slots, 4.0), copy.deepcopy(cfg))
+    assert "time-boxed" not in proven.status_msg
+    short = proven.bathing_reports["spa"].window_shortfall_c[0]
+    assert short is not None and short > 1.0  # forced by the group, not by physics
+    monkeypatch.setattr("planner.solver.kepler.solve_is_time_boxed", lambda *a, **k: True)
+    result = KeplerSolver().solve(KeplerInput(slots, 4.0), cfg)  # must not raise
+    assert "time-boxed incumbent" in result.status_msg
+    rep = result.bathing_reports["spa"]
+    assert rep.window_shortfall_c[0] == pytest.approx(short, abs=0.05)
+    assert rep.incumbent_unproven_shortfall_c is not None
 
 
 def test_tripwire_accepts_unavoidable_shortfall(monkeypatch: pytest.MonkeyPatch):

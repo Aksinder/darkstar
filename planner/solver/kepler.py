@@ -351,9 +351,7 @@ def _dump_failed_solve_instance(
         # Retention: newest `keep` only (name-sorted == time-sorted).
         # Only names this writer produces: a stray "<prefix>_notes.json" would sort last,
         # count as the newest and push a real dump out.
-        stamped = [
-            p for p in dump_dir.glob(f"{prefix}_*.json") if _DUMP_STAMP_RE.fullmatch(p.stem)
-        ]
+        stamped = [p for p in dump_dir.glob(f"{prefix}_*.json") if _DUMP_STAMP_RE.fullmatch(p.stem)]
         for old in sorted(stamped)[: -max(1, keep)]:
             old.unlink(missing_ok=True)
         if prefix == _DUMP_PREFIX_FAIL:
@@ -457,8 +455,7 @@ class KeplerSolver:
             _bath_err = validate_bathing_spec(heater, slots)
             if _bath_err is not None:
                 logger.error(
-                    "Spa bathing spec for %s dropped (%s) - planning it in legacy "
-                    "daily-kWh mode",
+                    "Spa bathing spec for %s dropped (%s) - planning it in legacy daily-kWh mode",
                     heater.id,
                     _bath_err,
                 )
@@ -1341,7 +1338,9 @@ class KeplerSolver:
                         e_wh = wh.power_kw * slot_hours[t]
                         dev_pa.append((wh_on * e_wh, e_wh, wh.phases))
                     for c in plugged_chargers:
-                        dev_pa.append((ev_energy[c.id][t], c.max_power_kw * slot_hours[t], c.phases))
+                        dev_pa.append(
+                            (ev_energy[c.id][t], c.max_power_kw * slot_hours[t], c.phases)
+                        )
                     known_pa = {
                         str(k).upper(): float(v) for k, v in (s_pa.phased_load_kwh or {}).items()
                     }
@@ -1502,9 +1501,7 @@ class KeplerSolver:
                         # Floor deferral: the pipeline may hand bucket 0 a lower gross
                         # target. Clamped so it can only lower, never raise.
                         if heater.first_bucket_min_kwh is not None:
-                            bucket_floor = min(
-                                bucket_floor, max(0.0, heater.first_bucket_min_kwh)
-                            )
+                            bucket_floor = min(bucket_floor, max(0.0, heater.first_bucket_min_kwh))
                         # First day: deduct per-device heated-today progress
                         day_min_kwh: float = max(0.0, bucket_floor - heater.heated_today_kwh)
                     else:
@@ -1517,9 +1514,7 @@ class KeplerSolver:
                     if day_min_kwh > 0:
                         prob += (  # type: ignore[operator]
                             heater.power_kw
-                            * pulp.lpSum(
-                                water_heat[d][t] * slot_hours[t] for t in day_slot_indices
-                            )
+                            * pulp.lpSum(water_heat[d][t] * slot_hours[t] for t in day_slot_indices)
                             >= day_min_kwh - water_min_kwh_violation[d][i]
                         )
 
@@ -2033,7 +2028,6 @@ class KeplerSolver:
 
         _gap_rel: float = config.solver_gap_rel or 0.01
 
-
         used_solver: str = "highs"
         # Per-attempt timer: solve_is_time_boxed, the SOLVER_TIMEOUT mapping and the
         # degraded-quality WARNING all reason about the solver that produced
@@ -2170,6 +2164,9 @@ class KeplerSolver:
         # getattr: sol_status is standard PuLP, but test doubles / exotic wrappers
         # may lack it — default to "proven" (old behavior) rather than false-flag.
         _sol_status: int = int(getattr(prob, "sol_status", _LP_SOLUTION_OPTIMAL))  # type: ignore[arg-type]
+        # Spa bathing heaters whose time-boxed incumbent misses a window by more
+        # than physics alone forces (see below): flagged on the BathingReport.
+        bathing_unproven_c: dict[str, float] = {}
         if solve_is_time_boxed(is_optimal, _sol_status, used_solver, solve_duration, _limit_s):  # type: ignore[arg-type]
             floor_violation_kwh: float = 0.0
             for d in water_min_kwh_violation:
@@ -2223,42 +2220,24 @@ class KeplerSolver:
                         "dump_path": _dump_path,
                     },
                 )
-            # Spa bathing tripwire: an incumbent that misses a bath by more than the
-            # physics forces (avoidable shortfall > 1 degC) is garbage of the same
-            # kind as a floor violation. The unavoidable part (element on from now)
-            # is excluded, so a physically late schedule never rejects a plan.
+            # Spa bathing: a time-boxed incumbent that misses a bath by more than
+            # pure physics forces is FLAGGED, never rejected. Comfort is soft here,
+            # and "unavoidable" (element on from now, alone) ignores the model's own
+            # hard limits — a load-group cap, a co-member's force_on or its 1000
+            # SEK/kWh floor — so a proven-optimal shortfall can read as "avoidable";
+            # rejecting kept the previous plan on every replan until the window
+            # passed (2026-11-16 review, e1/e2/e4 repros). The water comfort-floor
+            # tripwire above stays the only plan-rejecting check.
             for _bd, _bm in bathing_models.items():
                 _avoidable = avoidable_shortfall_c(build_report(_bm, slot_hours))
                 if _avoidable > BATHING_TRIPWIRE_C:
-                    logger.error(
-                        "Kepler returned a time-boxed incumbent that misses a %s bath "
-                        "by %.2f degC more than physics forces - rejecting the plan "
-                        "(executor keeps the previous one).",
+                    bathing_unproven_c[_bd] = round(_avoidable, 2)
+                    logger.warning(
+                        "Kepler time-boxed incumbent misses a %s bath by %.2f degC more "
+                        "than the element alone forces (gap unproven; a load-group cap "
+                        "or co-member may force it) - shipping it flagged",
                         _bd,
                         _avoidable,
-                    )
-                    _dump_path = _dump_failed_solve_instance(
-                        input_data,
-                        config,
-                        reason="tripwire_bathing_shortfall",
-                        status=str(status),  # type: ignore[reportUnknownArgumentType]
-                        sol_status=_sol_status,
-                        used_solver=used_solver,
-                        solve_duration_s=solve_duration,
-                        chain_duration_s=total_duration,
-                        extra={"heater_id": _bd, "avoidable_shortfall_c": round(_avoidable, 2)},
-                    )
-                    raise PlannerError(
-                        code=PlannerErrorCode.SOLVER_TIMEOUT,
-                        details={
-                            "solver_status": status,
-                            "solve_duration_s": round(solve_duration, 3),
-                            "chain_duration_s": round(total_duration, 3),
-                            "reason": "time-boxed incumbent misses a bathing window",
-                            "heater_id": _bd,
-                            "avoidable_shortfall_c": round(_avoidable, 2),
-                            "dump_path": _dump_path,
-                        },
                     )
             status = f"{status} (time-boxed incumbent, gap unproven)"
             logger.warning(
@@ -2474,6 +2453,7 @@ class KeplerSolver:
         if is_optimal:
             for _bd, _bm in bathing_models.items():
                 _rep = build_report(_bm, slot_hours)
+                _rep.incumbent_unproven_shortfall_c = bathing_unproven_c.get(_bd)
                 bathing_reports[_bd] = _rep
                 logger.info(
                     "Spa bathing %s: ready T %s, shortfall %s (unavoidable %s), "

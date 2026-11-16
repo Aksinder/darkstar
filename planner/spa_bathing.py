@@ -397,4 +397,9 @@ def summarize(
         "windows": [[_iso(s), _iso(e)] for s, e in decision.windows],
         "next_bath": next_bath,
         "on_track": on_track,
+        # degC: a time-boxed plan misses a bath by more than the element alone
+        # forces, unproven (see BathingReport); None otherwise.
+        "unproven_shortfall_c": _round(
+            report.incumbent_unproven_shortfall_c if report is not None else None
+        ),
     }
