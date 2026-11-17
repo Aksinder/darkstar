@@ -1,3 +1,7 @@
+## dev-20261117.1258 — 2026-11-17 13:00
+
+- fix(ev): read the car right after every wake press, and let one press finish
+
 ## dev-20261116.1806 — 2026-11-16 18:08
 
 - fix(ev): don't send turn_off to an already-off switch on the first tick after restart
