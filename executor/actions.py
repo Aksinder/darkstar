@@ -525,6 +525,7 @@ class HAClient:
         entity_id: str | None = None,
         data: dict[str, Any] | None = None,
         max_retries: int = 3,
+        timeout: float | None = None,
     ) -> bool:
         """
         Call a Home Assistant service.
@@ -534,6 +535,10 @@ class HAClient:
             service: Service name (e.g., 'turn_on', 'select_option', 'set_value')
             entity_id: Target entity ID (optional)
             data: Additional service data (optional)
+            max_retries: Retries on timeouts, connection errors and 5xx answers
+            timeout: Total seconds for this call, overriding the client's write
+                deadline. For a service HA is known to hold open for a long time,
+                such as a vehicle wake that waits for the car to answer.
 
         Returns:
             True if successful
@@ -553,6 +558,9 @@ class HAClient:
         # number.x is outside valid range 10 - 9900"); raise_for_status() keeps only
         # the HTTP reason ("Bad Request"). Keep the body of the last failed attempt.
         error_body: list[str] = []
+        post_kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            post_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
         async def _post() -> None:
             error_body.clear()
@@ -562,6 +570,7 @@ class HAClient:
                 async with session.post(
                     f"{self.base_url}/api/services/{domain}/{service}",
                     json=payload,
+                    **post_kwargs,
                 ) as response:
                     status = getattr(response, "status", None)
                     if isinstance(status, int) and status >= 400:

@@ -27,6 +27,10 @@ class FakeHA:
         self.states = states or {}
         self.attrs = attrs or {}
         self.calls: list[tuple] = []
+        # The read that follows every wake is kept apart, so the press counts above
+        # stay exactly what they were before the refresh existed.
+        self.refreshes: list[str | None] = []
+        self.press_kwargs: list[dict] = []
         self.fail = fail
 
     async def get_state_value(self, entity):
@@ -37,8 +41,13 @@ class FakeHA:
             return None
         return {"state": self.states.get(entity), "attributes": self.attrs.get(entity, {})}
 
-    async def call_service(self, domain, service, entity_id=None, data=None, **_kw):
+    async def call_service(self, domain, service, entity_id=None, data=None, **kw):
+        if (domain, service) == ("homeassistant", "update_entity"):
+            self.refreshes.append(entity_id)
+            return True
         self.calls.append((domain, service, entity_id, data))
+        if (domain, service) == ("button", "press"):
+            self.press_kwargs.append(kw)
         if self.fail:
             raise RuntimeError("HTTP 500")
         return True
@@ -207,3 +216,59 @@ class TestWiredIntoTheRunLoop:
         assert WAKE not in ha.calls
         await ctrl.run(ha, T0 + HOUR)
         assert ha.calls.count(WAKE) == 1
+
+
+class TestEveryWakeIsRead:
+    """2026-11-16: a press at 21:29 woke the car, which slept again before the 21:38
+    poll; a press plus update_entity at 21:40 read it home, plugged, at 11 %."""
+
+    @pytest.mark.asyncio
+    async def test_blind_wake_is_followed_by_a_read_of_the_car(self):
+        ctrl, ha = _ctrl(), FakeHA()
+        await _tick(ctrl, ha, T0)
+        await _tick(ctrl, ha, T0 + HOUR)
+        assert ha.calls == [WAKE]
+        assert ha.refreshes == ["sensor.tesla_soc"]
+
+    @pytest.mark.asyncio
+    async def test_frozen_wake_reads_the_online_sensor(self):
+        from tests.executor.test_frozen_wake import _frozen_ctrl, _tick as frozen_tick
+
+        ctrl, ha = _frozen_ctrl(), FakeHA()
+        await frozen_tick(ctrl, ha, T0)
+        await frozen_tick(ctrl, ha, T0 + 0.5 * HOUR)
+        assert ha.calls == [WAKE]
+        assert ha.refreshes == ["binary_sensor.tesla_online"]
+
+    @pytest.mark.asyncio
+    async def test_one_press_with_room_to_finish(self):
+        ctrl, ha = _ctrl(), FakeHA()
+        await _tick(ctrl, ha, T0)
+        await _tick(ctrl, ha, T0 + HOUR)
+        (kw,) = ha.press_kwargs
+        assert kw["max_retries"] == 0
+        assert kw["timeout"] >= 30.0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_press_is_not_followed_by_a_read(self):
+        ctrl, ha = _ctrl(), FakeHA(fail=True)
+        await _tick(ctrl, ha, T0)
+        await _tick(ctrl, ha, T0 + HOUR)
+        assert ha.calls == [WAKE]
+        assert ha.refreshes == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_does_not_undo_the_press(self):
+        class ReadFails(FakeHA):
+            async def call_service(self, domain, service, entity_id=None, data=None, **kw):
+                if service == "update_entity":
+                    raise RuntimeError("timeout")
+                return await super().call_service(domain, service, entity_id, data, **kw)
+
+        ctrl, ha = _ctrl(), ReadFails()
+        await _tick(ctrl, ha, T0)
+        await _tick(ctrl, ha, T0 + HOUR)
+        assert ha.calls == [WAKE]
+        # The press counted: no second one inside the cooldown.
+        await _tick(ctrl, ha, T0 + HOUR + 600.0)
+        assert ha.calls == [WAKE]

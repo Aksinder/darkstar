@@ -115,6 +115,11 @@ _BLIND_WAKE_WINDOW_H = 12.0         # ...and only with a deadline this close
 _BLIND_WAKE_COOLDOWN_S = 3 * 3600.0  # at most four presses inside the window
 _FROZEN_WAKE_AFTER_S = 1800.0       # offline this long before its snapshot is doubted
 _FROZEN_WAKE_COOLDOWN_S = 2 * 3600.0  # a car that really is away costs <= 6 presses a night
+# Tesla Fleet holds a wake press open until the car answers: wake_up, then sleeps of
+# 5/10/15 s between checks, about 30 s at most. The client's 5 s write deadline cut
+# every press short, and its retries pressed twice more (the 7 s triplets of
+# 2026-11-15/16). One press, allowed to finish.
+_WAKE_PRESS_TIMEOUT_S = 40.0
 _UNREADABLE = {"", "unknown", "unavailable", "none"}
 # Before sending switch.turn_on, a power reading older than this is re-fetched
 # (homeassistant.update_entity) so a car that started itself is adopted instead of
@@ -1118,6 +1123,37 @@ class EVSurplusController:
             return resolved
         return str(v).lower() in {s.lower() for s in states}
 
+    async def _press_wake(self, ha: Any, c: EVSurplusChargerCfg) -> None:
+        """Press the car's wake button, then make the integration read the car at once.
+
+        2026-11-16: a press at 21:29 woke the Tesla (the call returned after 15 s), but
+        the car was asleep again when Tesla Fleet polled at 21:38, so Darkstar went on
+        seeing the stale snapshot. A press followed by homeassistant.update_entity at
+        21:40 read it awake, home, plugged in, at 11 %. A wake that nobody reads in the
+        few minutes the car stays up is wasted — that is why the overnight presses of
+        2026-11-15/16 never corrected the "away, 23 %" picture.
+
+        One press, no retries, with a deadline long enough for the wake to finish.
+        Raises if the press fails, so callers keep their own logging. The refresh is
+        best effort: it targets one of the car's polled entities, which refreshes the
+        whole vehicle coordinator.
+        """
+        await ha.call_service(
+            "button", "press", c.wake_entity,
+            max_retries=0, timeout=_WAKE_PRESS_TIMEOUT_S,
+        )
+        refresh = c.online_entity or c.soc_entity or c.home_entity
+        if refresh is None:
+            return
+        try:
+            await ha.call_service(
+                "homeassistant", "update_entity", refresh, max_retries=0
+            )
+        except Exception as exc:
+            logger.info(
+                "EV surplus: refresh of %s after waking %s failed: %s", refresh, c.id, exc
+            )
+
     async def _wake_frozen_cars(
         self, ha: Any, states: list[ChargerState], now_ts: float, shadow: bool
     ) -> None:
@@ -1165,7 +1201,7 @@ class EVSurplusController:
             self._last_frozen_wake_ts[st.id] = now_ts
             self._last_wake_ts[st.id] = now_ts
             try:
-                await ha.call_service("button", "press", c.wake_entity)
+                await self._press_wake(ha, c)
                 logger.warning(
                     "EV surplus: %s asleep for %.0f min, last snapshot %s at %.0f %% "
                     "(floor %.0f %%) with a deadline in %.1f h — pressed %s to check",
@@ -1221,7 +1257,7 @@ class EVSurplusController:
             self._last_blind_wake_ts[st.id] = now_ts
             self._last_wake_ts[st.id] = now_ts
             try:
-                await ha.call_service("button", "press", c.wake_entity)
+                await self._press_wake(ha, c)
                 logger.warning(
                     "EV surplus: %s has been unreadable for %.0f min with a deadline in "
                     "%.1f h — pressed %s to get a real reading",
@@ -2431,9 +2467,7 @@ class EVSurplusController:
                     if (now_ts - last_wake) >= 300.0:
                         self._last_wake_ts[cmd.id] = now_ts
                         try:
-                            await ha.call_service(
-                                "button", "press", ccfg.wake_entity
-                            )
+                            await self._press_wake(ha, ccfg)
                             woke_car = True
                             logger.info(
                                 "EV surplus: pressed wake button %s for %s",

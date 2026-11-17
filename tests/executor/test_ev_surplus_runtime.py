@@ -22,7 +22,7 @@ class FakeHA:
             return None
         return {"state": self.states.get(entity), "attributes": self.attrs.get(entity, {})}
 
-    async def call_service(self, domain, service, entity_id=None, data=None):
+    async def call_service(self, domain, service, entity_id=None, data=None, **_kw):
         self.calls.append((domain, service, entity_id, data))
         return True
 

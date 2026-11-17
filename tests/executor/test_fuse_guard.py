@@ -225,7 +225,7 @@ class FuseFakeHA:
             "last_updated": lu.isoformat(),
         }
 
-    async def call_service(self, domain, service, entity_id=None, data=None):
+    async def call_service(self, domain, service, entity_id=None, data=None, **_kw):
         self.calls.append((domain, service, entity_id, data))
         return True
 

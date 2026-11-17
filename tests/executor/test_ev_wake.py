@@ -70,6 +70,17 @@ async def test_failed_turn_on_presses_the_wake_button():
 
 
 @pytest.mark.asyncio
+async def test_failed_start_wake_is_read_right_after():
+    """The car stays awake only minutes; read it before it sleeps again."""
+    ctrl, _ = _controller(_wake_cfg())
+    ha = SleepyHA(_surplus_states())
+    await ctrl.run(ha, now_ts=1000.0, shadow=False)
+    press = next(i for i, c in enumerate(ha.calls) if c[:2] == ("button", "press"))
+    after = ha.calls[press + 1:]
+    assert after[0] == ("homeassistant", "update_entity", "sensor.tesla_soc", None)
+
+
+@pytest.mark.asyncio
 async def test_wake_press_is_cooldown_limited():
     """Backoff spares the API; the wake press must not undo that."""
     ctrl, _ = _controller(_wake_cfg())

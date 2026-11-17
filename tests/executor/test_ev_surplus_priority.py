@@ -161,7 +161,7 @@ class FakeHA:
             return None
         return {"state": self.states.get(entity), "attributes": self.attrs.get(entity, {})}
 
-    async def call_service(self, domain, service, entity_id=None, data=None):
+    async def call_service(self, domain, service, entity_id=None, data=None, **_kw):
         self.calls.append((domain, service, entity_id, data))
         return True
 
@@ -471,7 +471,7 @@ class TestActuationBackoff:
     @staticmethod
     def _ha_with_failing_tesla(states):
         class FailingHA(FakeHA):
-            async def call_service(self, domain, service, entity_id=None, data=None):
+            async def call_service(self, domain, service, entity_id=None, data=None, **_kw):
                 if entity_id == "switch.tesla" or (data or {}).get("value") is not None:
                     self.calls.append((domain, service, entity_id, data))
                     if domain == "switch":

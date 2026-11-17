@@ -123,6 +123,26 @@ class TestHAClientCallService:
             assert result is True
 
     @pytest.mark.asyncio
+    async def test_call_service_timeout_override_reaches_the_request(self):
+        """A per-call timeout replaces the 5 s write deadline; no timeout keeps it."""
+        client = HAClient("http://ha:8123", "token123")
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_session = MagicMock()
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_cm.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post.return_value = mock_cm
+
+        with patch.object(client, "_get_session", return_value=mock_session):
+            await client.call_service("button", "press", "button.car_wake", timeout=40.0)
+            kwargs = mock_session.post.call_args.kwargs
+            assert kwargs["timeout"].total == 40.0
+
+            await client.call_service("switch", "turn_on", "switch.test")
+            assert "timeout" not in mock_session.post.call_args.kwargs
+
+    @pytest.mark.asyncio
     async def test_call_service_failure(self):
         """call_service raises HACallError on request exception (REV F52 Phase 5)."""
         client = HAClient("http://ha:8123", "token123")
