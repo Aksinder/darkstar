@@ -2,7 +2,7 @@
 
 The solver optimises against ONE net node and knows nothing about sub-panels, so it
 happily books two loads whose combined draw exceeds the feed they share. Measured at
-The reference site 2026-08-16: the spa (1.8 kW = 7.8 A) and the villavagn tank (1.6 kW = 6.7 A)
+The reference site, 2026-08-16: the spa (1.8 kW = 7.8 A) and the villavagn tank (1.6 kW = 6.7 A)
 both sit on the villavagn's L2 and together reach 14.2 A against a 10 A guard — leaving
 the phase guard to clean up after the plan rather than acting as the backstop it is.
 """
